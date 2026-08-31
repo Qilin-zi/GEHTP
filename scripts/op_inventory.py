@@ -26,9 +26,13 @@ def main():
     with open(args.net_json) as f:
         net = json.load(f)
 
-    nodes = net.get("graph", {}).get("nodes", [])
+    graph = net.get("graph", {})
+    nodes = graph.get("nodes", [])
+    # 兼容两种 schema: list(旧) 与 dict(按节点名键控, 2.48 qairt-dlc-to-json)
+    if isinstance(nodes, dict):
+        nodes = [{"name": k, **v} for k, v in nodes.items()]
     type_counts = Counter(n["type"] for n in nodes)
-    total_params = sum(n.get("params_count", 0) for n in nodes)
+    total_params = sum(int(n.get("params_count", 0) or 0) for n in nodes)
     scalar_keys = Counter()
     io_shapes = {}
     n_with_scalar = 0
@@ -37,11 +41,21 @@ def main():
             scalar_keys[k] += 1
         if n.get("scalar_params"):
             n_with_scalar += 1
-    # 输入/输出张量: graph_tensors / tensor 区取 type=INPUT/OUTPUT
-    for t in net.get("graph", {}).get("tensors", []):
-        if t.get("type") in ("INPUT", "OUTPUT"):
-            io_shapes[t["name"]] = {
-                "type": t["type"],
+    # 输入/输出张量: tensors 区(dict 按名或 list)取 type=INPUT/OUTPUT
+    tensors = graph.get("tensors", {})
+    if isinstance(tensors, dict):
+        tensors = [{"name": k, **v} for k, v in tensors.items()]
+    for t in tensors:
+        ttype = t.get("type")
+        if ttype == "INPUT" or (isinstance(ttype, int) and ttype == 0):
+            io_shapes[t.get("name", t.get("id"))] = {
+                "type": "INPUT",
+                "dims": t.get("dims"),
+                "data_type": t.get("data_type"),
+            }
+        elif ttype == "OUTPUT" or (isinstance(ttype, int) and ttype == 1):
+            io_shapes[t.get("name", t.get("id"))] = {
+                "type": "OUTPUT",
                 "dims": t.get("dims"),
                 "data_type": t.get("data_type"),
             }
