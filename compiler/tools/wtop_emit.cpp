@@ -164,6 +164,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         in_f16.assign(input_elems * 2, 0);
     }
     em.add_slot((uint32_t)in_f16.size(), (uint32_t)input_elems, in_f16.data());
+    em.slots[0].addr = WT_SLOT_EXT_IN;  // Level 1: 输入槽标外部(wt_exec_run_io 注入)
 
     // 3. 权重槽(先扫 conv 的 W/B const)
     uint32_t w_slot = 0, b_slot = 0;
@@ -310,8 +311,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::vector<uint8_t> zeros((size_t)pool_end, 0);
             spill_pool_slot = em.add_slot((uint32_t)pool_end, (uint32_t)pool_end / 2, zeros.data());
         }
-        uint32_t t = em.temp_of(r.op_id);
-        // SPILL: 张量 → 池; FILL: 池 → 张量(设备执行序由引擎按 op 序串行)
+        uint32_t t;
+        if (r.op_id == gp.get_output_node_id()) {
+            // Output 节点的张量 = 其输入生产者的 temp
+            const OpDef* out = gp.get_op_at(r.op_id);
+            t = (out && !out->inputs.empty())
+                ? em.src_ref(out->inputs[0].src_id, gp.get_input_node_id())
+                : 0x8000u;
+        } else {
+            t = em.src_ref(r.op_id, gp.get_input_node_id());
+        }
+        // SPILL: 张量 → 池; FILL: 池 → 张量(设备执行序由引擎按 op 序串行;
+        // 输入节点的张量经 0x8000|slot 编码引用)
         em.add_op(OP_SPILL, {t, spill_pool_slot, (uint32_t)r.ddr_offset, (uint32_t)(r.size / 2)});
         em.add_op(OP_FILL, {spill_pool_slot, (uint32_t)r.ddr_offset, t, (uint32_t)(r.size / 2)});
     }

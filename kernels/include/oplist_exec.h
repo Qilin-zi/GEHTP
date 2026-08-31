@@ -41,10 +41,20 @@ void wt_exec_shutdown(void);
  * 同一执行体 (fused=run 一次; split=按 op 逐段), 输出必须恒等。 */
 struct wt_exec_stats {
     uint32_t ops, nop, matmul, rmsnorm, silu, pin, pin_skipped;
+    uint32_t im2col, conv2d, add, spill, fill, transpose;  /* GEHTP 阶段9 */
 };
 int  wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                        uint32_t* engine_m, int64_t* op_us, char* err, size_t errn);
 void wt_exec_get_stats(struct wt_exec_stats* st);
+
+/* GEHTP 阶段9 (Level 1 输入注入): 与 wt_exec_run 同语义, 但
+ *   in_ptr  : 外部输入缓冲 (addr==WT_SLOT_EXT_IN 的 slot 从此读)
+ *   out_ptr : 输出缓冲 (执行完后把 temps[out_temp] 拷到这里)
+ *   out_temp: 输出 temp id (由 manifest 记录)
+ * in_ptr/out_ptr 可 NULL (对应方向不注入/不回传)。 */
+int  wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
+                    uint32_t out_temp,
+                    uint32_t* engine_m, int64_t* op_us, char* err, size_t errn);
 
 /* W3 解析报告 (源: wt_w3.c)。emit 逐行收到 JSON 行; host wt_inspect 与
  * 设备输出共用此函数, 行逐字节一致。 */

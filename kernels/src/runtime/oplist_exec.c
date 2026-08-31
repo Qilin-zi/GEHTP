@@ -38,6 +38,23 @@ struct wt_exec {
 
 static struct wt_exec g_exec;
 
+/* Level 1 输入注入: 外部输入缓冲 (run_io 设置) */
+static const uint8_t* g_ext_in = NULL;
+
+/* slot 数据指针: addr==EXT_IN 的 slot 走外部缓冲 */
+static const uint8_t* slot_ptr(const struct wt_blob* b, uint32_t s) {
+    if (s >= b->n_slots) return NULL;
+    /* EXT_IN 槽: 有注入缓冲用注入, 否则回退 blob 内固化数据(整步/逐段校验) */
+    if (b->slots[s].addr == WT_SLOT_EXT_IN && g_ext_in) return g_ext_in;
+    return b->weight_base + b->slots[s].offset;
+}
+
+/* temp/slot 引用解码: 0x8000|slot_id → slot; 否则 temp */
+static const uint8_t* ref_ptr(const struct wt_blob* b, uint32_t arg) {
+    if (arg & 0x8000u) return slot_ptr(b, arg & 0x7FFFu);
+    return (arg < MAX_TEMPS) ? g_exec.temps[arg] : NULL;
+}
+
 uint8_t* wt_exec_temp(uint32_t id) {
     return (id < MAX_TEMPS) ? g_exec.temps[id] : NULL;
 }
@@ -256,6 +273,157 @@ static int exec_silu(const struct wt_op* op, char* err, size_t errn) {
     return 0;
 }
 
+/* GEHTP 阶段9: im2col (f16 NHWC act → cols [th*tw, kh*kw*C] f16, 窗口 gather
+ * + pad 零填充)。args: [act_ref, out_t, H, W, C, kh, kw, ph, pw, sh, sw, y0, x0, th, tw]
+ * 全局坐标: 输出 (oy,ox), 窗口位置 gy=oy*sh+k-ph (pad 区 → 0)。 */
+static int exec_im2col(const struct wt_blob* b, const struct wt_op* op,
+                       char* err, size_t errn) {
+    uint32_t H = op->args[2], W = op->args[3], C = op->args[4];
+    uint32_t kh = op->args[5], kw = op->args[6];
+    uint32_t ph = op->args[7], pw = op->args[8];
+    uint32_t sh = op->args[9], sw = op->args[10];
+    uint32_t y0 = op->args[11], x0 = op->args[12];
+    uint32_t th = op->args[13], tw = op->args[14];
+    const uint8_t* act = ref_ptr(b, op->args[0]);
+    if (!act) { snprintf(err, errn, "im2col act ref empty"); return -1; }
+    uint32_t K = kh * kw * C;
+    uint16_t* cols = (uint16_t*)temp_get(op->args[1], (size_t)th * tw * K * 2u);
+    if (!cols) { snprintf(err, errn, "im2col temp alloc"); return -1; }
+    const uint16_t* a = (const uint16_t*)act;
+    for (uint32_t oy = 0; oy < th; oy++)
+        for (uint32_t ox = 0; ox < tw; ox++) {
+            uint16_t* row = cols + ((size_t)oy * tw + ox) * K;
+            for (uint32_t k = 0; k < kh; k++)
+                for (uint32_t l = 0; l < kw; l++) {
+                    long gy = (long)(y0 + oy) * sh + (long)k - ph;
+                    long gx = (long)(x0 + ox) * sw + (long)l - pw;
+                    for (uint32_t c = 0; c < C; c++) {
+                        uint16_t v = 0;
+                        if (gy >= 0 && gy < (long)H && gx >= 0 && gx < (long)W)
+                            v = a[((size_t)gy * W + gx) * C + c];
+                        row[(k * kw + l) * C + c] = v;
+                    }
+                }
+        }
+    return 0;
+}
+
+/* GEHTP 阶段9: conv2d 标量 GEMM (f32 累加, f16 存储 —— fp16 纪律与
+ * host/ORT 金标同算法)。args: [cols_t, w_s, bias_s, out_t, M, K, N,
+ * out_y0, out_x0, out_H, out_W, co0, co_n]。
+ * 输出 tile 直接写入全图 out temp (NHWC [out_H, out_W, co])。 */
+static int exec_conv2d(const struct wt_blob* b, const struct wt_op* op,
+                       char* err, size_t errn) {
+    uint32_t M = op->args[4], K = op->args[5], N = op->args[6];
+    uint32_t oy0 = op->args[7], ox0 = op->args[8];
+    uint32_t out_H = op->args[9], out_W = op->args[10];
+    uint32_t co0 = op->args[11], co_n = op->args[12];
+    const uint8_t* cols = ref_ptr(b, op->args[0]);
+    const uint8_t* wp = slot_ptr(b, op->args[1]);
+    const uint8_t* bp = slot_ptr(b, op->args[2]);
+    if (!cols || !wp || !bp) { snprintf(err, errn, "conv2d ref empty"); return -1; }
+    if (b->slots[op->args[1]].len != K * N * 2u ||
+        b->slots[op->args[2]].len != N * 2u) {
+        snprintf(err, errn, "conv2d w/b slot size mismatch");
+        return -1;
+    }
+    uint16_t* out = (uint16_t*)temp_get(op->args[3], (size_t)out_H * out_W * N * 2u);
+    if (!out) { snprintf(err, errn, "conv2d temp alloc"); return -1; }
+    const uint16_t* A = (const uint16_t*)cols;
+    const uint16_t* Wm = (const uint16_t*)wp;
+    const uint16_t* Bm = (const uint16_t*)bp;
+    for (uint32_t r = 0; r < M; r++) {
+        for (uint32_t c = co0; c < co0 + co_n; c++) {
+            float acc = f16_to_f32(Bm[c]);
+            for (uint32_t k = 0; k < K; k++)
+                acc += f16_to_f32(A[(size_t)r * K + k]) * f16_to_f32(Wm[(size_t)k * N + c]);
+            uint32_t oy = oy0 + r / out_W, ox = ox0 + r % out_W;
+            out[((size_t)oy * out_W + ox) * N + c] = f32_to_f16(acc);
+        }
+    }
+    return 0;
+}
+
+/* GEHTP 阶段9: 纯 f16 加 (f32 累加, f16 存储; 无 ReLU)。args: [a_ref, b_ref, out_t, n] */
+static int exec_add(const struct wt_blob* b, const struct wt_op* op,
+                    char* err, size_t errn) {
+    uint32_t n = op->args[3];
+    const uint8_t* a = ref_ptr(b, op->args[0]);
+    const uint8_t* b2 = ref_ptr(b, op->args[1]);
+    if (!a || !b2) { snprintf(err, errn, "add ref empty"); return -1; }
+    uint16_t* y = (uint16_t*)temp_get(op->args[2], (size_t)n * 2u);
+    if (!y) { snprintf(err, errn, "add temp alloc"); return -1; }
+    const uint16_t* A = (const uint16_t*)a;
+    const uint16_t* B2 = (const uint16_t*)b2;
+    for (uint32_t i = 0; i < n; i++)
+        y[i] = f32_to_f16(f16_to_f32(A[i]) + f16_to_f32(B2[i]));
+    return 0;
+}
+
+/* GEHTP 阶段9: spill/fill (DDR temp ↔ 池, 标量拷贝; DMA 快路径 M3)。
+ * spill: [src_t, pool_s, off, n_elem]  fill: [pool_s, off, dst_t, n_elem] */
+static int exec_spill(const struct wt_blob* b, const struct wt_op* op,
+                      char* err, size_t errn) {
+    uint32_t n = op->args[3];
+    /* src 位置支持 0x8000|slot 编码(输入张量经 slot 引用) */
+    const uint8_t* src = ref_ptr(b, op->args[0]);
+    if (!src) { snprintf(err, errn, "spill src empty"); return -1; }
+    const uint8_t* pool = slot_ptr(b, op->args[1]);
+    if (!pool || b->slots[op->args[1]].len < op->args[2] + n * 2u) {
+        snprintf(err, errn, "spill pool oob"); return -1;
+    }
+    memcpy((uint8_t*)pool + op->args[2], src, n * 2u);
+    return 0;
+}
+static int exec_fill(const struct wt_blob* b, const struct wt_op* op,
+                     char* err, size_t errn) {
+    uint32_t n = op->args[3];
+    const uint8_t* pool = slot_ptr(b, op->args[0]);
+    if (!pool || b->slots[op->args[0]].len < op->args[1] + n * 2u) {
+        snprintf(err, errn, "fill pool oob"); return -1;
+    }
+    /* dst 位置支持 0x8000|slot 编码 */
+    uint8_t* dst = NULL;
+    if (op->args[2] & 0x8000u) {
+        dst = (uint8_t*)slot_ptr(b, op->args[2] & 0x7FFFu);
+    } else {
+        dst = temp_get(op->args[2], n * 2u);
+    }
+    if (!dst) { snprintf(err, errn, "fill dst empty"); return -1; }
+    memcpy(dst, pool + op->args[1], n * 2u);
+    return 0;
+}
+
+/* GEHTP 阶段9: f16 4-D 转置 (perm 每轴 1 字节, N=1 契约)。
+ * args: [src_ref, out_t, H, W, C, perm_u32] */
+static int exec_transpose(const struct wt_blob* b, const struct wt_op* op,
+                          char* err, size_t errn) {
+    uint32_t H = op->args[2], W = op->args[3], C = op->args[4];
+    uint32_t perm = op->args[5];
+    const uint8_t* src = ref_ptr(b, op->args[0]);
+    if (!src) { snprintf(err, errn, "transpose src ref empty"); return -1; }
+    uint16_t* dst = (uint16_t*)temp_get(op->args[1], (size_t)H * W * C * 2u);
+    if (!dst) { snprintf(err, errn, "transpose temp alloc"); return -1; }
+    const uint16_t* s16 = (const uint16_t*)src;
+    uint32_t p[4] = {(uint8_t)perm, (uint8_t)(perm >> 8),
+                     (uint8_t)(perm >> 16), (uint8_t)(perm >> 24)};
+    uint32_t dims[4] = {1, H, W, C};
+    uint32_t strides_in[4] = {H * W * C, W * C, C, 1};
+    for (uint32_t o0 = 0; o0 < dims[p[0]]; o0++)
+        for (uint32_t o1 = 0; o1 < dims[p[1]]; o1++)
+            for (uint32_t o2 = 0; o2 < dims[p[2]]; o2++)
+                for (uint32_t o3 = 0; o3 < dims[p[3]]; o3++) {
+                    uint32_t oc[4] = {o0, o1, o2, o3};
+                    uint32_t ic[4] = {0, 0, 0, 0};
+                    for (int ax = 0; ax < 4; ax++) ic[p[ax]] = oc[ax];
+                    size_t src_i = (size_t)ic[0] * strides_in[0] + ic[1] * strides_in[1] +
+                                   ic[2] * strides_in[2] + ic[3] * strides_in[3];
+                    dst[((size_t)o0 * dims[p[1]] + o1) * dims[p[2]] * dims[p[3]] +
+                        o2 * dims[p[3]] + o3] = s16[src_i];
+                }
+    return 0;
+}
+
 /* 执行 ops[first, first+count)。返回 0=全过; >0 = 失败的 op 序号 (blob 内 1 基)。
  * op_us[i] = 本段第 i 个 op 微秒 (可 NULL)。 */
 int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
@@ -300,6 +468,30 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             g_exec.st.silu++;
             rc = exec_silu(op, err, errn);
             break;
+        case OP_IM2COL:
+            g_exec.st.im2col++;
+            rc = exec_im2col(b, op, err, errn);
+            break;
+        case OP_CONV2D_F16:
+            g_exec.st.conv2d++;
+            rc = exec_conv2d(b, op, err, errn);
+            break;
+        case OP_ADD_F16:
+            g_exec.st.add++;
+            rc = exec_add(b, op, err, errn);
+            break;
+        case OP_SPILL:
+            g_exec.st.spill++;
+            rc = exec_spill(b, op, err, errn);
+            break;
+        case OP_FILL:
+            g_exec.st.fill++;
+            rc = exec_fill(b, op, err, errn);
+            break;
+        case OP_TRANSPOSE_F16:
+            g_exec.st.transpose++;
+            rc = exec_transpose(b, op, err, errn);
+            break;
         default:
             snprintf(err, errn, "opcode %u unhandled", (unsigned)op->opcode);
             rc = -1;
@@ -321,4 +513,18 @@ int wt_exec_run(const struct wt_blob* b, uint32_t* engine_m,
                 int64_t* op_us, char* err, size_t errn) {
     memset(&g_exec.st, 0, sizeof(g_exec.st));
     return wt_exec_run_range(b, 0, b->n_ops, engine_m, op_us, err, errn);
+}
+
+/* GEHTP 阶段9 (Level 1): 外部输入注入 + 输出回传 */
+int wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
+                   uint32_t out_temp,
+                   uint32_t* engine_m, int64_t* op_us, char* err, size_t errn) {
+    g_ext_in = (const uint8_t*)in_ptr;
+    int rc = wt_exec_run(b, engine_m, op_us, err, errn);
+    if (rc == 0 && out_ptr && out_temp < MAX_TEMPS && g_exec.temps[out_temp]) {
+        uint32_t ob = g_exec.temp_bytes[out_temp];
+        memcpy(out_ptr, g_exec.temps[out_temp], ob);
+    }
+    g_ext_in = NULL;
+    return rc;
 }

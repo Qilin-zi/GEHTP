@@ -106,7 +106,16 @@ void GraphPrepare::inject_htp_prepare_inputs() {
         op->inputs.push_back(ic);
     };
 
-    for (auto& [id, opdef] : opdef_map_) {
+    // 快照 keys 再遍历: 循环体内 get_or_create/append_const_node 会向
+    // opdef_map_ 插入合成 const, rehash 会使范围 for 迭代器失效 (UB,
+    // 实测表现为遍历跳过 Transpose/Input、重复访问 Eltwise_Binary)。
+    std::vector<op_id_t> op_ids;
+    op_ids.reserve(opdef_map_.size());
+    for (auto& [id, _] : opdef_map_) op_ids.push_back(id);
+    for (op_id_t id : op_ids) {
+        auto it = opdef_map_.find(id);
+        if (it == opdef_map_.end()) continue;
+        OpDef* opdef = it->second.get();
         if (!opdef || opdef->is_const() || opdef->is_dead()) continue;
         std::string nm = opdef->name_tag ? opdef->name_tag->name() : "";
         if (nm.empty() || nm == "Input" || nm == "Output") continue;
@@ -122,7 +131,7 @@ void GraphPrepare::inject_htp_prepare_inputs() {
                 auto cit = const_by_N.find(N);
                 op_id_t ws = (cit != const_by_N.end()) ? cit->second
                     : get_or_create("wscale_" + std::to_string(N), 562, 1,1,1,N, 4, 4);
-                add_input(opdef.get(), ws);
+                add_input(opdef, ws);
             }
             op_id_t stride_id = 0, pad_id = 0, dilation_id = 0;
             for (op_id_t tpid : opdef->tensor_param_ids) {
@@ -133,12 +142,19 @@ void GraphPrepare::inject_htp_prepare_inputs() {
                 else if (pn.find("pad_amount") != std::string::npos) pad_id = tpid;
                 else if (pn.find("dilation") != std::string::npos) dilation_id = tpid;
             }
-            if (stride_id) add_input(opdef.get(), stride_id);
-            if (pad_id) add_input(opdef.get(), pad_id);
-            add_input(opdef.get(), get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
-            if (dilation_id) add_input(opdef.get(), dilation_id);
-            add_input(opdef.get(), get_or_create("quant_marker", 1032, 1,1,1,1, 4, 4));
+            if (stride_id) add_input(opdef, stride_id);
+            if (pad_id) add_input(opdef, pad_id);
+            add_input(opdef, get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
+            if (dilation_id) add_input(opdef, dilation_id);
+            add_input(opdef, get_or_create("quant_marker", 1032, 1,1,1,1, 4, 4));
 
+        } else if (nm == "Transpose") {
+            // perm 是 tensor_param → 注入为 inputs[1](实测: 不注入则 perm const
+            // 在 DCE 被杀, 序列化/执行丢转置语义)
+            for (op_id_t tpid : opdef->tensor_param_ids) {
+                if (opdef->inputs.size() >= 2) break;
+                add_input(opdef, tpid);
+            }
         } else if (nm == "DepthWiseConv2d") {
             uint32_t N = 0;
             if (opdef->inputs.size() > 1) {
@@ -149,7 +165,7 @@ void GraphPrepare::inject_htp_prepare_inputs() {
                 auto cit = const_by_N.find(N);
                 op_id_t ws = (cit != const_by_N.end()) ? cit->second
                     : get_or_create("wscale_" + std::to_string(N), 562, 1,1,1,N, 4, 4);
-                add_input(opdef.get(), ws);
+                add_input(opdef, ws);
             }
             op_id_t stride_id = 0, pad_id = 0, dilation_id = 0;
             for (op_id_t tpid : opdef->tensor_param_ids) {
@@ -160,9 +176,9 @@ void GraphPrepare::inject_htp_prepare_inputs() {
                 else if (pn.find("pad_amount") != std::string::npos) pad_id = tpid;
                 else if (pn.find("dilation") != std::string::npos) dilation_id = tpid;
             }
-            if (stride_id) add_input(opdef.get(), stride_id);
-            if (pad_id) add_input(opdef.get(), pad_id);
-            if (dilation_id) add_input(opdef.get(), dilation_id);
+            if (stride_id) add_input(opdef, stride_id);
+            if (pad_id) add_input(opdef, pad_id);
+            if (dilation_id) add_input(opdef, dilation_id);
 
         } else if (nm == "FullyConnected") {
             if (opdef->inputs.size() <= 2) {
@@ -176,10 +192,10 @@ void GraphPrepare::inject_htp_prepare_inputs() {
                     auto cit = const_by_N.find(N);
                     op_id_t ws = (cit != const_by_N.end()) ? cit->second
                         : get_or_create("wscale_" + std::to_string(N), 562, 1,1,1,N, 4, 4);
-                    add_input(opdef.get(), ws);
+                    add_input(opdef, ws);
                 }
             }
-            add_input(opdef.get(), get_or_create("quant_marker", 1032, 1,1,1,1, 4, 4));
+            add_input(opdef, get_or_create("quant_marker", 1032, 1,1,1,1, 4, 4));
 
         } else if (nm == "MatMul") {
             uint32_t N = 0;
@@ -191,39 +207,39 @@ void GraphPrepare::inject_htp_prepare_inputs() {
                 auto cit = const_by_N.find(N);
                 op_id_t ws = (cit != const_by_N.end()) ? cit->second
                     : get_or_create("wscale_" + std::to_string(N), 562, 1,1,1,N, 4, 4);
-                add_input(opdef.get(), ws);
+                add_input(opdef, ws);
             }
             op_id_t qm = get_or_create("quant_marker", 1032, 1,1,1,1, 4, 4);
-            add_input(opdef.get(), qm);
-            add_input(opdef.get(), qm);
+            add_input(opdef, qm);
+            add_input(opdef, qm);
 
         } else if (nm == "ElementWiseNeuron") {
-            add_input(opdef.get(), get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
+            add_input(opdef, get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
             op_id_t sa = get_or_create("sc_ewn_a", 562, 1,1,1,1, 4, 4);
             op_id_t sb = get_or_create("sc_ewn_b", 562, 1,1,1,1, 4, 4);
-            for (int i = 0; i < 4; i++) add_input(opdef.get(), sa);
-            add_input(opdef.get(), sb);
+            for (int i = 0; i < 4; i++) add_input(opdef, sa);
+            add_input(opdef, sb);
 
         } else if (nm == "LayerNorm") {
-            add_input(opdef.get(), get_or_create("sc_" + nm, 562, 1,1,1,1, 4, 4));
-            add_input(opdef.get(), get_or_create("or_Softmax", 50, 1,1,1,1, 4, 4));
+            add_input(opdef, get_or_create("sc_" + nm, 562, 1,1,1,1, 4, 4));
+            add_input(opdef, get_or_create("or_Softmax", 50, 1,1,1,1, 4, 4));
 
         } else if (nm == "Softmax") {
-            add_input(opdef.get(), get_or_create("sc_" + nm, 562, 1,1,1,1, 4, 4));
-            add_input(opdef.get(), get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
+            add_input(opdef, get_or_create("sc_" + nm, 562, 1,1,1,1, 4, 4));
+            add_input(opdef, get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
 
         } else if (nm == "Gather") {
             if (opdef->inputs.size() > 1) opdef->inputs.resize(1);
             op_id_t or_id = get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4);
-            add_input(opdef.get(), or_id);
-            add_input(opdef.get(), or_id);
+            add_input(opdef, or_id);
+            add_input(opdef, or_id);
 
         } else if (nm == "ElementWiseBinary") {
-            add_input(opdef.get(), get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
+            add_input(opdef, get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
 
         } else if (nm == "Transpose") {
             for (op_id_t tpid : opdef->tensor_param_ids)
-                add_input(opdef.get(), tpid);
+                add_input(opdef, tpid);
 
         } else if (nm == "Reshape") {
             // [data] — no injected inputs

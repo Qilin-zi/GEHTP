@@ -45,6 +45,7 @@ static void usage() {
         "  --weights-bin <path> Path to weights .bin (TAR archive with W.raw, b.raw)\n"
         "                       or qairt-converter 2.48 params.bin (auto-detected)\n"
         "  --format <fmt>     qnn=路径A金样重放(默认) | tagged=我方 runlist\n"
+        "  --vtcm-budget <n>  VTCM 预算字节(0=默认 8MB; 小值强制溢出)\n"
         "  --output <path>     Output context binary path (default: output.bin)\n"
         "  --graph-name <name>  Graph name (default: from net.json or 'compiled_graph')\n"
         "  --verbose           Print detailed compilation info\n"
@@ -213,37 +214,20 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
     }
     cands = uniq;
 
-    // 尺寸匹配: 每个候选在 f16 流中找 |值|幅度最大的偏移(不重叠)
-    std::vector<bool> used(raw.size(), false);
+    // 顺序分配(阶段1 字节级实证: params.bin = 静态张量按 net.json 出现序的
+    // f16 拼接, 无对齐填充; [B][W][尾] 即此序)。此前用 |值|幅度启发式挑偏移,
+    // 在全部 N(0,1) 值域下不可靠(实测 W 匹配到偏移 32 错位)——弃用。
     std::vector<uint8_t> tar;
+    size_t off = 0;
     size_t n_hits = 0;
     for (const auto& c : cands) {
-        if (c.bytes > raw.size() || c.bytes == 0) continue;
-        size_t best_off = SIZE_MAX;
-        double best_mag = -1.0;
-        for (size_t o = 0; o + c.bytes <= raw.size(); o += 2) {
-            bool free = true;
-            for (size_t k = 0; k < c.bytes; k++) if (used[o + k]) { free = false; break; }
-            if (!free) continue;
-            const uint16_t* h = reinterpret_cast<const uint16_t*>(raw.data() + o);
-            double mag = 0.0;
-            size_t n = c.bytes / 2;
-            size_t step = std::max<size_t>(1, n / 64);
-            for (size_t k = 0; k < n; k += step) {
-                uint16_t v = h[k];
-                float f = widen_f16(v);
-                mag += std::fabs((double)f);
-            }
-            if (mag > best_mag) { best_mag = mag; best_off = o; }
-        }
-        if (best_off == SIZE_MAX) continue;
-        for (size_t k = 0; k < c.bytes; k++) used[best_off + k] = true;
-        // f16 → f32 拓宽 → TAR 条目
+        if (off + c.bytes > raw.size() || c.bytes == 0) continue;
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(raw.data() + off);
         std::vector<float> f32(c.bytes / 2);
-        const uint16_t* h = reinterpret_cast<const uint16_t*>(raw.data() + best_off);
         for (size_t k = 0; k < f32.size(); k++) f32[k] = widen_f16(h[k]);
-        std::string entry = c.name + ".raw";
-        tar_append(tar, entry, reinterpret_cast<const uint8_t*>(f32.data()), f32.size() * 4);
+        tar_append(tar, c.name + ".raw",
+                   reinterpret_cast<const uint8_t*>(f32.data()), f32.size() * 4);
+        off += c.bytes;
         n_hits++;
     }
     if (n_hits == 0) { std::fprintf(stderr, "Warning: no weight candidates matched in %s\n", weights_bin_path.c_str()); return ""; }
@@ -267,6 +251,7 @@ int main(int argc, char** argv) {
     std::string output_path = "output.bin";
     std::string graph_name = "simple_linear";
     std::string output_format = "qnn";   // qnn=路径A | tagged=我方 runlist
+    uint64_t vtcm_budget = 0;           // 0=默认 8MB; 阶段7: 小预算强制溢出(spill/fill)
     bool verbose = false;
 
     for (int i = 1; i < argc; i++) {
@@ -277,6 +262,7 @@ int main(int argc, char** argv) {
         else if (arg == "--weights-bin" && i+1 < argc) weights_bin_path = argv[++i];
         else if (arg == "--output" && i+1 < argc) output_path = argv[++i];
         else if (arg == "--format" && i+1 < argc) output_format = argv[++i];
+        else if (arg == "--vtcm-budget" && i+1 < argc) vtcm_budget = strtoull(argv[++i], nullptr, 0);
         else if (arg == "--graph-name" && i+1 < argc) graph_name = argv[++i];
         else if (arg == "--verbose" || arg == "-v") verbose = true;
         else {
@@ -303,15 +289,15 @@ int main(int argc, char** argv) {
     uint32_t op_count = 0;
     if (!net_json_path.empty()) {
         if (verbose) std::printf("[1a] Loading net.json: %s\n", net_json_path.c_str());
-        op_count = loader.load_net_json(net_json_path);
+        // 权重必须先注入: load_net_json → build_graph 立即消费 weights_
+        // (实测: 先 load 后 set_weights 会把 W/B 建成全零 const)
         if (!weights_bin_path.empty()) {
-            // 2.48 params.bin(实测: 静态张量 f16 拼接)自动识别并转 TAR
+            // 2.48 params.bin(实测: 静态张量按 net.json 序 f16 拼接)自动识别并转 TAR
             std::string tar = adapt_weights_bin(net_json_path, weights_bin_path);
-            if (!tar.empty()) {
-                auto w = loader.load_weight_bin(tar);
-                loader.set_weights(std::move(w));
-            }
+            if (!tar.empty())
+                loader.set_weights(loader.load_weight_bin(tar));
         }
+        op_count = loader.load_net_json(net_json_path);
     } else {
         if (verbose) std::printf("[1a] Loading .cpp: %s\n", cpp_path.c_str());
         if (weights_bin_path.empty()) {
@@ -343,6 +329,7 @@ int main(int argc, char** argv) {
     // Step 2: Prepare (optimize) the graph
     if (verbose) std::printf("[2a] Preparing graph...\n");
     HexagonNNEnv env;
+    if (vtcm_budget != 0) gp.set_vtcm_budget(vtcm_budget);
     GraphStatus s = gp.prepare(env);
     if (s != GraphStatus::Success) {
         std::fprintf(stderr, "Error: prepare() failed with status %d\n",

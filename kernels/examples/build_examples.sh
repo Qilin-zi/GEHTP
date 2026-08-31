@@ -40,7 +40,7 @@ EXAMPLES=(01_runtime_init 02_convf16_gemm 03_convbbb_int8 04_convhbh_u16 \
           18_smallm_gemv 19_gdn_sm 20_dualdomain 21_oplist_exec \
           22_dualcore_threads 23_fence 24_arena 25_harness 26_wpool \
           27_pxbridge 28_gdn_tree 29_kvcache 30_graph_step 31_gemm_dispatch 32_rbr \
-          33_bledger 34_dmaring 35_btrack 36_absoak)
+          33_bledger 34_dmaring 35_btrack 36_absoak 37_conv2d_add)
 
 adb() { command adb -s "$DEVICE" "$@"; }
 
@@ -62,6 +62,13 @@ if [ ! -x "$BUILD/host/pack_oplist" ] || [ ! -x "$BUILD/host/wt_inspect" ]; then
         "$LIB/src/runtime/oplist_parse.c" "$LIB/src/runtime/wt_sha256.c" \
         "$LIB/src/runtime/wt_w3.c"
 fi
+# GEHTP 例37 资产(conv_add_pipeline.sh 产出; 缺失则跳过推送)
+G37_DIR="${GEHTP_37_DIR:-$LIB/../../blobs_conv_add}"
+if [ -f "$G37_DIR/blob.wtop" ]; then
+    adb shell "mkdir -p $DEVDIR/g37" >/dev/null 2>&1
+    adb push "$G37_DIR"/*.wtop "$G37_DIR"/in*.f16.raw "$G37_DIR"/gold*.f16.raw "$DEVDIR/g37/" >/dev/null 2>&1 || true
+fi
+
 for tag in w4 w5; do
     if [ ! -f "$BLOBS/blob_$tag.wtop" ]; then
         "$BUILD/host/pack_oplist" --t10 "$LIB/assets/s2560" --out "$BLOBS" --tag "$tag"

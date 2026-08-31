@@ -1,0 +1,3 @@
+Attempting to run on unsigned PD on domain 3
+RPC to Hexagon DSP with args: "test_37_conv2d_add.so "
+Successfully called main() on Hexagon DSP and received return value of 0.

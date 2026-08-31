@@ -46,6 +46,11 @@ extern "C" {
 #define WT_MAX_SLOTS 64u
 #define WT_MAX_OPS 256u
 #define WT_MAX_ARGS 16u
+/* 外部槽标记 (Level 1 运行期输入注入, GEHTP 阶段9):
+ * slot.addr == EXT_IN  → 该 slot 数据在 wt_exec_run_io 的 in_ptr (blob 不固化)
+ * slot.addr == EXT_OUT → 输出 temp 拷贝目标由 run_io 的 out_ptr 提供 */
+#define WT_SLOT_EXT_IN  0xFFFFFFFFu
+#define WT_SLOT_EXT_OUT 0xFFFFFFFEu
 
 enum {
     OP_NOP = 0,

@@ -336,28 +336,24 @@ uint32_t QnnIRLoader::build_graph() {
     // registration missed them. Rebuild from input connections.
     gp_.rebuild_consumers();
 
-    // Register Split tensor_params consumers AFTER rebuild_consumers.
-    // tensor_params are not in op inputs, so rebuild_consumers misses them.
-    // Only Split's tensor_params (split_index) need consumers registered
-    // so that initial DCE doesn't delete them. After Split elimination,
-    // split_index becomes orphaned but DCE doesn't run again (matching QNN).
-    // Other tensor_params (e.g. LayerNorm axes) are NOT registered, so
-    // DCE deletes them (matching QNN before_graph which has no axes).
+    // Register tensor_params consumers AFTER rebuild_consumers (通用)。
+    // tensor_params 不在 op inputs 里, rebuild_consumers 看不到它们; 不注册
+    // 的话 initial DCE 会把仍在使用的参数 const 删掉 —— 实测 Transpose 的
+    // perm(以及 Conv 的 stride/pad/dilation)被删, 序列化/执行全丢参数。
+    // (QNN before_graph 无 axes 是 dump 行为, 本仓以正确性为准: 全部注册)
     for (const auto& node : nodes_) {
-        if (node.type != "Split") continue;
+        if (node.output_names.empty()) continue;
+        auto oit = tensor_opids_.find(node.output_names[0]);
+        if (oit == tensor_opids_.end()) continue;
+        op_id_t op_id = oit->second;
         for (const auto& tp : node.tensor_params) {
             auto pit = tensor_opids_.find(tp.name);
             if (pit == tensor_opids_.end()) continue;
             OpDef* param_op = gp_.get_op_at(pit->second);
             if (!param_op) continue;
-            for (const auto& out_name : node.output_names) {
-                auto oit = tensor_opids_.find(out_name);
-                if (oit == tensor_opids_.end()) continue;
-                op_id_t op_id = oit->second;
-                auto& cs = param_op->consumers;
-                if (std::find(cs.begin(), cs.end(), op_id) == cs.end())
-                    cs.push_back(op_id);
-            }
+            auto& cs = param_op->consumers;
+            if (std::find(cs.begin(), cs.end(), op_id) == cs.end())
+                cs.push_back(op_id);
         }
     }
 
