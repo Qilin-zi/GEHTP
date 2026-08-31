@@ -38,9 +38,17 @@ import transformers.modeling_attn_mask_utils as _mau
 
 def _jit_causal_mask(config, input_embeds, attention_mask=None, cache_position=None,
                      past_key_values=None, position_ids=None, **kwargs):
+    # 因果掩码: keep = (row >= col) → 0, 否则 -inf。
+    # 不用 torch.triu(diagonal=1): torch 2.10 导出 Trilu 会丢 k 属性(k=1 变 k=0,
+    # 实测小实验)导致对角线被误掩 → softmax 全 -inf 行 → NaN。
     bsz, q_len, _ = input_embeds.shape
-    m = torch.full((bsz, 1, q_len, q_len), float("-inf"), dtype=input_embeds.dtype)
-    m = torch.triu(m, diagonal=1)
+    row = torch.arange(q_len).unsqueeze(1)  # [q,1]
+    col = torch.arange(q_len).unsqueeze(0)  # [1,q]
+    keep = row >= col
+    m = torch.where(keep,
+                    torch.zeros((), dtype=input_embeds.dtype),
+                    torch.full((), float("-inf"), dtype=input_embeds.dtype))
+    m = m.unsqueeze(0).unsqueeze(0)  # [1,1,q,q]
     if attention_mask is not None:
         pad = torch.where(attention_mask == 0,
                           torch.full((), float("-inf"), dtype=m.dtype),
@@ -137,7 +145,10 @@ def main():
     #    如 text_position_ids 切片)→ 否则 ORT/转换器报缺 feed
     import onnx as _onnx
     _m = _onnx.load(args.out, load_external_data=False)
-    idx_names = {i.name for i in _m.graph.input}
+    # 空索引 Gather 的 indices = trace 自造图输入(如 onnx::Gather_4);
+    # 声明输入(input_ids 等)也是图输入但索引非空 → 排除
+    _declared = {"input_ids", "attention_mask", "position_ids"}
+    idx_names = {i.name for i in _m.graph.input if i.name not in _declared}
     for n in _m.graph.node:
         if n.op_type == "Gather" and len(n.input) >= 2 and n.input[1] in idx_names:
             n.op_type = "Identity"
@@ -172,6 +183,113 @@ def main():
                     _prune(a.g)
 
     _prune(_m.graph)
+
+    # 3) Trilu 降级: qairt-converter 2.48 缺 onnx_trilu 翻译(实测唯一缺口)。
+    #    trace 中间张量形状多为动态 → 运行时形状掩码链(免 rank,负索引 Slice):
+    #      s=Shape(X); r2=Slice(s,[-2]); c2=Slice(s,[-1])
+    #      c1=Unsqueeze(Range(0,c2,1),[0]); r1=Unsqueeze(Range(0,r2,1),[1])
+    #      keep = (c1 >= r1+k)   [upper]   /  Not(c1 > r1+k)   [tril]
+    #      Out = Where(keep, X, zero标量)   ← Where 广播免显式前导维
+    import onnx.shape_inference as _si
+    _m2 = _si.infer_shapes(_m)
+    _dtype_of = {}
+    for _vi in _m2.graph.value_info:
+        _t = _vi.type.tensor_type
+        if _t.HasField("elem_type"):
+            _dtype_of[_vi.name] = _t.elem_type
+    _n_trilu = 0
+    _new_nodes = []
+    _new_inits = []
+
+    def _scalar(name, value, dtype_np):
+        _a = np.array(value, dtype=dtype_np)
+        _init = _onnx.numpy_helper.from_array(_a, name)
+        _new_inits.append(_init)
+        return _init.name
+
+    def _vec1(name, value):
+        """1 元素向量(Unsqueeze/Squeeze 的 axes 输入要求 1-D tensor)。"""
+        _a = np.array([value], dtype=np.int64)
+        _init = _onnx.numpy_helper.from_array(_a, name)
+        _new_inits.append(_init)
+        return _init.name
+
+    for _i, _n in enumerate(list(_m.graph.node)):
+        if _n.op_type != "Trilu":
+            continue
+        _dtype = _dtype_of.get(_n.input[0])
+        if _dtype is None:
+            raise ValueError(f"Trilu {_n.name}: 无法确定输入 dtype")
+        _np_dtype = _onnx.helper.tensor_dtype_to_np_dtype(_dtype)
+        _upper = 1
+        _k = 0
+        for _a in _n.attribute:
+            if _a.name == "upper":
+                _upper = _a.i
+            elif _a.name == "k":
+                _k = _a.i
+        _p = f"{_n.name}_tri"
+        _s = _p + "_s"
+        _r2 = _p + "_r2"
+        _c2 = _p + "_c2"
+        _r2s = _p + "_r2s"
+        _c2s = _p + "_c2s"
+        _r1 = _p + "_r1"
+        _c1 = _p + "_c1"
+        _keep = _p + "_keep"
+        _rng_r = _p + "_rng_r"
+        _rng_c = _p + "_rng_c"
+        _nodes = [
+            _onnx.helper.make_node("Shape", [_n.input[0]], [_s], name=_p + "_shape"),
+            _onnx.helper.make_node("Slice", [_s, _scalar(_p + "_s_start", [-2], np.int64),
+                                           _scalar(_p + "_s_end", [-1], np.int64)],
+                                   [_r2], name=_p + "_sl2"),
+            _onnx.helper.make_node("Slice", [_s, _scalar(_p + "_s_start1", [-1], np.int64),
+                                           _scalar(_p + "_s_end1", [2**31 - 1], np.int64)],
+                                   [_c2], name=_p + "_sl1"),
+            _onnx.helper.make_node("Squeeze", [_r2, _vec1(_p + "_axsq", 0)],
+                                   [_r2s], name=_p + "_sq2"),
+            _onnx.helper.make_node("Squeeze", [_c2, _vec1(_p + "_axsq1", 0)],
+                                   [_c2s], name=_p + "_sq1"),
+            _onnx.helper.make_node("Range", [_scalar(_p + "_rg0", 0, np.int64), _r2s,
+                                             _scalar(_p + "_rg1", 1, np.int64)],
+                                   [_rng_r], name=_p + "_rngr"),
+            _onnx.helper.make_node("Range", [_scalar(_p + "_rg0c", 0, np.int64), _c2s,
+                                             _scalar(_p + "_rg1c", 1, np.int64)],
+                                   [_rng_c], name=_p + "_rngc"),
+            _onnx.helper.make_node("Unsqueeze", [_rng_r, _vec1(_p + "_ax1", 1)],
+                                   [_r1], name=_p + "_usr"),
+            _onnx.helper.make_node("Unsqueeze", [_rng_c, _vec1(_p + "_ax0", 0)],
+                                   [_c1], name=_p + "_usc"),
+        ]
+        if _k != 0:
+            _r1k = _p + "_r1k"
+            _nodes.append(_onnx.helper.make_node(
+                "Add", [_r1, _scalar(_p + "_k", _k, np.int64)], [_r1k], name=_p + "_addk"))
+        else:
+            _r1k = _r1
+        if _upper:
+            _nodes.append(_onnx.helper.make_node("GreaterOrEqual", [_c1, _r1k], [_keep],
+                                                 name=_p + "_ge"))
+        else:
+            _nodes.append(_onnx.helper.make_node("Greater", [_c1, _r1k], [_p + "_gt"],
+                                                 name=_p + "_gt"))
+            _nodes.append(_onnx.helper.make_node("Not", [_p + "_gt"], [_keep],
+                                                 name=_p + "_not"))
+        _zero = _scalar(_p + "_zero", (0 if _np_dtype != np.bool_ else False), _np_dtype)
+        _nodes.append(_onnx.helper.make_node("Where", [_keep, _n.input[0], _zero],
+                                             _n.output[:1], name=_p + "_where"))
+        _new_nodes.append((_i, _nodes))
+        _n_trilu += 1
+
+    _m.graph.initializer.extend(_new_inits)
+    _off = 0
+    for _i, _nodes in _new_nodes:
+        _m.graph.node.remove(_m.graph.node[_i + _off])  # 去掉原 Trilu
+        for _j, _n in enumerate(_nodes):
+            _m.graph.node.insert(_i + _off + _j, _n)
+        _off += len(_nodes) - 1
+    print(f"[export] lowered {_n_trilu} Trilu nodes -> runtime-shape Where chains")
     _onnx.save(_m, args.out)
 
     # ORT 一致性自检
