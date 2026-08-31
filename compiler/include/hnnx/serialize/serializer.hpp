@@ -127,6 +127,7 @@ enum BinFormatTag : uint32_t {
     TAG_IO_TENSOR_DESC       = 0x494F, // 'IO' input/output tensor descriptor
     TAG_GRAPH_HEADER         = 0x4748, // 'GH' graph header (op+io counts)
     TAG_CONST_EXTENT         = 0x4345, // 'CE' const extent descriptor table
+    TAG_PLAN_ORDER           = 0x504C, // 'PL' Scheduler(ST-Cut)计划执行序: [u32 count][u32 ids...]
 };
 
 constexpr uint32_t SEPARATOR_NORMAL  = 0xFA0000FA;

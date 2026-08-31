@@ -13,6 +13,7 @@
 #include "hnnx/vtcm/dp_group_graph.hpp"
 #include "hnnx/vtcm/supertile.hpp"
 #include "hnnx/ir/graph_deps.hpp"
+#include "hnnx/schedule/scheduler.hpp"  // Scheduler(ST-Cut 计划序, do_prepare2 计算)
 #include <algorithm>
 #include <cstring>
 #include <queue>
@@ -1094,14 +1095,33 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
     // 确定性发射: 按 op_id 升序(unordered_map 迭代序随进程 ASLR 变化,
     // deserialize 后重建的 map 序也可能不同 → round-trip 字节确定性
     // 必须显式排序; 设备侧执行序由 wtop_emit/引擎的拓扑处理保证)。
-    std::vector<std::pair<op_id_t, const OpDef*>> recs;
-    for (auto& [id, opdef] : opdef_map_) {
-        if (!opdef || !opdef->is_enabled() || opdef->is_dead()) continue;
-        recs.push_back({id, opdef.get()});
+    // 发射序 = Scheduler 计划序(ST-Cut, do_prepare2 计算); 未调度(空)则
+    // 回退 op_id 升序(确定性)。计划序随后以 TAG_PLAN_ORDER 记录写出,
+    // deserialize 回读 → re-serialize 字节确定性。
+    std::vector<op_id_t> emit_order = plan_order_;
+    if (emit_order.empty()) {
+        for (auto& [id, opdef] : opdef_map_) {
+            if (opdef && opdef->is_enabled() && !opdef->is_dead())
+                emit_order.push_back(id);
+        }
+        std::sort(emit_order.begin(), emit_order.end());
     }
-    std::sort(recs.begin(), recs.end());
-    for (auto& [id, opdef] : recs) {
-        serialize_opdef(ser, *opdef);
+    for (op_id_t id : emit_order) {
+        auto it = opdef_map_.find(id);
+        if (it == opdef_map_.end() || !it->second) continue;
+        if (!it->second->is_enabled() || it->second->is_dead()) continue;
+        serialize_opdef(ser, *it->second);
+    }
+    // TAG_PLAN_ORDER: [u32 count][u32 ids...](count=0 也写出, 显式"未调度")
+    {
+        std::vector<uint8_t> pl(4 + emit_order.size() * 4, 0);
+        uint32_t cnt = static_cast<uint32_t>(emit_order.size());
+        std::memcpy(pl.data(), &cnt, 4);
+        for (size_t i = 0; i < emit_order.size(); i++) {
+            uint32_t v = static_cast<uint32_t>(emit_order[i]);
+            std::memcpy(pl.data() + 4 + i * 4, &v, 4);
+        }
+        ser.write_tagged_record(TAG_PLAN_ORDER, pl.data(), static_cast<int>(pl.size()));
     }
 
     // End separator 0xBEEFF00D
@@ -1348,6 +1368,16 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
         if (tag == TAG_GRAPH_HEADER) {
             expected_ops = rec[0] | (rec[1] << 8) | (rec[2] << 16) | (rec[3] << 24);
             (void)expected_ops;
+            continue;
+        }
+        if (tag == TAG_PLAN_ORDER) {
+            BinReader rr(rec, data_size);
+            if (rr.remaining() >= 4) {
+                uint32_t cnt = rr.r32();
+                plan_order_.clear();
+                for (uint32_t i = 0; i < cnt && rr.remaining() >= 4; i++)
+                    plan_order_.push_back(static_cast<op_id_t>(rr.r32()));
+            }
             continue;
         }
         if (tag == TAG_CONST_EXTENT) {
@@ -3172,6 +3202,17 @@ GraphStatus GraphPrepare::build_graph_deps() {
         uint64_t esize = od.element_size ? od.element_size : 4;
         desc.vtcm_requirement = sz * esize;
         desc.ddr_requirement = desc.vtcm_requirement / 5;
+    }
+
+    // Step 8: Scheduler 计划(ST-Cut 链)产执行序 —— 产品路径的调度决策。
+    // 结果存入 plan_order_, do_serialize 按此序发射 op 记录并写出
+    // TAG_PLAN_ORDER(反序列化回读, round-trip 确定性)。
+    {
+        Scheduler sched;
+        Scheduler::Plan plan = sched.schedule(*this);
+        plan_order_.clear();
+        plan_order_.reserve(plan.op_order.size());
+        for (uint32_t id : plan.op_order) plan_order_.push_back(static_cast<op_id_t>(id));
     }
 
     return GraphStatus::Success;

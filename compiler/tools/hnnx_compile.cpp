@@ -123,7 +123,8 @@ int main(int argc, char** argv) {
     // Step 3: Schedule - convert optimized graph to HTP execution plan
     if (verbose) std::printf("[3a] Scheduling execution plan...\n");
     Scheduler scheduler;
-    Scheduler::Plan plan = scheduler.schedule(gp);
+    // 路径A金样重放(冻结): 19 步硬编码仅服务 ContextBinaryWriter 字节对拍
+    Scheduler::Plan plan = scheduler.schedule_path_a_replay(gp);
     std::printf("[3] Scheduled: %zu steps, %zu kernels\n",
                 plan.ops.size(), plan.kernel_names.size());
 

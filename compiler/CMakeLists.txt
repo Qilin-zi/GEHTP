@@ -230,3 +230,8 @@ add_test(NAME test_conv_add_host COMMAND test_conv_add_host)
 add_executable(test_conv_add_bin tests/test_conv_add_bin.cpp)
 target_link_libraries(test_conv_add_bin htp_core)
 add_test(NAME test_conv_add_bin COMMAND test_conv_add_bin)
+
+# 阶段5: Scheduler 接 ST-Cut(计划序 == 序列化序)
+add_executable(test_scheduler_integration tests/test_scheduler_integration.cpp)
+target_link_libraries(test_scheduler_integration htp_core)
+add_test(NAME test_scheduler_integration COMMAND test_scheduler_integration)

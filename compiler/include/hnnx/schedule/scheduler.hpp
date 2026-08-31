@@ -126,8 +126,16 @@ public:
 
     Scheduler();
 
-    // Build execution plan from a prepared graph
+    // Build execution plan from a prepared graph.
+    // 通用路径: ST-Cut 调度链(M31)产执行序 → plan.op_order;
+    // plan.ops = 每条一个图 op(record_id 按位次, block_ref 待 M37 回填);
+    // Phase B(CP spill/fill)照常。ST-Cut 不可用/不覆盖时按确定序兜底。
     Plan schedule(const GraphPrepare& gp);
+
+    // 路径A 金样重放(冻结): Qualcomm simple_linear 19 步硬编码重放,
+    // 仅服务 ContextBinaryWriter 字节对拍证据(Windows)。产品路径
+    // (tagged 序列化)一律走 schedule()。
+    Plan schedule_path_a_replay(const GraphPrepare& gp);
 
     // Build execution plan from explicit model descriptor (general)
     Plan schedule_general(const ModelDesc& model);

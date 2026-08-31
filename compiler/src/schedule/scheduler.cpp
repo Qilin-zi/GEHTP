@@ -1,7 +1,9 @@
 #include "hnnx/schedule/scheduler.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
+#include "hnnx/schedule/e2e_bridge.hpp"  // build_stcut_input_from_graph / run_stcut_schedule
 #include <algorithm>
 #include <cstring>
+#include <set>
 
 namespace hnnx {
 
@@ -737,6 +739,89 @@ Scheduler::Plan Scheduler::schedule_simple_linear(
 }
 
 Scheduler::Plan Scheduler::schedule(const GraphPrepare& gp) {
+    // 通用路径: ST-Cut 调度链(M31)产执行序; plan.ops 每条 = 一个图 op。
+    Plan plan;
+
+    // 1. 图结构清单(tensors 沿 gp 序 —— CP spill/fill 对齐依赖此走序)
+    std::vector<TensorInfo> tensors;
+    std::vector<std::string> op_names;
+    const auto& ordering = gp.get_ordering();
+    for (size_t i = 0; i < ordering.size(); i++) {
+        auto* opdef = gp.get_op_at(ordering[i]);
+        if (!opdef || !opdef->is_enabled() || opdef->is_dead()) continue;
+
+        std::string name = opdef->name_tag ? (opdef->name_tag->name() ? opdef->name_tag->name() : "") : "";
+        if (!name.empty()) op_names.push_back(name);
+
+        TensorInfo ti{};
+        ti.tensor_id = static_cast<uint32_t>(opdef->op_id);
+        ti.name = name;
+        ti.rank = opdef->output_def.rank;
+        for (uint32_t j = 0; j < 5 && j < ti.rank; j++) {
+            ti.dims[j] = opdef->output_def.dims[j];
+        }
+        ti.dtype = static_cast<DType>(opdef->output_def.dtype);
+        ti.is_const = opdef->is_const();
+        ti.is_graph_io = (name == "Input" || name == "Output");
+        tensors.push_back(ti);
+    }
+
+    // 2. dense→op_id 逆映射: 与 build_stcut_input_from_graph 完全相同的走序
+    //    (ordering 中 enabled 且未死的 op 依次编号 0..N-1)
+    std::vector<op_id_t> dense_to_id;
+    for (op_id_t id : ordering) {
+        const OpDef* od = gp.get_op_at(id);
+        if (!od || !od->is_enabled() || od->is_dead()) continue;
+        dense_to_id.push_back(id);
+    }
+
+    // 3. ST-Cut 链(M31)产 dense 执行序 → 译回 op_id
+    StCutGraphInput stin;
+    std::vector<uint32_t> best_dense;
+    std::vector<uint64_t> flows, cycles;
+    bool have_stcut = build_stcut_input_from_graph(gp, stin) && stin.node_count > 0;
+    if (have_stcut) {
+        StCutOptions opt{};
+        opt.rt = 3; opt.it = 50; opt.rg = 20; opt.am = 0;
+        opt.budget_base = 1ull << 40; opt.tr = 1.0;
+        run_stcut_schedule(gp, opt, best_dense, flows, cycles);
+    }
+    std::vector<uint32_t> order_ids;
+    for (uint32_t d : best_dense)
+        if (d < dense_to_id.size()) order_ids.push_back(static_cast<uint32_t>(dense_to_id[d]));
+    // 4. 校验/兜底: 必须 1:1 覆盖全部节点; 否则确定序(ordering)兜底
+    {
+        std::set<uint32_t> uniq(order_ids.begin(), order_ids.end());
+        if (!have_stcut || best_dense.empty() || order_ids.size() != dense_to_id.size() ||
+            uniq.size() != dense_to_id.size()) {
+            order_ids.clear();
+            for (op_id_t id : dense_to_id) order_ids.push_back(static_cast<uint32_t>(id));
+        }
+    }
+    plan.op_order = order_ids;
+
+    // 4. plan.ops: 每条 = 一个图 op(按 tensors 走序; record_id 按位次;
+    //    block_ref 暂 0 —— M37 phys_alloc 接真后回填)
+    for (size_t i = 0; i < tensors.size(); i++) {
+        ScheduledOp op;
+        op.record_id = compute_record_id(static_cast<uint32_t>(i));
+        op.tensor_id = tensors[i].tensor_id;
+        op.type = tensors[i].is_const ? OP_TYPE_MEMORY : OP_TYPE_COMPUTE;
+        op.f2 = 0;
+        op.block_ref = 0;
+        op.step_name = tensors[i].name;
+        plan.ops.push_back(op);
+    }
+    plan.op_names = op_names;
+    for (const auto& t : tensors) plan.tensor_names.push_back(t.name);
+
+    // 5. Phase B: CP spill/fill
+    apply_cp_spill_fill(plan, gp);
+    return plan;
+}
+
+// 路径A 金样重放(冻结): 19 步硬编码重放, 仅服务 ContextBinaryWriter 字节对拍。
+Scheduler::Plan Scheduler::schedule_path_a_replay(const GraphPrepare& gp) {
     // Extract tensor info from the graph
     std::vector<TensorInfo> tensors;
     std::vector<std::string> op_names;

@@ -138,7 +138,7 @@ int main() {
     // ---- Step 6: Run Scheduler + Phase 4.2 (SynctokenManager) ----
     std::cout << "\n[6] Phase 4.2: Scheduler + DMA sync tokens\n";
     Scheduler scheduler;
-    Scheduler::Plan plan = scheduler.schedule(gp);
+    Scheduler::Plan plan = scheduler.schedule_path_a_replay(gp)  // 路径A金样重放(冻结);
     std::cout << "  Scheduler produced " << plan.ops.size() << " steps\n";
     check(plan.ops.size() == 19, "19 steps (simple_linear)");
 
