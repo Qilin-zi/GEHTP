@@ -7,6 +7,7 @@
 #include "hnnx/schedule/scheduler.hpp"
 #include "hnnx/ir/types.hpp"
 #include <cstdio>
+#include "test_paths.hpp"
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -16,7 +17,7 @@
 using namespace hnnx;
 
 static const char* REAL_BIN =
-    "C:\\Users\\RQILIN\\Documents\\Default Project\\REQNN\\reference\\simple_linear_context.bin";
+    TP_SL_CTXBIN;
 
 static std::vector<uint8_t> read_file(const char* path) {
     std::ifstream f(path, std::ios::binary);

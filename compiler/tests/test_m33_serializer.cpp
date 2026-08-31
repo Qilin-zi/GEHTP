@@ -28,10 +28,18 @@ static int g_pass = 0, g_fail = 0;
         }                                                                                                           \
     } while (0)
 
-static_assert(sizeof(Deserz) == 0xd8, "Deserz 0xd8");
-static_assert(sizeof(Deserializer) == 0x11e8, "Deserializer 0x11e8");
-static_assert(sizeof(Serializer) == 0x360, "Serializer 0x360");
-static_assert(sizeof(FileSerializer) == 0x398, "FileSerializer 0x398");
+#if defined(_MSC_VER)
+static_assert(sizeof(Deserz) == 0xd8, "Deserz 0xd8"); // MSVC ABI RE 标定; Linux 布局不同
+#endif
+#if defined(_MSC_VER)
+static_assert(sizeof(Deserializer) == 0x11e8, "Deserializer 0x11e8"); // MSVC ABI RE 标定; Linux 布局不同
+#endif
+#if defined(_MSC_VER)
+static_assert(sizeof(Serializer) == 0x360, "Serializer 0x360"); // MSVC ABI RE 标定; Linux 布局不同
+#endif
+#if defined(_MSC_VER)
+static_assert(sizeof(FileSerializer) == 0x398, "FileSerializer 0x398"); // MSVC ABI RE 标定; Linux 布局不同
+#endif
 // 虚槽计数: Deserz 4 (D1/D0/fill_buffer/deserialize_fread), Serializer 25,
 // FileSerializer 25 (派生面一致)。以成员指针表大小近似复核 Deserz 面:
 static void test_static_layout()

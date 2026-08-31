@@ -1,6 +1,7 @@
 ﻿// test_transformer2.cpp 鈥?Load a real 2-layer transformer QNN IR (.cpp + .bin)
 // and verify before graph structure matches net.json.
 #include "hnnx/frontend/qnn_ir_loader.hpp"
+#include "test_paths.hpp"
 #include "hnnx/frontend/json.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
 #include <iostream>
@@ -10,7 +11,7 @@
 #include <algorithm>
 
 static const char* T2_DIR =
-    "C:\\Users\\RQILIN\\Documents\\Default Project\\REQNN\\test_models\\transformer2";
+    TP_T2_DIR;
 
 static void check(bool cond, const std::string& msg) {
     if (!cond) { std::cerr << "FAIL: " << msg << "\n"; std::exit(1); }
@@ -19,9 +20,9 @@ static void check(bool cond, const std::string& msg) {
 
 int main() {
     using namespace hnnx;
-    std::string cpp_path = std::string(T2_DIR) + "\\transformer2.cpp";
-    std::string bin_path = std::string(T2_DIR) + "\\transformer2.bin";
-    std::string json_path = std::string(T2_DIR) + "\\transformer2_net.json";
+    std::string cpp_path = std::string(T2_DIR) + "/transformer2.cpp";
+    std::string bin_path = std::string(T2_DIR) + "/transformer2.bin";
+    std::string json_path = std::string(T2_DIR) + "/transformer2_net.json";
 
     std::cout << "=== Transformer2 QNN IR Loader Test ===\n\n";
 

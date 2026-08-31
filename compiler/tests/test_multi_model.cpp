@@ -7,6 +7,7 @@
 #include "hnnx/schedule/scheduler.hpp"
 #include "hnnx/ir/types.hpp"
 #include <cstdio>
+#include "test_paths.hpp"
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -35,7 +36,7 @@ struct ModelTest {
 int main() {
     std::printf("=== Multi-Model .bin Generation Test ===\n\n");
 
-    std::string ref_dir = "C:\\Users\\RQILIN\\Documents\\Default Project\\REQNN\\reference\\";
+    std::string ref_dir = TP_REF_DIR;
 
     // fc_only: 14 steps
     // Tensors: 0=graph, 1=input, 2=perm, 3=input_ncf, 4=W, 5=fc_act, 6=dma_out, 7=sync, 8=output

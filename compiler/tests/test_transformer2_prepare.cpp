@@ -1,5 +1,6 @@
 
 #include "hnnx/ir/graph_prepare.hpp"
+#include "test_paths.hpp"
 #include "hnnx/frontend/qnn_ir_loader.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
 #include <iostream>
@@ -9,8 +10,8 @@ int main() {
     HexagonNNEnv env;
     GraphPrepare gp;
     QnnIRLoader loader(gp);
-    const char* CPP = "C:\\Users\\RQILIN\\Documents\\Default Project\\REQNN\\test_models\\transformer2\\transformer2.cpp";
-    const char* BIN = "C:\\Users\\RQILIN\\Documents\\Default Project\\REQNN\\test_models\\transformer2\\transformer2.bin";
+    const char* CPP = TP_T2_CPP;
+    const char* BIN = TP_T2_BIN;
     uint32_t ops = loader.load_qnn_ir(CPP, BIN);
     std::cout << "Loaded: " << ops << " ops, " << gp.op_count() << " nodes\n";
     std::cout << "Calling prepare()...\n";

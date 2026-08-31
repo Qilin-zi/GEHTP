@@ -36,6 +36,18 @@ add_library(htp_core STATIC
     src/serialize/context_binary_writer.cpp
     src/schedule/scheduler.cpp
     src/schedule/e2e_bridge.cpp
+    src/serialize/deserz_except.cpp
+    src/serialize/deserz_shared_obj.cpp
+    src/serialize/serializer_bridge.cpp
+    src/tens/crate_records.cpp
+    src/tens/interface_table.cpp
+    src/tens/shape.cpp
+    src/vtcm/alloc_io_tensors_m38.cpp
+    src/vtcm/create_supertiles_m36.cpp
+    src/vtcm/phys_alloc_m37.cpp
+    src/vtcm/spillfill_g4.cpp
+    src/vtcm/tcm_migration_m42.cpp
+    src/vtcm/tile_shape_m36c.cpp
     src/dma/spill_fill.cpp
     src/dma/op_emitter.cpp
     src/mcast/mcast_optimizer.cpp
@@ -52,6 +64,10 @@ add_library(htp_core STATIC
 )
 
 target_include_directories(htp_core PUBLIC include)
+# 测试数据路径便携化(见 tests/test_paths.hpp): Linux/Windows 双路径
+target_compile_definitions(htp_core PUBLIC
+    HNNX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test_models"
+    HNNX_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/reference")
 
 # Tests
 enable_testing()
@@ -174,3 +190,32 @@ add_test(NAME test_m36_supertile COMMAND test_m36_supertile)
 add_executable(test_small_graph_e2e tests/test_small_graph_e2e.cpp)
 target_link_libraries(test_small_graph_e2e htp_core)
 add_test(NAME test_small_graph_e2e COMMAND test_small_graph_e2e)
+
+# M33-M42 新模块测试(迁移后补注册,阶段 4-7 的回归基)
+add_executable(test_m33_serializer tests/test_m33_serializer.cpp)
+target_link_libraries(test_m33_serializer htp_core)
+add_test(NAME test_m33_serializer COMMAND test_m33_serializer)
+
+add_executable(test_m34_shape tests/test_m34_shape.cpp)
+target_link_libraries(test_m34_shape htp_core)
+add_test(NAME test_m34_shape COMMAND test_m34_shape)
+
+add_executable(test_m36c_tile_shape tests/test_m36c_tile_shape.cpp)
+target_link_libraries(test_m36c_tile_shape htp_core)
+add_test(NAME test_m36c_tile_shape COMMAND test_m36c_tile_shape)
+
+add_executable(test_m37_phys_alloc tests/test_m37_phys_alloc.cpp)
+target_link_libraries(test_m37_phys_alloc htp_core)
+add_test(NAME test_m37_phys_alloc COMMAND test_m37_phys_alloc)
+
+add_executable(test_m38_alloc_io tests/test_m38_alloc_io.cpp)
+target_link_libraries(test_m38_alloc_io htp_core)
+add_test(NAME test_m38_alloc_io COMMAND test_m38_alloc_io)
+
+add_executable(test_m42_tcm_migration tests/test_m42_tcm_migration.cpp)
+target_link_libraries(test_m42_tcm_migration htp_core)
+add_test(NAME test_m42_tcm_migration COMMAND test_m42_tcm_migration)
+
+# CLI: 图编译入口(阶段 8 扩展 --format tagged)
+add_executable(hnnx_compile tools/hnnx_compile.cpp)
+target_link_libraries(hnnx_compile htp_core)

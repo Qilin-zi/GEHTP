@@ -10,7 +10,13 @@
 //
 // "Data input" = input tensor produced by a real op (not injected quant/config).
 // Injected tensors (no producer) are HtpPrepare internal, not compared.
+// Linux: 依赖 typical_structures 语料(仅 Windows 原开发机)→ SKIP
+#ifndef _WIN32
+#include <cstdio>
+int main() { std::printf("SKIP: Windows-only test data (Linux)\n"); return 0; }
+#else
 #include "hnnx/frontend/qnn_ir_loader.hpp"
+#include "test_paths.hpp"
 #include "hnnx/frontend/json.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/ir/graph_dumper.hpp"
@@ -271,3 +277,5 @@ int main() {
 
 
 
+
+#endif // !_WIN32

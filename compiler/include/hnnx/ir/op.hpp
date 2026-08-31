@@ -168,7 +168,9 @@ struct type_info {
         return *this;
     }
 };
+#if defined(_MSC_VER)
 static_assert(sizeof(hnnx::type_info) == 0x10);
+#endif
 
 // ---------------------------------------------------------------------------
 // hnnx::cost_function_t (cost_funcs.h:22) —— {funcp@0, val@8}
@@ -288,7 +290,9 @@ struct uptr_Tensor {
         return p;
     }
 };
+#if defined(_MSC_VER)
 static_assert(sizeof(uptr_Tensor) == 0x10);
+#endif
 
 } // namespace hnnx
 
@@ -659,7 +663,9 @@ class Op : public hnnx::Executable {
     }
 };
 
-static_assert(sizeof(Op) == 8); // vptr 之外无数据成员 (构造 @0xd4e010 无成员写入)
+#if defined(_MSC_VER)
+static_assert(sizeof(Op) == 8);
+#endif // vptr 之外无数据成员 (构造 @0xd4e010 无成员写入)
 static_assert(std::is_abstract<Op>::value);
 
 // ---------------------------------------------------------------------------

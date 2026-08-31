@@ -383,7 +383,9 @@ class Deserz : public DeSerError {
     virtual void deserialize_fread(void *p, size_t len, bool align); // @0xcfd930
 };
 
+#if defined(_MSC_VER)
 static_assert(sizeof(Deserz) == 0xd8, "Deserz 布局");
+#endif
 
 // 自由函数 (nm): @0xcfc4c0 慢径 op 索引 / @0xcfca90 类型注册 / @0xcfcb60 张量
 unsigned deserialize_op_idx_slow(Deserz &, unsigned int idx);

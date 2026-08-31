@@ -10,6 +10,7 @@
 //   3. Same input/output count per node
 //   4. Same producer-consumer relationships (isomorphic graph structure)
 #include "hnnx/frontend/qnn_ir_loader.hpp"
+#include "test_paths.hpp"
 #include "hnnx/frontend/json.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
 #include <iostream>
@@ -21,7 +22,7 @@
 #include <algorithm>
 
 static const char* T2_DIR =
-    "C:\\Users\\RQILIN\\Documents\\Default Project\\REQNN\\test_models\\transformer2";
+    TP_T2_DIR;
 
 static int g_pass = 0, g_fail = 0;
 static void check(bool cond, const std::string& msg) {
@@ -38,9 +39,9 @@ static uint64_t parse_hex(const std::string& s) {
 
 int main() {
     using namespace hnnx;
-    std::string cpp_path = std::string(T2_DIR) + "\\transformer2.cpp";
-    std::string bin_path = std::string(T2_DIR) + "\\transformer2.bin";
-    std::string before_path = std::string(T2_DIR) + "\\transformer2_before_graph.json";
+    std::string cpp_path = std::string(T2_DIR) + "/transformer2.cpp";
+    std::string bin_path = std::string(T2_DIR) + "/transformer2.bin";
+    std::string before_path = std::string(T2_DIR) + "/transformer2_before_graph.json";
 
     std::cout << "=== Before Graph Comparison: QNN generator vs REQNN ===\n\n";
 

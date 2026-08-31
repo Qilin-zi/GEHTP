@@ -3,6 +3,7 @@
 #include "hnnx/vtcm/create_supertiles_m36.hpp"
 #include <cstdio>
 #include <cassert>
+#include <stdexcept>
 
 using namespace hnnx;
 

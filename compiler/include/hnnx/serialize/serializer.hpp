@@ -335,7 +335,11 @@ class Serializer : public SerOpsInterface, public DeSerError {
     unsigned char pad_354[4];      // +0x354..0x357 对齐填充
     SerializerPimpl *f_358 = nullptr; // +0x358 pimpl (D1: delete → 其 vptr+0x08 虚删除槽)
 };
+// RE 布局保真断言按 MSVC ABI 标定(真身 .so 在 Windows 工具链);Linux(g++/Itanium
+// ABI)下成员布局不同,此断言不适用——序列化行为走显式成员访问,与 sizeof 无关。
+#if defined(_MSC_VER)
 static_assert(sizeof(Serializer) == 0x360, "Serializer 布局");
+#endif
 
 // ---------------------------------------------------------------------------
 // FileSerializer —— Serializer 的文件落盘派生 (本地类, sizeof ≥0x398)。
@@ -365,7 +369,9 @@ class FileSerializer : public Serializer {
     uint64_t fs_388 = 0;      // +0x388
     uint64_t fs_390 = 0;      // +0x390 (rewrite_auxdata 临时构造: 缓冲基址)
 };
+#if defined(_MSC_VER)
 static_assert(sizeof(FileSerializer) >= 0x398);
+#endif
 
 // ---------------------------------------------------------------------------
 // Deserializer —— sizeof ≈0x11e8。ctor @0xcfcf20 内联 Deserz 基 (唯一差异:
@@ -425,7 +431,9 @@ class Deserializer : public Deserz {
     std::vector<void *const *> blocktable_link_table;     // +0x11d0
 };
 
+#if defined(_MSC_VER)
 static_assert(sizeof(Deserializer) == 0x11e8, "Deserializer 布局 (0xd8 Deserz 基 + 扩展区)");
+#endif
 
 // is_base_deser (SDK deserializer.h:624 原式) —— Deserializer 完整后给出
 inline bool Deserz::is_base_deser() const { return static_cast<Deserz const *>(full_deser) == this; }

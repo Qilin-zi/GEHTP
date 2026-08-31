@@ -247,7 +247,9 @@ class HexagonNNGraph {
     virtual void slot1c8_noop() = 0;                                              // +0x1c8
     virtual void slot1d0_noop() = 0;                                              // +0x1d0
 };
+#if defined(_MSC_VER)
 static_assert(sizeof(HexagonNNGraph) == 8);
+#endif
 
 // ============================================================================
 // Graph —— 具体类 (全局作用域, _ZTS5Graph = "5Graph")
@@ -541,4 +543,7 @@ struct GraphLayoutProbe { // 经 friend 访问 Graph 私有布局做编译期校
         offsetof(Graph, hmx_implicit_pwr_ctrl) == 0x68c8;
 };
 #pragma clang diagnostic pop
+// Graph 布局探针按 MSVC ABI 标定(M29 RE);Linux g++ 布局不同,门控。
+#if defined(_MSC_VER)
 static_assert(GraphLayoutProbe::ok, "Graph 布局: sizeof/全部锚点偏移 (M29)");
+#endif

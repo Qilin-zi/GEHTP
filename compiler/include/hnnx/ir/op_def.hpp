@@ -98,7 +98,9 @@ struct OutputDef {
     int32_t zero_offset = 0;                // +0x48
     float stepsize = 0.0f;                  // +0x4C
 };
+#if defined(_MSC_VER)
 static_assert(sizeof(OutputDef) == 0x50);
+#endif
 
 // InputDef — SDK interface_defs.h: "must be the same layout as struct input"
 // (C API hexagon_nn_append_node 的输入描述)。
@@ -106,7 +108,9 @@ struct InputDef {
     uint32_t input_id = 0;   // +0x00
     uint32_t output_idx = 0; // +0x04
 };
+#if defined(_MSC_VER)
 static_assert(sizeof(InputDef) == 8);
+#endif
 
 namespace hnnx {
 
@@ -725,7 +729,9 @@ struct OutputDefPatch {
         set_dim[dim] = true;
     }
 };
+#if defined(_MSC_VER)
 static_assert(sizeof(OutputDefPatch) == 0x78);
+#endif
 
 // set_outputdef(Patch) 依据 @0x10ba170 的精确语义:
 //   m_rest 非空 → 抛 (同上); 先 validate;

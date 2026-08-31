@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
     if (verbose) std::printf("[2a] Preparing graph...\n");
     HexagonNNEnv env;
     GraphStatus s = gp.prepare(env);
-    if (s != GraphStatus::OK) {
+    if (s != GraphStatus::Success) {
         std::fprintf(stderr, "Error: prepare() failed with status %d\n",
                      static_cast<int>(s));
         return 1;

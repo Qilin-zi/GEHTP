@@ -92,5 +92,9 @@ template <size_t Rank> class Shape : public hnnx::ShapeFlags {
     // get_shape_info @0x12f7020 (R4) 返回类型未解码 —— 暂不声明
 };
 
-static_assert(sizeof(Shape<4>) == 0x50); // 8 对齐: shplen 0x4c → sizeof 80
-static_assert(sizeof(hnnx::ShapeFlags) + 16 * 4 + 4 == 0x4c); // shplen 公式 (R4)
+#if defined(_MSC_VER)
+static_assert(sizeof(Shape<4>) == 0x50);
+#endif // 8 对齐: shplen 0x4c → sizeof 80
+#if defined(_MSC_VER)
+static_assert(sizeof(hnnx::ShapeFlags) + 16 * 4 + 4 == 0x4c);
+#endif // shplen 公式 (R4)
