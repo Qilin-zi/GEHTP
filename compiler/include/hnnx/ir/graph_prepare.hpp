@@ -1,5 +1,6 @@
 #pragma once
 #include "hnnx/ir/types.hpp"
+#include "hnnx/tiling/tiler.hpp"  // TilingConfig(阶段6 单算子分块)
 #include "hnnx/vtcm/fancy_allocator.hpp"
 #include "hnnx/vtcm/cp_solver.hpp"
 #include "hnnx/mcast/mcast_optimizer.hpp"
@@ -54,6 +55,9 @@ public:
     const std::vector<op_id_t>& get_ordering() const { return ordering_; }
     // Scheduler(ST-Cut)计划执行序: do_prepare2 计算, do_serialize 按此发射 op 记录
     const std::vector<op_id_t>& plan_order() const { return plan_order_; }
+    // 单算子分块配置(阶段6): Conv2d extra_info tiling 段消费
+    void set_tiling_config(const TilingConfig& cfg) { tiling_cfg_ = cfg; }
+    const TilingConfig& tiling_config() const { return tiling_cfg_; }
 
     // Const 池只读访问(阶段4 P0 验证用: prepare 后权重/参数字节均在池中)
     const std::vector<uint8_t>& const_pool() const { return const_pool_; }
@@ -396,6 +400,7 @@ private:
     op_id_t output_node_id_ = 0;  // +0x5348
     std::vector<op_id_t> ordering_;  // topological ordering of ops
     std::vector<op_id_t> plan_order_;  // ST-Cut 计划执行序(do_prepare2; 空 = 未调度)
+    TilingConfig tiling_cfg_;          // 单算子分块配置(阶段6)
     struct TimePoint { const char* name; uint64_t timestamp; };
     std::vector<TimePoint> time_points_;
 

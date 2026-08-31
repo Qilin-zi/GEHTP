@@ -14,6 +14,7 @@
 #include "hnnx/vtcm/supertile.hpp"
 #include "hnnx/ir/graph_deps.hpp"
 #include "hnnx/schedule/scheduler.hpp"  // Scheduler(ST-Cut 计划序, do_prepare2 计算)
+#include "hnnx/tiling/conv_tiling.hpp"  // 阶段6: conv 空间分块(halo 推导)
 #include <algorithm>
 #include <cstring>
 #include <queue>
@@ -1209,6 +1210,47 @@ std::vector<uint8_t> extract_conv_extra(const GraphPrepare& gp, const OpDef& opd
 
     std::vector<uint8_t> out(sizeof(ConvExtraInfo));
     std::memcpy(out.data(), &e, sizeof(ConvExtraInfo));
+
+    // Tiling 段(阶段6, 通用): [u32 tile_h][u32 tile_w][u32 co_per_tile]
+    //                          [u32 num_tiles][ConvTileDesc × num_tiles]
+    // 配置来源: gp.tiling_config()(conv_height/width/channel_tiling = 切分数)
+    {
+        uint32_t in_h = 0, in_w = 0, cin = 0;
+        if (!opdef.inputs.empty()) {
+            const OpDef* act = gp.get_op_at(opdef.inputs[0].src_id);
+            if (act && act->output_def.rank >= 4) {
+                in_h = static_cast<uint32_t>(act->output_def.dims[1]);
+                in_w = static_cast<uint32_t>(act->output_def.dims[2]);
+                cin = static_cast<uint32_t>(act->output_def.dims[3]);
+            }
+        }
+        uint32_t out_h = (opdef.output_def.rank >= 4)
+            ? static_cast<uint32_t>(opdef.output_def.dims[1]) : 0;
+        uint32_t out_w = (opdef.output_def.rank >= 4)
+            ? static_cast<uint32_t>(opdef.output_def.dims[2]) : 0;
+        uint32_t cout = (opdef.output_def.rank >= 4)
+            ? static_cast<uint32_t>(opdef.output_def.dims[3]) : 0;
+
+        const TilingConfig& cfg = gp.tiling_config();
+        uint32_t ht = cfg.conv_height_tiling > 0 ? cfg.conv_height_tiling : 1;
+        uint32_t wt = cfg.conv_width_tiling > 0 ? cfg.conv_width_tiling : 1;
+        uint32_t ct = cfg.conv_channel_tiling > 0 ? cfg.conv_channel_tiling : 1;
+        uint32_t tile_h = out_h > 0 ? (out_h + ht - 1) / ht : 0;
+        uint32_t tile_w = out_w > 0 ? (out_w + wt - 1) / wt : 0;
+        uint32_t co_per_tile = cout > 0 ? (cout + ct - 1) / ct : 0;
+
+        std::vector<ConvTileDesc> tiles = compute_conv_tiles(
+            in_h, in_w, cin, out_h, out_w, cout,
+            e.kh, e.kw, e.sh, e.sw, e.ph_begin, e.pw_begin,
+            tile_h, tile_w, co_per_tile);
+
+        std::vector<uint8_t> sec(16 + tiles.size() * sizeof(ConvTileDesc));
+        uint32_t hdr[4] = {tile_h, tile_w, co_per_tile,
+                           static_cast<uint32_t>(tiles.size())};
+        std::memcpy(sec.data(), hdr, 16);
+        std::memcpy(sec.data() + 16, tiles.data(), tiles.size() * sizeof(ConvTileDesc));
+        out.insert(out.end(), sec.begin(), sec.end());
+    }
     return out;
 }
 

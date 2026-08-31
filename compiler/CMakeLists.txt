@@ -27,6 +27,7 @@ add_library(htp_core STATIC
     src/vtcm/dp_group_graph.cpp
     src/vtcm/supertile.cpp
     src/tiling/tiler.cpp
+    src/tiling/conv_tiling.cpp
     src/serialize/serializer.cpp
     src/serialize/deserializer.cpp
     src/serialize/bin_format.cpp
@@ -235,3 +236,8 @@ add_test(NAME test_conv_add_bin COMMAND test_conv_add_bin)
 add_executable(test_scheduler_integration tests/test_scheduler_integration.cpp)
 target_link_libraries(test_scheduler_integration htp_core)
 add_test(NAME test_scheduler_integration COMMAND test_scheduler_integration)
+
+# 阶段6: 单算子 conv 分块(公式级 + 序列化 + 数值等价)
+add_executable(test_conv_tiling tests/test_conv_tiling.cpp)
+target_link_libraries(test_conv_tiling htp_core)
+add_test(NAME test_conv_tiling COMMAND test_conv_tiling)

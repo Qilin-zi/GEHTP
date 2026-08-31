@@ -204,8 +204,9 @@ int main() {
     // conv 的 extra_info 值(sh=sw=1, pad=1, kh=kw=3)
     const OpDef* conv2 = gp2.get_op_at(6);
     CHECK(conv2 != nullptr, "round-trip: Conv2d 存在");
+    // extra = 60B fixed + tiling 段(阶段6: 16B hdr + 1×76B 全图 tile, 默认配置)
     bool extra_ok = false;
-    if (conv2 && conv2->serialized_extra.size() == sizeof(ConvExtraInfo)) {
+    if (conv2 && conv2->serialized_extra.size() == sizeof(ConvExtraInfo) + 16 + 76) {
         ConvExtraInfo e;
         std::memcpy(&e, conv2->serialized_extra.data(), sizeof(ConvExtraInfo));
         extra_ok = (e.sh == 1 && e.sw == 1 && e.ph_begin == 1 && e.ph_end == 1 &&
