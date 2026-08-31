@@ -13,6 +13,9 @@ compiler/our_simple_linear_context.bin
 *.raw
 *.wtop
 
+# 阶段1 converter 产物(gen_all.sh 可重生成)
+test_models/**/conv_add_qnn/
+
 # python
 __pycache__/
 *.pyc
