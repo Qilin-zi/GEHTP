@@ -1,0 +1,18 @@
+# 构建产物
+compiler/build*/
+kernels/build/
+kernels/lib/
+kernels/results/
+*.exe
+*.o
+*.so.signed
+*.signed.so
+
+# 生成/中间产物
+compiler/our_simple_linear_context.bin
+*.raw
+*.wtop
+
+# python
+__pycache__/
+*.pyc

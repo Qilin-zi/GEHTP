@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>调度子系统逆向重实现 · 周进度</title>
+<style>
+  :root {
+    --bg: #0d1411;
+    --panel: #121b17;
+    --panel2: #16221d;
+    --ink: #dbe7e0;
+    --dim: #9db4a9;
+    --faint: #6d857b;
+    --line: #24352e;
+    --line2: #2e443a;
+    --accent: #4fd1a5;
+    --accent-deep: #173b30;
+    --amber: #e0a83f;
+    --amber-bg: #221c0f;
+    --crimson: #e5695a;
+    --crimson-bg: #241412;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --sans: -apple-system, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); font-size: 15.5px; line-height: 1.8;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 52px 28px 110px; }
+
+  .topline {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .16em;
+    color: var(--faint); text-transform: uppercase;
+    border-bottom: 1px solid var(--line2); padding-bottom: 14px;
+  }
+  .topline .live { color: var(--accent); }
+  header.hero { margin: 42px 0 8px; }
+  header.hero h1 {
+    font-family: var(--serif); font-weight: 600; font-size: 40px;
+    line-height: 1.15; margin: 14px 0 10px; letter-spacing: .01em; text-wrap: balance;
+  }
+  header.hero p.sub { color: var(--dim); max-width: 68ch; margin: 0 0 22px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; font-family: var(--mono); font-size: 11.5px; }
+  .meta span { border: 1px solid var(--line2); color: var(--dim); padding: 3px 10px; border-radius: 4px; background: var(--panel); }
+  .meta span b { color: var(--accent); font-weight: 400; }
+
+  nav.toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 34px 0 6px; font-size: 13px; }
+  nav.toc a {
+    color: var(--dim); text-decoration: none; border: 1px solid var(--line);
+    padding: 5px 12px; border-radius: 4px; background: var(--panel);
+    transition: color .15s, border-color .15s;
+  }
+  nav.toc a:hover { color: var(--accent); border-color: var(--accent-deep); }
+
+  section { margin-top: 82px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .22em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 8px;
+  }
+  h2 { font-family: var(--serif); font-weight: 600; font-size: 26px; margin: 0 0 14px; line-height: 1.25; text-wrap: balance; }
+  section > p.lead { color: var(--dim); max-width: 72ch; margin-top: 0; }
+  section > p { max-width: 72ch; }
+  h3 { font-family: var(--sans); font-size: 15.5px; font-weight: 600; margin: 36px 0 10px; color: var(--ink); }
+
+  figure {
+    margin: 22px 0; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel); padding: 22px 20px 16px; overflow-x: auto;
+  }
+  pre.mermaid { font-family: var(--mono) !important; margin: 0; min-width: min-content; color: var(--ink); }
+  figcaption {
+    font-family: var(--mono); font-size: 11.5px; color: var(--faint);
+    margin-top: 14px; border-top: 1px dashed var(--line); padding-top: 10px;
+    letter-spacing: .02em; line-height: 1.9;
+  }
+  figcaption b { color: var(--dim); font-weight: 400; }
+
+  .tbl-scroll { overflow-x: auto; margin: 18px 0; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th {
+    text-align: left; font-weight: 400; font-size: 11px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint); padding: 11px 14px;
+    border-bottom: 1px solid var(--line2); white-space: nowrap;
+  }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .rc-ok { color: var(--accent); }
+  .rc-retry { color: var(--amber); }
+  .rc-bad { color: var(--crimson); }
+  code { font-family: var(--mono); font-size: .9em; color: var(--accent); background: var(--panel2); padding: 1px 6px; border-radius: 4px; }
+
+  .callout {
+    border: 1px solid var(--line2); border-left: 3px solid var(--accent);
+    background: var(--panel); border-radius: 6px;
+    padding: 18px 22px; margin: 22px 0; max-width: 78ch;
+  }
+  .callout h4 {
+    margin: 0 0 10px; font-family: var(--mono); font-size: 11.5px;
+    letter-spacing: .18em; text-transform: uppercase; color: var(--accent); font-weight: 400;
+  }
+  .callout.retry { border-left-color: var(--amber); }
+  .callout.retry h4 { color: var(--amber); }
+  .callout.fatal { border-left-color: var(--crimson); }
+  .callout.fatal h4 { color: var(--crimson); }
+  .callout p { margin: 8px 0; }
+  .callout ul { margin: 8px 0 4px; padding-left: 20px; }
+  .callout li { margin: 5px 0; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 26px; font-size: 12.5px; color: var(--faint); }
+  .legend b { color: var(--dim); font-weight: 400; }
+  footer {
+    margin-top: 90px; border-top: 1px solid var(--line2); padding-top: 22px;
+    font-size: 12.5px; color: var(--faint); line-height: 2.1;
+  }
+  footer code { font-family: var(--mono); font-size: .95em; color: var(--dim); }
+  @media (max-width: 640px) {
+    header.hero h1 { font-size: 30px; }
+    .wrap { padding: 36px 16px 90px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="topline">
+  <span>libHtpPrepare · HTP graph compiler</span>
+  <span class="live">scheduling subsystem · weekly report 2026-08-28</span>
+</div>
+
+<header class="hero">
+  <div class="eyebrow">scheduling × allocation, reverse-engineered</div>
+  <h1>调度子系统：逆向重实现与本周进展</h1>
+  <p class="sub">神经网络里成百上千个算子要挤进 DSP 片上那一小块高速内存（VTCM）里运行。执行顺序决定哪些数据同时占用内存，放置方案决定它们装不装得下。这套「排序 → 规划 → 放置 → 装不下就重排」的调度逻辑，本周已经逐指令逆向贯通，并重实现进代码。</p>
+  <div class="meta">
+    <span><b>排序引擎</b> ST-Cut 调度</span>
+    <span><b>内存分配</b> 生命周期分配器</span>
+    <span><b>主流程</b> 回退重试</span>
+    <span><b>状态</b> 重实现完成 · 测试通过</span>
+  </div>
+  <nav class="toc">
+    <a href="#s1">§1 调度解决什么问题</a>
+    <a href="#s2">§2 总流程</a>
+    <a href="#s3">§3 排序引擎</a>
+    <a href="#s4">§4 优化循环</a>
+    <a href="#s5">§5 内存分配</a>
+    <a href="#s6">§6 本周进展与下一步</a>
+  </nav>
+  <div class="legend">
+    <span><b>Legend</b> <span style="color:var(--accent)">&#9632; 正常推进</span> <span style="color:var(--amber)">&#9632; 决策点 / 回退</span> <span style="color:var(--crimson)">&#9632; 不可恢复 / 待做</span></span>
+    <span><b>术语</b> VTCM = 片上高速内存；grain = 内存计数单位（1 grain = 2048 字节）</span>
+  </div>
+</header>
+
+<!-- ================= §1 ================= -->
+<section id="s1">
+  <p class="eyebrow">§1 调度解决什么问题</p>
+  <h2>一句话：让计算图在片上一小块内存里跑起来</h2>
+  <p class="lead">编译器面对的核心问题只有一个：<b>神经网络里成百上千个算子，要在一小块片上高速内存（VTCM）里依次执行</b>。执行顺序决定哪些数据会同时「活着」占用内存；放置方案决定它们能不能都放得下。所以调度的本质，就是找一个执行顺序，让「同时活着的数据」尽量少，峰值内存尽量低。</p>
+
+  <div class="callout">
+    <h4>为什么顺序决定内存</h4>
+    <p>两个大张量如果「生命周期」重叠，就会同时占内存，峰值就高；如果调换执行顺序，让它们一个用完、另一个才开始，它们就能共用同一块内存，峰值就低。编译器不能改图，但能改执行顺序——这正是调度的用武之地。</p>
+  </div>
+</section>
+
+<!-- ================= §2 ================= -->
+<section id="s2">
+  <p class="eyebrow">§2 总流程</p>
+  <h2>走一遍；装不下就重排、再走一遍</h2>
+  <p class="lead">整条链只做四件事：分析依赖 → 决定顺序 → 沿顺序放置内存 → 产出执行序列。唯一的分岔在最后一步之前：<b>装不下时，不是立刻报错，而是标记「需要重排」，回到起点换一个顺序再来</b>——因为不同的顺序可能把内存峰值压下去。</p>
+
+  <figure>
+<pre class="mermaid">
+%%{init:{"theme":"base","flowchart":{"curve":"linear"},"themeVariables":{"primaryColor":"#15261f","primaryBorderColor":"#33604f","primaryTextColor":"#dce8e1","lineColor":"#4e7065","edgeLabelBackground":"#121b17","fontFamily":"ui-monospace,Menlo,monospace","fontSize":"13px"}}}%%
+flowchart TD
+    A["模型计算图<br/>算子 + 张量 + 依赖"] --> B["分析依赖<br/>每个张量何时产生、何时最后一次被用"]
+    B --> C["排序<br/>决定算子的执行顺序"]
+    C --> D["内存规划<br/>按生命周期给每个张量分配位置"]
+    D --> E{"最终放置<br/>都能放进片上内存吗？"}
+    E -->|"放得下"| F["产出执行序列<br/>编译完成"]
+    E -->|"放不下"| G["标记「需要重排」<br/>换个顺序可能放得下"]
+    G --> H["回到起点<br/>先重排，再重新规划放置"]
+    H --> C
+    E -->|"不可恢复失败"| Z["结束<br/>返回失败原因"]
+    classDef ok fill:#12261e,stroke:#4fd1a5,color:#c9f0e0;
+    classDef gate fill:#221c0f,stroke:#e0a83f,color:#f2d9a0;
+    classDef bad fill:#241412,stroke:#e5695a,color:#f0c4bd;
+    class F,A,B,C,D ok;
+    class E,G,H gate;
+    class Z bad;
+</pre>
+    <figcaption><b>Fig. 1 — 总流程</b>：从加载到完成的完整图景。绿色是正常推进；琥珀色的回边（放不下 → 重排）是重试循环；红色是不可恢复失败，立即终止。</figcaption>
+  </figure>
+
+  <div class="callout">
+    <h4>最重要的一个判断</h4>
+    <p>决定「要不要再来一轮」的，不是返回值本身，而是内部状态有没有被写成「需要重排」。只有「内存不足 · 可重试」这一类失败会写这个状态，其它失败都不写，所以只走一轮就结束。</p>
+  </div>
+</section>
+
+<!-- ================= §3 ================= -->
+<section id="s3">
+  <p class="eyebrow">§3 排序引擎</p>
+  <h2>怎么算出「这个顺序的内存峰值」</h2>
+  <p class="lead">排序引擎的核心直觉一句话：<b>沿着执行顺序一步步走，每步记录「此刻还活着的张量总共多大」，走到最后取最大值——那就是这个顺序的内存峰值</b>。排序的目标，就是让这个最大值尽可能小。</p>
+  <p>「活着」指的是：已经算出来、并且后面还有算子要用它。一个张量从它被产生算起，直到最后一个用它的算子结束——这段就是它的<b>生命周期</b>。</p>
+
+  <figure>
+<pre class="mermaid">
+%%{init:{"theme":"base","flowchart":{"curve":"linear"},"themeVariables":{"primaryColor":"#15261f","primaryBorderColor":"#33604f","primaryTextColor":"#dce8e1","lineColor":"#4e7065","edgeLabelBackground":"#121b17","fontFamily":"ui-monospace,Menlo,monospace","fontSize":"13px"}}}%%
+flowchart TD
+    A["输入<br/>算子列表 + 依赖 + 内存预算"] --> B["加虚拟起点、终点<br/>让所有算子串成一条完整链"]
+    B --> C["给每条依赖边标上内存权重<br/>= 张量大小（按 grain 计）"]
+    C --> D["按依赖做拓扑排序<br/>得到一个合法的初始顺序"]
+    D --> E["沿顺序逐步累加内存<br/>记录运行最大值 = 峰值"]
+    E --> F{"值得优化吗？<br/>允许重排 且 峰值超预算？"}
+    F -->|"峰值已在预算内<br/>或重排被禁用"| OUT["直接采用当前顺序"]
+    F -->|"超预算"| LOOP["进入优化循环，试几轮（下一节）"]
+    LOOP --> OUT2["采用见到的最好顺序<br/>复核峰值后产出"]
+    classDef ok fill:#12261e,stroke:#4fd1a5,color:#c9f0e0;
+    classDef gate fill:#221c0f,stroke:#e0a83f,color:#f2d9a0;
+    classDef virt fill:#15261f,stroke:#33604f,color:#9db4a9,stroke-dasharray: 4 3;
+    class A,E,OUT,OUT2 ok;
+    class F gate;
+    class B,C virt;
+</pre>
+    <figcaption><b>Fig. 2 — 从依赖到「一个顺序 + 一个峰值」</b>：决策框问的是「这个峰值需要处理吗」？在预算内就不折腾；超了才进优化循环。虚线框是结构准备（加端点、标权重）。</figcaption>
+  </figure>
+
+  <h3>初始顺序：剥洋葱式拓扑排序</h3>
+  <p>初始顺序用 Kahn 拓扑排序——像剥洋葱一样，每轮剥掉一层「所有前驱都已就绪」的算子：</p>
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th class="num">步骤</th><th>做什么</th></tr></thead>
+      <tbody>
+        <tr><td class="num">1</td><td>统计每个算子的入度（还有几个前驱没做完）</td></tr>
+        <tr><td class="num">2</td><td>入度为 0 的算子进候选队列，按注册顺序排</td></tr>
+        <tr><td class="num">3</td><td>弹出队头进入结果顺序，把后继入度减一，减到 0 就入队</td></tr>
+        <tr><td class="num">4</td><td>重复直到队空（有环则按注册顺序兜底追加）</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>两个关键性质：<b>稳定</b>（无依赖的算子保持原始相对顺序）；<b>只保证合法、不优化内存</b>（初始顺序只是「把你给的顺序里能提前的提前」，压峰值交给后面的优化循环）。</p>
+</section>
+
+<!-- ================= §4 ================= -->
+<section id="s4">
+  <p class="eyebrow">§4 优化循环</p>
+  <h2>换新顺序：试一步、量一次、记住最好的</h2>
+  <p class="lead">优化循环是「排序」内部的打磨车间。一轮 = 快照 → 提出一个调整 → 验证合法性 → 量峰值 → 更新最优记录 → 回滚 → 决定是否继续。每一次改动都是<b>先快照、试完就回滚</b>，所以无论尝试多乱，原始顺序永远完好。</p>
+
+  <figure>
+<pre class="mermaid">
+%%{init:{"theme":"base","flowchart":{"curve":"linear"},"themeVariables":{"primaryColor":"#15261f","primaryBorderColor":"#33604f","primaryTextColor":"#dce8e1","lineColor":"#4e7065","edgeLabelBackground":"#121b17","fontFamily":"ui-monospace,Menlo,monospace","fontSize":"13px"}}}%%
+flowchart TD
+    S{"值得优化吗？"}
+    S -->|"否"| X["跳过循环，采用当前顺序"]
+    S -->|"是 · 第 1 轮"| R1["读入本轮参数<br/>读不出就用安全默认值"]
+    R1 --> R2["快照内部记录<br/>以便整批回滚"]
+    R2 --> R3["引擎提出一个顺序调整"]
+    R3 --> R4{"新顺序合法吗？<br/>依赖没被破坏"}
+    R4 -->|"非法"| R4X["回滚到原始顺序"]
+    R4 -->|"合法"| R5["量新顺序的内存峰值"]
+    R5 --> R6{"比目前最好还好？"}
+    R6 -->|"是"| R6Y["更新最优记录"]
+    R6 -->|"否"| R7
+    R6Y --> R7["回滚内部记录<br/>下一轮仍从原始顺序起"]
+    R7 --> R8{"继续下一轮？"}
+    R8 -->|"峰值达标 / 时间或轮数耗尽 / 无可用调整"| X2["结束，采用最好顺序"]
+    R8 -->|"还有余量"| R1N["进入下一轮"]
+    R1N --> R1
+    classDef gate fill:#221c0f,stroke:#e0a83f,color:#f2d9a0;
+    classDef bad fill:#241412,stroke:#e5695a,color:#f0c4bd;
+    classDef ok fill:#12261e,stroke:#4fd1a5,color:#c9f0e0;
+    class S,R4,R6,R8 gate;
+    class R4X bad;
+    class X,X2 ok;
+</pre>
+    <figcaption><b>Fig. 3 — 一轮的完整生命周期</b>：三个决策点管「进不进、收不收、继不继续」。四类停止原因，命中任一就以最好结果收尾。</figcaption>
+  </figure>
+
+  <h3>引擎每轮做什么：七步 + 一个走查例子</h3>
+  <p class="lead">「引擎提出一个顺序调整」是整个系统的心脏，也是最容易绕晕的地方。每轮它固定做七件事：先挑「最痛」的一段，再挑最值得挪的那个算子，然后问依赖图一个问题（一个最小割），按答案切割，再修复受影响的内存曲线。</p>
+
+  <figure>
+<pre class="mermaid">
+%%{init:{"theme":"base","flowchart":{"curve":"linear"},"themeVariables":{"primaryColor":"#15261f","primaryBorderColor":"#33604f","primaryTextColor":"#dce8e1","lineColor":"#4e7065","edgeLabelBackground":"#121b17","fontFamily":"ui-monospace,Menlo,monospace","fontSize":"13px"}}}%%
+flowchart TD
+    A["① 挑窗口<br/>给每个窗口打分（超过痛线的张量计 3×）<br/>选得分最高的"] --> B["② 挑节点<br/>窗口内按「组大小 × 权重」打分<br/>加随机抖动，避免总盯着一个点"]
+    B --> C["③ 重分层<br/>清空并重算所有层级标签"]
+    C --> D["④ 问一个最小割<br/>临时加「无限容量」边<br/>最小割 = 必须一起挪的集合"]
+    D --> E{"⑤ 切割 还是 合并"}
+    E -->|"空集或整个窗口"| E1["只统一组标签<br/>顺序不变"]
+    E -->|"真子集"| E2["抽出该段<br/>注册两个新组（前队 / 后队）<br/>重接线，账本一分为二"]
+    E1 --> F["⑥ 修复曲线<br/>只重算受影响窗口的累计内存<br/>其它段不动"]
+    E2 --> F
+    F --> G["⑦ 偶尔打乱<br/>每隔固定轮数随机解散一个账本<br/>避免卡在局部最优"]
+    G --> H["交回循环去量峰值"]
+    classDef ok fill:#12261e,stroke:#4fd1a5,color:#c9f0e0;
+    classDef gate fill:#221c0f,stroke:#e0a83f,color:#f2d9a0;
+    class E gate;
+    class A,B,C,D,F,G,H ok;
+</pre>
+    <figcaption><b>Fig. 4 — 一轮的七步</b>：前四步是「看清该挪谁」，第五步才是真正的挪动，六七步是收尾。精髓在第四步：它一次性回答「我挪这个，谁必须跟着一起挪」，保证切割后顺序依然合法。</figcaption>
+  </figure>
+
+  <h3>一个例子：一个大张量拖住两个分支</h3>
+  <p>图里有六个算子 <b>a–f</b>，两个「大」张量：<b>a</b> 产出 A（8 grain），被 c 和 d 用；<b>b</b> 产出 B（7 grain），被 e 用；<b>f</b> 汇总 c、d、e 的结果。</p>
+
+  <figure>
+<pre class="mermaid">
+%%{init:{"theme":"base","flowchart":{"curve":"linear"},"themeVariables":{"primaryColor":"#15261f","primaryBorderColor":"#33604f","primaryTextColor":"#dce8e1","lineColor":"#4e7065","edgeLabelBackground":"#121b17","fontFamily":"ui-monospace,Menlo,monospace","fontSize":"13px"}}}%%
+flowchart LR
+    a["a<br/>产出 A = 8"] -->|"A"| c["c<br/>产出 C = 1"]
+    a -->|"A"| d["d<br/>产出 D = 1"]
+    b["b<br/>产出 B = 7"] -->|"B"| e["e<br/>产出 E = 1"]
+    c -->|"C"| f["f<br/>汇总输出"]
+    d -->|"D"| f
+    e -->|"E"| f
+    classDef ok fill:#12261e,stroke:#4fd1a5,color:#c9f0e0;
+    class f ok;
+</pre>
+    <figcaption><b>Fig. 5 — 例子本身</b>：A、B 是大张量；A 有两个消费者（c、d），B 有一个（e）。要不要重排、峰值降不降，全看 A、B 的生命周期何时重叠。</figcaption>
+  </figure>
+
+  <p><b>初始顺序 a,b,c,d,e,f 的峰值是 16</b>（走到 c 时，A、B、C 同时活着）：</p>
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th class="num">步骤</th><th>顺序</th><th>活着的张量</th><th class="num">总 grain</th></tr></thead>
+      <tbody>
+        <tr><td class="num">1</td><td>a</td><td>A</td><td class="num">8</td></tr>
+        <tr><td class="num">2</td><td>b</td><td>A, B</td><td class="num">15</td></tr>
+        <tr><td class="num">3</td><td>c</td><td>A, B, C</td><td class="num rc-retry">16 ← 峰值</td></tr>
+        <tr><td class="num">4</td><td>d</td><td>B, C, D</td><td class="num">9</td></tr>
+        <tr><td class="num">5</td><td>e</td><td>C, D, E</td><td class="num">3</td></tr>
+        <tr><td class="num">6</td><td>f</td><td>—</td><td class="num">0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>引擎怎么切（对照七步）：</p>
+  <ol>
+    <li><b>挑窗口</b>：痛线是当前峰值的一个比例（此例 5 grain）。A(8)、B(7) 都超线，该窗口计 3×，得分最高。</li>
+    <li><b>挑节点</b>：窗口内挑 b——B 大、权重高，挪它收益最大。</li>
+    <li><b>重分层</b>：清空并重算层级标签，确认 b、e 是下一步的候选。</li>
+    <li><b>问最小割</b>：临时加无限边后，最小割回答「<b>b 和它的消费者 e 必须一起挪，整块可以滑到 d 之后</b>」——B 只有 e 用，挪 b 必须拖 e；A 被 c、d 用，所以 A 不能死在 d 之前。</li>
+    <li><b>切割</b>：切出真子集 {b, e}，从顺序里抽出，注册新组。新顺序 <b>a, c, d, b, e, f</b>。</li>
+    <li><b>修复曲线</b>：只重算受影响段，得到新峰值。</li>
+  </ol>
+
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th class="num">步骤</th><th>新顺序</th><th>活着的张量</th><th class="num">总 grain</th></tr></thead>
+      <tbody>
+        <tr><td class="num">1</td><td>a</td><td>A</td><td class="num">8</td></tr>
+        <tr><td class="num">2</td><td>c</td><td>A, C</td><td class="num">9</td></tr>
+        <tr><td class="num">3</td><td>d</td><td>C, D</td><td class="num">2</td></tr>
+        <tr><td class="num">4</td><td>b</td><td>B, C, D</td><td class="num">9</td></tr>
+        <tr><td class="num">5</td><td>e</td><td>C, D, E</td><td class="num">3</td></tr>
+        <tr><td class="num">6</td><td>f</td><td>—</td><td class="num">0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><b>发生了什么</b>：a、c、d 连着跑，A 在 d 之后立刻死；b、e 连着跑，B 晚生早死。两个大张量不再同时活着，峰值从 16 降到 9。这就是「重排降峰值」在引擎内部的样子——不是改图，而是把大张量的生命周期错开。</p>
+
+  <div class="callout retry">
+    <h4>诚实边界</h4>
+    <p>这七步已与真实二进制逐调用交叉核对（反汇编 ↔ 反编译语料），但<b>尚未落到代码</b>：当前引擎仍是占位（第一轮就报「无候选」，循环确定性一轮结束）。一旦这套机制实现，重试才真正有探索空间。</p>
+  </div>
+</section>
+
+<!-- ================= §5 ================= -->
+<section id="s5">
+  <p class="eyebrow">§5 内存分配</p>
+  <h2>有多少内存池、各管什么、内部怎么管</h2>
+  <p class="lead">把内存的两重世界分开，问题就清楚了：<b>宿主机内存</b>（编译器自己运行时用的真内存）和<b>DSP 片上内存的「账本」</b>（编译期从不碰真实地址，只规划谁放哪，偏移算好后由后端填真实地址）。账本有三个，加宿主机池共四个池；溢到片外 DDR 的也不是没人管——常量池有近/远之分，溢出的张量有 arena。</p>
+
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>池</th><th>管什么</th><th>内部怎么管</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><b>宿主机记账池</b></td>
+          <td>编译器自己的数据结构（账本本身、各种表）</td>
+          <td>每个池默认 8 MiB、256 字节对齐、向上堆；放不下就开新池；超大请求独占一池</td>
+        </tr>
+        <tr>
+          <td><b>生命周期账本</b></td>
+          <td>中间张量在片上内存的偏移</td>
+          <td>维护「可用区间表」，每个区间记四件事：起点、大小、前任何时死、后任何时生；复用标准是时间完全不重叠；放不下的从高水位线向上堆，只升不降</td>
+        </tr>
+        <tr>
+          <td><b>常驻块池</b></td>
+          <td>从头活到尾的常量 / 权重块</td>
+          <td>按 256 字节单位管区间表：分配取第一个放得下的区间头，释放与左右邻合并；还跟踪「最大连续空闲」当快速闸门</td>
+        </tr>
+        <tr>
+          <td><b>最终放置账本</b></td>
+          <td>每个块在片上内存的最终位置</td>
+          <td>块号先在 minimap 里登记去重；每块 2 KiB 对齐；累计总量守预算</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <h4>三个账本各管一段，互不重叠</h4>
+    <p><b>中间张量进生命周期账本</b>（生命周期有起有落，可以错开复用）；<b>常量 / 权重进常驻块池</b>（全程活着，没有复用机会，直接头尾紧挨着打包）；<b>最终放置账本做总校验</b>（把前两个的结果对着预算称重）。「放不下 · 可重试」的判定只来自最后一个账本。</p>
+  </div>
+
+  <div class="callout retry">
+    <h4>串起来</h4>
+    <p>顺序决定生命周期如何重叠 → 生命周期决定谁复用谁的内存（账本一）→ 复用程度决定总需求 → 总需求过不过预算（账本三）决定要不要重排重试。这条因果链的头是「顺序」，所以重试动作是「重排」，不是「缩小张量」。</p>
+  </div>
+</section>
+
+<!-- ================= §6 ================= -->
+<section id="s6">
+  <p class="eyebrow">§6 本周进展与下一步</p>
+  <h2>进展：调度已逆向贯通、重实现完成</h2>
+  <p class="lead">本周把上述整套调度逻辑<b>逐指令逆向贯通，并重实现进代码，测试通过</b>。这纠正了此前「调度 = 图着色」的误读——真实是上面讲的 ST-Cut 排序 + 生命周期分配。</p>
+
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>模块</th><th class="num">完成度</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td>图解析（模型 → 内部表示）</td><td class="num rc-ok">~85%</td><td class="rc-ok">字节级对齐</td></tr>
+        <tr><td>调度（ST-Cut 排序）</td><td class="num rc-ok">~75%</td><td class="rc-ok">逆向贯通 + 重实现 + 测试通过</td></tr>
+        <tr><td>内存分配（生命周期分配器）</td><td class="num rc-ok">~75%</td><td class="rc-ok">同上</td></tr>
+        <tr><td>序列化（产出可执行 bin）</td><td class="num rc-retry">~50%</td><td class="rc-retry">容器已对齐，正文待补齐</td></tr>
+        <tr><td>上板（真机运行）</td><td class="num rc-bad">~0%</td><td class="rc-bad">待做</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>下一步：全链闭环一个小模型</h3>
+  <p>目标：一个小模型（卷积 + 加法）走通「模型 → 图解析 → 调度 → 内存分配 → 序列化 → 真机执行」，产出与官方工具链一致的数值。当前关键路径只剩最后一段——把调度结果正确地序列化成可执行文件，再上真机验证。</p>
+
+  <div class="callout">
+    <h4>一句话总结</h4>
+    <p>最难的调度逻辑（ST-Cut 排序 + 生命周期分配）已经逆向贯通并重实现；剩下的工作是把它接上序列化、上真机跑通，预计还需几周。</p>
+  </div>
+</section>
+
+<footer>
+  <div>对应源码：排序引擎 <code>st_cut.cpp</code> · 内存分配 <code>fancy_allocator.cpp</code> · 主流程与重试 <code>do_prepare2.cpp</code> · 六阶段 <code>sequencing_stage.cpp</code></div>
+  <div>本页是调度算法的平实说明；字段命名、边界条件等细节以代码注释为准。</div>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  function boot() {
+    if (typeof mermaid === "undefined") return;
+    mermaid.initialize({ startOnLoad: false, fontFamily: "ui-monospace, Menlo, monospace", fontSize: 13 });
+    mermaid.run({ querySelector: "pre.mermaid" });
+  }
+  if (typeof mermaid !== "undefined") { boot(); return; }
+  var s = document.createElement("script");
+  s.src = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js";
+  s.onload = boot;
+  document.head.appendChild(s);
+})();
+</script>
+</body>
+</html>

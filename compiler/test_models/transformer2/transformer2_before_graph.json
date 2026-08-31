@@ -1,0 +1,3753 @@
+{
+ "header": {
+      "header_version": {
+          "major": 1,
+         "minor": 0,
+          "patch": 0
+      },
+       "version": {
+           "major": 1,
+           "minor": 0,
+           "patch": 0
+       },
+      "artifact_type": "HTP_GRAPH"
+   },
+  "model.cpp": "htp_graph",
+  "graph": {
+    "tensors": {
+      "0x0000000000000002": {
+        "id": 0,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          64,
+          8
+        ]
+
+      },
+      "0x0000000000000011": {
+        "id": 1,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x0000000000000012": {
+        "id": 2,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          3
+        ]
+
+      },
+      "0x0000000000000014": {
+        "id": 3,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000015": {
+        "id": 4,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          3
+        ]
+
+      },
+      "0x0000000000000016": {
+        "id": 5,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          192,
+          64
+        ]
+
+      },
+      "0x0000000000000017": {
+        "id": 6,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          192
+        ]
+
+      },
+      "0x0000000000000018": {
+        "id": 7,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          192
+        ]
+
+      },
+      "0x0000000000000019": {
+        "id": 8,
+        "type": 4,
+        "data_type": 1032,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x000000000000001a": {
+        "id": 9,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          3,
+          64
+        ]
+
+      },
+      "0x000000000000001b": {
+        "id": 10,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          5
+        ]
+
+      },
+      "0x000000000000001c": {
+        "id": 11,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          3,
+          8,
+          1,
+          1,
+          64
+        ]
+
+      },
+      "0x000000000000001d": {
+        "id": 12,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          3,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x000000000000001e": {
+        "id": 13,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x000000000000001f": {
+        "id": 14,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000021": {
+        "id": 15,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          4,
+          16
+        ]
+
+      },
+      "0x0000000000000022": {
+        "id": 16,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x0000000000000023": {
+        "id": 17,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000025": {
+        "id": 18,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          4,
+          16
+        ]
+
+      },
+      "0x0000000000000026": {
+        "id": 19,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x0000000000000027": {
+        "id": 20,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000029": {
+        "id": 21,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          4,
+          16
+        ]
+
+      },
+      "0x000000000000002b": {
+        "id": 22,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          16
+        ]
+
+      },
+      "0x000000000000002c": {
+        "id": 23,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          3
+        ]
+
+      },
+      "0x000000000000002e": {
+        "id": 24,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          16
+        ]
+
+      },
+      "0x0000000000000030": {
+        "id": 25,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x0000000000000031": {
+        "id": 26,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          16
+        ]
+
+      },
+      "0x0000000000000032": {
+        "id": 27,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x0000000000000034": {
+        "id": 28,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          16,
+          8
+        ]
+
+      },
+      "0x0000000000000035": {
+        "id": 29,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          3
+        ]
+
+      },
+      "0x0000000000000036": {
+        "id": 30,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          8
+        ]
+
+      },
+      "0x0000000000000037": {
+        "id": 31,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          8
+        ]
+
+      },
+      "0x000000000000003a": {
+        "id": 32,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          8
+        ]
+
+      },
+      "0x000000000000003b": {
+        "id": 33,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x000000000000003d": {
+        "id": 34,
+        "type": 4,
+        "data_type": 50,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x000000000000003e": {
+        "id": 35,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          16
+        ]
+
+      },
+      "0x000000000000003f": {
+        "id": 36,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          16
+        ]
+
+      },
+      "0x0000000000000043": {
+        "id": 37,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          4,
+          16
+        ]
+
+      },
+      "0x0000000000000045": {
+        "id": 38,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          64,
+          64
+        ]
+
+      },
+      "0x0000000000000046": {
+        "id": 39,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000047": {
+        "id": 40,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x0000000000000049": {
+        "id": 41,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x000000000000004b": {
+        "id": 42,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x000000000000004d": {
+        "id": 43,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x000000000000004f": {
+        "id": 44,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000051": {
+        "id": 45,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x0000000000000052": {
+        "id": 46,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x0000000000000054": {
+        "id": 47,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x0000000000000055": {
+        "id": 48,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          128,
+          64
+        ]
+
+      },
+      "0x0000000000000056": {
+        "id": 49,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          128
+        ]
+
+      },
+      "0x0000000000000057": {
+        "id": 50,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          128
+        ]
+
+      },
+      "0x0000000000000059": {
+        "id": 51,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          128
+        ]
+
+      },
+      "0x000000000000005a": {
+        "id": 52,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          128
+        ]
+
+      },
+      "0x000000000000005c": {
+        "id": 53,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x0000000000000060": {
+        "id": 54,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          1
+        ]
+
+      },
+      "0x0000000000000061": {
+        "id": 55,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          128
+        ]
+
+      },
+      "0x0000000000000062": {
+        "id": 56,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          64,
+          128
+        ]
+
+      },
+      "0x0000000000000063": {
+        "id": 57,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000064": {
+        "id": 58,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x0000000000000066": {
+        "id": 59,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x0000000000000067": {
+        "id": 60,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x000000000000006a": {
+        "id": 61,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x000000000000006e": {
+        "id": 62,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000070": {
+        "id": 63,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          192,
+          64
+        ]
+
+      },
+      "0x0000000000000071": {
+        "id": 64,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          192
+        ]
+
+      },
+      "0x0000000000000074": {
+        "id": 65,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          3,
+          64
+        ]
+
+      },
+      "0x0000000000000076": {
+        "id": 66,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          3,
+          8,
+          1,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000077": {
+        "id": 67,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          3,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000078": {
+        "id": 68,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x000000000000007a": {
+        "id": 69,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          4,
+          16
+        ]
+
+      },
+      "0x000000000000007b": {
+        "id": 70,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x000000000000007d": {
+        "id": 71,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          4,
+          16
+        ]
+
+      },
+      "0x000000000000007e": {
+        "id": 72,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x0000000000000080": {
+        "id": 73,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          4,
+          16
+        ]
+
+      },
+      "0x0000000000000082": {
+        "id": 74,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          16
+        ]
+
+      },
+      "0x0000000000000085": {
+        "id": 75,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          16
+        ]
+
+      },
+      "0x0000000000000087": {
+        "id": 76,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          16
+        ]
+
+      },
+      "0x000000000000008a": {
+        "id": 77,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          16,
+          8
+        ]
+
+      },
+      "0x000000000000008c": {
+        "id": 78,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          8
+        ]
+
+      },
+      "0x0000000000000090": {
+        "id": 79,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          8
+        ]
+
+      },
+      "0x0000000000000094": {
+        "id": 80,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          4,
+          8,
+          16
+        ]
+
+      },
+      "0x0000000000000099": {
+        "id": 81,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          4,
+          16
+        ]
+
+      },
+      "0x000000000000009b": {
+        "id": 82,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          64,
+          64
+        ]
+
+      },
+      "0x000000000000009c": {
+        "id": 83,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x000000000000009e": {
+        "id": 84,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          8,
+          1,
+          64
+        ]
+
+      },
+      "0x00000000000000a0": {
+        "id": 85,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x00000000000000a2": {
+        "id": 86,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x00000000000000a5": {
+        "id": 87,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x00000000000000a8": {
+        "id": 88,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x00000000000000a9": {
+        "id": 89,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          128,
+          64
+        ]
+
+      },
+      "0x00000000000000aa": {
+        "id": 90,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          128
+        ]
+
+      },
+      "0x00000000000000ab": {
+        "id": 91,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          128
+        ]
+
+      },
+      "0x00000000000000ad": {
+        "id": 92,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          128
+        ]
+
+      },
+      "0x00000000000000ae": {
+        "id": 93,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          128
+        ]
+
+      },
+      "0x00000000000000b5": {
+        "id": 94,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          128
+        ]
+
+      },
+      "0x00000000000000b6": {
+        "id": 95,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          64,
+          128
+        ]
+
+      },
+      "0x00000000000000b7": {
+        "id": 96,
+        "type": 4,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          1,
+          64
+        ]
+
+      },
+      "0x00000000000000b8": {
+        "id": 97,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x00000000000000ba": {
+        "id": 98,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x00000000000000bb": {
+        "id": 99,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      },
+      "0x00000000000000be": {
+        "id": 100,
+        "type": 3,
+        "data_type": 562,
+        "dims": [
+          1,
+          1,
+          8,
+          64
+        ]
+
+      }
+    },
+    "nodes": {
+      "0x0000000000000011": {
+        "type": "Transpose", 
+        "grouping": "input_ncf", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "input_ncf"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 8192
+             },
+            "mem_vtcm_write": {
+              "100": 40960
+             }
+        },
+        "input_names": [
+          "0x0000000000000002",
+          "0x0000000000000012"
+        ],
+        "output_names": ["0x0000000000000011"]
+      },
+      "0x0000000000000014": {
+        "type": "Transpose", 
+        "grouping": "_layer1_attn_Transpose", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Transpose"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 40960
+             },
+            "mem_vtcm_write": {
+              "100": 12288
+             }
+        },
+        "input_names": [
+          "0x0000000000000002",
+          "0x0000000000000015"
+        ],
+        "output_names": ["0x0000000000000014"]
+      },
+      "0x0000000000000017": {
+        "type": "FullyConnected", 
+        "grouping": "_layer1_attn_MatMul", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "FullyConnected"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_MatMul"
+             },
+            "mem_dram_read": {
+              "100": 26624
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 40960
+             },
+            "mem_vtcm_write": {
+              "100": 61440
+             }
+        },
+        "input_names": [
+          "0x0000000000000014",
+          "0x0000000000000016",
+          "0x0000000000000018",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x0000000000000017"]
+      },
+      "0x000000000000001a": {
+        "type": "Reshape", 
+        "grouping": "_layer1_attn_MatMul_post_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 5
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_MatMul_post_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x0000000000000017"
+        ],
+        "output_names": ["0x000000000000001a"]
+      },
+      "0x000000000000001c": {
+        "type": "Transpose", 
+        "grouping": "_layer1_attn_Transpose_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 5
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Transpose_1"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x000000000000001a",
+          "0x000000000000001b"
+        ],
+        "output_names": ["0x000000000000001c"]
+      },
+      "0x000000000000001d": {
+        "type": "Reshape", 
+        "grouping": "_layer1_attn_Squeeze_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Squeeze_1"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 28672
+             },
+            "mem_vtcm_write": {
+              "100": 8192
+             }
+        },
+        "input_names": [
+          "0x000000000000001c"
+        ],
+        "output_names": ["0x000000000000001d"]
+      },
+      "0x000000000000001f": {
+        "type": "Gather", 
+        "grouping": "_layer1_attn_Gather_3", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Gather"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Gather_3"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x000000000000001d",
+          "0x000000000000001e",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x000000000000001f"]
+      },
+      "0x0000000000000021": {
+        "type": "Reshape", 
+        "grouping": "Reshape_post__layer1_attn_Gather_3", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "Reshape_post__layer1_attn_Gather_3"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 4096
+             }
+        },
+        "input_names": [
+          "0x000000000000001f"
+        ],
+        "output_names": ["0x0000000000000021"]
+      },
+      "0x0000000000000023": {
+        "type": "Gather", 
+        "grouping": "_layer1_attn_Gather_4", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Gather"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Gather_4"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x000000000000001d",
+          "0x0000000000000022",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x0000000000000023"]
+      },
+      "0x0000000000000025": {
+        "type": "Reshape", 
+        "grouping": "Reshape_post__layer1_attn_Gather_4", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "Reshape_post__layer1_attn_Gather_4"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000023"
+        ],
+        "output_names": ["0x0000000000000025"]
+      },
+      "0x0000000000000027": {
+        "type": "Gather", 
+        "grouping": "_layer1_attn_Gather_5", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Gather"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Gather_5"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x000000000000001d",
+          "0x0000000000000026",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x0000000000000027"]
+      },
+      "0x0000000000000029": {
+        "type": "Reshape", 
+        "grouping": "Reshape_post__layer1_attn_Gather_5", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "Reshape_post__layer1_attn_Gather_5"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000027"
+        ],
+        "output_names": ["0x0000000000000029"]
+      },
+      "0x000000000000002b": {
+        "type": "Transpose", 
+        "grouping": "_layer1_attn_Transpose_2", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Transpose_2"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 4096
+             }
+        },
+        "input_names": [
+          "0x0000000000000021",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x000000000000002b"]
+      },
+      "0x000000000000002e": {
+        "type": "Transpose", 
+        "grouping": "_layer1_attn_Transpose_3", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Transpose_3"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000029",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x000000000000002e"]
+      },
+      "0x0000000000000031": {
+        "type": "ElementWiseBinary", 
+        "grouping": "_layer1_attn_Mul_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "ElementWiseBinary"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Mul_1"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 4096
+             }
+        },
+        "input_names": [
+          "0x000000000000002b",
+          "0x0000000000000030",
+          "0x0000000000000032"
+        ],
+        "output_names": ["0x0000000000000031"]
+      },
+      "0x0000000000000034": {
+        "type": "Transpose", 
+        "grouping": "_layer1_attn_Transpose_4", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Transpose_4"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000025",
+          "0x0000000000000035"
+        ],
+        "output_names": ["0x0000000000000034"]
+      },
+      "0x0000000000000036": {
+        "type": "MatMul", 
+        "grouping": "_layer1_attn_MatMul_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "MatMul"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_MatMul_1"
+             },
+            "mem_dram_read": {
+              "100": 2048
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 49152
+             },
+            "mem_vtcm_write": {
+              "100": 34816
+             }
+        },
+        "input_names": [
+          "0x0000000000000031",
+          "0x0000000000000034",
+          "0x0000000000000037",
+          "0x0000000000000019",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x0000000000000036"]
+      },
+      "0x000000000000003a": {
+        "type": "Softmax", 
+        "grouping": "_layer1_attn_Softmax", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Softmax"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Softmax"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 16384
+             },
+            "mem_vtcm_write": {
+              "100": 16384
+             }
+        },
+        "input_names": [
+          "0x0000000000000036",
+          "0x000000000000003b",
+          "0x000000000000003d"
+        ],
+        "output_names": ["0x000000000000003a"]
+      },
+      "0x000000000000003e": {
+        "type": "MatMul", 
+        "grouping": "_layer1_attn_MatMul_2", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "MatMul"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_MatMul_2"
+             },
+            "mem_dram_read": {
+              "100": 2048
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 65536
+             },
+            "mem_vtcm_write": {
+              "100": 38912
+             }
+        },
+        "input_names": [
+          "0x000000000000003a",
+          "0x000000000000002e",
+          "0x000000000000003f",
+          "0x0000000000000019",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x000000000000003e"]
+      },
+      "0x0000000000000043": {
+        "type": "Transpose", 
+        "grouping": "_layer1_attn_Transpose_5", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Transpose_5"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x000000000000003e",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x0000000000000043"]
+      },
+      "0x0000000000000047": {
+        "type": "FullyConnected", 
+        "grouping": "_layer1_attn_Gemm", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "FullyConnected"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Gemm"
+             },
+            "mem_dram_read": {
+              "100": 12288
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 22528
+             },
+            "mem_vtcm_write": {
+              "100": 30720
+             }
+        },
+        "input_names": [
+          "0x0000000000000043",
+          "0x0000000000000045",
+          "0x0000000000000046",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x0000000000000047"]
+      },
+      "0x0000000000000049": {
+        "type": "Reshape", 
+        "grouping": "_layer1_attn_Reshape_7", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Reshape_7"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x0000000000000047"
+        ],
+        "output_names": ["0x0000000000000049"]
+      },
+      "0x000000000000004b": {
+        "type": "Transpose", 
+        "grouping": "_layer1_attn_Transpose_6", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_attn_Transpose_6"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 10240
+             },
+            "mem_vtcm_write": {
+              "100": 6144
+             }
+        },
+        "input_names": [
+          "0x0000000000000049",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x000000000000004b"]
+      },
+      "0x000000000000004d": {
+        "type": "ElementWiseBinary", 
+        "grouping": "_layer1_Add", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "ElementWiseBinary"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_Add"
+             },
+            "mem_dram_read": {
+              "100": 4096
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 26624
+             },
+            "mem_vtcm_write": {
+              "100": 22528
+             }
+        },
+        "input_names": [
+          "0x0000000000000011",
+          "0x000000000000004b",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x000000000000004d"]
+      },
+      "0x0000000000000051": {
+        "type": "LayerNorm", 
+        "grouping": "_layer1_norm1_LayerNormalization", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "LayerNorm"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_norm1_LayerNormalization"
+             },
+            "mem_dram_read": {
+              "100": 4096
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 40960
+             },
+            "mem_vtcm_write": {
+              "100": 24576
+             }
+        },
+        "input_names": [
+          "0x000000000000004d",
+          "0x000000000000004f",
+          "0x0000000000000046",
+          "0x0000000000000052",
+          "0x000000000000003d"
+        ],
+        "output_names": ["0x0000000000000051"]
+      },
+      "0x0000000000000054": {
+        "type": "Reshape", 
+        "grouping": "_layer1_ff_ff_0_MatMul_pre_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_ff_ff_0_MatMul_pre_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x0000000000000051"
+        ],
+        "output_names": ["0x0000000000000054"]
+      },
+      "0x0000000000000057": {
+        "type": "FullyConnected", 
+        "grouping": "_layer1_ff_ff_0_MatMul", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "FullyConnected"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_ff_ff_0_MatMul"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x0000000000000054",
+          "0x0000000000000055",
+          "0x0000000000000056",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x0000000000000057"]
+      },
+      "0x0000000000000059": {
+        "type": "Reshape", 
+        "grouping": "_layer1_ff_ff_0_MatMul_post_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_ff_ff_0_MatMul_post_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x0000000000000057"
+        ],
+        "output_names": ["0x0000000000000059"]
+      },
+      "0x000000000000005a": {
+        "type": "ElementWiseNeuron", 
+        "grouping": "_elementwiseneuron_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "ElementWiseNeuron"
+             },
+            "qnn_op_name": {
+              "1544": "_elementwiseneuron_1"
+             },
+            "mem_dram_read": {
+              "100": 22528
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 30720
+             },
+            "mem_vtcm_write": {
+              "100": 38912
+             }
+        },
+        "input_names": [
+          "0x0000000000000059",
+          "0x0000000000000022",
+          "0x000000000000005c",
+          "0x000000000000005c",
+          "0x000000000000005c",
+          "0x000000000000005c",
+          "0x0000000000000060"
+        ],
+        "output_names": ["0x000000000000005a"]
+      },
+      "0x0000000000000061": {
+        "type": "Reshape", 
+        "grouping": "_layer1_ff_ff_2_MatMul_pre_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_ff_ff_2_MatMul_pre_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x000000000000005a"
+        ],
+        "output_names": ["0x0000000000000061"]
+      },
+      "0x0000000000000064": {
+        "type": "FullyConnected", 
+        "grouping": "_layer1_ff_ff_2_MatMul", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "FullyConnected"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_ff_ff_2_MatMul"
+             },
+            "mem_dram_read": {
+              "100": 18432
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 45056
+             },
+            "mem_vtcm_write": {
+              "100": 32768
+             }
+        },
+        "input_names": [
+          "0x0000000000000061",
+          "0x0000000000000062",
+          "0x0000000000000063",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x0000000000000064"]
+      },
+      "0x0000000000000066": {
+        "type": "Reshape", 
+        "grouping": "_layer1_ff_ff_2_MatMul_post_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_ff_ff_2_MatMul_post_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x0000000000000064"
+        ],
+        "output_names": ["0x0000000000000066"]
+      },
+      "0x0000000000000067": {
+        "type": "ElementWiseBinary", 
+        "grouping": "_layer1_Add_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "ElementWiseBinary"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_Add_1"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 26624
+             },
+            "mem_vtcm_write": {
+              "100": 18432
+             }
+        },
+        "input_names": [
+          "0x0000000000000051",
+          "0x0000000000000066",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x0000000000000067"]
+      },
+      "0x000000000000006a": {
+        "type": "LayerNorm", 
+        "grouping": "_layer1_norm2_LayerNormalization", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "LayerNorm"
+             },
+            "qnn_op_name": {
+              "1544": "_layer1_norm2_LayerNormalization"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 40960
+             },
+            "mem_vtcm_write": {
+              "100": 20480
+             }
+        },
+        "input_names": [
+          "0x0000000000000067",
+          "0x000000000000004f",
+          "0x0000000000000046",
+          "0x0000000000000052",
+          "0x000000000000003d"
+        ],
+        "output_names": ["0x000000000000006a"]
+      },
+      "0x000000000000006e": {
+        "type": "Transpose", 
+        "grouping": "_layer2_attn_Transpose", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Transpose"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x000000000000006a",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x000000000000006e"]
+      },
+      "0x0000000000000071": {
+        "type": "FullyConnected", 
+        "grouping": "_layer2_attn_MatMul", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "FullyConnected"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_MatMul"
+             },
+            "mem_dram_read": {
+              "100": 24576
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 34816
+             },
+            "mem_vtcm_write": {
+              "100": 49152
+             }
+        },
+        "input_names": [
+          "0x000000000000006e",
+          "0x0000000000000070",
+          "0x0000000000000018",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x0000000000000071"]
+      },
+      "0x0000000000000074": {
+        "type": "Reshape", 
+        "grouping": "_layer2_attn_MatMul_post_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 5
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_MatMul_post_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x0000000000000071"
+        ],
+        "output_names": ["0x0000000000000074"]
+      },
+      "0x0000000000000076": {
+        "type": "Transpose", 
+        "grouping": "_layer2_attn_Transpose_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 5
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Transpose_1"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x0000000000000074",
+          "0x000000000000001b"
+        ],
+        "output_names": ["0x0000000000000076"]
+      },
+      "0x0000000000000077": {
+        "type": "Reshape", 
+        "grouping": "_layer2_attn_Squeeze_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Squeeze_1"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 28672
+             },
+            "mem_vtcm_write": {
+              "100": 8192
+             }
+        },
+        "input_names": [
+          "0x0000000000000076"
+        ],
+        "output_names": ["0x0000000000000077"]
+      },
+      "0x0000000000000078": {
+        "type": "Gather", 
+        "grouping": "_layer2_attn_Gather_3", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Gather"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Gather_3"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000077",
+          "0x000000000000001e",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x0000000000000078"]
+      },
+      "0x000000000000007a": {
+        "type": "Reshape", 
+        "grouping": "Reshape_post__layer2_attn_Gather_3", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "Reshape_post__layer2_attn_Gather_3"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 4096
+             }
+        },
+        "input_names": [
+          "0x0000000000000078"
+        ],
+        "output_names": ["0x000000000000007a"]
+      },
+      "0x000000000000007b": {
+        "type": "Gather", 
+        "grouping": "_layer2_attn_Gather_4", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Gather"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Gather_4"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000077",
+          "0x0000000000000022",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x000000000000007b"]
+      },
+      "0x000000000000007d": {
+        "type": "Reshape", 
+        "grouping": "Reshape_post__layer2_attn_Gather_4", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "Reshape_post__layer2_attn_Gather_4"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x000000000000007b"
+        ],
+        "output_names": ["0x000000000000007d"]
+      },
+      "0x000000000000007e": {
+        "type": "Gather", 
+        "grouping": "_layer2_attn_Gather_5", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Gather"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Gather_5"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000077",
+          "0x0000000000000026",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x000000000000007e"]
+      },
+      "0x0000000000000080": {
+        "type": "Reshape", 
+        "grouping": "Reshape_post__layer2_attn_Gather_5", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "Reshape_post__layer2_attn_Gather_5"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x000000000000007e"
+        ],
+        "output_names": ["0x0000000000000080"]
+      },
+      "0x0000000000000082": {
+        "type": "Transpose", 
+        "grouping": "_layer2_attn_Transpose_2", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Transpose_2"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 4096
+             }
+        },
+        "input_names": [
+          "0x000000000000007a",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x0000000000000082"]
+      },
+      "0x0000000000000085": {
+        "type": "Transpose", 
+        "grouping": "_layer2_attn_Transpose_3", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Transpose_3"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000080",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x0000000000000085"]
+      },
+      "0x0000000000000087": {
+        "type": "ElementWiseBinary", 
+        "grouping": "_layer2_attn_Mul_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "ElementWiseBinary"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Mul_1"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 4096
+             }
+        },
+        "input_names": [
+          "0x0000000000000082",
+          "0x0000000000000030",
+          "0x0000000000000032"
+        ],
+        "output_names": ["0x0000000000000087"]
+      },
+      "0x000000000000008a": {
+        "type": "Transpose", 
+        "grouping": "_layer2_attn_Transpose_4", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Transpose_4"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 2048
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x000000000000007d",
+          "0x0000000000000035"
+        ],
+        "output_names": ["0x000000000000008a"]
+      },
+      "0x000000000000008c": {
+        "type": "MatMul", 
+        "grouping": "_layer2_attn_MatMul_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "MatMul"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_MatMul_1"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 49152
+             },
+            "mem_vtcm_write": {
+              "100": 32768
+             }
+        },
+        "input_names": [
+          "0x0000000000000087",
+          "0x000000000000008a",
+          "0x0000000000000037",
+          "0x0000000000000019",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x000000000000008c"]
+      },
+      "0x0000000000000090": {
+        "type": "Softmax", 
+        "grouping": "_layer2_attn_Softmax", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Softmax"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Softmax"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 16384
+             },
+            "mem_vtcm_write": {
+              "100": 16384
+             }
+        },
+        "input_names": [
+          "0x000000000000008c",
+          "0x000000000000003b",
+          "0x000000000000003d"
+        ],
+        "output_names": ["0x0000000000000090"]
+      },
+      "0x0000000000000094": {
+        "type": "MatMul", 
+        "grouping": "_layer2_attn_MatMul_2", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "MatMul"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_MatMul_2"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 65536
+             },
+            "mem_vtcm_write": {
+              "100": 36864
+             }
+        },
+        "input_names": [
+          "0x0000000000000090",
+          "0x0000000000000085",
+          "0x000000000000003f",
+          "0x0000000000000019",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x0000000000000094"]
+      },
+      "0x0000000000000099": {
+        "type": "Transpose", 
+        "grouping": "_layer2_attn_Transpose_5", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Transpose_5"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 4096
+             },
+            "mem_vtcm_write": {
+              "100": 2048
+             }
+        },
+        "input_names": [
+          "0x0000000000000094",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x0000000000000099"]
+      },
+      "0x000000000000009c": {
+        "type": "FullyConnected", 
+        "grouping": "_layer2_attn_Gemm", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "FullyConnected"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Gemm"
+             },
+            "mem_dram_read": {
+              "100": 8192
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 22528
+             },
+            "mem_vtcm_write": {
+              "100": 26624
+             }
+        },
+        "input_names": [
+          "0x0000000000000099",
+          "0x000000000000009b",
+          "0x0000000000000046",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x000000000000009c"]
+      },
+      "0x000000000000009e": {
+        "type": "Reshape", 
+        "grouping": "_layer2_attn_Reshape_7", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Reshape_7"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x000000000000009c"
+        ],
+        "output_names": ["0x000000000000009e"]
+      },
+      "0x00000000000000a0": {
+        "type": "Transpose", 
+        "grouping": "_layer2_attn_Transpose_6", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Transpose"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_attn_Transpose_6"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 10240
+             },
+            "mem_vtcm_write": {
+              "100": 6144
+             }
+        },
+        "input_names": [
+          "0x000000000000009e",
+          "0x000000000000002c"
+        ],
+        "output_names": ["0x00000000000000a0"]
+      },
+      "0x00000000000000a2": {
+        "type": "ElementWiseBinary", 
+        "grouping": "_layer2_Add", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "ElementWiseBinary"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_Add"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 26624
+             },
+            "mem_vtcm_write": {
+              "100": 18432
+             }
+        },
+        "input_names": [
+          "0x000000000000006a",
+          "0x00000000000000a0",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x00000000000000a2"]
+      },
+      "0x00000000000000a5": {
+        "type": "LayerNorm", 
+        "grouping": "_layer2_norm1_LayerNormalization", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "LayerNorm"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_norm1_LayerNormalization"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 40960
+             },
+            "mem_vtcm_write": {
+              "100": 20480
+             }
+        },
+        "input_names": [
+          "0x00000000000000a2",
+          "0x000000000000004f",
+          "0x0000000000000046",
+          "0x0000000000000052",
+          "0x000000000000003d"
+        ],
+        "output_names": ["0x00000000000000a5"]
+      },
+      "0x00000000000000a8": {
+        "type": "Reshape", 
+        "grouping": "_layer2_ff_ff_0_MatMul_pre_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_ff_ff_0_MatMul_pre_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x00000000000000a5"
+        ],
+        "output_names": ["0x00000000000000a8"]
+      },
+      "0x00000000000000ab": {
+        "type": "FullyConnected", 
+        "grouping": "_layer2_ff_ff_0_MatMul", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "FullyConnected"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_ff_ff_0_MatMul"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x00000000000000a8",
+          "0x00000000000000a9",
+          "0x00000000000000aa",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x00000000000000ab"]
+      },
+      "0x00000000000000ad": {
+        "type": "Reshape", 
+        "grouping": "_layer2_ff_ff_0_MatMul_post_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_ff_ff_0_MatMul_post_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x00000000000000ab"
+        ],
+        "output_names": ["0x00000000000000ad"]
+      },
+      "0x00000000000000ae": {
+        "type": "ElementWiseNeuron", 
+        "grouping": "_elementwiseneuron_3", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "ElementWiseNeuron"
+             },
+            "qnn_op_name": {
+              "1544": "_elementwiseneuron_3"
+             },
+            "mem_dram_read": {
+              "100": 22528
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 30720
+             },
+            "mem_vtcm_write": {
+              "100": 38912
+             }
+        },
+        "input_names": [
+          "0x00000000000000ad",
+          "0x0000000000000022",
+          "0x000000000000005c",
+          "0x000000000000005c",
+          "0x000000000000005c",
+          "0x000000000000005c",
+          "0x0000000000000060"
+        ],
+        "output_names": ["0x00000000000000ae"]
+      },
+      "0x00000000000000b5": {
+        "type": "Reshape", 
+        "grouping": "_layer2_ff_ff_2_MatMul_pre_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_ff_ff_2_MatMul_pre_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x00000000000000ae"
+        ],
+        "output_names": ["0x00000000000000b5"]
+      },
+      "0x00000000000000b8": {
+        "type": "FullyConnected", 
+        "grouping": "_layer2_ff_ff_2_MatMul", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "FullyConnected"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_ff_ff_2_MatMul"
+             },
+            "mem_dram_read": {
+              "100": 18432
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 45056
+             },
+            "mem_vtcm_write": {
+              "100": 32768
+             }
+        },
+        "input_names": [
+          "0x00000000000000b5",
+          "0x00000000000000b6",
+          "0x00000000000000b7",
+          "0x0000000000000019"
+        ],
+        "output_names": ["0x00000000000000b8"]
+      },
+      "0x00000000000000ba": {
+        "type": "Reshape", 
+        "grouping": "_layer2_ff_ff_2_MatMul_post_reshape", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "Reshape"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_ff_ff_2_MatMul_post_reshape"
+             },
+            "optimized_out": {
+              "1288": true
+             }
+        },
+        "input_names": [
+          "0x00000000000000b8"
+        ],
+        "output_names": ["0x00000000000000ba"]
+      },
+      "0x00000000000000bb": {
+        "type": "ElementWiseBinary", 
+        "grouping": "_layer2_Add_1", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "ElementWiseBinary"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_Add_1"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 26624
+             },
+            "mem_vtcm_write": {
+              "100": 18432
+             }
+        },
+        "input_names": [
+          "0x00000000000000a5",
+          "0x00000000000000ba",
+          "0x000000000000001e"
+        ],
+        "output_names": ["0x00000000000000bb"]
+      },
+      "0x00000000000000be": {
+        "type": "LayerNorm", 
+        "grouping": "_layer2_norm2_LayerNormalization", 
+        "tensor_params": {},
+        "scalar_params": {
+            "output_step_size": {
+              "562": 1
+             },
+            "output_zero_offset": {
+              "50": 0
+             },
+            "output_rank": {
+              "50": 4
+             },
+            "qnn_op_type": {
+              "1544": "LayerNorm"
+             },
+            "qnn_op_name": {
+              "1544": "_layer2_norm2_LayerNormalization"
+             },
+            "mem_dram_read": {
+              "100": 0
+             },
+            "mem_dram_write": {
+              "100": 0
+             },
+            "mem_vtcm_read": {
+              "100": 28672
+             },
+            "mem_vtcm_write": {
+              "100": 12288
+             }
+        },
+        "input_names": [
+          "0x00000000000000bb",
+          "0x000000000000004f",
+          "0x0000000000000046",
+          "0x0000000000000052",
+          "0x000000000000003d"
+        ],
+        "output_names": ["0x00000000000000be"]
+      }
+    }
+  },
+  "op_types": [
+    "ElementWiseBinary",
+    "ElementWiseNeuron",
+    "FullyConnected",
+    "Gather",
+    "LayerNorm",
+    "MatMul",
+    "Reshape",
+    "Softmax",
+    "Transpose"
+  ]
+}
