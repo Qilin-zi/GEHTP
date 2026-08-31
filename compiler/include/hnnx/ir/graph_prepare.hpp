@@ -29,6 +29,13 @@ struct OrderInfo {
     int ordering_index;
 };
 
+// Const 池 extent 描述(从 GraphPrepare 私有区提升到命名空间级,供公开访问器使用)
+struct ConstExtent {
+    op_id_t op_id;
+    uint64_t offset;  // 在 const_pool_ 中的字节偏移
+    uint64_t size;    // 字节数
+};
+
 class GraphPrepare {
 public:
     GraphPrepare();
@@ -45,6 +52,10 @@ public:
     op_id_t get_input_node_id() const { return input_node_id_; }
     op_id_t get_output_node_id() const { return output_node_id_; }
     const std::vector<op_id_t>& get_ordering() const { return ordering_; }
+
+    // Const 池只读访问(阶段4 P0 验证用: prepare 后权重/参数字节均在池中)
+    const std::vector<uint8_t>& const_pool() const { return const_pool_; }
+    const std::vector<ConstExtent>& const_extents() const { return const_extents_; }
 
     // Get opdefs in topological execution order
     std::vector<const OpDef*> get_sorted_opdefs() const;
@@ -348,11 +359,6 @@ private:
     // Const pool:集中存储所有 OpDef_Const 的权重/常量数据。
     // 序列化时作为单一数据块写出，每个 const op 通过 (offset,size) 引用。
     std::vector<uint8_t> const_pool_;
-    struct ConstExtent {
-        op_id_t op_id;
-        uint64_t offset;     // 在 const_pool_ 中的字节偏移
-        uint64_t size;        // 字节数
-    };
     std::vector<ConstExtent> const_extents_;
 
     // Block table: VTCM block_id -> (pool_id, offset, size) 映射。

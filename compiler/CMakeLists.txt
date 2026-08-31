@@ -225,3 +225,8 @@ target_link_libraries(hnnx_compile htp_core)
 add_executable(test_conv_add_host tests/test_conv_add_host.cpp)
 target_link_libraries(test_conv_add_host htp_core)
 add_test(NAME test_conv_add_host COMMAND test_conv_add_host)
+
+# 阶段4: const 池验证 + serialize_opdef 参数 schema + round-trip
+add_executable(test_conv_add_bin tests/test_conv_add_bin.cpp)
+target_link_libraries(test_conv_add_bin htp_core)
+add_test(NAME test_conv_add_bin COMMAND test_conv_add_bin)

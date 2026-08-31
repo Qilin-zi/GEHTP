@@ -189,6 +189,11 @@ struct OpDef {
     // 真实库在 Op 构造时解析这些字节得到 stride/padding/dilation/axis 等。
     std::vector<uint8_t> op_data;
 
+    // serialized_extra: 序列化侧 per-op 参数 schema 的尾随字段字节
+    // (serialize_opdef 尾随 [u32 len][bytes])。deserialize 回读存于此,
+    // re-serialize 时原样重发(round-trip 确定性, 不重跑 extractor)。
+    std::vector<uint8_t> serialized_extra;
+
     // grouping: 原始 op 名（来自 QNN IR addNode 的 node_name 参数），
     // 用于 dump before/after graph JSON 时和 QNN before_graph.json 对齐。
     // 例如 "input_ncf"、"MatMul_0_pre_reshape"。
