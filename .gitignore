@@ -19,3 +19,7 @@ test_models/**/conv_add_qnn/
 # python
 __pycache__/
 *.pyc
+# Qwen3.5 模型产出(大二进制/权重/golden)
+test_models/qwen35_08b/
+scripts/venv_qpm/
+scripts/venv_qpm210/
