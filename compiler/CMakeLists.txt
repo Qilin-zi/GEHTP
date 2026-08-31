@@ -67,6 +67,7 @@ target_include_directories(htp_core PUBLIC include)
 # 测试数据路径便携化(见 tests/test_paths.hpp): Linux/Windows 双路径
 target_compile_definitions(htp_core PUBLIC
     HNNX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test_models"
+    HNNX_GEHTP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../test_models"
     HNNX_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/reference")
 
 # Tests
@@ -219,3 +220,8 @@ add_test(NAME test_m42_tcm_migration COMMAND test_m42_tcm_migration)
 # CLI: 图编译入口(阶段 8 扩展 --format tagged)
 add_executable(hnnx_compile tools/hnnx_compile.cpp)
 target_link_libraries(hnnx_compile htp_core)
+
+# 阶段3: conv2d+add op 注册 + host 参考执行对拍
+add_executable(test_conv_add_host tests/test_conv_add_host.cpp)
+target_link_libraries(test_conv_add_host htp_core)
+add_test(NAME test_conv_add_host COMMAND test_conv_add_host)

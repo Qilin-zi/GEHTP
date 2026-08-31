@@ -516,12 +516,47 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
         }
     }
 
+    // 拓扑排序(通用): ops_ 源自 opdef_map_ 迭代(unordered, 序不可靠),
+    // 必须按输入依赖序执行(Kahn)。环图回退到原序。
+    std::vector<const TypicalOp*> topo;
+    {
+        std::vector<const TypicalOp*> cands;
+        std::unordered_map<op_id_t, size_t> indeg;
+        std::unordered_map<op_id_t, std::vector<op_id_t>> succ;
+        for (auto& op_ptr : ops_) {
+            auto* t = dynamic_cast<const TypicalOp*>(op_ptr.get());
+            if (!t || t->op_id == 0) continue;
+            cands.push_back(t);
+            indeg[t->op_id] = 0;
+        }
+        for (auto* t : cands)
+            for (const auto& c : t->exec_inputs) {
+                if (indeg.count(c.src_id)) {
+                    ++indeg[t->op_id];
+                    succ[c.src_id].push_back(t->op_id);
+                }
+            }
+        std::vector<op_id_t> ready;
+        for (auto* t : cands)
+            if (indeg[t->op_id] == 0) ready.push_back(t->op_id);
+        std::unordered_map<op_id_t, const TypicalOp*> by_id;
+        for (auto* t : cands) by_id[t->op_id] = t;
+        while (!ready.empty()) {
+            op_id_t id = ready.back();
+            ready.pop_back();
+            topo.push_back(by_id[id]);
+            for (op_id_t s : succ[id])
+                if (--indeg[s] == 0) ready.push_back(s);
+        }
+        if (topo.size() != cands.size()) {  // 环: 回退原序(正确性由上游保证)
+            topo.clear();
+            topo = cands;
+        }
+    }
+
     // Iterate ops_ (compute ops only: Relu, Conv, Add, etc.).
     // Input/Output are not in ops_ (not registered).
-    for (auto& op_ptr : ops_) {
-        auto* top = dynamic_cast<const TypicalOp*>(op_ptr.get());
-        if (!top) continue;
-
+    for (const TypicalOp* top : topo) {
         op_id_t oid = top->op_id;
         if (oid == 0) continue;
 

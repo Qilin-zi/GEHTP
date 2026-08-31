@@ -99,7 +99,8 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         // Relu: max(0, x); ConvActivations (post-fusion): 同 Relu 语义对第一个输入
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? std::max(0.0f, in0[i]) : 0.0f;
-    } else if (op_type_name == "Add") {
+    } else if (op_type_name == "Add" || op_type_name == "Eltwise_Binary"
+               || op_type_name == "ElementWiseBinary") {
         for (size_t i = 0; i < n; ++i) out[i] = in_float(0, i) + in_float(1, i);
     } else if (op_type_name == "Sub") {
         for (size_t i = 0; i < n; ++i) out[i] = in_float(0, i) - in_float(1, i);
@@ -370,7 +371,8 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                 out[i * nn + j] = acc;
             }
         }
-    } else if (op_type_name == "Conv" || op_type_name == "DepthWiseConv2d") {
+    } else if (op_type_name == "Conv" || op_type_name == "Conv2d"
+               || op_type_name == "DepthWiseConv2d") {
         // Conv2D host reference: NHWC layout
         // inputs[0] = input [N, Hi, Wi, Cin]
         // inputs[1] = weight [Kh, Kw, Cin, Cout] (standard Conv)
@@ -615,6 +617,8 @@ void register_all_ops() {
     auto& reg = OpRegistry::instance();
         // Conv ops
         reg.register_op_fn("Conv", ConvOp::construct);
+        // qnn-onnx-converter 产出的 op type 名为 "Conv2d"(见阶段1实测 net.json)
+        reg.register_op_fn("Conv2d", ConvOp::construct);
         reg.register_op_fn("DepthWiseConv2d", DepthWiseConvOp::construct);
         reg.register_op_fn("DilatedConv", DilatedConvOp::construct);
         reg.register_op_fn("GroupedConv", GroupedConvOp::construct);
@@ -630,6 +634,9 @@ void register_all_ops() {
         reg.register_op_fn("Dense", DenseOp::construct);
         // Elementwise
         reg.register_op_fn("Add", AddOp::construct);
+        // converter 的二元逐元素 op 类型名(2.48 实测 "Eltwise_Binary";旧版别名)
+        reg.register_op_fn("Eltwise_Binary", AddOp::construct);
+        reg.register_op_fn("ElementWiseBinary", AddOp::construct);
         reg.register_op_fn("Sub", SubOp::construct);
         reg.register_op_fn("Mul", MulOp::construct);
         reg.register_op_fn("Div", DivOp::construct);
