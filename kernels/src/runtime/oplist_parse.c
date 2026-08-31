@@ -14,6 +14,12 @@ static int arity_of(uint16_t opcode) {
     case OP_RMSNORM_F16: return WT_ARITY_RMSNORM;
     case OP_PIN: return WT_ARITY_PIN;
     case OP_SILU_F16: return WT_ARITY_SILU;
+    case OP_IM2COL: return WT_ARITY_IM2COL;
+    case OP_CONV2D_F16: return WT_ARITY_CONV2D_F16;
+    case OP_ADD_F16: return WT_ARITY_ADD_F16;
+    case OP_SPILL: return WT_ARITY_SPILL;
+    case OP_FILL: return WT_ARITY_FILL;
+    case OP_TRANSPOSE_F16: return WT_ARITY_TRANSPOSE_F16;
     default: return -1;
     }
 }
@@ -24,6 +30,9 @@ static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     case OP_MATMUL_W4A16: return idx == 0 || idx == 1;
     case OP_RMSNORM_F16: return idx == 1;
     case OP_PIN: return idx == 0;
+    case OP_CONV2D_F16: return idx == 1 || idx == 2;
+    case OP_SPILL: return idx == 1;
+    case OP_FILL: return idx == 0;
     default: return 0;
     }
 }

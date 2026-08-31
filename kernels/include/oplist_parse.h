@@ -12,11 +12,22 @@
  *   接    : weight 区 (起点 = op 表结束后首个 128B 对齐偏移; slot 间 pad 128B)
  *
  * opcode 语义 (args 只放 slot id / temp id / 维度, 不放指针):
+ *   temp 位置的 arg 可用 (0x8000|slot_id) 引用 slot —— 输入注入(首层
+ *   transpose 读输入 slot 0, 引擎按位 0x8000 区分 temp/slot 空间)。
  *   OP_NOP          = 0  : []
  *   OP_MATMUL_W4A16 = 1  : [act_slot, w_slot, out_temp, M, K, N]
  *   OP_RMSNORM_F16  = 2  : [x_temp, w_slot, y_temp, n]
  *   OP_PIN          = 3  : [slot]
  *   OP_SILU_F16     = 4  : [x_temp, y_temp, n_elem]   (V2.3 U16)
+ *   OP_IM2COL       = 5  : [act_temp, out_temp, H, W, C, kh, kw, ph, pw,
+ *                           sh, sw, y0, x0, th, tw]   (GEHTP 阶段8 契约)
+ *   OP_CONV2D_F16   = 6  : [act_temp, w_slot, bias_slot, out_temp, M, K, N,
+ *                           out_y0, out_x0, out_H, out_W, co0, co_n]
+ *   OP_ADD_F16      = 7  : [a_temp, b_temp, out_temp, n_elem]
+ *   OP_SPILL        = 8  : [src_temp, pool_slot, pool_offset, n_elem]
+ *   OP_FILL         = 9  : [pool_slot, pool_offset, dst_temp, n_elem]
+ *   OP_TRANSPOSE_F16= 10 : [src_temp, out_temp, H, W, C, perm_u32]
+ *                          (perm: 每轴 1 字节, N 恒 1 契约)
  */
 #ifndef OPLIST_PARSE_H
 #define OPLIST_PARSE_H
@@ -34,7 +45,7 @@ extern "C" {
 #define WT_WEIGHT_ALIGN 128u
 #define WT_MAX_SLOTS 64u
 #define WT_MAX_OPS 256u
-#define WT_MAX_ARGS 8u
+#define WT_MAX_ARGS 16u
 
 enum {
     OP_NOP = 0,
@@ -42,6 +53,13 @@ enum {
     OP_RMSNORM_F16 = 2,
     OP_PIN = 3,
     OP_SILU_F16 = 4,
+    /* GEHTP 阶段8/9 契约(conv2d+add 流水线) */
+    OP_IM2COL = 5,
+    OP_CONV2D_F16 = 6,
+    OP_ADD_F16 = 7,
+    OP_SPILL = 8,
+    OP_FILL = 9,
+    OP_TRANSPOSE_F16 = 10,
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -50,6 +68,12 @@ enum {
 #define WT_ARITY_RMSNORM 4
 #define WT_ARITY_PIN 1
 #define WT_ARITY_SILU 3
+#define WT_ARITY_IM2COL 15
+#define WT_ARITY_CONV2D_F16 13
+#define WT_ARITY_ADD_F16 4
+#define WT_ARITY_SPILL 4
+#define WT_ARITY_FILL 4
+#define WT_ARITY_TRANSPOSE_F16 6
 
 struct wt_slot {
     uint32_t len;

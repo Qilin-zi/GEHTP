@@ -268,6 +268,10 @@ uint32_t QnnIRLoader::build_graph() {
                     pdata.assign(ec * pod.element_size, 0);
                 }
                 gp_.append_const_node(static_cast<uint32_t>(param_id), pod, pdata.data(), pdata.size());
+                // 参数 const 带名字(inject_htp_prepare_inputs 与 extra_info extractor
+                // 都按名匹配 stride/pad_amount/dilation/perm)
+                if (OpDef* pc = gp_.get_op_at(static_cast<uint32_t>(param_id)))
+                    pc->name_tag = string_tag_t::map_str(tp.name.c_str());
                 tensor_opids_[tp.name] = param_id;
                 param_dedup_[tp.name] = param_id;
                 tp_ids.push_back(param_id);
@@ -277,16 +281,21 @@ uint32_t QnnIRLoader::build_graph() {
             // (quant_marker/scale/output_rank 的注入挪到 do_prepare1)。
             // tensor_param ids 存到 OpDef::tensor_param_ids, 供 do_prepare1 注入。
 
-            gp_.append_node(node->type, ti.id,
+            // 节点 id = tensor id; 若已被占(如该 op 自己的 tensor_param const
+            // 恰好用同一 id —— 实测 X_0231 Transpose 与 perm const 撞 id=5 被
+            // 静默丢弃), 自动后移到空闲 id(通用防碰撞)。
+            op_id_t target = ti.id;
+            while (gp_.get_op_at(target) != nullptr) target++;
+            gp_.append_node(node->type, target,
                             inputs.data(), inputs.size(),
                             &od, 1, nullptr);
             // Set grouping = original node name (for before/after graph dump)
-            OpDef* created = gp_.get_op_at(ti.id);
+            OpDef* created = gp_.get_op_at(target);
             if (created) {
                 created->grouping = node->name;
                 created->tensor_param_ids = std::move(tp_ids);
             }
-            tensor_opids_[item.tensor_name] = ti.id;
+            tensor_opids_[item.tensor_name] = target;
 
             // Register this op as consumer of its tensor_params (for DCE).
             // tensor_params are not in op inputs, so append_node's consumer

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(htp_reimpl CXX)
+project(htp_reimpl CXX C)  # C 供 kernels/src/runtime/oplist_parse.c (wtop_emit 自校验)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -222,6 +222,12 @@ add_test(NAME test_m42_tcm_migration COMMAND test_m42_tcm_migration)
 add_executable(hnnx_compile tools/hnnx_compile.cpp)
 target_link_libraries(hnnx_compile htp_core)
 
+# 阶段8: wtop_emit —— tagged .bin → WTOP blob(WTOP 契约头/解析器取 kernels)
+add_executable(wtop_emit tools/wtop_emit.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
+target_link_libraries(wtop_emit htp_core)
+target_include_directories(wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
+
 # 阶段3: conv2d+add op 注册 + host 参考执行对拍
 add_executable(test_conv_add_host tests/test_conv_add_host.cpp)
 target_link_libraries(test_conv_add_host htp_core)
@@ -246,3 +252,12 @@ add_test(NAME test_conv_tiling COMMAND test_conv_tiling)
 add_executable(test_spill_fill_serialize tests/test_spill_fill_serialize.cpp)
 target_link_libraries(test_spill_fill_serialize htp_core)
 add_test(NAME test_spill_fill_serialize COMMAND test_spill_fill_serialize)
+
+# 阶段8: wtop_emit 转换验收(.bin → WTOP blob 契约 + 负例)
+add_executable(test_wtop_emit tests/test_wtop_emit.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
+target_link_libraries(test_wtop_emit htp_core)
+target_include_directories(test_wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
+target_compile_definitions(test_wtop_emit PRIVATE WTOP_EMIT_PATH="${CMAKE_BINARY_DIR}/wtop_emit")
+add_dependencies(test_wtop_emit wtop_emit)
+add_test(NAME test_wtop_emit COMMAND test_wtop_emit)

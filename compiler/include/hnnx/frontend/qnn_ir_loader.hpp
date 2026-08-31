@@ -55,6 +55,8 @@ public:
     const std::vector<QnnNodeInfo>& nodes() const { return nodes_; }
     const std::map<std::string, op_id_t>& tensor_opids() const { return tensor_opids_; }
     const std::map<std::string, std::vector<uint8_t>>& weights() const { return weights_; }
+    // net.json 路径的权重注入(2.48 params.bin 适配后经 TAR 加载进来)
+    void set_weights(std::map<std::string, std::vector<uint8_t>> w) { weights_ = std::move(w); }
 
 private:
     GraphPrepare& gp_;

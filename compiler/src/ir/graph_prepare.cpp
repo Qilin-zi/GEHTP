@@ -1261,6 +1261,53 @@ std::vector<uint8_t> extract_conv_extra(const GraphPrepare& gp, const OpDef& opd
         auto v = read_param_u32(gp, dl, 2);
         if (v.size() == 2) { e.dh = v[0]; e.dw = v[1]; }
     }
+    // 位置回退(loader 建的 tensor_param const 无名字, 按 inject_htp_prepare_inputs
+    // 注入序契约: inputs[3]=stride, [4]=pad_amount, [5]=dilation, 各为 u32 数组)
+    if (e.sh == 1 && e.sw == 1 && e.ph_begin == 0 && e.ph_end == 0 &&
+        e.pw_begin == 0 && e.pw_end == 0 && e.dh == 1 && e.dw == 1) {
+        auto pos_param = [&](size_t idx) -> const OpDef* {
+            if (idx >= opdef.inputs.size()) return nullptr;
+            const OpDef* c = gp.get_op_at(opdef.inputs[idx].src_id);
+            return (c && c->is_const()) ? c : nullptr;
+        };
+        if (const OpDef* st = pos_param(3)) {
+            auto v = read_param_u32(gp, st, 2);
+            if (v.size() == 2) { e.sh = v[0]; e.sw = v[1]; }
+        }
+        if (const OpDef* pd = pos_param(4)) {
+            auto v = read_param_u32(gp, pd, 4);
+            if (v.size() == 4) { e.ph_begin = v[0]; e.ph_end = v[1]; e.pw_begin = v[2]; e.pw_end = v[3]; }
+        }
+        if (const OpDef* dl = pos_param(5)) {
+            auto v = read_param_u32(gp, dl, 2);
+            if (v.size() == 2) { e.dh = v[0]; e.dw = v[1]; }
+        }
+    }
+
+    // 几何推导兜底: net.json 路径的 tensor_param 值在 NETP 二进制中(B线尚未
+    // 解析, loader 零填充)。当参数值缺失且 out==in 尺寸(3x3 s1 same 契约签名)
+    // 时按 same-pad 推导; 否则保持 0, 由 wtop_emit 受支持几何门诚实报错。
+    if (e.sh == 1 && e.sw == 1 && e.ph_begin == 0 && e.ph_end == 0 &&
+        e.pw_begin == 0 && e.pw_end == 0 && e.dh == 1 && e.dw == 1) {
+        uint32_t in_h = 0, in_w = 0, out_h = 0, out_w = 0;
+        if (!opdef.inputs.empty()) {
+            const OpDef* act = gp.get_op_at(opdef.inputs[0].src_id);
+            if (act && act->output_def.rank >= 4) {
+                in_h = (uint32_t)act->output_def.dims[1];
+                in_w = (uint32_t)act->output_def.dims[2];
+            }
+        }
+        if (opdef.output_def.rank >= 4) {
+            out_h = (uint32_t)opdef.output_def.dims[1];
+            out_w = (uint32_t)opdef.output_def.dims[2];
+        }
+        if (in_h > 0 && in_w > 0 && out_h == in_h && out_w == in_w &&
+            (e.kh & 1) && (e.kw & 1)) {
+            uint32_t ph = e.kh / 2, pw = e.kw / 2;
+            e.ph_begin = e.ph_end = ph;
+            e.pw_begin = e.pw_end = pw;
+        }
+    }
 
     std::vector<uint8_t> out(sizeof(ConvExtraInfo));
     std::memcpy(out.data(), &e, sizeof(ConvExtraInfo));
