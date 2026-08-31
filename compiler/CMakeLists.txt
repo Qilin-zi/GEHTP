@@ -241,3 +241,8 @@ add_test(NAME test_scheduler_integration COMMAND test_scheduler_integration)
 add_executable(test_conv_tiling tests/test_conv_tiling.cpp)
 target_link_libraries(test_conv_tiling htp_core)
 add_test(NAME test_conv_tiling COMMAND test_conv_tiling)
+
+# 阶段7: spill/fill 接入序列化(强制小预算溢出 + round-trip)
+add_executable(test_spill_fill_serialize tests/test_spill_fill_serialize.cpp)
+target_link_libraries(test_spill_fill_serialize htp_core)
+add_test(NAME test_spill_fill_serialize COMMAND test_spill_fill_serialize)

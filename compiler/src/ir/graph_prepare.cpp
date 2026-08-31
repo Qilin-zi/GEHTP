@@ -46,7 +46,9 @@ GraphStatus GraphPrepare::prepare(HexagonNNEnv& env) {
     // 1. do_prepare1: initial graph building and basic optimization
     // 2. do_prepare2: full optimization including tiling, DMA, sequencing
     // 3. do_prepare2_late: late-stage optimizations and runlist generation
-    VtcmCacheInstance vtcm(0, 8 * 1024 * 1024);
+    // 阶段7: VTCM 预算可覆盖(0 = 默认 8MB); 小预算强制分配器溢出 → spill/fill
+    VtcmCacheInstance vtcm(0, vtcm_budget_override_ ? vtcm_budget_override_
+                                                      : 8 * 1024 * 1024);
     int retry_count = 0;
     GraphStatus s1 = do_prepare1(env, vtcm);
     if (s1 != GraphStatus::Success) return s1;
@@ -1125,6 +1127,58 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
         ser.write_tagged_record(TAG_PLAN_ORDER, pl.data(), static_cast<int>(pl.size()));
     }
 
+    // Spill/fill(阶段7): 溢出张量 → 0x4453 配置记录 + 每张量 0x5346 DMA 记录。
+    // 收集来源: ①allocator spilled(vtcm_allocations_)②tcm_migration 标记
+    // (flags2 & SPILL_TO_DDR=0x40, 未在①中)。DDR 池偏移按 op_id 升序确定性
+    // 分配(128B 对齐, 起 0x1000)。反序列化回读 spill_fill_recs_, 优先复用
+    // (round-trip 确定性)。
+    {
+        std::vector<SpillFillRec> recs;
+        if (!spill_fill_recs_.empty()) {
+            recs = spill_fill_recs_;
+        } else {
+            auto tensor_size = [&](op_id_t id) -> uint64_t {
+                const OpDef* od = get_op_at(id);
+                if (!od) return 0;
+                uint64_t sz = 1;
+                for (uint32_t d = 0; d < od->output_def.rank && d < 5; ++d)
+                    if (od->output_def.dims[d] > 0) sz *= od->output_def.dims[d];
+                return sz * (od->output_def.element_size ? od->output_def.element_size : 4);
+            };
+            for (const auto& [id, a] : vtcm_allocations_) {
+                if (a.spilled) recs.push_back({id, a.block_id, 0, tensor_size(id)});
+            }
+            constexpr uint32_t SPILL_TO_DDR = 0x40;
+            for (auto& [id, opdef] : opdef_map_) {
+                if (!opdef || !(opdef->flags2 & SPILL_TO_DDR)) continue;
+                bool dup = false;
+                for (const auto& r : recs) dup |= (r.op_id == id);
+                if (!dup) recs.push_back({id, 0, 0, tensor_size(id)});
+            }
+            std::sort(recs.begin(), recs.end(),
+                      [](const SpillFillRec& a, const SpillFillRec& b) { return a.op_id < b.op_id; });
+            uint64_t cur = 0x1000;
+            for (auto& r : recs) {
+                r.ddr_offset = cur;
+                cur += (r.size + 127) & ~uint64_t(127);
+            }
+        }
+        if (!recs.empty()) {
+            uint32_t cnt = static_cast<uint32_t>(recs.size());
+            ser.write_tagged_record(TAG_SPILL_FILL_INSTEAD, &cnt, 4);
+            // 28B 固定布局(显式逐字段写入, 避免 struct padding 歧义;
+            // 设备侧同构解析): [u64 op_id][u32 block_id][u64 ddr_offset][u64 size]
+            for (const auto& r : recs) {
+                uint8_t payload[28];
+                size_t o = 0;
+                auto w64 = [&](uint64_t v) { std::memcpy(payload + o, &v, 8); o += 8; };
+                auto w32 = [&](uint32_t v) { std::memcpy(payload + o, &v, 4); o += 4; };
+                w64(r.op_id); w32(r.block_id); w64(r.ddr_offset); w64(r.size);
+                ser.write_tagged_record(TAG_SPILL_FILL_OP, payload, 28);
+            }
+        }
+    }
+
     // End separator 0xBEEFF00D
     ser.write_uint32(0xBEEFF00D);
 
@@ -1410,6 +1464,23 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
         if (tag == TAG_GRAPH_HEADER) {
             expected_ops = rec[0] | (rec[1] << 8) | (rec[2] << 16) | (rec[3] << 24);
             (void)expected_ops;
+            continue;
+        }
+        if (tag == TAG_SPILL_FILL_OP) {
+            BinReader rr(rec, data_size);
+            if (rr.remaining() >= 28) {
+                SpillFillRec r{};
+                r.op_id = rr.r64();
+                r.block_id = rr.r32();
+                r.ddr_offset = rr.r64();
+                r.size = rr.r64();
+                spill_fill_recs_.push_back(r);
+            }
+            continue;
+        }
+        if (tag == TAG_SPILL_FILL_INSTEAD && data_size == 4) {
+            // 0x4453 现在携带 spill 计数(阶段7); 旧语义(仅 flag+multicast)已被
+            // 此计数形式取代 —— 记录本身无副作用, 计数由 0x5346 记录实际决定。
             continue;
         }
         if (tag == TAG_PLAN_ORDER) {

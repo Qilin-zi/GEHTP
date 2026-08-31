@@ -58,6 +58,16 @@ public:
     // 单算子分块配置(阶段6): Conv2d extra_info tiling 段消费
     void set_tiling_config(const TilingConfig& cfg) { tiling_cfg_ = cfg; }
     const TilingConfig& tiling_config() const { return tiling_cfg_; }
+    // VTCM 预算覆盖(阶段7 测试用): 0 = 默认 8MB; 小预算可强制分配器溢出
+    void set_vtcm_budget(uint64_t bytes) { vtcm_budget_override_ = bytes; }
+    // spill/fill 记录(阶段7): do_serialize 发射, deserialize 回读
+    struct SpillFillRec {
+        uint64_t op_id;
+        uint32_t block_id;
+        uint64_t ddr_offset;  // DDR 池偏移(序列化时确定性分配)
+        uint64_t size;        // 字节数
+    };
+    const std::vector<SpillFillRec>& spill_fill_recs() const { return spill_fill_recs_; }
 
     // Const 池只读访问(阶段4 P0 验证用: prepare 后权重/参数字节均在池中)
     const std::vector<uint8_t>& const_pool() const { return const_pool_; }
@@ -401,6 +411,8 @@ private:
     std::vector<op_id_t> ordering_;  // topological ordering of ops
     std::vector<op_id_t> plan_order_;  // ST-Cut 计划执行序(do_prepare2; 空 = 未调度)
     TilingConfig tiling_cfg_;          // 单算子分块配置(阶段6)
+    uint64_t vtcm_budget_override_ = 0;  // 阶段7: 0=默认 8MB
+    std::vector<SpillFillRec> spill_fill_recs_;  // 阶段7: spill/fill 记录
     struct TimePoint { const char* name; uint64_t timestamp; };
     std::vector<TimePoint> time_points_;
 
