@@ -83,6 +83,13 @@ enum {
     OP_ARGMAX_F16 = 21,     /* [x_t,out_t,n] */
     OP_KV_APPEND_F16 = 22,  /* [k_t,v_t,state_s,pos]    (M5 decode 用) */
     OP_KV_GATHER_F16 = 23,  /* [state_s,q_t,pos,n_kv,head_dim] */
+    OP_MATMUL_F16 = 24,     /* [a_ref,w_s,out_t,M,K,N,flags] f16×f16→f16 (f32 累加)
+                               flags bit0=转置 a(存[K,M]) bit1=转置 w(存[N,K]);
+                               W4A16 留给 Q4_0 打包权重 (float 图 GEMM) */
+    OP_RMSNORM2_F16 = 25,   /* [x_ref,w_s,b_s,y_t,n] 通用 RMSNorm: 纯 f16 面直读
+                               (无 crouton); n=总元素, 行宽=w 槽长/2, m=n/行宽;
+                               b_s 为 bias 槽(无 bias 时 zero dummy 槽); eps=1e-6
+                               (opcode 2 保留 conv 管线 crouton 契约不动) */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -110,6 +117,8 @@ enum {
 #define WT_ARITY_ARGMAX_F16 3
 #define WT_ARITY_KV_APPEND_F16 4
 #define WT_ARITY_KV_GATHER_F16 5
+#define WT_ARITY_MATMUL_F16 7
+#define WT_ARITY_RMSNORM2_F16 5
 
 struct wt_slot {
     uint32_t len;

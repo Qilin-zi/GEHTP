@@ -40,7 +40,8 @@ EXAMPLES=(01_runtime_init 02_convf16_gemm 03_convbbb_int8 04_convhbh_u16 \
           18_smallm_gemv 19_gdn_sm 20_dualdomain 21_oplist_exec \
           22_dualcore_threads 23_fence 24_arena 25_harness 26_wpool \
           27_pxbridge 28_gdn_tree 29_kvcache 30_graph_step 31_gemm_dispatch 32_rbr \
-          33_bledger 34_dmaring 35_btrack 36_absoak 37_conv2d_add 38_transformer_ops)
+          33_bledger 34_dmaring 35_btrack 36_absoak 37_conv2d_add 38_transformer_ops \
+          39_probe)
 
 adb() { command adb -s "$DEVICE" "$@"; }
 
@@ -63,10 +64,19 @@ if [ ! -x "$BUILD/host/pack_oplist" ] || [ ! -x "$BUILD/host/wt_inspect" ]; then
         "$LIB/src/runtime/wt_w3.c"
 fi
 # GEHTP 例37 资产(conv_add_pipeline.sh 产出; 缺失则跳过推送)
-G37_DIR="${GEHTP_37_DIR:-$LIB/../../blobs_conv_add}"
+G37_DIR="${GEHTP_37_DIR:-$LIB/../blobs_conv_add}"
 if [ -f "$G37_DIR/blob.wtop" ]; then
     adb shell "mkdir -p $DEVDIR/g37" >/dev/null 2>&1
     adb push "$G37_DIR"/*.wtop "$G37_DIR"/in*.f16.raw "$G37_DIR"/gold*.f16.raw "$DEVDIR/g37/" >/dev/null 2>&1 || true
+fi
+# GEHTP 例39 资产(M3c probe: wtop_emit 产物 + qnn2layer calib tokens)
+G39_DIR="${GEHTP_39_DIR:-$LIB/../test_models/qnn_probe}"
+if [ -f "$G39_DIR/probe_t0.wtop" ]; then
+    adb shell "mkdir -p $DEVDIR/g39" >/dev/null 2>&1
+    adb push "$G39_DIR/probe_t0.wtop" "$DEVDIR/g39/blob.wtop" >/dev/null 2>&1
+    for i in 0 1 2 3 4 5 6 7; do
+        adb push "$G39_DIR/tokens_$i.raw" "$DEVDIR/g39/" >/dev/null 2>&1 || true
+    done
 fi
 
 for tag in w4 w5; do
@@ -152,6 +162,13 @@ run_one() {
         python3 "$LIB/host/analyze_dd.py" "$RES"
         # 门统一归并到 20_dualdomain.txt (per-tag 文件留作 sha 证据, 无门)
         mv "$RES/20_dualdomain_host.txt" "$RES/20_dualdomain.txt"
+        ;;
+    39_probe)
+        echo "  run (CDSP PD 3, out_temp from manifest):"
+        OT=$(python3 -c "import json;print(json.load(open('$G39_DIR/probe_manifest.json'))['output_temp'])" 2>/dev/null || echo 6)
+        run_shell "./run_main_on_hexagon 3 test_${EX}.so $OT" 2>&1 \
+            | grep -E 'return|Successfully|ERROR' | head -2 || true
+        pull_result "$EX"
         ;;
     *)
         echo "  run (CDSP PD 3):"

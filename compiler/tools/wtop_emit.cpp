@@ -693,8 +693,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
             uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
+            const OpDef* bs = od->inputs.size() > 2 ? gp.get_op_at(od->inputs[2].src_id) : nullptr;
+            uint32_t b_s = bs ? em.ensure_weight_slot(gp, bs, wslots, od->grouping) : em.dummy_slot_id;
             uint32_t out_t = em.fresh_temp(od->op_id);
-            em.add_op(OP_RMSNORM_F16, {x_t, w_s, out_t, (uint32_t)elems_of(od)});
+            em.add_op(OP_RMSNORM2_F16, {x_t, w_s, b_s, out_t, (uint32_t)elems_of(od)});
             break;
         }
 
@@ -719,7 +721,20 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 std::fprintf(stderr, "error: %s extra 未提取 (M/K/N=0)\n", nm.c_str());
                 return 4;
             }
-            em.add_op(OP_MATMUL_W4A16, {a_t, w_s, out_t, m, k, nn});
+            /* Q4_0 打包权重(K*N/2 字节)→ W4A16;f16 池权重 → MATMUL_F16
+             * (float 图; probe 首撞: f16 权重被按 W4A16 执行直接失败) */
+            bool w4 = (w_s != em.dummy_slot_id) &&
+                      (em.slots[w_s].len == (k * nn / 2u));
+            if (w4) {
+                em.add_op(OP_MATMUL_W4A16, {a_t, w_s, out_t, m, k, nn});
+            } else {
+                uint32_t flags = 0;
+                if (nm == "MatMul")
+                    flags = (em2.transpose_in0 & 1u) | ((em2.transpose_in1 & 1u) << 1);
+                else
+                    flags = 2u;  /* FC: 权重存 [N,K] */
+                em.add_op(OP_MATMUL_F16, {a_t, w_s, out_t, m, k, nn, flags});
+            }
             break;
         }
 
@@ -970,10 +985,16 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     if (!manifest_path.empty()) {
         FILE* f = std::fopen(manifest_path.c_str(), "w");
         if (f) {
+            /* 输出 temp = Output 节点输入解析到的 temp id(liveness 复用下
+             * 末 op 输出可能落在低编号 temp, next_temp-1 是错的) */
+            uint32_t out_temp = 0;
+            const OpDef* out = gp.get_op_at(gp.get_output_node_id());
+            if (out && !out->inputs.empty())
+                out_temp = em.src_ref(out->inputs[0], gp.get_input_node_id(), gp, wslots);
             std::fprintf(f, "{\n");
             std::fprintf(f, "  \"input_slot\": 0,\n");
             std::fprintf(f, "  \"input_elems\": %zu,\n", input_elems);
-            std::fprintf(f, "  \"output_temp\": %u,\n", em.next_temp > 0 ? em.next_temp - 1 : 0);
+            std::fprintf(f, "  \"output_temp\": %u,\n", out_temp & 0x7FFFu);
             std::fprintf(f, "  \"n_slots\": %u,\n  \"n_ops\": %u,\n",
                          (unsigned)em.slots.size(), (unsigned)em.ops.size());
             std::fprintf(f, "  \"opcodes\": [");

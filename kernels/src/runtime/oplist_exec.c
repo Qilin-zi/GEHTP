@@ -71,7 +71,10 @@ static void cpu_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
 
 static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
     if (id >= MAX_TEMPS) return NULL;
-    if (!g_exec.temps[id]) {
+    /* liveness 复用下同 id 可被更大输出接管(恒等 Reshape 等):
+     * 需要 > 已分配时必须扩容, 否则写越界 = PD 死(M3c probe 实锤) */
+    if (!g_exec.temps[id] || g_exec.temp_bytes[id] < bytes) {
+        free(g_exec.temps[id]);
         g_exec.temps[id] = memalign(128, bytes);
         g_exec.temp_bytes[id] = bytes;
     }
@@ -631,7 +634,10 @@ static int exec_conv1d_ssm(const struct wt_blob* b, const struct wt_op* op,
 
 static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
                        char* err, size_t errn) {
-    uint32_t tbl_s = op->args[0], idx_s = op->args[1], out_t = op->args[2];
+    /* 槽引用兼容两种形态(emit 对输入槽用 0x8000|slot 编码, 权重槽裸 id;
+     * wt_parse 校验已按位解码, 执行侧同步) */
+    uint32_t tbl_s = op->args[0] & 0x7FFFu, idx_s = op->args[1] & 0x7FFFu;
+    uint32_t out_t = op->args[2];
     uint32_t n = op->args[3], row_bytes = op->args[4];
     const uint8_t* tbl = slot_ptr(b, tbl_s);
     const int32_t* idx = (const int32_t*)slot_ptr(b, idx_s);
@@ -643,6 +649,62 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
         int32_t r = idx[i];
         if (r < 0) r = 0;
         memcpy(y + (size_t)i * row_n, tbl + (size_t)r * row_bytes, row_bytes);
+    }
+    return 0;
+}
+
+/* f16×f16 GEMM (float 图; f32 累加 f16 存储)。M3c 正确性版 —— 性能版
+ * 走 HMX (M7)。flags bit0 = a 转置(存 [K,M]), bit1 = w 转置(存 [N,K])。 */
+static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
+                           char* err, size_t errn) {
+    uint32_t a_t = op->args[0], w_s = op->args[1] & 0x7FFFu, out_t = op->args[2];
+    uint32_t M = op->args[3], K = op->args[4], N = op->args[5];
+    uint32_t flags = op->args[6];
+    int t0 = (int)(flags & 1u), t1 = (int)(flags & 2u);
+    const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
+    const uint16_t* w = (const uint16_t*)slot_ptr(b, w_s);
+    uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N * 2u);
+    if (!a || !w || !y) { snprintf(err, errn, "matmul_f16 ref fail"); return -1; }
+    for (uint32_t m = 0; m < M; m++)
+        for (uint32_t n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (uint32_t k = 0; k < K; k++) {
+                float av = f16_to_f32(a[t0 ? (size_t)k * M + m : (size_t)m * K + k]);
+                float wv = f16_to_f32(w[t1 ? (size_t)n * K + k : (size_t)k * N + n]);
+                acc += av * wv;
+            }
+            y[(size_t)m * N + n] = f32_to_f16(acc);
+        }
+    return 0;
+}
+
+/* 通用 RMSNorm: 纯 f16 面直读(无 crouton)。y = x/rms(x) * gamma + bias。
+ * eps=1e-6(Qwen3.5 缺省); 行宽 = gamma 槽长/2; m = n/行宽。 */
+static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
+                         char* err, size_t errn) {
+    uint32_t x_t = op->args[0];
+    uint32_t w_s = op->args[1] & 0x7FFFu, b_s = op->args[2] & 0x7FFFu;
+    uint32_t y_t = op->args[3], n = op->args[4];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    const uint16_t* wv = (const uint16_t*)slot_ptr(b, w_s);
+    const uint16_t* bv = (const uint16_t*)slot_ptr(b, b_s);
+    uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)n * 2u);
+    if (!x || !wv || !y) { snprintf(err, errn, "rmsnorm2 ref fail"); return -1; }
+    uint32_t rw = b->slots[w_s].len / 2u;
+    if (rw == 0 || n % rw != 0) { snprintf(err, errn, "rmsnorm2 shape n%u rw%u", n, rw); return -1; }
+    uint32_t m = n / rw;
+    for (uint32_t r = 0; r < m; r++) {
+        double acc = 0.0;
+        for (uint32_t i = 0; i < rw; i++) {
+            float v = f16_to_f32(x[(size_t)r * rw + i]);
+            acc += (double)v * (double)v;
+        }
+        float rms = (float)sqrt(acc / (double)rw + 1e-6);
+        for (uint32_t i = 0; i < rw; i++) {
+            float v = f16_to_f32(x[(size_t)r * rw + i]) / rms;
+            v = v * f16_to_f32(wv[i]) + (bv ? f16_to_f32(bv[i]) : 0.0f);
+            y[(size_t)r * rw + i] = f32_to_f16(v);
+        }
     }
     return 0;
 }
@@ -803,6 +865,12 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         case OP_KV_GATHER_F16:
             snprintf(err, errn, "kv op 未实现 (M5)");
             rc = -1;
+            break;
+        case OP_MATMUL_F16:
+            rc = exec_matmul_f16(b, op, err, errn);
+            break;
+        case OP_RMSNORM2_F16:
+            rc = exec_rmsnorm2(b, op, err, errn);
             break;
         default:
             snprintf(err, errn, "opcode %u unhandled", (unsigned)op->opcode);

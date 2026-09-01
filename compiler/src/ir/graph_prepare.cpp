@@ -231,11 +231,10 @@ void GraphPrepare::inject_htp_prepare_inputs() {
             add_input(opdef, get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
 
         } else if (nm == "Gather") {
-            if (opdef->inputs.size() > 1) opdef->inputs.resize(1);
-            op_id_t or_id = get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4);
-            add_input(opdef, or_id);
-            add_input(opdef, or_id);
-
+            // [table, indices] — 我方设备契约保持原样。REQNN 重构版曾
+            // resize(1) + 双 or_Gather 注入: 运行索引输入被替换成常量 →
+            // 全图被 const_prop 折叠 → emit 产出空 blob(0.8B 无 Gather
+            // 未暴露, qnn2layer probe 首撞, M3c 实锤)。
         } else if (nm == "ElementWiseBinary") {
             add_input(opdef, get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
 
@@ -3031,19 +3030,13 @@ void GraphPrepare::const_prop(HexagonNNEnv& env, bool aggressive) {
             }
 
             if (all_const) {
-                // All inputs are const -> this op can be folded
-                // Source: const_prop_extract_outputs @ 0xF7A090 (2043 bytes)
-                // Evaluate the op with constant inputs to produce constant output
-                //
-                // For simple ops (Add, Mul, etc.): compute result directly
-                // For complex ops (Conv, MatMul): would need full kernel
-                //
-                // Source: replace_opdef_with_opconst @ 0xF7A950 (609 bytes)
-                // Replace this opdef with an OpDef_Const containing the folded value
-
-                // Mark as const (simplified: real impl would compute value)
-                opdef->flags |= OP_CONST;
-                changed = true;
+                // 折叠必须算出值(replace_opdef_with_opconst 语义);
+                // 无值只标 OP_CONST 会让 emit 跳过该 op → 消费方读空槽
+                // → 数值错(M3c probe 实锤: 掩码子图折叠后 emit 空 blob)。
+                // 求值需接 TypicalOp host 参考核(run_host 通路已存在,
+                // 见 optimize 区 tensor_map 执行链), 暂缓 —— 设备执行
+                // 常量子图成本可忽略, 正确性优先。
+                (void)aggressive;
             }
         }
     }
