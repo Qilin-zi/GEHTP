@@ -1528,11 +1528,15 @@ std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& o
     const OpDef* b = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
     if (a && b && a->output_def.rank >= 2 && b->output_def.rank >= 2) {
         uint32_t ar = a->output_def.rank, br = b->output_def.rank;
-        e.m = a->output_def.dims[ar - 2];
-        e.k = a->output_def.dims[ar - 1];
+        /* 批维全折: rank>2 时 m = Π dims[0..r-2](设备按扁平 [M,K] 读) */
+        uint64_t mprod = 1, kprod = 1;
+        for (uint32_t i = 0; i + 1 < ar; ++i) mprod *= a->output_def.dims[i];
+        uint32_t alast = a->output_def.dims[ar - 1];
+        if (e.transpose_in0) { e.m = alast; e.k = (uint32_t)mprod; }
+        else { e.m = (uint32_t)mprod; e.k = alast; }
+        (void)kprod;
         uint32_t bk = e.transpose_in1 ? b->output_def.dims[br - 1] : b->output_def.dims[br - 2];
         uint32_t bn = e.transpose_in1 ? b->output_def.dims[br - 2] : b->output_def.dims[br - 1];
-        if (e.transpose_in0) { e.m = a->output_def.dims[ar - 1]; e.k = a->output_def.dims[ar - 2]; }
         (void)bk;
         e.n = bn;
     }

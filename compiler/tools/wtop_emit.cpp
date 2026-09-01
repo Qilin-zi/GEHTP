@@ -580,7 +580,17 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             }
             uint32_t src_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
-            em.add_op(OP_TRANSPOSE_F16, {src_t, out_t, H, W, C, perm});
+            /* 4-D NCHW(conv 管线)与 rank<4(transformer 张量)两条契约:
+             * 通用 opcode 27 形状全参数化 */
+            if (src->output_def.rank >= 4) {
+                em.add_op(OP_TRANSPOSE_F16, {src_t, out_t, H, W, C, perm});
+            } else {
+                uint32_t d[4] = {1, 1, 1, 1};
+                for (uint32_t i = 0; i < src->output_def.rank && i < 4; i++)
+                    d[i] = src->output_def.dims[i];
+                em.add_op(OP_TRANSPOSE_GEN_F16,
+                          {src_t, out_t, src->output_def.rank, d[0], d[1], d[2], d[3], perm});
+            }
             break;
         }
 
@@ -648,8 +658,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             uint32_t b_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
-            if (subtype == 0) em.add_op(OP_ADD_F16, {a_t, b_t, out_t, H * W * C});
-            else em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, H * W * C, subtype});
+            uint64_t n = elems_of(od);
+            /* numpy 广播: b 元素 < 输出时先物化为全尺寸 temp(循环展开),
+             * 保持 ADD/BINARY 纯元素语义 */
+            const OpDef* bb = gp.get_op_at(od->inputs[1].src_id);
+            uint64_t b_elems = bb ? elems_of(bb) : n;
+            if (b_elems < n) {
+                uint32_t btmp = em.fresh_temp(od->op_id);
+                em.add_op(OP_BROADCAST_F16, {b_t, btmp, (uint32_t)n, (uint32_t)b_elems});
+                b_t = btmp;
+            }
+            if (subtype == 0) em.add_op(OP_ADD_F16, {a_t, b_t, out_t, (uint32_t)n});
+            else em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, (uint32_t)n, subtype});
             break;
         }
 

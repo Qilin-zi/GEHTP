@@ -90,6 +90,12 @@ enum {
                                (无 crouton); n=总元素, 行宽=w 槽长/2, m=n/行宽;
                                b_s 为 bias 槽(无 bias 时 zero dummy 槽); eps=1e-6
                                (opcode 2 保留 conv 管线 crouton 契约不动) */
+    OP_BROADCAST_F16 = 26,  /* [b_ref,y_t,n,b_elems] C 序循环展开: y[i]=b[i%b_elems]
+                               (emit 在二元 op 前把广播操作数物化为全尺寸 temp;
+                                保持 OP_ADD/OP_BINARY 纯元素语义不动) */
+    OP_TRANSPOSE_GEN_F16 = 27, /* [x_ref,y_t,rank,d0..d3,perm4B] 通用 N-D C 序转置
+                               (rank 2/3/4; dims 为输入形状; opcode 10 保留
+                               conv 管线 4-D NCHW 契约不动) */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -119,6 +125,8 @@ enum {
 #define WT_ARITY_KV_GATHER_F16 5
 #define WT_ARITY_MATMUL_F16 7
 #define WT_ARITY_RMSNORM2_F16 5
+#define WT_ARITY_BROADCAST_F16 4
+#define WT_ARITY_TRANSPOSE_GEN_F16 9
 
 struct wt_slot {
     uint32_t len;

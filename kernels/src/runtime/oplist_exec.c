@@ -709,6 +709,58 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
+/* C 序循环展开: y[i] = b[i % b_elems](广播操作数物化为全尺寸) */
+static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
+                          char* err, size_t errn) {
+    uint32_t b_t = op->args[0], y_t = op->args[1], n = op->args[2], b_elems = op->args[3];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, b_t);
+    uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)n * 2u);
+    if (!x || !y || b_elems == 0) { snprintf(err, errn, "broadcast ref fail"); return -1; }
+    for (uint32_t i = 0; i < n; i++) y[i] = x[i % b_elems];
+    return 0;
+}
+
+/* 通用 N-D C 序转置: dims/perm 全参数化(rank 2/3/4) */
+static int exec_transpose_gen(const struct wt_blob* b, const struct wt_op* op,
+                              char* err, size_t errn) {
+    uint32_t x_t = op->args[0], y_t = op->args[1], rk = op->args[2];
+    uint32_t dims[4] = {op->args[3], op->args[4], op->args[5], op->args[6]};
+    uint32_t perm = op->args[7];
+    const uint16_t* s16 = (const uint16_t*)ref_ptr(b, x_t);
+    if (rk < 2 || rk > 4) { snprintf(err, errn, "transpose_gen rank %u", rk); return -1; }
+    size_t n = 1;
+    for (uint32_t i = 0; i < rk; i++) n *= dims[i];
+    uint16_t* dst = (uint16_t*)temp_get(y_t, (uint32_t)n * 2u);
+    if (!s16 || !dst) { snprintf(err, errn, "transpose_gen ref fail"); return -1; }
+    uint32_t p[4] = {(uint8_t)perm, (uint8_t)(perm >> 8),
+                     (uint8_t)(perm >> 16), (uint8_t)(perm >> 24)};
+    /* C 序输入 strides(rank 维有效, 其余 1 占位) */
+    uint32_t si[4], so[4];
+    si[rk - 1] = 1; so[rk - 1] = 1;
+    for (int i = (int)rk - 2; i >= 0; i--) {
+        si[i] = si[i + 1] * dims[i + 1];
+        uint32_t pd = p[i + 1] >= rk ? 1u : dims[p[i + 1]];  /* 输出轴 i 的跨度 =
+            其后续轴输出尺寸之积 */
+        so[i] = so[i + 1] * pd;
+    }
+    uint32_t out_dims[4];
+    for (uint32_t i = 0; i < rk; i++) out_dims[i] = dims[p[i]];
+    uint32_t idx[4] = {0, 0, 0, 0};
+    for (size_t t = 0; t < n; t++) {
+        /* 输入线性坐标 → 输入多维坐标(与 perm 对应)→ 输出坐标 */
+        uint32_t rem = (uint32_t)t;
+        uint32_t ic[4] = {0, 0, 0, 0};
+        for (uint32_t i = 0; i < rk; i++) { ic[i] = rem / si[i]; rem %= si[i]; }
+        uint32_t oc[4] = {0, 0, 0, 0};
+        for (uint32_t ax = 0; ax < rk; ax++) oc[ax] = ic[p[ax]];
+        uint32_t ot = 0;
+        for (uint32_t ax = 0; ax < rk; ax++) ot += oc[ax] * so[ax];
+        dst[ot] = s16[t];
+        (void)idx; (void)out_dims;
+    }
+    return 0;
+}
+
 static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
                       char* err, size_t errn) {
     /* rank≤3 通用切片: [x,y,n_out,rank,b0..2,e0..2,s0..2]
@@ -871,6 +923,12 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             break;
         case OP_RMSNORM2_F16:
             rc = exec_rmsnorm2(b, op, err, errn);
+            break;
+        case OP_BROADCAST_F16:
+            rc = exec_broadcast(b, op, err, errn);
+            break;
+        case OP_TRANSPOSE_GEN_F16:
+            rc = exec_transpose_gen(b, op, err, errn);
             break;
         default:
             snprintf(err, errn, "opcode %u unhandled", (unsigned)op->opcode);
