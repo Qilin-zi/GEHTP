@@ -51,19 +51,45 @@ int main(int argc, char** argv) {
     ex_log("probe: ops=%u slots=%u", w->n_ops, w->n_slots);
 
     int bad = 0;
-    /* 首轮逐 op 推进(崩溃取证: 无缓冲日志, 死点 = 最后一行之后) */
+    /* 首轮逐 op 推进: 每 op 输出 temp 落盘(与 host execute_host 对拍) */
     {
         char err[128] = {0};
         int rc = 0;
         for (uint32_t i = 0; i < w->n_ops; i++) {
-            ex_log("diag: op %u", i);
             rc = wt_exec_run_range(w, i, 1, NULL, NULL, err, sizeof(err));
-            if (rc) { ex_log("[FAIL] diag op %u rc=%d %s", i, rc, err); bad = 1; }
+            if (rc) { ex_log("[FAIL] diag op %u rc=%d %s", i, rc, err); bad = 1; continue; }
+            /* out temp 位置按 opcode 契约 */
+            const struct wt_op* o = &w->ops[i];
+            uint32_t out_t = 0xFFFFFFFFu;
+            switch (o->opcode) {
+            case OP_ADD_F16: out_t = o->args[2]; break;
+            case OP_UNARY_F16: case OP_SOFTMAX_F16: case OP_STRIDED_SLICE_F16:
+            case OP_SPLIT_F16: case OP_ARGMAX_F16: case OP_BROADCAST_F16:
+            case OP_TRANSPOSE_GEN_F16: case OP_TRANSPOSE_F16:
+                out_t = o->args[1]; break;
+            case OP_BINARY_F16: out_t = o->args[2]; break;
+            case OP_CONCAT_F16: out_t = o->args[8]; break;
+            case OP_GATHER_F16: out_t = o->args[2]; break;
+            case OP_MATMUL_F16: out_t = o->args[2]; break;
+            case OP_RMSNORM2_F16: out_t = o->args[3]; break;
+            case OP_RMSNORM_F16: out_t = o->args[2]; break;
+            default: break;
+            }
+            if (out_t < WT_EXEC_MAX_TEMPS && wt_exec_temp(out_t)) {
+                char p[160];
+                snprintf(p, sizeof(p), D "/dump_%u.f16.raw", i);
+                FILE* f = fopen(p, "wb");
+                if (f) {
+                    fwrite(wt_exec_temp(out_t), 1, wt_exec_temp_bytes(out_t), f);
+                    fclose(f);
+                }
+            }
         }
         wt_exec_shutdown();
         ex_log("diag: op-by-op done rc=%d", rc);
     }
     for (int i = 0; i < 8; i++) {
+        ex_log("run %d: loading tokens", i);
         char p[128];
         snprintf(p, sizeof(p), D "/tokens_%d.raw", i);
         size_t tlen = 0;
@@ -74,7 +100,9 @@ int main(int argc, char** argv) {
         }
         uint8_t* out = malloc(LOGITS * 2u);
         char err[128] = {0};
+        ex_log("run %d: calling run_io", i);
         int rc = wt_exec_run_io(w, tok, out, out_temp, NULL, NULL, err, sizeof(err));
+        ex_log("run %d: run_io rc=%d", i, rc);
         wt_exec_shutdown();
         if (rc) { ex_log("[FAIL] run_io %d rc=%d %s", i, rc, err); bad = 1; }
         else {

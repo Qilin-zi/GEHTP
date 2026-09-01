@@ -82,7 +82,7 @@ public:
         std::vector<float> output;
         bool ok = false;
     };
-    ExecResult execute_host(const std::vector<float>& input) const;
+    ExecResult execute_host(const std::vector<float>& input);  /* 内部重建 ops_ (DCE 后陈旧) */
 
     // Op management
     op_id_t append_node(const std::string& name, uint32_t node_type,

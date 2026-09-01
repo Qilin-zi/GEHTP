@@ -251,6 +251,17 @@ void GraphPrepare::inject_htp_prepare_inputs() {
     // Rebuild consumers: injected const 节点在 op 之后创建, append_node 的
     // consumer 注册漏了它们。从 input 连接重建。
     rebuild_consumers();
+    // tensor_param const(ranges/perm 等)不在 op inputs 里, rebuild 后必须
+    // 重注册消费者 —— 否则 Phase7 DCE 删 param const, StridedSlice 等
+    // 拿不到参数(probe rope Slice 全零实锤)。
+    for (auto& [id, opdef] : opdef_map_) {
+        if (!opdef) continue;
+        for (op_id_t tpid : opdef->tensor_param_ids) {
+            auto it = opdef_map_.find(tpid);
+            if (it != opdef_map_.end() && it->second)
+                it->second->consumers.push_back(id);
+        }
+    }
 }
 
 // do_prepare1: initial graph building
@@ -274,9 +285,12 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
         std::fprintf(stderr, "do_prepare1: initial DCE removed %d ops\n", dce_result);
     }
 
-    // 1c. Eliminate Split nodes (HtpPrepare graph import folds Split)
-    // Split outputs are replaced by direct references to Split's input producer.
-    eliminate_split_nodes();
+    // 1c. Split 消除已禁用: eliminate_split_nodes() 是 REQNN 逆向对拍实现,
+    // 把 Split 消费者重定向到 dims=[1] 占位 const(模仿 QNN before_graph
+    // 形态)——执行语义全毁(probe Reshape 输入 [1,32,64] 变 4 字节占位,
+    // 恒等拷贝越界 + 数值错)。我方管线保留 Split 正常执行
+    // (OP_SPLIT_F16 + exec_split, M3 契约), 需要 QNN 形态对拍时
+    // 显式调用 eliminate_split_nodes() 即可。
 
     // 2. Run initial const propagation
     // TODO: const_prop currently propagates through Split placeholder consts,
@@ -387,7 +401,6 @@ GraphStatus GraphPrepare::do_prepare2(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     // Verifies every op has a valid execution path
 
     // 3. Run optimization passes (8-phase)
-    run_optimize_passes(env);
 
     // 4. TCM migration is done inside phase 2 and 4
 
@@ -499,8 +512,24 @@ std::vector<const OpDef*> GraphPrepare::get_sorted_opdefs() const {
 }
 
 // Host-side reference execute: float buffers, topo order, tensor map.
-GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& input) const {
+GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& input) {
     ExecResult ret{};
+
+    /* ops_ 在 do_prepare2 的 prepare_op 填充后, Phase7 fixpoint 的 DCE 仍会
+     * 改 opdef_map_(删 op)——ops_ 保持陈旧(probe: Slice 被删但 TypicalOp
+     * 照跑, tensor_param 注入/输入链全断)。以 opdef_map_ 为准重建。 */
+    ops_.clear();
+    for (auto& [id, opdef] : opdef_map_) {
+        if (!opdef || !opdef->is_enabled() || opdef->is_dead()) continue;
+        if (!opdef->name_tag || !opdef->name_tag->name()) continue;
+        OpIoPtrs io{};
+        io.graph_prepare = this;
+        io.opdef_ptr = opdef.get();
+        auto op = op_factory_generate(io, id);
+        if (op) {
+            ops_.push_back(std::move(op));
+        }
+    }
 
     // Input/Output are boundary nodes (not in ops_). Read their info from opdef_map_.
     op_id_t input_id = get_input_node_id();
@@ -560,6 +589,7 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
         std::vector<op_id_t> ready;
         for (auto* t : cands)
             if (indeg[t->op_id] == 0) ready.push_back(t->op_id);
+        std::sort(ready.begin(), ready.end());  /* 确定性(与 emit 对拍同序) */
         std::unordered_map<op_id_t, const TypicalOp*> by_id;
         for (auto* t : cands) by_id[t->op_id] = t;
         while (!ready.empty()) {
@@ -577,6 +607,7 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
 
     // Iterate ops_ (compute ops only: Relu, Conv, Add, etc.).
     // Input/Output are not in ops_ (not registered).
+    size_t seq_idx = 0;
     for (const TypicalOp* top : topo) {
         op_id_t oid = top->op_id;
         if (oid == 0) continue;
@@ -590,6 +621,35 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
                 ? reinterpret_cast<const uint8_t*>(it->second.data()) : nullptr);
             in_ods.push_back(conn.src_out_def);
         }
+        /* tensor_param const(ranges/perm/axes)追加到输入尾部 —
+         * host 参考 StridedSlice/Transpose 等按名/按位消费
+         * (inject 未把它们进 op inputs 的形态下同样可见) */
+        if (const OpDef* od2 = get_op_at(oid)) {
+            for (op_id_t tpid : od2->tensor_param_ids) {
+                const OpDef* pc = get_op_at(tpid);
+                if (!pc || pc->const_data_size == 0) continue;
+                auto& tbuf = tensor_map[tpid];
+                size_t en = pc->const_data_size / sizeof(float);
+                if (tbuf.empty() && en > 0) {
+                    tbuf.resize(en, 0.0f);
+                    /* offset 0 合法(池首 const) */
+                    if (pc->const_data_offset + pc->const_data_size <= const_pool_.size())
+                        std::memcpy(tbuf.data(),
+                                    const_pool_.data() + pc->const_data_offset,
+                                    pc->const_data_size);
+                }
+                if (true) {
+                    std::fprintf(stderr, "[hostdiag] op %llu param %llu off=%llu size=%llu first4=%g %g %g %g\n",
+                                 (unsigned long long)oid, (unsigned long long)tpid,
+                                 (unsigned long long)pc->const_data_offset,
+                                 (unsigned long long)pc->const_data_size,
+                                 tbuf.size() > 0 ? tbuf[0] : -1.f, tbuf.size() > 1 ? tbuf[1] : -1.f,
+                                 tbuf.size() > 2 ? tbuf[2] : -1.f, tbuf.size() > 3 ? tbuf[3] : -1.f);
+                }
+                in_bufs.push_back(reinterpret_cast<const uint8_t*>(tbuf.data()));
+                in_ods.push_back(pc->output_def);
+            }
+        }
 
         // Allocate output buffer.
         size_t out_n = 1;
@@ -601,6 +661,46 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
         out_vec.resize(out_n, 0.0f);
 
         top->execute(in_bufs, reinterpret_cast<uint8_t*>(out_vec.data()), top->cached_out_def, in_ods);
+        seq_idx++;
+        if (oid == 3 || oid == 14 || oid == 45 || oid == 151) {
+            std::fprintf(stderr, "[hostdiag] op %llu out[0..3]=%g %g %g %g\n",
+                         (unsigned long long)oid,
+                         out_vec.size() > 0 ? out_vec[0] : 0.f,
+                         out_vec.size() > 1 ? out_vec[1] : 0.f,
+                         out_vec.size() > 2 ? out_vec[2] : 0.f,
+                         out_vec.size() > 3 ? out_vec[3] : 0.f);
+        }
+        /* 全 op 按 op_id dump(与设备 dump 经 manifest 映射对拍) */
+        {
+            char pn2[64];
+            std::snprintf(pn2, sizeof(pn2), "/tmp/host_seq_%zu.f32.raw", seq_idx);
+            char pn3[64];
+            std::snprintf(pn3, sizeof(pn3), "/tmp/host_id_%llu.f32.raw", (unsigned long long)oid);
+            std::FILE* fo3 = std::fopen(pn3, "wb");
+            if (fo3) {
+                std::fwrite(out_vec.data(), 4, out_vec.size(), fo3);
+                std::fclose(fo3);
+            }
+            std::FILE* fo2 = std::fopen(pn2, "wb");
+            if (fo2) {
+                std::fwrite(out_vec.data(), 4, out_vec.size(), fo2);
+                std::fclose(fo2);
+            }
+        }
+        /* 中间对拍 dump(与 ORT 同名输出逐元素比) */
+        if (oid == 22 || oid == 25 || oid == 40 || oid == 42 || oid == 43 || oid == 44 || oid == 53 || oid == 56 || oid == 58 || oid == 63 || oid == 67 || oid == 69 || oid == 70 || oid == 72 || oid == 77 || oid == 8 || oid == 10 || oid == 12 ||
+            oid == 13 || oid == 29 ||
+            oid == 38 || oid == 45 ||
+            oid == 51 || oid == 63 || oid == 65 || oid == 81 ||
+            oid == 148 || oid == 151) {
+            char pn[64];
+            std::snprintf(pn, sizeof(pn), "/tmp/host_op_%llu.f32.raw", (unsigned long long)oid);
+            std::FILE* fo = std::fopen(pn, "wb");
+            if (fo) {
+                std::fwrite(out_vec.data(), 4, out_vec.size(), fo);
+                std::fclose(fo);
+            }
+        }
     }
 
     // Read Output's predecessor from opdef_map_ (Output is not in ops_).
@@ -1259,6 +1359,13 @@ const OpDef* find_param_const(const GraphPrepare& gp, const OpDef& opdef, const 
         const char* n = s->name_tag->name();
         if (n && std::strstr(n, key)) return s;
     }
+    /* tensor_param 不一定在 inputs(ranges 等留在 tensor_param_ids) */
+    for (op_id_t tpid : opdef.tensor_param_ids) {
+        const OpDef* s = gp.get_op_at(tpid);
+        if (!s || !s->name_tag) continue;
+        const char* n = s->name_tag->name();
+        if (n && std::strstr(n, key)) return s;
+    }
     return nullptr;
 }
 
@@ -1470,8 +1577,11 @@ size_t const_elem_count(const GraphPrepare& gp, const OpDef& opdef, size_t input
 
 std::vector<uint8_t> extract_eltwise_extra(const GraphPrepare& gp, const OpDef& opdef) {
     ExtraEltwise e{};
-    // 缺省 ADD(0): 合成图/无 scalar_params 的流保持 conv_add 语义
-    e.operation = op_to_u32(scalar_str(opdef, "operation"), 0);
+    /* 2.48 scalar 为数字枚举(NEG=8/MULTIPLY=13 等) — 直读数字;
+     * 旧字符串形态仅作兼容回退 */
+    const std::string os = scalar_str(opdef, "operation");
+    e.operation = os.empty() ? static_cast<uint32_t>(scalar_num(opdef, "operation", 0))
+                             : (op_to_u32(os, static_cast<uint32_t>(scalar_num(opdef, "operation", 0))));
     e.eltwise_type = (scalar_str(opdef, "eltwise_type") == "SELECT") ? 0 : 0xFFFFFFFFu;
     return raw_extra(&e, sizeof(e));
 }
@@ -1528,17 +1638,31 @@ std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& o
     const OpDef* b = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
     if (a && b && a->output_def.rank >= 2 && b->output_def.rank >= 2) {
         uint32_t ar = a->output_def.rank, br = b->output_def.rank;
-        /* 批维全折: rank>2 时 m = Π dims[0..r-2](设备按扁平 [M,K] 读) */
-        uint64_t mprod = 1, kprod = 1;
-        for (uint32_t i = 0; i + 1 < ar; ++i) mprod *= a->output_def.dims[i];
-        uint32_t alast = a->output_def.dims[ar - 1];
-        if (e.transpose_in0) { e.m = alast; e.k = (uint32_t)mprod; }
-        else { e.m = (uint32_t)mprod; e.k = alast; }
-        (void)kprod;
+        /* 压尾 1 得有效 rank(QNN 前置填充 [1,1,m,k]) */
+        while (ar > 0 && a->output_def.dims[ar - 1] == 1) ar--;
+        while (br > 0 && b->output_def.dims[br - 1] == 1) br--;
         uint32_t bk = e.transpose_in1 ? b->output_def.dims[br - 1] : b->output_def.dims[br - 2];
         uint32_t bn = e.transpose_in1 ? b->output_def.dims[br - 2] : b->output_def.dims[br - 1];
         (void)bk;
         e.n = bn;
+        /* batched BMM(attention q·kᵀ / probs·v): 有效 rank≥3 且 A/B 批维
+         * 同构 → 批维不折叠, m = 每批行数(批数由输出形状推)。
+         * rank≤2 或 B 批维广播 → 普通 GEMM 折批(等价)。 */
+        uint64_t mprod = 1;
+        uint32_t alast = a->output_def.dims[ar - 1];
+        bool same_batch = (ar >= 3 && br >= 3);
+        if (same_batch)
+            for (uint32_t i = 0; i + 2 < ar; ++i)
+                if (a->output_def.dims[i] != b->output_def.dims[i]) same_batch = false;
+        if (same_batch) {
+            e.batched = 1;
+            e.m = a->output_def.dims[ar - 2];
+            e.k = alast;
+        } else {
+            for (uint32_t i = 0; i + 1 < ar; ++i) mprod *= a->output_def.dims[i];
+            if (e.transpose_in0) { e.m = alast; e.k = (uint32_t)mprod; }
+            else { e.m = (uint32_t)mprod; e.k = alast; }
+        }
     }
     return raw_extra(&e, sizeof(e));
 }
@@ -1631,12 +1755,33 @@ std::vector<uint8_t> extract_scatternd_extra(const GraphPrepare& gp, const OpDef
 std::vector<uint8_t> extract_split_extra(const GraphPrepare& gp, const OpDef& opdef) {
     ExtraSplit e{};
     e.axis = static_cast<int32_t>(scalar_num(opdef, "axis", -1));
+    e.split_index = static_cast<uint32_t>(scalar_num(opdef, "split_index", 0));
     // 段大小 tensor_param 名含 split_index
     const OpDef* si = find_param_const(gp, opdef, "split_index");
     if (!si) si = find_param_const(gp, opdef, "split");
     auto v = read_param_u32(gp, si, 8);
     e.num_splits = static_cast<uint32_t>(std::min<size_t>(v.size(), 8));
     for (size_t i = 0; i < v.size() && i < 8; ++i) e.sizes[i] = v[i];
+    /* 形状推断优先: converter 2.48 对 3 段 Split 的 param 实测写错
+     * ([64,64,64] 写成 [64,128] — ONNX Constant 实为三段), 一律以
+     * 输入末维/输出末维 推段数与段长覆盖 */
+    {
+        const OpDef* src = opdef.inputs.empty() ? nullptr
+                                                : gp.get_op_at(opdef.inputs[0].src_id);
+        if (src) {
+            uint32_t ar = src->output_def.rank;
+            while (ar > 0 && src->output_def.dims[ar - 1] == 1) ar--;
+            uint32_t rk = opdef.output_def.rank;
+            while (rk > 0 && opdef.output_def.dims[rk - 1] == 1) rk--;
+            uint64_t in_axis = (ar >= 1) ? src->output_def.dims[ar - 1] : 0;
+            uint64_t out_axis = (rk >= 1) ? opdef.output_def.dims[rk - 1] : 1;
+            if (in_axis > 0 && out_axis > 0 && in_axis % out_axis == 0) {
+                e.num_splits = static_cast<uint32_t>(in_axis / out_axis);
+                for (uint32_t i = 0; i < e.num_splits && i < 8; ++i)
+                    e.sizes[i] = static_cast<uint32_t>(out_axis);
+            }
+        }
+    }
     return raw_extra(&e, sizeof(e));
 }
 
@@ -2939,6 +3084,21 @@ int GraphPrepare::common_subexpr_eliminate(bool) {
             sig ^= (conn.src_id * 0x9E3779B97F4A7C15ULL);
             sig ^= (static_cast<uint64_t>(conn.out_idx) << 32);
             sig = (sig << 1) | (sig >> 63);
+        }
+        /* tensor_param 也是语义的一部分: 同名同输入但 ranges/perm 不同的
+         * op(probe rope Slice 半切)不得合并 */
+        std::vector<op_id_t> tp = opdef->tensor_param_ids;
+        std::sort(tp.begin(), tp.end());
+        for (op_id_t tpid : tp) {
+            sig ^= (static_cast<uint64_t>(tpid) * 0x9E3779B97F4A7C15ULL);
+            sig = (sig << 1) | (sig >> 63);
+        }
+        /* scalar params(op_data)同样参与签名 —— Split 三副本同名字同输入,
+         * 仅 split_index 不同, 不混 params 会被 CSE 合并(probe qkv 实锤:
+         * 副本 1/2 被删 → Reshape_2 输入重连到 q 段 → 整链数值错) */
+        for (uint8_t b8 : opdef->op_data) {
+            sig ^= (static_cast<uint64_t>(b8) + 0x9E3779B97F4A7C15ULL);
+            sig = (sig << 8) | (sig >> 56);
         }
         return sig;
     };

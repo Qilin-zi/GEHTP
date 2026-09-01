@@ -49,19 +49,31 @@ void QnnIRLoader::fill_output_def(OutputDef& od, const std::vector<uint32_t>& di
 std::vector<uint8_t> QnnIRLoader::pack_data(const JsonValue& data_arr, uint32_t qnn_dtype) {
     std::vector<uint8_t> packed;
     if (!data_arr.is_array()) return packed;
-    size_t n = data_arr.size();
-    if (qnn_dtype == 0x0132 || qnn_dtype == 0x0432) {
+    /* 拍平嵌套数组(ranges = [[b,e,s]×rank] 形态) */
+    std::vector<double> flat;
+    std::function<void(const JsonValue&)> walk = [&](const JsonValue& v) {
+        if (v.is_array()) {
+            for (size_t i = 0; i < v.size(); i++) walk(v.at(i));
+        } else {
+            flat.push_back(v.as_num());
+        }
+    };
+    walk(data_arr);
+    size_t n = flat.size();
+    /* 2.48 枚举: INT_32=0x0032(50) UINT_32=0x0132; 旧路径 0x0432 兼容 */
+    if (qnn_dtype == 0x0132 || qnn_dtype == 0x0432 || qnn_dtype == 0x0032) {
         // uint32 / int32: 4 bytes each
         packed.resize(n * 4);
         for (size_t i = 0; i < n; ++i) {
-            uint32_t v = static_cast<uint32_t>(data_arr.at(i).as_int());
+            uint32_t v = static_cast<uint32_t>((int64_t)flat[i]);
             std::memcpy(packed.data() + i * 4, &v, 4);
         }
     } else if (qnn_dtype == 0x0232) {
-        // float32: 4 bytes each
+        // float32: 4 bytes each(数值在 flat, 精确到 int 之外需 as_num;
+        // 拍平 walk 已用 as_int — 对 f32 数据元素需按 num 重取, 见下)
         packed.resize(n * 4);
         for (size_t i = 0; i < n; ++i) {
-            float v = static_cast<float>(data_arr.at(i).as_num());
+            float v = static_cast<float>(flat[i]);
             std::memcpy(packed.data() + i * 4, &v, 4);
         }
     } else {
@@ -326,6 +338,21 @@ uint32_t QnnIRLoader::build_graph() {
             op_id_t target = ti.id;
             while (gp_.get_op_at(target) != nullptr) target++;
             std::vector<uint8_t> op_blob = QnnIRLoader::pack_scalar_params(*node);
+            /* 多输出 op(Split): 每输出 tensor 建一个 op 副本, 按
+             * output_names 序注入 split_index — host 参考/emit 切段依据 */
+            if (node->output_names.size() > 1) {
+                for (size_t k = 0; k < node->output_names.size(); k++) {
+                    if (node->output_names[k] != item.tensor_name) continue;
+                    auto sp = ::hnnx::unpack_scalar_params(op_blob);
+                    ScalarParam p;
+                    p.name = "split_index";
+                    p.is_numeric = true;
+                    p.value_num = static_cast<double>(k);
+                    sp.push_back(p);
+                    op_blob = ::hnnx::pack_scalar_params(sp);
+                    break;
+                }
+            }
             gp_.append_node(node->type, target,
                             inputs.data(), inputs.size(),
                             &od, 1, op_blob.empty() ? nullptr : op_blob.data(),

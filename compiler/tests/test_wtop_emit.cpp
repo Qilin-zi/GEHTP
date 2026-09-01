@@ -156,14 +156,17 @@ int main() {
     CHECK(wb->slots[1].len == 18432 && wb->slots[1].count == 9216, "slot1 = W f16 18432B");
     CHECK(wb->slots[2].len == 64 && wb->slots[2].count == 32, "slot2 = B f16 64B");
     {
-        const uint16_t expect_op[5] = {OP_TRANSPOSE_F16, OP_IM2COL, OP_CONV2D_F16,
-                                       OP_ADD_F16, OP_TRANSPOSE_F16};
+        /* M3c: Transpose 统一走 OP_TRANSPOSE_GEN_F16(形状参数化; 旧 4D
+         * NCHW 契约对 transformer 张量全错) */
+        const uint16_t expect_op[5] = {OP_TRANSPOSE_GEN_F16, OP_IM2COL, OP_CONV2D_F16,
+                                       OP_ADD_F16, OP_TRANSPOSE_GEN_F16};
         bool seq = true;
         for (uint32_t i = 0; i < 5; i++) seq &= (wb->ops[i].opcode == expect_op[i]);
-        CHECK(seq, "opcode 序列 [T, IM2COL, CONV, ADD, T]");
-        // TRANSPOSE 参数: [src(0x8000|slot0), out=0, H,W,C, perm]
+        CHECK(seq, "opcode 序列 [TG, IM2COL, CONV, ADD, TG]");
+        // GEN 参数: [src, out, rank, d0..3, perm]
         CHECK((wb->ops[0].args[0] & 0x8000) != 0, "首 Transpose src = 0x8000|slot0 (输入注入)");
-        CHECK(wb->ops[0].args[5] == (0u | (2u << 8) | (3u << 16) | (1u << 24)),
+        CHECK(wb->ops[0].args[2] == 4, "首 Transpose rank=4");
+        CHECK(wb->ops[0].args[7] == (0u | (2u << 8) | (3u << 16) | (1u << 24)),
               "首 Transpose perm = [0,2,3,1] 打包");
         // CONV: M=32*32 K=288 N=32
         CHECK(wb->ops[2].args[4] == 1024 && wb->ops[2].args[5] == 288 && wb->ops[2].args[6] == 32,

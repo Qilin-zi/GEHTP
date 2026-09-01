@@ -46,6 +46,7 @@ struct ExtraMatMul {
     uint32_t n;              // +8
     uint32_t transpose_in0;  // +12
     uint32_t transpose_in1;  // +16
+    uint32_t batched;        // +20  batch-BMM(q·kᵀ per head: 批维不折叠)
 };
 
 // StridedSlice: ranges 从 tensor_param const 读出(begin/end/strides 各 4 字节/维)
@@ -99,6 +100,7 @@ struct ExtraSplit {
     uint32_t axis;           // +0
     uint32_t num_splits;     // +4
     uint32_t sizes[8];       // +8..+39
+    uint32_t split_index;    // +40  本副本在 Split 的段序号(loader 注入)
 };
 
 } // namespace hnnx

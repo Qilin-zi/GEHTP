@@ -130,8 +130,11 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
             // 槽引用两种形态: 裸 slot id 或 0x8000|slot(发射器统一用
             // src_ref 的 flagged 编码, 引擎 ref_ptr 按位解码)
             uint32_t v = op->args[a];
-            uint32_t id = (v & 0x8000u) ? (v & 0x7FFFu) : v;
-            if (id >= out->n_slots) return WT_ERR_BAD_REF;
+            /* 仅 0x8000 编码的引用指向 slot 空间; 裸 id 是 temp 引用,
+             * 不做 slot 范围校验(conv_add 的 Transpose 输入 temp id 可
+             * ≥ n_slots, probe/37 实测) */
+            if ((v & 0x8000u) && ((v & 0x7FFFu) >= out->n_slots))
+                return WT_ERR_BAD_REF;
         }
     }
     return WT_OK;

@@ -135,7 +135,11 @@ int main() {
     std::printf("[5] Round-trip graph: MatMul(%llu) has %zu inputs, Add(%llu) has %zu inputs\n",
                 (unsigned long long)mm_id, mm2->inputs.size(),
                 (unsigned long long)add_id, add2->inputs.size());
-    if (mm2->inputs.size() != 2 || add2->inputs.size() != 2) {
+    /* M2 注入语义: MatMul prepare 后 = 2 data + wscale + 2×quant_marker;
+     * round-trip 保真 = 与 prepare 后输入数一致(非固定 2) */
+    OpDef* mm_pre = gp.get_op_at(mm_id);
+    if (!mm_pre || mm2->inputs.size() != mm_pre->inputs.size() ||
+        add2->inputs.size() != 2) {
         std::printf("FAILED: input count mismatch\n"); return 1;
     }
     // Verify const pool data round-tripped

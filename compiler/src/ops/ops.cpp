@@ -95,22 +95,67 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         if (idx >= inputs.size() || !inputs[idx]) return 0.0f;
         return reinterpret_cast<const float*>(inputs[idx])[i];
     };
+    /* numpy 广播: 右对齐逐轴(probe rope Mul 的第二操作数 [1,32,1,16]
+     * 中间轴广播 —— 线性 i%n 展开是错的) */
+    const auto in_bc = [&](size_t idx, size_t i) -> float {
+        if (idx >= inputs.size() || !inputs[idx]) return 0.0f;
+        uint32_t r = out_def.rank;
+        while (r > 0 && out_def.dims[r - 1] == 1) r--;
+        uint32_t ork = r;
+        uint32_t ir = (idx < in_defs.size()) ? in_defs[idx].rank : 0;
+        while (ir > 0 && in_defs[idx].dims[ir - 1] == 1) ir--;
+        if (ir > ork) ir = ork;
+        uint32_t istr[4] = {1, 1, 1, 1}, ostr[4] = {1, 1, 1, 1};
+        for (int d = (int)ir - 2; d >= 0; d--) istr[d] = istr[d + 1] * in_defs[idx].dims[d + 1];
+        for (int d = (int)ork - 2; d >= 0; d--) ostr[d] = ostr[d + 1] * out_def.dims[d + 1];
+        uint32_t rem = (uint32_t)i, in_lin = 0, lead = ork - ir;
+        for (uint32_t d = 0; d < ork; d++) {
+            uint32_t c = rem / ostr[d];
+            rem %= ostr[d];
+            if (d < lead) continue;
+            uint32_t idim = in_defs[idx].dims[d - lead];
+            if (idim > 1) in_lin += c * istr[d - lead];
+        }
+        return reinterpret_cast<const float*>(inputs[idx])[in_lin];
+    };
 
     if (op_type_name == "Relu" || op_type_name == "ConvActivations") {
         // Relu: max(0, x); ConvActivations (post-fusion): 同 Relu 语义对第一个输入
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? std::max(0.0f, in0[i]) : 0.0f;
-    } else if (op_type_name == "Add" || op_type_name == "Eltwise_Binary"
-               || op_type_name == "ElementWiseBinary") {
-        for (size_t i = 0; i < n; ++i) out[i] = in_float(0, i) + in_float(1, i);
+    } else if (op_type_name == "Add" || op_type_name == "ElementWiseBinary") {
+        for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) + in_bc(1, i);
+    } else if (op_type_name == "Eltwise_Binary") {
+        /* QNN 2.48 枚举: ADD=0 AND=1 DIVIDE=2 ... MULTIPLY=13 ...
+         * SUBTRACT=18 POWER=16(与旧版 0/1/2/3=ADD/SUB/MUL/DIV 不同 —
+         * probe rope Mul(13)/Div(2) 实锤) */
+        auto spb = unpack_scalar_params(params);
+        int oper = 0;
+        if (const ScalarParam* p = scalar_get(spb, "operation"))
+            oper = (int)(p->is_numeric ? p->value_num
+                                       : std::strtol(p->value_str.c_str(), nullptr, 10));
+        if (oper == 13) {
+            for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) * in_bc(1, i);
+        } else if (oper == 2) {
+            for (size_t i = 0; i < n; ++i) {
+                float d = in_bc(1, i);
+                out[i] = (d != 0.0f) ? in_bc(0, i) / d : 0.0f;
+            }
+        } else if (oper == 18) {
+            for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) - in_bc(1, i);
+        } else if (oper == 16) {
+            for (size_t i = 0; i < n; ++i) out[i] = std::pow(in_bc(0, i), in_bc(1, i));
+        } else {
+            for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) + in_bc(1, i);
+        }
     } else if (op_type_name == "Sub") {
-        for (size_t i = 0; i < n; ++i) out[i] = in_float(0, i) - in_float(1, i);
+        for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) - in_bc(1, i);
     } else if (op_type_name == "Mul") {
-        for (size_t i = 0; i < n; ++i) out[i] = in_float(0, i) * in_float(1, i);
+        for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) * in_bc(1, i);
     } else if (op_type_name == "Div") {
         for (size_t i = 0; i < n; ++i) {
-            float d = in_float(1, i);
-            out[i] = (d != 0.0f) ? in_float(0, i) / d : 0.0f;
+            float d = in_bc(1, i);
+            out[i] = (d != 0.0f) ? in_bc(0, i) / d : 0.0f;
         }
     } else if (op_type_name == "Sigmoid") {
         for (size_t i = 0; i < n; ++i) out[i] = 1.0f / (1.0f + std::exp(-in_float(0, i)));
@@ -122,30 +167,45 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         for (size_t i = 0; i < n; ++i) out[i] = -in_float(0, i);
 
     } else if (op_type_name == "Eltwise_Unary" || op_type_name == "ElementWiseNeuron") {
-        // operation 由 scalar_params 决定(QNN 2.48 net.json): Eltwise_Unary =
-        // NEG/EXP/SQRT/RSQRT/LOG/ABS/SIN/COS; ElementWiseNeuron = SWISH/SIGMOID/
-        // TANH/GELU/RELU 等。未知 operation → 恒等(host 参考路径, 逐 op 扩支持)
+        /* QNN 2.48 枚举(数字, 非字符串):
+         * Unary: ABS=0 ... COS=4 EXP=5 FLOOR=6 LOG=7 NEG=8 RECIPROCAL=10
+         *        RSQRT=12 SIN=14 SQRT=15
+         * Neuron: GELU=1 HARD_SWISH=3 RELU=4 SIGMOID=6 SOFTPLUS=7 TANH=8
+         * 未知 operation → 恒等(host 参考路径, 逐 op 扩支持) */
         auto sp = unpack_scalar_params(params);
         const ScalarParam* po = scalar_get(sp, "operation");
-        std::string oper = po ? po->value_str : "";
+        int oper = -1;
+        if (po)
+            oper = (int)(po->is_numeric ? po->value_num
+                                        : std::strtol(po->value_str.c_str(), nullptr, 10));
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
         for (size_t i = 0; i < n; ++i) {
             float x = in0 ? in0[i] : 0.0f;
-            if (oper == "NEG") out[i] = -x;
-            else if (oper == "EXP") out[i] = std::exp(x);
-            else if (oper == "SQRT") out[i] = (x >= 0) ? std::sqrt(x) : 0.0f;
-            else if (oper == "RSQRT") out[i] = (x > 0) ? 1.0f / std::sqrt(x) : 0.0f;
-            else if (oper == "LOG") out[i] = (x > 0) ? std::log(x) : 0.0f;
-            else if (oper == "ABS") out[i] = std::fabs(x);
-            else if (oper == "SIN") out[i] = std::sin(x);
-            else if (oper == "COS") out[i] = std::cos(x);
-            else if (oper == "SIGMOID" || oper == "SWISH" || oper == "HARD_SIGMOID")
-                out[i] = 1.0f / (1.0f + std::exp(-x));
-            else if (oper == "TANH") out[i] = std::tanh(x);
-            else if (oper == "GELU" || oper == "GELU_TANH")
-                out[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
-            else if (oper == "RELU") out[i] = std::max(0.0f, x);
-            else out[i] = x;
+            switch (oper) {
+            case 8:  out[i] = -x; break;                                   /* NEG */
+            case 5:  out[i] = std::exp(x); break;                          /* EXP */
+            case 15: out[i] = (x >= 0) ? std::sqrt(x) : 0.0f; break;       /* SQRT */
+            case 12: out[i] = (x > 0) ? 1.0f / std::sqrt(x) : 0.0f; break; /* RSQRT */
+            case 7:  out[i] = (x > 0) ? std::log(x) : 0.0f; break;         /* LOG */
+            case 0:  out[i] = std::fabs(x); break;                         /* ABS */
+            case 14: out[i] = std::sin(x); break;                          /* SIN */
+            case 4:  out[i] = std::cos(x); break;                          /* COS */
+            case 10: out[i] = (x != 0.0f) ? 1.0f / x : 0.0f; break;        /* RECIPROCAL */
+            case 6:  out[i] = 1.0f / (1.0f + std::exp(-x)); break;         /* SIGMOID */
+            case 8 + 100: out[i] = std::tanh(x); break;                    /* TANH(neuron) */
+            case 1:  out[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608f *
+                        (x + 0.044715f * x * x * x))); break;              /* GELU */
+            case 4 + 100: out[i] = std::max(0.0f, x); break;               /* RELU(neuron) */
+            case 7 + 100: out[i] = std::log(1.0f + std::exp(x)); break;    /* SOFTPLUS */
+            default: out[i] = x; break;
+            }
+        }
+        /* Neuron 的 TANH(8)/RELU(4)与 Unary 值冲突 —— 按 op 类型二次分派 */
+        if (op_type_name == "ElementWiseNeuron" && (oper == 8 || oper == 4)) {
+            for (size_t i = 0; i < n; ++i) {
+                float x = in0 ? in0[i] : 0.0f;
+                out[i] = (oper == 8) ? std::tanh(x) : std::max(0.0f, x);
+            }
         }
     } else if (op_type_name == "Eltwise_Ternary") {
         // SELECT 语义(eltwise_type scalar): out = in0(cond) ? in1 : in2
@@ -297,10 +357,53 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                 out[i] = (src < n) ? in0[src] : 0.0f;
             }
         }
+    } else if (op_type_name == "StridedSlice") {
+        // 4D C 序切片: ranges = [begin,end,stride]×rank(int32 经 float 缓冲
+        // 传递), 由 execute_host 注入的 tensor_param 提供(inputs[1])。
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        /* ranges 是 int32 数据(execute_host 缓冲按 float 存字节, 位模式不变) */
+        const int32_t* rg = (inputs.size() > 1) ? reinterpret_cast<const int32_t*>(inputs[1]) : nullptr;
+        if (!in0 || !rg) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; }
+        else {
+            uint32_t rank = out_def.rank;
+            if (rank > 4) rank = 4;
+            int b[4] = {0, 0, 0, 0}, e[4] = {0, 0, 0, 0}, s[4] = {1, 1, 1, 1};
+            for (uint32_t ax = 0; ax < rank; ax++) {
+                b[ax] = (int)rg[ax * 3 + 0];
+                e[ax] = (int)rg[ax * 3 + 1];
+                s[ax] = (int)rg[ax * 3 + 2];
+                if (s[ax] == 0) s[ax] = 1;
+            }
+            /* 输入形状(in_defs[0], 4D 填充)与输出形状逐轴 */
+            uint32_t id_[4] = {1, 1, 1, 1};
+            if (!in_defs.empty())
+                for (uint32_t ax = 0; ax < in_defs[0].rank && ax < 4; ax++)
+                    id_[ax] = in_defs[0].dims[ax];
+            size_t in_strides[4] = {1, 1, 1, 1};
+            for (int d = 2; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
+            uint32_t od[4] = {1, 1, 1, 1};
+            for (uint32_t ax = 0; ax < rank; ax++) od[ax] = out_def.dims[ax];
+            size_t out_strides[4] = {1, 1, 1, 1};
+            for (int d = 2; d >= 0; d--) out_strides[d] = out_strides[d + 1] * od[d + 1];
+            for (size_t i = 0; i < n; i++) {
+                size_t rem = i, src = 0;
+                for (uint32_t d = 0; d < rank; d++) {
+                    size_t c = rem / out_strides[d];
+                    rem %= out_strides[d];
+                    src += (size_t)(b[d] + (int)c * s[d]) * in_strides[d];
+                }
+                out[i] = in0[src];
+            }
+        }
     } else if (op_type_name == "Concat") {
-        // Concat: join inputs along axis.  axis from params or default last.
+        // Concat: join inputs along axis.  axis from scalar 通道
+        // (params 是 pack_scalar_params blob, 开头非 axis — memcpy 直读是
+        // 布局硬假设, probe 实锤越界)。
         int axis = -1;
-        if (params.size() >= 4) { int32_t a; std::memcpy(&a, params.data(), 4); axis = a; }
+        auto sp2 = unpack_scalar_params(params);
+        if (const ScalarParam* p = scalar_get(sp2, "axis"))
+            axis = (int)(p->is_numeric ? p->value_num
+                                     : std::strtol(p->value_str.c_str(), nullptr, 10));
         uint32_t rank = out_def.rank;
         if (axis < 0) axis += rank;
         if (axis < 0) axis = (int)rank - 1;
@@ -369,8 +472,36 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         }
 
     // ── Normalization ──
+    } else if (op_type_name == "RmsNorm") {
+        // RMSNorm(与 LayerNorm 不同: 不减均值): y = x/sqrt(mean(x²)+eps) * γ (+β)
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        const float* scale = (inputs.size() > 1) ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
+        const float* bias  = (inputs.size() > 2) ? reinterpret_cast<const float*>(inputs[2]) : nullptr;
+        if (!in0) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; }
+        else {
+            uint32_t rk = out_def.rank;
+            while (rk > 0 && out_def.dims[rk - 1] == 1) rk--;
+            size_t C = (rk >= 1) ? out_def.dims[rk - 1] : 1;
+            if (C == 0) C = 1;
+            size_t groups = n / C;
+            if (groups == 0) groups = 1;
+            for (size_t g = 0; g < groups; g++) {
+                double acc = 0.0;
+                for (size_t c = 0; c < C; c++) {
+                    float v = in0[g * C + c];
+                    acc += (double)v * (double)v;
+                }
+                float inv = 1.0f / std::sqrt((float)(acc / (double)C) + 1e-6f);
+                for (size_t c = 0; c < C; c++) {
+                    float v = in0[g * C + c] * inv;
+                    if (scale) v *= scale[c % C];
+                    if (bias) v += bias[c % C];
+                    out[g * C + c] = v;
+                }
+            }
+        }
     } else if (op_type_name == "BatchNorm" || op_type_name == "LayerNorm" ||
-               op_type_name == "RmsNorm" || op_type_name == "InstanceNorm" ||
+               op_type_name == "InstanceNorm" ||
                op_type_name == "GroupNorm") {
         // Generic normalization: inputs[0]=data, inputs[1]=scale, inputs[2]=bias
         // For host reference: normalize to zero-mean/unit-variance, then scale+bias
@@ -399,45 +530,167 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                 }
             }
         }
+    } else if (op_type_name == "Gather") {
+        // Gather: inputs[0]=表 const, inputs[1]=索引(execute_host 中 int32
+        // 以 float 缓冲传递, 值在 2^24 内精确)。行宽 = 表末维; n = 输出元素。
+        const float* tbl = inputs.size() > 0 ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
+        const float* idx = inputs.size() > 1 ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
+        if (!tbl || !idx) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; }
+        else {
+            uint32_t tr = (in_defs.size() > 0) ? in_defs[0].rank : 0;
+            while (tr > 0 && in_defs[0].dims[tr - 1] == 1) tr--;
+            size_t row_w = (tr >= 1) ? in_defs[0].dims[tr - 1] : 1;
+            if (row_w == 0) row_w = 1;
+            size_t rows = n / row_w;
+            for (size_t i = 0; i < rows; i++) {
+                int r = (int)idx[i];
+                if (r < 0) r = 0;
+                const float* src = tbl + (size_t)r * row_w;
+                for (size_t j = 0; j < row_w; j++) out[i * row_w + j] = src[j];
+            }
+        }
+    } else if (op_type_name == "Split") {
+        // Split(host 参考): 输入沿 axis(缺省末维)等段切; 本副本取
+        // split_index 段(loader 注入)。n = 本段元素数。
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        auto sp3 = unpack_scalar_params(params);
+        int split_index = 0;
+        if (const ScalarParam* p = scalar_get(sp3, "split_index"))
+            split_index = (int)(p->is_numeric ? p->value_num
+                                              : std::strtol(p->value_str.c_str(), nullptr, 10));
+        if (!in0 || in_defs.empty()) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; }
+        else {
+            uint32_t ar = in_defs[0].rank;
+            while (ar > 0 && in_defs[0].dims[ar - 1] == 1) ar--;
+            size_t in_axis_len = (ar >= 1) ? in_defs[0].dims[ar - 1] : 1;
+            if (in_axis_len == 0) in_axis_len = 1;
+            size_t outer = n > 0 ? 0 : 0;
+            size_t in_n = 1;
+            for (uint32_t d = 0; d < ar; d++) in_n *= in_defs[0].dims[d];
+            outer = in_n / in_axis_len;
+            size_t seg_len = n / (outer ? outer : 1);
+            size_t seg_off = (size_t)split_index * seg_len;
+            for (size_t o = 0; o < outer; o++) {
+                const float* src = in0 + o * in_axis_len + seg_off;
+                for (size_t j = 0; j < seg_len; j++) out[o * seg_len + j] = src[j];
+            }
+        }
     } else if (op_type_name == "Softmax") {
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
         if (!in0) { for (size_t i=0;i<n;++i) out[i]=0; return; }
-        float mx = in0[0];
-        for (size_t i = 1; i < n; ++i) if (in0[i] > mx) mx = in0[i];
-        float sum = 0.0f;
-        for (size_t i = 0; i < n; ++i) { out[i] = std::exp(in0[i] - mx); sum += out[i]; }
-        if (sum > 0) for (size_t i = 0; i < n; ++i) out[i] /= sum;
+        /* per-row softmax: 行宽 = axis(缺省末维)维长; 行数 = n/行宽 */
+        auto sp4 = unpack_scalar_params(params);
+        int axis = -1;
+        if (const ScalarParam* p = scalar_get(sp4, "axis"))
+            axis = (int)(p->is_numeric ? p->value_num
+                                       : std::strtol(p->value_str.c_str(), nullptr, 10));
+        uint32_t rk = out_def.rank;
+        while (rk > 0 && out_def.dims[rk - 1] == 1) rk--;
+        int ax = axis;
+        if (ax < 0) ax += (int)rk;
+        if (ax < 0 || ax >= (int)rk) ax = (int)rk - 1;
+        size_t row_w = (rk > 0) ? out_def.dims[ax] : 1;
+        if (row_w == 0) row_w = 1;
+        size_t rows = n / row_w;
+        for (size_t r = 0; r < rows; r++) {
+            float mx = in0[r * row_w];
+            for (size_t i = 1; i < row_w; ++i)
+                if (in0[r * row_w + i] > mx) mx = in0[r * row_w + i];
+            float sum = 0.0f;
+            for (size_t i = 0; i < row_w; ++i) {
+                out[r * row_w + i] = std::exp(in0[r * row_w + i] - mx);
+                sum += out[r * row_w + i];
+            }
+            if (sum > 0)
+                for (size_t i = 0; i < row_w; ++i) out[r * row_w + i] /= sum;
+        }
     } else if (op_type_name == "MatMul" || op_type_name == "Dense"
                || op_type_name == "FullyConnected") {
         // MatMul: C[m,n] = A[m,k] @ B[k,n]
-        // in_defs[0] = A shape [m,k], in_defs[1] = B shape [k,n]
-        // output_def.dims = [m, n]
+        // QNN 4D 填充: 逻辑形状 [m,k] 存为 [m,k,1,...] 或 [1,m,k,1] —
+        // "末二维"启发失效; 压掉尾部 1 维得有效 rank, 批维全折
+        // (与 extract_matmul_extra / 设备 exec_matmul_f16 同规则)。
         const float* A = inputs.size() > 0 ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
         const float* B = inputs.size() > 1 ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
         if (!A || !B) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; return; }
-        // Determine m, n from output_def; k from input shapes.
-        // After batch-dim padding, rank-2 matrices [m,n] become [1,1,m,n].
-        // Always use the LAST two dimensions for the matrix shape.
-        size_t m = (out_def.rank >= 2) ? out_def.dims[out_def.rank - 2] : 1;
-        size_t nn = (out_def.rank >= 1) ? out_def.dims[out_def.rank - 1] : n;
+        auto eff_rank = [](const OutputDef& d) {
+            uint32_t r = d.rank;
+            while (r > 0 && d.dims[r - 1] == 1) r--;
+            return r;
+        };
+        auto sp = unpack_scalar_params(params);
+        uint32_t ork = eff_rank(out_def);
+        size_t m = 1;
+        for (uint32_t i = 0; i + 1 < ork; i++) m *= out_def.dims[i];
+        size_t nn = (ork >= 1) ? out_def.dims[ork - 1] : 1;
         size_t k = 0;
-        // Prefer: k from B's second-to-last dim (B is [..., k, n])
-        if (in_defs.size() > 1 && in_defs[1].rank >= 2 && in_defs[1].dims[in_defs[1].rank - 2] > 0) {
-            k = in_defs[1].dims[in_defs[1].rank - 2];
-        } else if (in_defs.size() > 0 && in_defs[0].rank >= 2 && in_defs[0].dims[in_defs[0].rank - 1] > 0) {
-            k = in_defs[0].dims[in_defs[0].rank - 1];
-        } else if (m > 0) {
-            k = m;
+        bool t0 = false, t1 = false;
+        /* transpose 判定: scalar 标志优先(None/空串 = 未设置 = 0),
+         * 否则形状自洽(converter 的 qkv 预合并 MatMul 无 scalar 标志,
+         * B 直接存 [n,k]) */
+        if (const ScalarParam* p = scalar_get(sp, "transpose_in1"))
+            t1 = p->is_numeric ? (p->value_num != 0)
+                               : (!p->value_str.empty() && p->value_str != "0");
+        /* FC 语义固定 W 存 [N,K](方阵时形状自洽无法判转置 — probe
+         * attn_out W 64×64 实锤; emit 侧 FC 分支同样硬编码 flags=2) */
+        if (op_type_name == "FullyConnected") t1 = true;
+        if (in_defs.size() > 1) {
+            uint32_t br = eff_rank(in_defs[1]);
+            if (br >= 2) {
+                size_t k_nt = in_defs[1].dims[br - 2], n_nt = in_defs[1].dims[br - 1];
+                size_t k_t = n_nt, n_t = k_nt;
+                if (!t1 && n_nt != nn && n_t == nn) t1 = true;   /* 形状自洽判转置 */
+                k = t1 ? k_t : k_nt;
+            } else if (br >= 1) {
+                k = in_defs[1].dims[br - 1];
+            }
+        } else if (in_defs.size() > 0) {
+            uint32_t ar = eff_rank(in_defs[0]);
+            if (ar >= 1) k = in_defs[0].dims[ar - 1];
         }
         if (k == 0) k = 1;
+        /* A 侧转置: A 元素数 = m*k 自洽, 否则试 [k,m] */
+        if (in_defs.size() > 0 && m * k > 1) {
+            size_t a_n = 1;
+            uint32_t ar = eff_rank(in_defs[0]);
+            for (uint32_t i = 0; i < ar; i++) a_n *= in_defs[0].dims[i];
+            if (a_n != m * k && a_n == nn * k) { t0 = true; std::swap(m, nn); }
+        }
+        /* batched BMM(attention): A [B,M,K] × B [B,N,K](t1)/[B,K,N] → [B,M,N] */
+        bool batched = (ork >= 3 && in_defs.size() > 1);
+        if (batched) {
+            uint32_t br2 = eff_rank(in_defs[1]);
+            if (br2 < 3) batched = false;
+            else for (uint32_t i = 0; i + 2 < ork && batched; i++)
+                if (out_def.dims[i] != in_defs[1].dims[i]) batched = false;
+        }
+        if (batched) {
+            size_t Bn = 1;
+            for (uint32_t i = 0; i + 2 < ork; i++) Bn *= out_def.dims[i];
+            size_t M2 = out_def.dims[ork - 2], N2 = out_def.dims[ork - 1];
+            for (size_t b = 0; b < Bn; b++)
+                for (size_t i = 0; i < M2; i++)
+                    for (size_t j = 0; j < N2; j++) {
+                        float acc = 0.0f;
+                        for (size_t p = 0; p < k; p++) {
+                            float av = A[(b * M2 + i) * k + p];
+                            float bv = t1 ? B[(b * N2 + j) * k + p] : B[(b * k + p) * N2 + j];
+                            acc += av * bv;
+                        }
+                        out[(b * M2 + i) * N2 + j] = acc;
+                    }
+        } else {
         for (size_t i = 0; i < m; ++i) {
             for (size_t j = 0; j < nn; ++j) {
                 float acc = 0.0f;
                 for (size_t p = 0; p < k; ++p) {
-                    acc += A[i * k + p] * B[p * nn + j];
+                    float av = t0 ? A[(size_t)p * m + i] : A[i * k + p];
+                    float bv = t1 ? B[j * k + p] : B[p * nn + j];
+                    acc += av * bv;
                 }
                 out[i * nn + j] = acc;
             }
+        }
         }
     } else if (op_type_name == "Conv" || op_type_name == "Conv2d"
                || op_type_name == "DepthWiseConv2d") {

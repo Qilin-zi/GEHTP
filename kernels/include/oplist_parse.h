@@ -72,9 +72,11 @@ enum {
     OP_SOFTMAX_F16 = 13,    /* [x_t,y_t,rows,n]       rows = 行数(每行 n 元素) */
     OP_CONCAT_F16 = 14,     /* [in_t0..7,out_t,axis,n_segments,n_elems,size0..3] arity 16
                                 (每段 axis 维尺寸显式; ≤4 段, 0.8B 实测 2-3 段) */
-    OP_STRIDED_SLICE_F16 = 15, /* [x_t,y_t,n_out,rank,b0..2,e0..2,s0..2] arity 13
-                                rank≤3 通用切片(rank4 且 dim0=1 由 emit 降 rank) */
-    OP_SPLIT_F16 = 16,      /* [x_t,out_t0..7,axis,n_segments,size0..3] arity 15 */
+    OP_STRIDED_SLICE_F16 = 15, /* [x_t,y_t,n_out,rank,b0..2,e0..2,s0..2,d0..2]
+                                arity 16: rank≤3 通用切片, d=输入 dims(rank4 且
+                                dim0=1 由 emit 降 rank 并取轴 1..3) */
+    OP_SPLIT_F16 = 16,      /* [x_t,out_t0..7,axis,n_segments,size0..3,split_index]
+                                arity 16 (副本 op 取第 split_index 段写 out_t0) */
     OP_REDUCE_F16 = 17,     /* [x_t,y_t,n,axis,subtype,dim0..3] arity 9
                                 n=输入元素数, dims=输入形状(rank≤4) */
     OP_CUMSUM_F32 = 18,     /* [x_t,y_t,rows,n,axis,exclusive,reverse] f32 保持 */
@@ -90,9 +92,10 @@ enum {
                                (无 crouton); n=总元素, 行宽=w 槽长/2, m=n/行宽;
                                b_s 为 bias 槽(无 bias 时 zero dummy 槽); eps=1e-6
                                (opcode 2 保留 conv 管线 crouton 契约不动) */
-    OP_BROADCAST_F16 = 26,  /* [b_ref,y_t,n,b_elems] C 序循环展开: y[i]=b[i%b_elems]
-                               (emit 在二元 op 前把广播操作数物化为全尺寸 temp;
-                                保持 OP_ADD/OP_BINARY 纯元素语义不动) */
+    OP_BROADCAST_F16 = 26,  /* [b_ref,y_t,n,b_elems,in_d0..3,out_d0..3] numpy 广播
+                               (右对齐逐轴: in==1 的轴扩到 out, 缺失轴视 1);
+                               emit 在二元 op 前把广播操作数物化为全尺寸 temp,
+                               保持 OP_ADD/OP_BINARY 纯元素语义不动 */
     OP_TRANSPOSE_GEN_F16 = 27, /* [x_ref,y_t,rank,d0..d3,perm4B] 通用 N-D C 序转置
                                (rank 2/3/4; dims 为输入形状; opcode 10 保留
                                conv 管线 4-D NCHW 契约不动) */
@@ -114,8 +117,8 @@ enum {
 #define WT_ARITY_BINARY_F16 5
 #define WT_ARITY_SOFTMAX_F16 4
 #define WT_ARITY_CONCAT_F16 16
-#define WT_ARITY_STRIDED_SLICE_F16 13
-#define WT_ARITY_SPLIT_F16 15
+#define WT_ARITY_STRIDED_SLICE_F16 16
+#define WT_ARITY_SPLIT_F16 16
 #define WT_ARITY_REDUCE_F16 9
 #define WT_ARITY_CUMSUM_F32 7
 #define WT_ARITY_CONV1D_SSM_F16 6
@@ -125,8 +128,8 @@ enum {
 #define WT_ARITY_KV_GATHER_F16 5
 #define WT_ARITY_MATMUL_F16 7
 #define WT_ARITY_RMSNORM2_F16 5
-#define WT_ARITY_BROADCAST_F16 4
-#define WT_ARITY_TRANSPOSE_GEN_F16 9
+#define WT_ARITY_BROADCAST_F16 12
+#define WT_ARITY_TRANSPOSE_GEN_F16 8
 
 struct wt_slot {
     uint32_t len;

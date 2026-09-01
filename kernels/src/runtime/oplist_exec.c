@@ -539,6 +539,7 @@ static int exec_split(const struct wt_blob* b, const struct wt_op* op,
     uint32_t x_t = op->args[0];
     uint32_t n_seg = op->args[10];
     uint32_t sizes[4] = {op->args[11], op->args[12], op->args[13], op->args[14]};
+    uint32_t split_index = op->args[15];  /* 副本 op 取第 split_index 段写 out0 */
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     if (!x) { snprintf(err, errn, "split in fail"); return -1; }
     uint32_t total_axis = 0;
@@ -551,12 +552,20 @@ static int exec_split(const struct wt_blob* b, const struct wt_op* op,
     if ((x_t & 0x8000u) == 0 && x_t < MAX_TEMPS) x_elems = g_exec.temp_bytes[x_t] / 2u;
     if (x_elems == 0) { snprintf(err, errn, "split x size"); return -1; }
     uint32_t outer = x_elems / total_axis;
+    /* 副本语义: 本 op 只写自己的段(第 split_index 段 → out0 槽);
+     * 其余段 temp 不分配(emit 已按副本只建 out0)。
+     * last-dim split = concat 之逆: 段 k = 每 outer 行内 [off_k, off_k+seg)
+     * 通道 strided 段, 非连续块(probe q/k/v 实锤) */
     uint32_t off = 0;
     for (uint32_t k = 0; k < n_seg && k < 4; k++) {
-        uint16_t* yk = (uint16_t*)temp_get(op->args[1 + k], (size_t)outer * sizes[k] * 2u);
-        if (!yk) { snprintf(err, errn, "split out fail"); return -1; }
-        memcpy(yk, x + off, (size_t)outer * sizes[k] * 2u);
-        off += outer * sizes[k];
+        if (k == split_index) {
+            uint16_t* yk = (uint16_t*)temp_get(op->args[1], (size_t)outer * sizes[k] * 2u);
+            if (!yk) { snprintf(err, errn, "split out fail"); return -1; }
+            for (uint32_t o = 0; o < outer; o++)
+                memcpy(yk + (size_t)o * sizes[k],
+                       x + (size_t)o * total_axis + off, sizes[k] * 2u);
+        }
+        off += sizes[k];
     }
     return 0;
 }
@@ -654,17 +663,37 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
 }
 
 /* f16×f16 GEMM (float 图; f32 累加 f16 存储)。M3c 正确性版 —— 性能版
- * 走 HMX (M7)。flags bit0 = a 转置(存 [K,M]), bit1 = w 转置(存 [N,K])。 */
+ * 走 HMX (M7)。flags bit0 = a 转置(存 [K,M]), bit1 = w 转置(存 [N,K]),
+ * bit2 = batched BMM(attention q·kᵀ/probs·v; 批数在高 16 位) */
 static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
                            char* err, size_t errn) {
-    uint32_t a_t = op->args[0], w_s = op->args[1] & 0x7FFFu, out_t = op->args[2];
+    uint32_t a_t = op->args[0], w_s = op->args[1], out_t = op->args[2];
     uint32_t M = op->args[3], K = op->args[4], N = op->args[5];
     uint32_t flags = op->args[6];
     int t0 = (int)(flags & 1u), t1 = (int)(flags & 2u);
+    int batched = (int)(flags & 4u);
+    uint32_t Bn = flags >> 16;
+    if (Bn == 0) Bn = 1;
     const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
-    const uint16_t* w = (const uint16_t*)slot_ptr(b, w_s);
-    uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N * 2u);
+    /* w 可为 slot(权重)或 temp(运行时 B, 如 attention q·kᵀ) */
+    const uint16_t* w = (const uint16_t*)ref_ptr(b, op->args[1]);
+    uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N * Bn * 2u);
     if (!a || !w || !y) { snprintf(err, errn, "matmul_f16 ref fail"); return -1; }
+    if (batched) {
+        for (uint32_t bb = 0; bb < Bn; bb++)
+            for (uint32_t m = 0; m < M; m++)
+                for (uint32_t n = 0; n < N; n++) {
+                    float acc = 0.0f;
+                    for (uint32_t k = 0; k < K; k++) {
+                        float av = f16_to_f32(a[((size_t)bb * M + m) * K + k]);
+                        float wv = f16_to_f32(w[t1 ? ((size_t)bb * N + n) * K + k
+                                                  : ((size_t)bb * K + k) * N + n]);
+                        acc += av * wv;
+                    }
+                    y[((size_t)bb * M + m) * N + n] = f32_to_f16(acc);
+                }
+        return 0;
+    }
     for (uint32_t m = 0; m < M; m++)
         for (uint32_t n = 0; n < N; n++) {
             float acc = 0.0f;
@@ -709,14 +738,38 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
-/* C 序循环展开: y[i] = b[i % b_elems](广播操作数物化为全尺寸) */
+/* numpy 广播: 右对齐逐轴, in==1 的轴扩到 out(缺失轴视 1)。
+ * in_d/out_d 为 QNN 4D 填充 dims; 压尾 1 得有效 rank 后解坐标。 */
 static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
                           char* err, size_t errn) {
     uint32_t b_t = op->args[0], y_t = op->args[1], n = op->args[2], b_elems = op->args[3];
+    uint32_t in_d[4] = {op->args[4], op->args[5], op->args[6], op->args[7]};
+    uint32_t out_d[4] = {op->args[8], op->args[9], op->args[10], op->args[11]};
     const uint16_t* x = (const uint16_t*)ref_ptr(b, b_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)n * 2u);
     if (!x || !y || b_elems == 0) { snprintf(err, errn, "broadcast ref fail"); return -1; }
-    for (uint32_t i = 0; i < n; i++) y[i] = x[i % b_elems];
+    uint32_t r = 4;
+    while (r > 0 && out_d[r - 1] == 1) r--;
+    uint32_t ir = 4;
+    while (ir > 0 && in_d[ir - 1] == 1) ir--;
+    if (r == 0) r = 1;
+    if (ir > r) ir = r;  /* 输入 rank 不得高于输出(右对齐前导 1 已折叠) */
+    uint32_t istr[4] = {1, 1, 1, 1};
+    for (int i = (int)ir - 2; i >= 0; i--) istr[i] = istr[i + 1] * in_d[i + 1];
+    uint32_t ostr[4] = {1, 1, 1, 1};
+    for (int i = (int)r - 2; i >= 0; i--) ostr[i] = ostr[i + 1] * out_d[i + 1];
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t rem = i, in_lin = 0;
+        uint32_t lead = r - ir;  /* 输入右对齐: 前 lead 轴广播为 0 */
+        for (uint32_t d = 0; d < r; d++) {
+            uint32_t c = rem / ostr[d];
+            rem %= ostr[d];
+            if (d < lead) continue;
+            uint32_t idim = in_d[d - lead];
+            if (idim > 1) in_lin += c * istr[d - lead];
+        }
+        y[i] = x[in_lin];
+    }
     return 0;
 }
 
@@ -763,35 +816,40 @@ static int exec_transpose_gen(const struct wt_blob* b, const struct wt_op* op,
 
 static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
                       char* err, size_t errn) {
-    /* rank≤3 通用切片: [x,y,n_out,rank,b0..2,e0..2,s0..2]
-       输入形状由 emit 保证(dim0=1 的 rank4 已降 rank3); 这里线性遍历:
-       末维 stride 1 的常见形态(RoPE) 快路 + 通用三重循环 */
+    /* rank≤3 通用切片: 输出线性 → 输出坐标 → 输入坐标 = b[ax]+c*s[ax]
+     * → 输入线性(d 为输入 dims, C 序)。probe RoPE 半切为末维切片形态。 */
     uint32_t x_t = op->args[0], y_t = op->args[1], n_out = op->args[2];
     uint32_t rk = op->args[3];
     uint32_t b0 = op->args[4], b1 = op->args[5], b2 = op->args[6];
     uint32_t e0 = op->args[7], e1 = op->args[8], e2 = op->args[9];
     uint32_t s0 = op->args[10], s1 = op->args[11], s2 = op->args[12];
+    uint32_t d0 = op->args[13], d1 = op->args[14], d2 = op->args[15];
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, n_out * 2u);
     if (!x || !y) { snprintf(err, errn, "slice ref fail"); return -1; }
-    /* 快路: 末两维 stride=1 且 rk=2/3 的连续段拷贝(输入形状 = 输出形状按
-       stride 关系; 输入末维长 = (e2-b2)*s2 (s2=1 时 = 段长)。
-       通用可靠实现: 三重循环需要输入 dims — 契约未含; 由 emit 保证快路
-       形态(rk≤3、末维 stride=1、rank4 dim0=1 降级)。
-       快路假设输入为 [d0,d1,d2] 且 y 拷贝 [b0:e0:s0,b1:e1:s1,b2:e2:s2]。
-       以 s2=1 实现: y[i] = x[b0*D1*D2 + b1*D2 + b2 + i'] — D1/D2 不可知。
-       最终方案: 本 op 在 0.8B 中均为 RoPE 后半切片(dim 轴=末维, 连续) —
-       按"末维连续段"实现: 每行(n_out/rows 个)拷贝 x 中偏移 b2 起的段,
-       行数 = n_out/段长。段长由 emit 的 end-begin 保证 = n_out 每行。 */
-    uint32_t seg = (rk >= 3) ? (e2 - b2) / s2 : n_out;
-    if (seg == 0) seg = n_out;
-    uint32_t rows = n_out / seg;
-    uint32_t src_seg = (rk >= 3 && s2 == 1) ? seg : seg;
-    for (uint32_t r = 0; r < rows; r++) {
-        uint32_t src_off = 0;
-        if (rk >= 3) src_off = (b2 + r * s1) * 0;  /* 占位: 输入行宽未知 */
-        (void)src_off;
-        memcpy(y + (size_t)r * src_seg, x + (size_t)r * src_seg, src_seg * 2u);
+    if (rk < 1 || rk > 3) { snprintf(err, errn, "slice rank %u", rk); return -1; }
+    uint32_t bb[3] = {b0, b1, b2}, ee[3] = {e0, e1, e2}, ss[3] = {s0, s1, s2};
+    uint32_t dd[3] = {d0, d1, d2};
+    uint32_t od[3] = {1, 1, 1};
+    for (uint32_t ax = 0; ax < rk; ax++) {
+        if (ss[ax] == 0) ss[ax] = 1;
+        uint32_t span = (ee[ax] > bb[ax]) ? ee[ax] - bb[ax] : 0;
+        od[ax] = (span + ss[ax] - 1) / ss[ax];
+    }
+    uint32_t istr[3], ostr[3];
+    istr[rk - 1] = 1; ostr[rk - 1] = 1;
+    for (int i = (int)rk - 2; i >= 0; i--) {
+        istr[i] = istr[i + 1] * dd[i + 1];
+        ostr[i] = ostr[i + 1] * od[i + 1];
+    }
+    for (uint32_t i = 0; i < n_out; i++) {
+        uint32_t rem = i, in_lin = 0;
+        for (uint32_t ax = 0; ax < rk; ax++) {
+            uint32_t c = rem / ostr[ax];
+            rem %= ostr[ax];
+            in_lin += (bb[ax] + c * ss[ax]) * istr[ax];
+        }
+        y[i] = x[in_lin];
     }
     return 0;
 }
