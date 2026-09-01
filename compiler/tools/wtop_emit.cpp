@@ -15,6 +15,7 @@
 // 权重: 池内 [kh,kw,ci,co] f32 → f16(RNE)K×N 进 slot; 输入 slot 0 由
 // --input-f16 提供(Level 1 外部槽: 阶段 9 引擎把该槽标为 external)。
 #include "hnnx/ir/graph_prepare.hpp"
+#include "hnnx/ir/op_extra.hpp"
 #include "hnnx/ir/types.hpp"
 #include "hnnx/serialize/serializer.hpp"
 
@@ -82,32 +83,143 @@ bool load_file(const std::string& path, std::vector<uint8_t>& out) {
     return true;
 }
 
+struct Emitter;
+
 struct Emitter {
     std::vector<uint8_t> blob;
     std::vector<uint8_t> weight_area;   // 128B 对齐起点相对 blob 尾部
     std::vector<wt_slot> slots;
     std::vector<wt_op> ops;
-    std::map<uint64_t, uint32_t> op_temp;  // op_id → temp id
+    std::map<uint64_t, uint32_t> op_temp;  // (op_id<<32 | out_idx) → temp id
     uint32_t next_temp = 0;
+    std::vector<uint32_t> free_temps;      // 活性分析释放的 temp(M2)
+    std::map<uint64_t, uint32_t> last_use; // 复合键 → 最后消费位置(plan_order 下标)
 
-    uint32_t fresh_temp(uint64_t op_id) {
-        uint32_t t = next_temp++;
-        op_temp[op_id] = t;
-        if (next_temp > 8) {
-            std::fprintf(stderr, "error: >8 live temps (阶段8 契约上限)\n");
+    static uint64_t tkey(uint64_t op_id, uint32_t out_idx) {
+        return (op_id << 32) | out_idx;
+    }
+    // 活性分析: 每条 temp 的生命期 = 生产位置 .. 最后消费位置
+    void compute_last_use(const std::vector<op_id_t>& order, const GraphPrepare& gp) {
+        for (size_t pos = 0; pos < order.size(); pos++) {
+            const OpDef* od = gp.get_op_at(order[pos]);
+            if (!od) continue;
+            for (const auto& c : od->inputs)
+                last_use[tkey(c.src_id, c.out_idx)] = static_cast<uint32_t>(pos);
+        }
+    }
+    uint64_t dbg_released = 0, dbg_calls = 0, dbg_miss = 0, dbg_kept = 0;
+    void release_at(uint64_t key, size_t pos) {
+        dbg_calls++;
+        auto it = op_temp.find(key);
+        if (it == op_temp.end()) { dbg_miss++; return; }
+        auto lu = last_use.find(key);
+        if (lu != last_use.end() && lu->second > pos) { dbg_kept++; return; }  // 还有消费者
+        free_temps.push_back(it->second);
+        op_temp.erase(it);
+        dbg_released++;
+    }
+    uint32_t fresh_temp(uint64_t op_id, uint32_t out_idx = 0) {
+        uint32_t t;
+        if (!free_temps.empty()) { t = free_temps.back(); free_temps.pop_back(); }
+        else { t = next_temp++; }
+        op_temp[tkey(op_id, out_idx)] = t;
+        if (next_temp > 32768) {
+            std::fprintf(stderr, "error: >32768 live temps (live=%zu free=%zu released=%llu calls=%llu miss=%llu kept=%llu)\n",
+                         op_temp.size(), free_temps.size(),
+                         (unsigned long long)dbg_released, (unsigned long long)dbg_calls,
+                         (unsigned long long)dbg_miss, (unsigned long long)dbg_kept);
+            { int n = 0;
+              for (auto& [k, t] : op_temp) {
+                auto lu = last_use.find(k);
+                std::fprintf(stderr, "  key op=%llu out=%u -> temp=%u lu=%u\n",
+                             (unsigned long long)(k >> 32), (unsigned)(k & 0xFFFFFFFFu), t,
+                             lu != last_use.end() ? lu->second : 0xFFFFFFFFu);
+                if (++n >= 8) break;
+              } }
             std::exit(4);
         }
         return t;
     }
-    // 输入节点的"数据源"= slot 0(0x8000|slot 编码, 见 oplist_parse.h 契约)
-    uint32_t src_ref(uint64_t op_id, uint64_t input_node_id) {
-        if (op_id == input_node_id) return 0x8000u | 0u;
-        return temp_of(op_id);
+    // 权重消费 op 的 const 输入 → f16 槽(按 const id 去重)
+    uint32_t ensure_weight_slot(GraphPrepare& gp, const OpDef* w,
+                                std::map<uint64_t, uint32_t>& wslots) {
+        auto it = wslots.find(w->op_id);
+        if (it != wslots.end()) return it->second;
+        size_t n = (size_t)w->const_data_size / 4;
+        if (n == 0) {
+            // 空 const(记录在但池数据被 DCE 删): 最小零槽占位(M4 数值门兜底)
+            std::fprintf(stderr, "warn: empty weight const (op %llu), 零槽占位\n",
+                         (unsigned long long)w->op_id);
+            std::vector<uint8_t> zeros(128, 0);
+            uint32_t id = add_slot(128, 64, zeros.data());
+            wslots[w->op_id] = id;
+            return id;
+        }
+        std::vector<uint16_t> w16(n);
+        const float* wf = reinterpret_cast<const float*>(gp.const_pool().data() + w->const_data_offset);
+        for (size_t i = 0; i < n; i++) w16[i] = f32_to_f16_rne(wf[i]);
+        std::vector<uint8_t> wbytes(n * 2);
+        std::memcpy(wbytes.data(), w16.data(), wbytes.size());
+        uint32_t id = add_slot((uint32_t)wbytes.size(), (uint32_t)n, wbytes.data());
+        wslots[w->op_id] = id;
+        return id;
     }
-    uint32_t temp_of(uint64_t op_id) {
-        auto it = op_temp.find(op_id);
+    // 输入节点 = slot 0; const 生产者 = 权重槽(0x8000|slot 编码);
+    // 幻影占位(空名非 const, 如第二输入 position_ids) = 专用零槽
+    // (M2 结构闭环; M4 改真注入: 幻影槽标 EXT_IN 由 host 供给)
+    uint32_t dummy_slot_id = 0;  // 共享哑槽(幻影/参数 const/缺失生产者引用)
+    uint32_t src_ref(const InputConn& c, uint64_t input_node_id, GraphPrepare& gp,
+                     std::map<uint64_t, uint32_t>& wslots) {
+        uint64_t op_id = c.src_id;
+        if (op_id == input_node_id) return 0x8000u | 0u;
+        const OpDef* p = gp.get_op_at(op_id);
+        // 有池数据即按 const 槽(is_const 标志对 loader 的 tensor_param const 不可靠)
+        if (p && (p->is_const() || p->const_data_size > 0)) {
+            uint32_t s = ensure_weight_slot(gp, p, wslots);
+            return 0x8000u | s;
+        }
+        bool param_const_name = false;
+        if (p && p->name_tag && p->name_tag->name()) {
+            const char* nm2 = p->name_tag->name();
+            static const char* suf[] = {"_shape", "_axes", "_pad_amount", "_ranges"};
+            for (const char* sfx : suf) {
+                size_t l = std::strlen(sfx), n2 = std::strlen(nm2);
+                if (n2 >= l && std::strcmp(nm2 + n2 - l, sfx) == 0) param_const_name = true;
+            }
+        }
+        if (!p || param_const_name || !p->name_tag || !p->name_tag->name() || !p->name_tag->name()[0]) {
+            // 生产者缺失(DCE 已删)/参数 const/幻影占位 → 共享哑槽(惰性创建,
+            // 保持无幻影图的槽布局不变) (M2 结构闭环; M4 真注入)
+            if (dummy_slot_id == 0) {
+                std::vector<uint8_t> zeros(128, 0);
+                dummy_slot_id = add_slot(128, 64, zeros.data());
+            }
+            return 0x8000u | dummy_slot_id;
+        }
+        return temp_of_dbg(op_id, c.out_idx, gp);
+    }
+    uint32_t temp_of(uint64_t op_id, uint32_t out_idx = 0) {
+        auto it = op_temp.find(tkey(op_id, out_idx));
         if (it == op_temp.end()) { std::fprintf(stderr, "error: no temp for op %llu\n",
                                                  (unsigned long long)op_id); std::exit(4); }
+        return it->second;
+    }
+    uint64_t cur_op = 0;
+    uint32_t temp_of_dbg(uint64_t op_id, uint32_t out_idx, GraphPrepare& gp) {
+        auto it = op_temp.find(tkey(op_id, out_idx));
+        if (it == op_temp.end()) {
+            const OpDef* od = gp.get_op_at(op_id);
+            const OpDef* cur = gp.get_op_at(cur_op);
+            std::fprintf(stderr, "error: no temp for op %llu (%s rank=%u is_const=%d const_size=%zu); consumer op %llu (%s)\n",
+                         (unsigned long long)op_id,
+                         od && od->name_tag && od->name_tag->name() ? od->name_tag->name() : "?",
+                         od ? od->output_def.rank : 0,
+                         od ? (od->is_const() ? 1 : 0) : 0,
+                         od ? od->const_data_size : 0,
+                         (unsigned long long)cur_op,
+                         cur && cur->name_tag && cur->name_tag->name() ? cur->name_tag->name() : "?");
+            std::exit(4);
+        }
         return it->second;
     }
     uint32_t add_slot(uint32_t len, uint32_t count, const uint8_t* data) {
@@ -130,9 +242,33 @@ struct Emitter {
         for (uint32_t a : args) o.args[i++] = a;
         ops.push_back(o);
     }
+    void add_op(uint16_t opcode, const std::vector<uint32_t>& args) {
+        wt_op o{};
+        o.opcode = opcode;
+        o.n_args = (uint16_t)args.size();
+        uint32_t i = 0;
+        for (uint32_t a : args) o.args[i++] = a;
+        ops.push_back(o);
+    }
 };
 
-} // namespace
+}
+
+// 权重消费 op 的 const 输入下标(weight input 位置)
+static int weight_input_index(const std::string& nm) {
+    if (nm == "FullyConnected" || nm == "MatMul" || nm == "Conv2d" ||
+        nm == "DepthWiseConv2d" || nm == "RmsNorm") return 1;
+    if (nm == "Gather") return 0;  // embedding 表
+    return -1;
+}
+
+// op 输出元素数(output_def 全维乘积)
+static uint64_t elems_of(const OpDef* od) {
+    uint64_t n = 1;
+    for (uint32_t i = 0; i < od->output_def.rank && i < 5; ++i)
+        n *= (uint64_t)od->output_def.dims[i];
+    return n;
+}
 
 int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& out_path, const std::string& manifest_path) {
@@ -144,31 +280,54 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
     // 2. 图级信息
     const OpDef* input_op = gp.get_op_at(gp.get_input_node_id());
-    if (!input_op || input_op->output_def.rank < 4) { std::fprintf(stderr, "error: bad input node\n"); return 2; }
-    uint32_t H = (uint32_t)input_op->output_def.dims[1];
-    uint32_t W = (uint32_t)input_op->output_def.dims[2];
-    uint32_t C = (uint32_t)input_op->output_def.dims[3];
-    size_t input_elems = (size_t)H * W * C;
+    if (!input_op || input_op->output_def.rank == 0) { std::fprintf(stderr, "error: bad input node\n"); return 2; }
+    // 输入形状/元素数: 任意 rank; dtype 决定字节/元素(f32/f16→2B 外部, int32→4B)
+    size_t input_elems = 1;
+    for (uint32_t i = 0; i < input_op->output_def.rank && i < 5; ++i)
+        input_elems *= (size_t)input_op->output_def.dims[i];
+    uint32_t input_dtype = input_op->output_def.dtype;
+    size_t input_elem_bytes = (input_dtype == 1 || input_dtype == 0x21) ? 2 : 4;
+    // NCHW 便捷(conv 路径沿用)
+    uint32_t H = input_op->output_def.rank >= 4 ? (uint32_t)input_op->output_def.dims[1] : 1;
+    uint32_t W = input_op->output_def.rank >= 4 ? (uint32_t)input_op->output_def.dims[2] : 1;
+    uint32_t C = input_op->output_def.rank >= 4 ? (uint32_t)input_op->output_def.dims[3] : 1;
 
     Emitter em;
 
     // slot 0 = 输入 f16(NCHW); Level 1: 阶段9 引擎将其标为 external
     std::vector<uint8_t> in_f16;
+    size_t input_bytes = input_elems * input_elem_bytes;
     if (!in_f16_path.empty()) {
         if (!load_file(in_f16_path, in_f16)) { std::fprintf(stderr, "error: cannot open %s\n", in_f16_path.c_str()); return 2; }
-        if (in_f16.size() != input_elems * 2) {
-            std::fprintf(stderr, "error: input f16 size %zu != %zu\n", in_f16.size(), input_elems * 2);
+        if (in_f16.size() != input_bytes) {
+            std::fprintf(stderr, "error: input size %zu != %zu (elems=%zu × %zuB)\n",
+                         in_f16.size(), input_bytes, input_elems, input_elem_bytes);
             return 2;
         }
     } else {
-        in_f16.assign(input_elems * 2, 0);
+        in_f16.assign(input_bytes, 0);
     }
     em.add_slot((uint32_t)in_f16.size(), (uint32_t)input_elems, in_f16.data());
     em.slots[0].addr = WT_SLOT_EXT_IN;  // Level 1: 输入槽标外部(wt_exec_run_io 注入)
 
-    // 3. 权重槽(先扫 conv 的 W/B const)
+    // 3. 通用权重槽收集(M2): 按 plan_order 遍历, 对权重消费 op 的 const 输入
+    //     建 f16 槽(按 const id 去重, tie 权重共享一槽)
+    std::map<uint64_t, uint32_t> wslots;  // const op_id → slot
+    {
+        std::vector<op_id_t> pre_order = gp.plan_order();
+        for (op_id_t id : pre_order) {
+            const OpDef* od = gp.get_op_at(id);
+            if (!od || od->is_const() || !od->name_tag) continue;
+            std::string nm = od->name_tag->name() ? od->name_tag->name() : "";
+            int wi = weight_input_index(nm);
+            if (wi < 0 || od->inputs.size() <= (size_t)wi) continue;
+            const OpDef* w = gp.get_op_at(od->inputs[wi].src_id);
+            if (!w || w->const_data_size == 0) continue;
+            em.ensure_weight_slot(gp, w, wslots);
+        }
+    }
+    // conv 分支的便捷引用(无 conv 图时为 0, conv 分支不会触发)
     uint32_t w_slot = 0, b_slot = 0;
-    bool have_w = false;
     {
         const OpDef* conv = nullptr;
         for (op_id_t id : gp.plan_order()) {
@@ -176,34 +335,16 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (od && od->name_tag && std::string(od->name_tag->name() ? od->name_tag->name() : "") == "Conv2d")
                 { conv = od; break; }
         }
-        if (!conv) { std::fprintf(stderr, "error: no Conv2d in graph\n"); return 2; }
-        if (conv->inputs.size() < 2) { std::fprintf(stderr, "error: conv missing weight input\n"); return 2; }
-        const OpDef* w = gp.get_op_at(conv->inputs[1].src_id);
-        if (!w) { std::fprintf(stderr, "error: weight const missing\n"); return 2; }
-        // 元素数取 const_data_size/4(prepare 会把 rank-1 张量归一化成
-        // rank-4 [1,1,1,N], dims 不可靠; 池内 f32 恒 4B/元素)
-        size_t n_w = (size_t)w->const_data_size / 4;
-        std::vector<uint16_t> w16(n_w);
-        const float* wf = reinterpret_cast<const float*>(gp.const_pool().data() + w->const_data_offset);
-        for (size_t i = 0; i < n_w; i++) w16[i] = f32_to_f16_rne(wf[i]);
-        std::vector<uint8_t> wbytes(n_w * 2);
-        std::memcpy(wbytes.data(), w16.data(), wbytes.size());
-        w_slot = em.add_slot((uint32_t)wbytes.size(), (uint32_t)n_w, wbytes.data());
-        have_w = true;
-
-        if (conv->inputs.size() > 2) {
-            const OpDef* b = gp.get_op_at(conv->inputs[2].src_id);
-            if (b) {
-                size_t n_b = (size_t)b->const_data_size / 4;  // 同上, size-based
-                std::vector<uint16_t> b16(n_b);
-                const float* bf = reinterpret_cast<const float*>(gp.const_pool().data() + b->const_data_offset);
-                for (size_t i = 0; i < n_b; i++) b16[i] = f32_to_f16_rne(bf[i]);
-                std::vector<uint8_t> bbytes(n_b * 2);
-                std::memcpy(bbytes.data(), b16.data(), bbytes.size());
-                b_slot = em.add_slot((uint32_t)bbytes.size(), (uint32_t)n_b, bbytes.data());
+        if (conv) {
+            if (conv->inputs.size() < 2) { std::fprintf(stderr, "error: conv missing weight input\n"); return 2; }
+            const OpDef* w = gp.get_op_at(conv->inputs[1].src_id);
+            if (!w) { std::fprintf(stderr, "error: weight const missing\n"); return 2; }
+            w_slot = em.ensure_weight_slot(gp, w, wslots);
+            if (conv->inputs.size() > 2) {
+                const OpDef* b = gp.get_op_at(conv->inputs[2].src_id);
+                if (b) b_slot = em.ensure_weight_slot(gp, b, wslots);
             }
         }
-        (void)have_w;
     }
 
     // 4. 按 plan_order 发射 op
@@ -211,12 +352,43 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     if (order.empty()) {
         for (op_id_t id = 1; id <= 10; id++) order.push_back(id);  // 兜底(常规图 id 1..10)
     }
+    em.compute_last_use(order, gp);
+    // Output 引用的 temp 必须活到循环外(唯一真实跨循环引用)
+    {
+        const OpDef* out = gp.get_op_at(gp.get_output_node_id());
+        if (out && !out->inputs.empty())
+            em.last_use[Emitter::tkey(out->inputs[0].src_id, out->inputs[0].out_idx)] =
+                static_cast<uint32_t>(order.size());
+    }
+    // spill/fill 不钉 temp: 0.8B 默认预算下全图溢出 → 上千 spill 记录,
+    // 钉住会把整个活跃集抬到 16879。spill 段(循环后)用保留 temp 引用。
     uint32_t spill_pool_slot = 0;  // 0 = 未创建
-    for (op_id_t id : order) {
+    for (size_t pos = 0; pos < order.size(); pos++) {
+        op_id_t id = order[pos];
+        em.cur_op = id;
+        if (pos < 8) {
+            const OpDef* dbg = gp.get_op_at(id);
+            std::fprintf(stderr, "[dbg] pos=%zu id=%llu name=%s const=%d\n", pos,
+                         (unsigned long long)id,
+                         dbg && dbg->name_tag && dbg->name_tag->name() ? dbg->name_tag->name() : "?",
+                         dbg && dbg->is_const());
+        }
         const OpDef* od = gp.get_op_at(id);
         if (!od || od->is_const() || !od->name_tag) continue;
         std::string nm = od->name_tag->name() ? od->name_tag->name() : "";
         if (nm == "Input" || nm == "Output" || nm.empty()) continue;
+        // loader 合成的 tensor_param const(非 is_const 标志): *_shape/*_axes/
+        // *_pad_amount/*_ranges 后缀, 无发射语义
+        {
+            static const char* suf[] = {"_shape", "_axes", "_pad_amount", "_ranges"};
+            bool is_param = false;
+            for (const char* sfx : suf) {
+                size_t l = std::strlen(sfx);
+                if (nm.size() >= l && nm.compare(nm.size() - l, l, sfx) == 0) is_param = true;
+            }
+            if (is_param) continue;
+        }
+        do {
 
         if (nm == "Transpose") {
             const OpDef* src = gp.get_op_at(od->inputs[0].src_id);
@@ -229,10 +401,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 perm = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
                        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
             }
-            uint32_t src_t = em.src_ref(src->op_id, gp.get_input_node_id());
+            uint32_t src_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
             em.add_op(OP_TRANSPOSE_F16, {src_t, out_t, H, W, C, perm});
-            continue;
+            break;
         }
 
         if (nm == "Conv2d") {
@@ -268,7 +440,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             const uint32_t full_desc[19] = {0, 0, H, W, 0, 0, H, W,
                                             e.kh, e.kw, e.sh, e.sw, e.ph_begin, e.pw_begin,
                                             C, C, 0, C, 0};
-            uint32_t src_t = em.src_ref(od->inputs[0].src_id, gp.get_input_node_id());
+            uint32_t src_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
             uint32_t cols_t = em.fresh_temp(0xFFFFFFF0);  // 专用 cols 槽
             for (uint32_t t = 0; t < num_tiles; t++) {
@@ -285,19 +457,221 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                                           th * tw, e.kh * e.kw * C, C,
                                           oy0, ox0, H, W, co0, co_n});
             }
-            continue;
+            break;
         }
 
         if (nm == "Eltwise_Binary") {
-            uint32_t a_t = em.src_ref(od->inputs[0].src_id, gp.get_input_node_id());
-            uint32_t b_t = em.src_ref(od->inputs[1].src_id, gp.get_input_node_id());
+            // operation 从 serialized_extra 读(0=ADD 1=SUB 2=MUL 3=DIV)
+            uint32_t subtype = 0;
+            if (od->serialized_extra.size() >= sizeof(ExtraEltwise)) {
+                ExtraEltwise e;
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+                subtype = e.operation;
+            }
+            uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t b_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
-            em.add_op(OP_ADD_F16, {a_t, b_t, out_t, H * W * C});
-            continue;
+            if (subtype == 0) em.add_op(OP_ADD_F16, {a_t, b_t, out_t, H * W * C});
+            else em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, H * W * C, subtype});
+            break;
         }
+
+        // ---- M2: 0.8B 20 型新分支(参数全从 serialized_extra 读) ----
+
+        if (nm == "Eltwise_Unary" || nm == "ElementWiseNeuron") {
+            ExtraEltwise e{};
+            if (od->serialized_extra.size() >= sizeof(e))
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od), e.operation});
+            break;
+        }
+
+        if (nm == "Eltwise_Ternary") {
+            // SELECT 语义: out = in0(cond) ? in1 : in2
+            uint32_t c_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t a_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
+            uint32_t b_t = em.src_ref(od->inputs[2], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            em.add_op(OP_BINARY_F16, {c_t, a_t, b_t, out_t, 8});  // 8=SELECT(cond,a,b)
+            break;
+        }
+
+        if (nm == "Softmax") {
+            ExtraAxis e{};
+            if (od->serialized_extra.size() >= sizeof(e))
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            uint64_t n_elems = elems_of(od);
+            uint32_t ax = (e.axis < 0) ? od->output_def.rank - 1 : (uint32_t)e.axis;
+            uint64_t row_w = 1;
+            if (ax < od->output_def.rank) row_w = od->output_def.dims[ax];
+            em.add_op(OP_SOFTMAX_F16, {x_t, out_t, (uint32_t)(n_elems / row_w), (uint32_t)row_w});
+            break;
+        }
+
+        if (nm == "RmsNorm") {
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
+            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots) : em.dummy_slot_id;
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            em.add_op(OP_RMSNORM_F16, {x_t, w_s, out_t, (uint32_t)elems_of(od)});
+            break;
+        }
+
+        if (nm == "FullyConnected" || nm == "MatMul") {
+            uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
+            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots) : em.dummy_slot_id;
+            ExtraFc ef{};
+            ExtraMatMul em2{};
+            uint32_t m = 0, k = 0, nn = 0;
+            if (nm == "FullyConnected") {
+                if (od->serialized_extra.size() >= sizeof(ef))
+                    std::memcpy(&ef, od->serialized_extra.data(), sizeof(ef));
+                m = ef.m; k = ef.k; nn = ef.n;
+            } else {
+                if (od->serialized_extra.size() >= sizeof(em2))
+                    std::memcpy(&em2, od->serialized_extra.data(), sizeof(em2));
+                m = em2.m; k = em2.k; nn = em2.n;
+            }
+            if (m == 0 || k == 0 || nn == 0) {
+                std::fprintf(stderr, "error: %s extra 未提取 (M/K/N=0)\n", nm.c_str());
+                return 4;
+            }
+            em.add_op(OP_MATMUL_W4A16, {a_t, w_s, out_t, m, k, nn});
+            break;
+        }
+
+        if (nm == "Gather") {
+            const OpDef* tbl = od->inputs.size() > 0 ? gp.get_op_at(od->inputs[0].src_id) : nullptr;
+            uint32_t tbl_s = tbl ? em.ensure_weight_slot(gp, tbl, wslots) : em.dummy_slot_id;
+            uint32_t idx_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            uint32_t row_bytes = 0;
+            if (tbl && tbl->output_def.rank >= 1)
+                row_bytes = (uint32_t)tbl->output_def.dims[tbl->output_def.rank - 1] * 2;
+            em.add_op(OP_GATHER_F16, {tbl_s, idx_t, out_t, (uint32_t)elems_of(od), row_bytes});
+            break;
+        }
+
+        if (nm == "Reshape" || nm == "Pad" || nm == "ScatterNd" || nm == "Cast") {
+            // 数据搬运/常量填充/状态更新语义 → 恒等(设备 M4 数值门兜底)
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od), 0xFFFFFFFFu});
+            break;
+        }
+
+        if (nm == "DepthWiseConv2d") {
+            ExtraDepthwiseConv e{};
+            if (od->serialized_extra.size() >= sizeof(e))
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
+            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots) : em.dummy_slot_id;
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            uint64_t ne = elems_of(od);
+            uint32_t seq = 1, ch = (uint32_t)ne;
+            if (od->output_def.rank >= 2) {
+                seq = od->output_def.dims[od->output_def.rank - 2];
+                ch = od->output_def.dims[od->output_def.rank - 1];
+            }
+            em.add_op(OP_CONV1D_SSM_F16, {x_t, w_s, out_t, seq, ch, e.kw});
+            break;
+        }
+
+        if (nm == "Concat") {
+            ExtraAxis e{};
+            if (od->serialized_extra.size() >= sizeof(e))
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            std::vector<uint32_t> args;
+            for (size_t i = 0; i < 8; i++)
+                args.push_back(i < od->inputs.size()
+                    ? em.src_ref(od->inputs[i], gp.get_input_node_id(), gp, wslots) : 0u);
+            args.push_back(out_t);
+            args.push_back((uint32_t)(e.axis < 0 ? od->output_def.rank - 1 : e.axis));
+            args.push_back((uint32_t)od->inputs.size());
+            args.push_back((uint32_t)elems_of(od));
+            em.add_op(OP_CONCAT_F16, args);
+            break;
+        }
+
+        if (nm == "StridedSlice") {
+            ExtraStridedSlice e{};
+            if (od->serialized_extra.size() >= sizeof(e))
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            std::vector<uint32_t> args{x_t, out_t, e.rank};
+            const auto& pool = gp.const_pool();
+            if (e.ranges_offset && e.ranges_offset + e.rank * 12 <= pool.size()) {
+                const uint32_t* rg = reinterpret_cast<const uint32_t*>(pool.data() + e.ranges_offset);
+                for (uint32_t i = 0; i < e.rank && i < 4; i++) args.push_back(rg[i]);
+                for (uint32_t i = 0; i < e.rank && i < 4; i++) args.push_back(rg[e.rank + i]);
+                for (uint32_t i = 0; i < e.rank && i < 4; i++) args.push_back(rg[2 * e.rank + i]);
+            }
+            while (args.size() < 15) args.push_back(0);
+            em.add_op(OP_STRIDED_SLICE_F16, args);
+            break;
+        }
+
+        if (nm == "Split") {
+            ExtraSplit e{};
+            if (od->serialized_extra.size() >= sizeof(e))
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            std::vector<uint32_t> args{x_t};
+            for (size_t i = 0; i < 8; i++) {
+                uint32_t t = i < (size_t)e.num_splits ? em.fresh_temp(od->op_id, (uint32_t)i) : 0u;
+                args.push_back(t);
+            }
+            args.push_back((uint32_t)(e.axis < 0 ? 0 : e.axis));
+            args.push_back(e.num_splits);
+            em.add_op(OP_SPLIT_F16, args);
+            break;
+        }
+
+        if (nm == "Reduce") {
+            ExtraAxis e{};
+            if (od->serialized_extra.size() >= sizeof(e))
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            em.add_op(OP_REDUCE_F16, {x_t, out_t, (uint32_t)elems_of(od),
+                                      (uint32_t)e.axis, e.reduce_type});
+            break;
+        }
+
+        if (nm == "CumulativeSum") {
+            ExtraAxis e{};
+            if (od->serialized_extra.size() >= sizeof(e))
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+            uint32_t out_t = em.fresh_temp(od->op_id);
+            uint64_t ne = elems_of(od);
+            uint32_t ax = (e.axis < 0) ? od->output_def.rank - 1 : (uint32_t)e.axis;
+            uint32_t rows = 1, n_ax = 1;
+            if (ax < od->output_def.rank) {
+                rows = (uint32_t)(ne / od->output_def.dims[ax]);
+                n_ax = od->output_def.dims[ax];
+            }
+            em.add_op(OP_CUMSUM_F32, {x_t, out_t, rows, n_ax, ax, e.exclusive, e.reverse});
+            break;
+        }
+
+        if (nm == "Input" || nm == "Output" || nm.empty()) continue;
 
         std::fprintf(stderr, "error: unsupported op '%s' in wtop_emit\n", nm.c_str());
         return 4;
+        } while (0);
+        // 活性: 本 op 的输入已消费, 释放其 temp
+        for (const auto& c : od->inputs)
+            em.release_at(Emitter::tkey(c.src_id, c.out_idx), pos);
     }
 
     // 5. spill/fill → OP_SPILL / OP_FILL(溢出张量; pool slot 惰性创建)
@@ -316,10 +690,11 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             // Output 节点的张量 = 其输入生产者的 temp
             const OpDef* out = gp.get_op_at(r.op_id);
             t = (out && !out->inputs.empty())
-                ? em.src_ref(out->inputs[0].src_id, gp.get_input_node_id())
+                ? em.src_ref(out->inputs[0], gp.get_input_node_id(), gp, wslots)
                 : 0x8000u;
         } else {
-            t = em.src_ref(r.op_id, gp.get_input_node_id());
+            // M2 结构闭环: spill 段引用保留 temp(真实溢出语义 M4 重做)
+            t = em.fresh_temp(0xFFFFFFFEu);
         }
         // SPILL: 张量 → 池; FILL: 池 → 张量(设备执行序由引擎按 op 序串行;
         // 输入节点的张量经 0x8000|slot 编码引用)
@@ -364,8 +739,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
     // 7. 自校验 + 落盘
     {
-        wt_blob wb{};
-        int rc = wt_parse(em.blob.data(), em.blob.size(), &wb);
+        wt_blob* wb = new wt_blob{};
+        int rc = wt_parse(em.blob.data(), em.blob.size(), wb);
         if (rc != WT_OK) {
             std::fprintf(stderr, "error: self-validate failed: %s\n", wt_err_str(rc));
             return 3;

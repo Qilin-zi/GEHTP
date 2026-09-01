@@ -36,6 +36,7 @@ static OutputDef make_od4(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3) {
 
 static void build_conv_add(GraphPrepare& gp) {
     auto od_nchw = make_od4(1, 32, 32, 32);
+    od_nchw.dtype = static_cast<uint32_t>(DType::Float16);  // 对齐真实管线: 输入 f16
     gp.append_node("Input", 1, nullptr, 0, &od_nchw, 1, nullptr);
 
     const int32_t perm_in[4] = {0, 2, 3, 1}, perm_out[4] = {0, 3, 1, 2};
@@ -147,29 +148,29 @@ int main() {
     // 4. wt_parse 校验 + 契约断言
     std::vector<uint8_t> blob;
     CHECK(load_file(blob_path, blob), "read blob");
-    wt_blob wb{};
-    CHECK(wt_parse(blob.data(), blob.size(), &wb) == WT_OK, "wt_parse OK");
-    CHECK(wb.n_slots == 3, "3 slots (input/W/B)");
-    CHECK(wb.n_ops == 5, "5 ops (T/IM2COL/CONV/ADD/T)");
-    CHECK(wb.slots[0].len == 65536 && wb.slots[0].count == 32768, "slot0 = 输入 f16 64KB");
-    CHECK(wb.slots[1].len == 18432 && wb.slots[1].count == 9216, "slot1 = W f16 18432B");
-    CHECK(wb.slots[2].len == 64 && wb.slots[2].count == 32, "slot2 = B f16 64B");
+    wt_blob* wb = new wt_blob{};
+    CHECK(wt_parse(blob.data(), blob.size(), wb) == WT_OK, "wt_parse OK");
+    CHECK(wb->n_slots == 3, "3 slots (input/W/B)");
+    CHECK(wb->n_ops == 5, "5 ops (T/IM2COL/CONV/ADD/T)");
+    CHECK(wb->slots[0].len == 65536 && wb->slots[0].count == 32768, "slot0 = 输入 f16 64KB");
+    CHECK(wb->slots[1].len == 18432 && wb->slots[1].count == 9216, "slot1 = W f16 18432B");
+    CHECK(wb->slots[2].len == 64 && wb->slots[2].count == 32, "slot2 = B f16 64B");
     {
         const uint16_t expect_op[5] = {OP_TRANSPOSE_F16, OP_IM2COL, OP_CONV2D_F16,
                                        OP_ADD_F16, OP_TRANSPOSE_F16};
         bool seq = true;
-        for (uint32_t i = 0; i < 5; i++) seq &= (wb.ops[i].opcode == expect_op[i]);
+        for (uint32_t i = 0; i < 5; i++) seq &= (wb->ops[i].opcode == expect_op[i]);
         CHECK(seq, "opcode 序列 [T, IM2COL, CONV, ADD, T]");
         // TRANSPOSE 参数: [src(0x8000|slot0), out=0, H,W,C, perm]
-        CHECK((wb.ops[0].args[0] & 0x8000) != 0, "首 Transpose src = 0x8000|slot0 (输入注入)");
-        CHECK(wb.ops[0].args[5] == (0u | (2u << 8) | (3u << 16) | (1u << 24)),
+        CHECK((wb->ops[0].args[0] & 0x8000) != 0, "首 Transpose src = 0x8000|slot0 (输入注入)");
+        CHECK(wb->ops[0].args[5] == (0u | (2u << 8) | (3u << 16) | (1u << 24)),
               "首 Transpose perm = [0,2,3,1] 打包");
         // CONV: M=32*32 K=288 N=32
-        CHECK(wb.ops[2].args[4] == 1024 && wb.ops[2].args[5] == 288 && wb.ops[2].args[6] == 32,
+        CHECK(wb->ops[2].args[4] == 1024 && wb->ops[2].args[5] == 288 && wb->ops[2].args[6] == 32,
               "CONV M=1024 K=288 N=32");
-        CHECK(wb.ops[2].args[1] == 1 && wb.ops[2].args[2] == 2, "CONV w_slot=1 bias_slot=2");
+        CHECK(wb->ops[2].args[1] == 1 && wb->ops[2].args[2] == 2, "CONV w_slot=1 bias_slot=2");
         // ADD: n_elem = 32768
-        CHECK(wb.ops[3].args[3] == 32768, "ADD n_elem=32768");
+        CHECK(wb->ops[3].args[3] == 32768, "ADD n_elem=32768");
     }
 
     // 5. 负例
@@ -177,22 +178,22 @@ int main() {
         std::vector<uint8_t> bad;
         // 截断
         bad.assign(blob.begin(), blob.begin() + 8);
-        CHECK(wt_parse(bad.data(), bad.size(), &wb) == WT_ERR_SHORT, "neg: 截断 -> SHORT");
+        CHECK(wt_parse(bad.data(), bad.size(), wb) == WT_ERR_SHORT, "neg: 截断 -> SHORT");
         // 坏 magic
         bad = blob;
         bad[0] = 'X';
-        CHECK(wt_parse(bad.data(), bad.size(), &wb) == WT_ERR_MAGIC, "neg: 坏 magic -> MAGIC");
+        CHECK(wt_parse(bad.data(), bad.size(), wb) == WT_ERR_MAGIC, "neg: 坏 magic -> MAGIC");
         // 坏 arity: 把首 op 的 n_args 改掉
         bad = blob;
         {
-            wt_blob wb2{};
-            wt_parse(blob.data(), blob.size(), &wb2);
-            uint32_t n_slots = wb2.n_slots;
+            wt_blob* wb2 = new wt_blob{};
+            wt_parse(blob.data(), blob.size(), wb2);
+            uint32_t n_slots = wb2->n_slots;
             size_t op0 = 16 + (size_t)n_slots * 16;
             uint16_t wrong = 0;
             std::memcpy(bad.data() + op0 + 2, &wrong, 2);
         }
-        CHECK(wt_parse(bad.data(), bad.size(), &wb) == WT_ERR_ARITY, "neg: 坏 arity -> ARITY");
+        CHECK(wt_parse(bad.data(), bad.size(), wb) == WT_ERR_ARITY, "neg: 坏 arity -> ARITY");
     }
 
     std::printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASS", failed);

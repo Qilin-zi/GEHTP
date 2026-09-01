@@ -20,6 +20,19 @@ static int arity_of(uint16_t opcode) {
     case OP_SPILL: return WT_ARITY_SPILL;
     case OP_FILL: return WT_ARITY_FILL;
     case OP_TRANSPOSE_F16: return WT_ARITY_TRANSPOSE_F16;
+    case OP_UNARY_F16: return WT_ARITY_UNARY_F16;
+    case OP_BINARY_F16: return WT_ARITY_BINARY_F16;
+    case OP_SOFTMAX_F16: return WT_ARITY_SOFTMAX_F16;
+    case OP_CONCAT_F16: return WT_ARITY_CONCAT_F16;
+    case OP_STRIDED_SLICE_F16: return WT_ARITY_STRIDED_SLICE_F16;
+    case OP_SPLIT_F16: return WT_ARITY_SPLIT_F16;
+    case OP_REDUCE_F16: return WT_ARITY_REDUCE_F16;
+    case OP_CUMSUM_F32: return WT_ARITY_CUMSUM_F32;
+    case OP_CONV1D_SSM_F16: return WT_ARITY_CONV1D_SSM_F16;
+    case OP_GATHER_F16: return WT_ARITY_GATHER_F16;
+    case OP_ARGMAX_F16: return WT_ARITY_ARGMAX_F16;
+    case OP_KV_APPEND_F16: return WT_ARITY_KV_APPEND_F16;
+    case OP_KV_GATHER_F16: return WT_ARITY_KV_GATHER_F16;
     default: return -1;
     }
 }
@@ -33,6 +46,19 @@ static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     case OP_CONV2D_F16: return idx == 1 || idx == 2;
     case OP_SPILL: return idx == 1;
     case OP_FILL: return idx == 0;
+    case OP_UNARY_F16: return idx == 0;
+    case OP_BINARY_F16: return idx == 0 || idx == 1;
+    case OP_SOFTMAX_F16: return idx == 0;
+    case OP_CONCAT_F16: return idx <= 7;
+    case OP_STRIDED_SLICE_F16: return idx == 0;
+    case OP_SPLIT_F16: return idx == 0;
+    case OP_REDUCE_F16: return idx == 0;
+    case OP_CUMSUM_F32: return idx == 0;
+    case OP_CONV1D_SSM_F16: return idx == 0 || idx == 1;
+    case OP_GATHER_F16: return idx == 0 || idx == 1;
+    case OP_ARGMAX_F16: return idx == 0;
+    case OP_KV_APPEND_F16: return idx == 0 || idx == 1 || idx == 2;
+    case OP_KV_GATHER_F16: return idx == 0 || idx == 1;
     default: return 0;
     }
 }
@@ -91,9 +117,14 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
     }
     for (uint32_t i = 0; i < out->n_ops; i++) {
         const struct wt_op* op = &out->ops[i];
-        for (uint16_t a = 0; a < op->n_args; a++)
-            if (arg_is_slot(op->opcode, a) && op->args[a] >= out->n_slots)
-                return WT_ERR_BAD_REF;
+        for (uint16_t a = 0; a < op->n_args; a++) {
+            if (!arg_is_slot(op->opcode, a)) continue;
+            // 槽引用两种形态: 裸 slot id 或 0x8000|slot(发射器统一用
+            // src_ref 的 flagged 编码, 引擎 ref_ptr 按位解码)
+            uint32_t v = op->args[a];
+            uint32_t id = (v & 0x8000u) ? (v & 0x7FFFu) : v;
+            if (id >= out->n_slots) return WT_ERR_BAD_REF;
+        }
     }
     return WT_OK;
 }

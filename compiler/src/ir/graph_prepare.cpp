@@ -1,5 +1,7 @@
 ﻿#include <cstdio>
 #include "hnnx/ir/graph_prepare.hpp"
+#include "hnnx/ir/scalar_params.hpp"
+#include "hnnx/ir/op_extra.hpp"
 #include "hnnx/ir/op_registry.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
 #include "hnnx/opt/optimization_passes.hpp"
@@ -1393,10 +1395,272 @@ std::vector<uint8_t> extract_conv_extra(const GraphPrepare& gp, const OpDef& opd
     return out;
 }
 
+// ---- 20 型 extractor(M2): 参数从 op_data(scalar_params)+ tensor_param const 推导 ----
+
+std::vector<uint8_t> raw_extra(const void* p, size_t n) {
+    std::vector<uint8_t> out(n);
+    std::memcpy(out.data(), p, n);
+    return out;
+}
+
+// 从 opdef.op_data 取 scalar(数值)
+double scalar_num(const OpDef& opdef, const char* key, double dflt) {
+    auto sp = unpack_scalar_params(opdef.op_data);
+    const ScalarParam* p = scalar_get(sp, key);
+    return (p && p->is_numeric) ? p->value_num : dflt;
+}
+
+// 从 opdef.op_data 取 scalar(字符串)
+std::string scalar_str(const OpDef& opdef, const char* key) {
+    auto sp = unpack_scalar_params(opdef.op_data);
+    const ScalarParam* p = scalar_get(sp, key);
+    return p ? p->value_str : "";
+}
+
+// 从 tensor_param const 读 f64 数组
+std::vector<double> read_param_f64(const GraphPrepare& gp, const OpDef* p, size_t max_n) {
+    std::vector<double> v;
+    if (!p || p->const_data_size < 8) return v;
+    size_t n = std::min(max_n, p->const_data_size / 8);
+    const auto& pool = gp.const_pool();
+    if (p->const_data_offset == 0 || p->const_data_offset + p->const_data_size > pool.size())
+        return v;
+    v.resize(n);
+    std::memcpy(v.data(), pool.data() + p->const_data_offset, n * 8);
+    return v;
+}
+
+uint32_t op_to_u32(const std::string& s, uint32_t dflt) {
+    if (s == "ADD") return 0;
+    if (s == "SUB") return 1;
+    if (s == "MUL") return 2;
+    if (s == "DIV") return 3;
+    return dflt;
+}
+
+uint32_t neuron_to_u32(const std::string& s, uint32_t dflt) {
+    if (s == "SWISH") return 0;
+    if (s == "SIGMOID") return 1;
+    if (s == "TANH") return 2;
+    if (s == "GELU") return 3;
+    if (s == "RELU") return 4;
+    return dflt;
+}
+
+uint32_t unary_to_u32(const std::string& s, uint32_t dflt) {
+    if (s == "NEG") return 0;
+    if (s == "EXP") return 1;
+    if (s == "SQRT") return 2;
+    if (s == "RSQRT") return 3;
+    if (s == "LOG") return 4;
+    if (s == "ABS") return 5;
+    if (s == "SIN") return 6;
+    if (s == "COS") return 7;
+    return dflt;
+}
+
+// 通用: 从 opdef 输入侧 const 的 output_def 拿形状乘积
+size_t const_elem_count(const GraphPrepare& gp, const OpDef& opdef, size_t input_idx) {
+    if (opdef.inputs.size() <= input_idx) return 0;
+    const OpDef* s = gp.get_op_at(opdef.inputs[input_idx].src_id);
+    if (!s) return 0;
+    size_t n = 1;
+    for (uint32_t i = 0; i < s->output_def.rank && i < 5; ++i) n *= s->output_def.dims[i];
+    return n;
+}
+
+std::vector<uint8_t> extract_eltwise_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraEltwise e{};
+    // 缺省 ADD(0): 合成图/无 scalar_params 的流保持 conv_add 语义
+    e.operation = op_to_u32(scalar_str(opdef, "operation"), 0);
+    e.eltwise_type = (scalar_str(opdef, "eltwise_type") == "SELECT") ? 0 : 0xFFFFFFFFu;
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_axis_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraAxis e{};
+    e.axis = static_cast<int32_t>(scalar_num(opdef, "axis", -1));
+    const std::string rt = scalar_str(opdef, "reduce_type");
+    e.reduce_type = (rt == "SUM" || rt.empty()) ? 0 : (rt == "AVG" ? 1 : 0xFFFFFFFFu);
+    e.keep_dims = static_cast<uint32_t>(scalar_num(opdef, "keep_dims", 0));
+    e.exclusive = static_cast<uint32_t>(scalar_num(opdef, "exclusive", 0));
+    e.reverse = static_cast<uint32_t>(scalar_num(opdef, "reverse", 0));
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_rmsnorm_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraRmsNorm e{};
+    e.epsilon = scalar_num(opdef, "epsilon", 1e-6);
+    // axes 是 tensor_param; 无则 -1
+    const OpDef* axes = find_param_const(gp, opdef, "axes");
+    auto ax = read_param_u32(gp, axes, 4);
+    e.axes = ax.empty() ? 0xFFFFFFFFu : ax[0];
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_fc_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraFc e{};
+    // K = 权重 const(inputs[1])的首维(2D [out,in] 时 in = dims[1])
+    const OpDef* w = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
+    if (w) {
+        size_t n = 1;
+        for (uint32_t i = 0; i < w->output_def.rank && i < 5; ++i) n *= w->output_def.dims[i];
+        uint32_t r = w->output_def.rank;
+        if (r >= 2) {
+            e.k = w->output_def.dims[r - 1];  // 内维
+            e.n = n / e.k;
+        } else {
+            e.k = 0; e.n = static_cast<uint32_t>(n);
+        }
+    }
+    // M = 输入激活的元素数 / K
+    size_t m = const_elem_count(gp, opdef, 0);
+    e.m = (e.k > 0) ? static_cast<uint32_t>(m / e.k) : 0;
+    e.has_bias = opdef.inputs.size() > 2 && const_elem_count(gp, opdef, 2) == e.n;
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraMatMul e{};
+    // M/K/N: a [M,K] b [K,N](transpose_in0/1 由 scalar 决定; 默认 0=不转置)
+    e.transpose_in0 = static_cast<uint32_t>(scalar_num(opdef, "transpose_in0", 0));
+    e.transpose_in1 = static_cast<uint32_t>(scalar_num(opdef, "transpose_in1", 0));
+    const OpDef* a = opdef.inputs.size() > 0 ? gp.get_op_at(opdef.inputs[0].src_id) : nullptr;
+    const OpDef* b = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
+    if (a && b && a->output_def.rank >= 2 && b->output_def.rank >= 2) {
+        uint32_t ar = a->output_def.rank, br = b->output_def.rank;
+        e.m = a->output_def.dims[ar - 2];
+        e.k = a->output_def.dims[ar - 1];
+        uint32_t bk = e.transpose_in1 ? b->output_def.dims[br - 1] : b->output_def.dims[br - 2];
+        uint32_t bn = e.transpose_in1 ? b->output_def.dims[br - 2] : b->output_def.dims[br - 1];
+        if (e.transpose_in0) { e.m = a->output_def.dims[ar - 1]; e.k = a->output_def.dims[ar - 2]; }
+        (void)bk;
+        e.n = bn;
+    }
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_strided_slice_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraStridedSlice e{};
+    e.begin_mask = static_cast<uint32_t>(scalar_num(opdef, "begin_mask", 0));
+    e.end_mask = static_cast<uint32_t>(scalar_num(opdef, "end_mask", 0));
+    e.new_axes_mask = static_cast<uint32_t>(scalar_num(opdef, "new_axes_mask", 0));
+    e.shrink_axes = static_cast<uint32_t>(scalar_num(opdef, "shrink_axes", 0));
+    // ranges = tensor_param const (名含 "ranges")
+    const OpDef* rg = find_param_const(gp, opdef, "ranges");
+    if (rg) {
+        e.rank = static_cast<uint32_t>(rg->const_data_size / 4 / 3);
+        e.ranges_offset = static_cast<uint32_t>(rg->const_data_offset);
+    }
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_reshape_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraReshape e{};
+    // 形状 const: 名含 "shape" 的 tensor_param(loader 合成 Reshape_post_*_shape)
+    const OpDef* sh = find_param_const(gp, opdef, "shape");
+    if (!sh) sh = find_param_const(gp, opdef, "Reshape_post");
+    if (sh) {
+        auto d = read_param_u32(gp, sh, 5);
+        // 形状可能存 i32/f32: 先按 u32 读, 数序取非零合理值
+        e.rank = static_cast<uint32_t>(std::min<size_t>(d.size(), 5));
+        for (size_t i = 0; i < d.size() && i < 5; ++i) e.dims[i] = static_cast<int64_t>(d[i]);
+    } else {
+        // 兜底: 输出形状
+        e.rank = opdef.output_def.rank;
+        for (uint32_t i = 0; i < e.rank && i < 5; ++i) e.dims[i] = opdef.output_def.dims[i];
+    }
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_transpose_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraTranspose e{};
+    const OpDef* pm = find_param_const(gp, opdef, "perm");
+    if (pm) {
+        auto d = read_param_u32(gp, pm, 5);
+        e.rank = static_cast<uint32_t>(std::min<size_t>(d.size(), 5));
+        for (size_t i = 0; i < d.size() && i < 5; ++i) e.perm[i] = static_cast<int64_t>(d[i]);
+    } else {
+        e.rank = 0;
+    }
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_depthwise_conv_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraDepthwiseConv e{};
+    // 权重 const [1,1,K,C] 或 [Kh,Kw,C,1](depthwise); 这里按 [1,k,1,C] QNN 布局
+    const OpDef* w = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
+    if (w && w->output_def.rank >= 2) {
+        uint32_t r = w->output_def.rank;
+        e.kw = w->output_def.dims[r - 2];
+        e.kh = 1;
+    }
+    // stride/pad 在 tensor_param(stride/pad_amount), 名匹配
+    const OpDef* st = find_param_const(gp, opdef, "stride");
+    auto sv = read_param_u32(gp, st, 2);
+    if (sv.size() >= 2) { e.sh = sv[0]; e.sw = sv[1]; }
+    const OpDef* pd = find_param_const(gp, opdef, "pad");
+    auto pv = read_param_u32(gp, pd, 4);
+    if (pv.size() >= 4) { e.pad_t = pv[0]; e.pad_b = pv[1]; e.pad_l = pv[2]; e.pad_r = pv[3]; }
+    const OpDef* w2 = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
+    if (w2 && w2->output_def.rank >= 1) {
+        size_t g = 1;
+        for (uint32_t i = 0; i + 1 < w2->output_def.rank && i < 4; ++i) g *= w2->output_def.dims[i];
+        e.group = static_cast<uint32_t>(g);
+    }
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_pad_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraPad e{};
+    e.scheme = static_cast<uint32_t>(scalar_num(opdef, "scheme", 0));
+    e.constant_value = scalar_num(opdef, "pad_constant_value", 0.0);
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_scatternd_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraScatterNd e{};
+    const std::string rd = scalar_str(opdef, "reduction");
+    e.reduction = (rd == "SUM" || rd.empty()) ? 0 : (rd == "MUL" ? 1 : 0xFFFFFFFFu);
+    return raw_extra(&e, sizeof(e));
+}
+
+std::vector<uint8_t> extract_split_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraSplit e{};
+    e.axis = static_cast<int32_t>(scalar_num(opdef, "axis", -1));
+    // 段大小 tensor_param 名含 split_index
+    const OpDef* si = find_param_const(gp, opdef, "split_index");
+    if (!si) si = find_param_const(gp, opdef, "split");
+    auto v = read_param_u32(gp, si, 8);
+    e.num_splits = static_cast<uint32_t>(std::min<size_t>(v.size(), 8));
+    for (size_t i = 0; i < v.size() && i < 8; ++i) e.sizes[i] = v[i];
+    return raw_extra(&e, sizeof(e));
+}
+
 std::map<std::string, ExtraInfoFn>& extra_info_registry() {
     static std::map<std::string, ExtraInfoFn> reg = [] {
         std::map<std::string, ExtraInfoFn> m;
         m["Conv2d"] = extract_conv_extra;
+        // M2: 0.8B net.json 实测 20 型
+        m["Eltwise_Binary"] = extract_eltwise_extra;
+        m["Eltwise_Unary"] = extract_eltwise_extra;
+        m["ElementWiseNeuron"] = extract_eltwise_extra;
+        m["Eltwise_Ternary"] = extract_eltwise_extra;
+        m["Softmax"] = extract_axis_extra;
+        m["Gather"] = extract_axis_extra;
+        m["Concat"] = extract_axis_extra;
+        m["Reduce"] = extract_axis_extra;
+        m["CumulativeSum"] = extract_axis_extra;
+        m["RmsNorm"] = extract_rmsnorm_extra;
+        m["FullyConnected"] = extract_fc_extra;
+        m["MatMul"] = extract_matmul_extra;
+        m["StridedSlice"] = extract_strided_slice_extra;
+        m["Reshape"] = extract_reshape_extra;
+        m["Transpose"] = extract_transpose_extra;
+        m["DepthWiseConv2d"] = extract_depthwise_conv_extra;
+        m["Pad"] = extract_pad_extra;
+        m["ScatterNd"] = extract_scatternd_extra;
+        m["Split"] = extract_split_extra;
         return m;
     }();
     return reg;

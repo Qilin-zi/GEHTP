@@ -23,7 +23,7 @@
 #include "oplist_exec.h"
 #include "wtcache.h"
 
-#define MAX_TEMPS 8
+#define MAX_TEMPS 32768
 
 struct wt_exec {
     struct wtcache_ctx* wc;

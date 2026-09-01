@@ -43,8 +43,9 @@ extern "C" {
 #define WT_ENDIAN_CHK 0x1234u
 #define WT_SLOT_SIZE 16u
 #define WT_WEIGHT_ALIGN 128u
-#define WT_MAX_SLOTS 64u
-#define WT_MAX_OPS 256u
+/* M2 容量: 千节点图(0.8B ~6K op)需大表; 设备侧 wt_parse/exec 同步 */
+#define WT_MAX_SLOTS 4096u
+#define WT_MAX_OPS 65536u
 #define WT_MAX_ARGS 16u
 /* 外部槽标记 (Level 1 运行期输入注入, GEHTP 阶段9):
  * slot.addr == EXT_IN  → 该 slot 数据在 wt_exec_run_io 的 in_ptr (blob 不固化)
@@ -65,6 +66,20 @@ enum {
     OP_SPILL = 8,
     OP_FILL = 9,
     OP_TRANSPOSE_F16 = 10,
+    /* M2/M3 契约(D6 清单, QNN op 语义; 0-10 不动, 向后兼容) */
+    OP_UNARY_F16 = 11,      /* [x_t,y_t,n,subtype]   subtype: 0=NEG 1=EXP 2=SQRT 3=RSQRT 4=LOG 5=ABS 6=SIN 7=COS; (Neuron) 8=SIGMOID 9=TANH 10=GELU 11=RELU 12=SWISH */
+    OP_BINARY_F16 = 12,     /* [a_t,b_t,y_t,n,subtype] subtype: 0=ADD 1=SUB 2=MUL 3=DIV */
+    OP_SOFTMAX_F16 = 13,    /* [x_t,y_t,rows,n]       rows = 行数(每行 n 元素) */
+    OP_CONCAT_F16 = 14,     /* [in_t0..in_t7(8路),out_t,axis,n_segments,n_elems] 固定 12 参数 */
+    OP_STRIDED_SLICE_F16 = 15, /* [x_t,y_t,rank,begin0..3,end0..3,stride0..3] rank≤4 固定 15 参数 */
+    OP_SPLIT_F16 = 16,      /* [x_t,out_t0..out_t7(8路),axis,n_segments] 固定 11 参数 */
+    OP_REDUCE_F16 = 17,     /* [x_t,y_t,n,axis,subtype] subtype: 0=SUM 1=MEAN */
+    OP_CUMSUM_F32 = 18,     /* [x_t,y_t,rows,n,axis,exclusive,reverse] f32 保持 */
+    OP_CONV1D_SSM_F16 = 19, /* [x_t,w_s,y_t,seq,C,k]    depthwise causal conv+SiLU(SSM) */
+    OP_GATHER_F16 = 20,     /* [table_s,idx_s,out_t,n,row_bytes] idx_s 为 int32 槽 */
+    OP_ARGMAX_F16 = 21,     /* [x_t,out_t,n] */
+    OP_KV_APPEND_F16 = 22,  /* [k_t,v_t,state_s,pos]    (M5 decode 用) */
+    OP_KV_GATHER_F16 = 23,  /* [state_s,q_t,pos,n_kv,head_dim] */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -79,6 +94,19 @@ enum {
 #define WT_ARITY_SPILL 4
 #define WT_ARITY_FILL 4
 #define WT_ARITY_TRANSPOSE_F16 6
+#define WT_ARITY_UNARY_F16 4
+#define WT_ARITY_BINARY_F16 5
+#define WT_ARITY_SOFTMAX_F16 4
+#define WT_ARITY_CONCAT_F16 12
+#define WT_ARITY_STRIDED_SLICE_F16 15
+#define WT_ARITY_SPLIT_F16 11
+#define WT_ARITY_REDUCE_F16 5
+#define WT_ARITY_CUMSUM_F32 7
+#define WT_ARITY_CONV1D_SSM_F16 6
+#define WT_ARITY_GATHER_F16 5
+#define WT_ARITY_ARGMAX_F16 3
+#define WT_ARITY_KV_APPEND_F16 4
+#define WT_ARITY_KV_GATHER_F16 5
 
 struct wt_slot {
     uint32_t len;
