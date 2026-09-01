@@ -22,7 +22,7 @@ import json
 import sys
 
 sys.path.insert(0, "/disk2/GEHTP/scripts")
-from golden_qwen35 import gguf_read, GGUF_Q4_0, GGUF_F32  # noqa: E402
+from golden_qwen35 import gguf_read_full, GGUF_Q4_0, GGUF_F32  # noqa: E402
 
 # GGUF 角色表(arch=qwen35; 由 golden_qwen35.py 的实测映射固化)
 ROLE_MAP = {
@@ -106,7 +106,7 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    arch, tensors = gguf_read(args.gguf)
+    arch, tensors, data_start = gguf_read_full(args.gguf)
     assert arch == "qwen35", f"arch={arch}, 需要 qwen35"
 
     with open(args.net_json) as f:
@@ -153,8 +153,7 @@ def main():
         if gguf_name not in tensors:
             unmatched_net.append((name, gguf_name))
             continue
-        gtype, dims, buf = tensors[gguf_name]
-        nbytes = len(buf)
+        gtype, dims, offset, nbytes = tensors[gguf_name]
         # 形状交叉验证: net.json 权重张量 dims(HF 序)与 GGUF dims(ggml 序)互转
         wt_shape = None
         for t in wt_inputs:
@@ -171,7 +170,8 @@ def main():
                 unmatched_net.append((name, f"{gguf_name} 形状不符 gguf{dims} vs net{wt_shape}"))
                 continue
         match[name] = {"gguf_name": gguf_name, "ggml_type": gtype,
-                       "dims": list(dims), "nbytes": nbytes}
+                       "dims": list(dims), "nbytes": nbytes,
+                       "file_offset": data_start + offset}
 
     # 双向完备性
     # 白名单: A_log 被 ONNX 常量折叠(实测 net.json 无 A_log 张量)→ 由 .bin 池供应
@@ -188,7 +188,13 @@ def main():
 
     with open(args.out, "w") as f:
         json.dump(match, f, indent=2)
-    print(f"[wtlink] OK: {len(match)} 权重节点 ↔ GGUF 双向完备 → {args.out}")
+    tsv = args.out.replace(".json", ".tsv")
+    with open(tsv, "w") as f:
+        f.write("node\tgguf_name\tggml_type\tfile_offset\tnbytes\tdims\n")
+        for k, v in match.items():
+            f.write(f"{k}\t{v['gguf_name']}\t{v['ggml_type']}\t{v['file_offset']}\t"
+                    f"{v['nbytes']}\t{','.join(map(str, v['dims']))}\n")
+    print(f"[wtlink] OK: {len(match)} 权重节点 ↔ GGUF 双向完备 → {args.out} + {tsv}")
 
 
 if __name__ == "__main__":

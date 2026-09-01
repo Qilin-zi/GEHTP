@@ -47,12 +47,16 @@ static std::vector<op_id_t> parse_emit_order(const std::vector<uint8_t>& buf) {
         uint32_t v;
         std::memcpy(&v, buf.data() + i, 4);
         if (v == enc_op) {
-            // [encoded][word_count][?][payload: name_len u32 ... op_id u64 @ 4+name_padded]
+            // [encoded][word_count][?][payload: name_len u32 ... grp_len u32
+            // (M2c) ... op_id u64 @ 12+4+name_padded+4+grp_padded]
             uint32_t name_len;
             std::memcpy(&name_len, buf.data() + i + 12, 4);  // 假定记录头 12B
             uint32_t name_padded = (name_len + 3) & ~3u;
+            uint32_t grp_len;
+            std::memcpy(&grp_len, buf.data() + i + 12 + 4 + name_padded, 4);
+            uint32_t grp_padded = (grp_len + 3) & ~3u;
             uint64_t op_id;
-            std::memcpy(&op_id, buf.data() + i + 12 + 4 + name_padded, 8);
+            std::memcpy(&op_id, buf.data() + i + 12 + 4 + name_padded + 4 + grp_padded, 8);
             order.push_back(static_cast<op_id_t>(op_id));
             i += 8;
         } else {

@@ -1701,9 +1701,15 @@ void GraphPrepare::serialize_opdef(Serializer& ser, const OpDef& opdef) const {
         if (it != extra_info_registry().end()) extra = it->second(*this, opdef);
     }
 
+    // M2c: 记录内加 grouping(原始节点名, wtop_emit --gguf 的 match 键)
+    const std::string& grp = opdef.grouping;
+    uint32_t grp_len = static_cast<uint32_t>(grp.size());
+    uint32_t grp_padded = (grp_len + 3) & ~uint32_t(3);
+
     // Compute total payload size for the tagged record header word count.
     size_t payload =
         4 + name_padded +            // name_len + name
+        4 + grp_padded +             // grp_len + grouping(M2c)
         8 + 2 + 2 + 4 +              // op_id, flags, reserved, num_inputs
         opdef.inputs.size() * 16 +   // (src_id, out_idx, pad) per input
         sizeof(OutputDef) +           // output_def
@@ -1720,6 +1726,10 @@ void GraphPrepare::serialize_opdef(Serializer& ser, const OpDef& opdef) const {
     w32(name_len);
     std::memcpy(buf.data() + off, name, name_len);
     off += name_padded;
+
+    w32(grp_len);
+    std::memcpy(buf.data() + off, grp.data(), grp_len);
+    off += grp_padded;
     w64(opdef.op_id);
     w16(opdef.flags);
     w16(0);  // reserved
@@ -1916,6 +1926,18 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
             uint32_t name_padded = (name_len + 3) & ~uint32_t(3);
             std::string name(reinterpret_cast<const char*>(rr.p), name_len);
             rr.p += name_padded;
+            // M2c: grouping(原始节点名) — 用 remaining 守卫兼容旧流
+            std::string grp;
+            if (rr.remaining() >= 4) {
+                uint32_t grp_len = rr.r32();
+                uint32_t grp_padded = (grp_len + 3) & ~uint32_t(3);
+                if (rr.remaining() >= grp_padded) {
+                    grp.assign(reinterpret_cast<const char*>(rr.p), grp_len);
+                    rr.p += grp_padded;
+                } else {
+                    rr.p -= 4;
+                }
+            }
             uint64_t op_id = rr.r64();
             uint16_t flags = rr.r16();
             (void)rr.r16();  // reserved
@@ -1926,6 +1948,7 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
             opdef->graph = this;
             opdef->op_id = op_id;
             opdef->name_tag = string_tag_t::map_str(name.c_str());
+            opdef->grouping = grp;
 
             opdef->inputs.reserve(num_inputs);
             for (uint32_t i = 0; i < num_inputs; ++i) {

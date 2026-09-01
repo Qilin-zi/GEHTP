@@ -23,6 +23,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <map>
@@ -83,6 +85,46 @@ bool load_file(const std::string& path, std::vector<uint8_t>& out) {
     return true;
 }
 
+// GGUF 匹配条目(TSV 行; M2c)
+struct GgufEntry { uint64_t file_offset; uint64_t nbytes; uint32_t type; std::vector<uint64_t> dims; };
+
+// 字符串按分隔符切分
+static std::vector<std::string> split_str(const std::string& st, char sep) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= st.size()) {
+        size_t pp = st.find(sep, start);
+        out.push_back(st.substr(start, pp == std::string::npos ? std::string::npos : pp - start));
+        if (pp == std::string::npos) break;
+        start = pp + 1;
+    }
+    return out;
+}
+
+// f16 → f32(反量化用)
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t u;
+    if (exp == 0) {
+        if (mant == 0) { u = sign; }
+        else {
+            int e = -1;
+            while (!(mant & 0x400)) { mant <<= 1; e--; }
+            mant &= 0x3FF;
+            u = sign | ((uint32_t)(127 + 15 + e) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        u = sign | 0x7F800000u | (mant << 13);
+    } else {
+        u = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
 struct Emitter;
 
 struct Emitter {
@@ -140,11 +182,113 @@ struct Emitter {
         }
         return t;
     }
-    // 权重消费 op 的 const 输入 → f16 槽(按 const id 去重)
+// GGUF 供给上下文(M2c; emit 启动时设置)
+    const std::map<std::string, GgufEntry>* gguf_tab = nullptr;
+    const std::vector<uint8_t>* gguf_bytes = nullptr;
+    bool use_gguf = false;
+    uint32_t gguf_hits = 0, gguf_miss = 0;
+
+    // GGUF Q4_0 → tile-major repack(tile 契约 = 例15 ref_dequant_q4_0_tile):
+    // tile 640B = [4×128B 列对 quants][32 fp16 scales@+512][pad];
+    // 列对(c,c+1) 32B: byte r = lo(列c nib r) | hi(列c+1 nib r)<<4;
+    // GGUF 块(n 列, kt)= 18B [2B d][16B nibbles: 元素0..15=lo, 16..31=hi]。
+    // tile 的 per-row scale 与 GGUF per-block d 分组不同 → 反量化 f32 后按行重量化。
+    static std::vector<uint8_t> repack_q4_0_tiles(const uint8_t* src, size_t nbytes,
+                                                  size_t K, size_t N) {
+        size_t n_k_tiles = K / 32, n_col_tiles = N / 32;
+        std::vector<float> w(K * N);
+        for (size_t b = 0; b < nbytes / 18; b++) {
+            uint16_t d_raw;
+            std::memcpy(&d_raw, src + b * 18, 2);
+            float d = f16_to_f32(d_raw);
+            const uint8_t* nib = src + b * 18 + 2;
+            for (int j = 0; j < 16; j++) {
+                w[(b * 32) + j] = d * ((nib[j] & 0xF) - 8);
+                w[(b * 32) + 16 + j] = d * ((nib[j] >> 4) - 8);
+            }
+        }
+        std::vector<uint8_t> out(n_col_tiles * n_k_tiles * 640, 0);
+        for (size_t ct = 0; ct < n_col_tiles; ct++)
+            for (size_t kt = 0; kt < n_k_tiles; kt++) {
+                uint8_t* tile = out.data() + (ct * n_k_tiles + kt) * 640;
+                for (size_t r = 0; r < 32; r++) {
+                    float mx = 0.0f;
+                    for (size_t c = 0; c < 32; c++)
+                        mx = std::max(mx, std::fabs(w[(kt * 32 + r) * N + ct * 32 + c]));
+                    float d = mx / 7.0f;
+                    uint16_t d16 = f32_to_f16_rne(d);
+                    std::memcpy(tile + 512 + r * 2, &d16, 2);
+                    for (size_t c = 0; c < 32; c++) {
+                        float v = w[(kt * 32 + r) * N + ct * 32 + c];
+                        int q = (int)std::lround(v / d) + 8;
+                        if (q < 0) q = 0;
+                        if (q > 15) q = 15;
+                        uint8_t& byte = tile[(c / 2) * 32 + r];
+                        if (c & 1) byte |= (uint8_t)(q << 4);
+                        else byte = (uint8_t)q;
+                    }
+                }
+            }
+        return out;
+    }
+
+    // 权重消费 op 的 const 输入 → 权重槽(按 const id 去重; GGUF 供给优先)
+    // consumer_grp = 消费节点的原始名(loader 只给计算 op 设 grouping,
+    // 权重 const 自身没有; TSV 键 = 消费节点名)
     uint32_t ensure_weight_slot(GraphPrepare& gp, const OpDef* w,
-                                std::map<uint64_t, uint32_t>& wslots) {
+                                std::map<uint64_t, uint32_t>& wslots,
+                                const std::string& consumer_grp = "") {
         auto it = wslots.find(w->op_id);
         if (it != wslots.end()) return it->second;
+        if (use_gguf && gguf_tab && gguf_bytes) {
+            auto mit = gguf_tab->find(w->grouping);
+            if (mit == gguf_tab->end() && !consumer_grp.empty())
+                mit = gguf_tab->find(consumer_grp);
+            if (mit != gguf_tab->end()) {
+                const GgufEntry& e = mit->second;
+                if (e.file_offset + e.nbytes <= gguf_bytes->size()) {
+                    const uint8_t* src = gguf_bytes->data() + e.file_offset;
+                    uint32_t id;
+                    size_t K = e.dims[0], NN = 1;
+                    for (size_t i = 1; i < e.dims.size(); i++) NN *= e.dims[i];
+                    if (e.type == 2 && K % 32 == 0 && NN % 32 == 0) {
+                        // Q4_0 → tile-major(32×32 tile 契约)
+                        auto tile = repack_q4_0_tiles(src, e.nbytes, K, NN);
+                        id = add_slot((uint32_t)tile.size(), (uint32_t)(K * NN), tile.data());
+                    } else if (e.type == 2) {
+                        // 小维度(<32)不走 tile: 反量化 f16 直存
+                        std::vector<float> wf2(K * NN);
+                        for (size_t b = 0; b < e.nbytes / 18; b++) {
+                            uint16_t d_raw;
+                            std::memcpy(&d_raw, src + b * 18, 2);
+                            float d = f16_to_f32(d_raw);
+                            const uint8_t* nib = src + b * 18 + 2;
+                            for (int j = 0; j < 16; j++) {
+                                wf2[(b * 32) + j] = d * ((nib[j] & 0xF) - 8);
+                                wf2[(b * 32) + 16 + j] = d * ((nib[j] >> 4) - 8);
+                            }
+                        }
+                        std::vector<uint16_t> w16(K * NN);
+                        for (size_t i = 0; i < K * NN; i++) w16[i] = f32_to_f16_rne(wf2[i]);
+                        std::vector<uint8_t> wb(K * NN * 2);
+                        std::memcpy(wb.data(), w16.data(), wb.size());
+                        id = add_slot((uint32_t)wb.size(), (uint32_t)(K * NN), wb.data());
+                    } else {  // F32 → f16
+                        size_t n4 = e.nbytes / 4;
+                        std::vector<uint16_t> w16(n4);
+                        const float* wf = reinterpret_cast<const float*>(src);
+                        for (size_t i = 0; i < n4; i++) w16[i] = f32_to_f16_rne(wf[i]);
+                        std::vector<uint8_t> wb(n4 * 2);
+                        std::memcpy(wb.data(), w16.data(), wb.size());
+                        id = add_slot((uint32_t)wb.size(), (uint32_t)n4, wb.data());
+                    }
+                    wslots[w->op_id] = id;
+                    gguf_hits++;
+                    return id;
+                }
+            }
+            gguf_miss++;
+        }
         size_t n = (size_t)w->const_data_size / 4;
         if (n == 0) {
             // 空 const(记录在但池数据被 DCE 删): 最小零槽占位(M4 数值门兜底)
@@ -271,7 +415,8 @@ static uint64_t elems_of(const OpDef* od) {
 }
 
 int emit(const std::string& bin_path, const std::string& in_f16_path,
-         const std::string& out_path, const std::string& manifest_path) {
+         const std::string& out_path, const std::string& manifest_path,
+         const std::string& gguf_path, const std::string& match_path) {
     // 1. deserialize .bin
     std::vector<uint8_t> bin;
     if (!load_file(bin_path, bin)) { std::fprintf(stderr, "error: cannot open %s\n", bin_path.c_str()); return 2; }
@@ -310,6 +455,38 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     em.add_slot((uint32_t)in_f16.size(), (uint32_t)input_elems, in_f16.data());
     em.slots[0].addr = WT_SLOT_EXT_IN;  // Level 1: 输入槽标外部(wt_exec_run_io 注入)
 
+    // 2b. GGUF 供给(M2c): 读 TSV 匹配表 + GGUF 文件
+    std::map<std::string, GgufEntry> gguf_map;
+    std::vector<uint8_t> gguf_data;
+    bool have_gguf = false;
+    if (!gguf_path.empty() && !match_path.empty()) {
+        std::ifstream mf(match_path);
+        std::string line;
+        while (std::getline(mf, line)) {
+            if (line.empty() || line[0] == 'n') continue;
+            std::vector<std::string> cols = split_str(line, '\t');
+            if (cols.size() < 6) continue;
+            GgufEntry e{};
+            e.type = (uint32_t)std::strtoul(cols[2].c_str(), nullptr, 10);
+            e.file_offset = std::strtoull(cols[3].c_str(), nullptr, 10);
+            e.nbytes = std::strtoull(cols[4].c_str(), nullptr, 10);
+            for (auto& d : split_str(cols[5], ','))
+                e.dims.push_back(std::strtoull(d.c_str(), nullptr, 10));
+            gguf_map[cols[0]] = e;
+        }
+        if (!load_file(gguf_path, gguf_data)) {
+            std::fprintf(stderr, "error: cannot open %s\n", gguf_path.c_str());
+            return 2;
+        }
+        have_gguf = true;
+        std::printf("[gguf] loaded %zu entries, %zu bytes\n", gguf_map.size(), gguf_data.size());
+    }
+    if (have_gguf) {
+        em.use_gguf = true;
+        em.gguf_tab = &gguf_map;
+        em.gguf_bytes = &gguf_data;
+    }
+
     // 3. 通用权重槽收集(M2): 按 plan_order 遍历, 对权重消费 op 的 const 输入
     //     建 f16 槽(按 const id 去重, tie 权重共享一槽)
     std::map<uint64_t, uint32_t> wslots;  // const op_id → slot
@@ -323,7 +500,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (wi < 0 || od->inputs.size() <= (size_t)wi) continue;
             const OpDef* w = gp.get_op_at(od->inputs[wi].src_id);
             if (!w || w->const_data_size == 0) continue;
-            em.ensure_weight_slot(gp, w, wslots);
+            em.ensure_weight_slot(gp, w, wslots, od->grouping);
         }
     }
     // conv 分支的便捷引用(无 conv 图时为 0, conv 分支不会触发)
@@ -339,10 +516,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (conv->inputs.size() < 2) { std::fprintf(stderr, "error: conv missing weight input\n"); return 2; }
             const OpDef* w = gp.get_op_at(conv->inputs[1].src_id);
             if (!w) { std::fprintf(stderr, "error: weight const missing\n"); return 2; }
-            w_slot = em.ensure_weight_slot(gp, w, wslots);
+            w_slot = em.ensure_weight_slot(gp, w, wslots, conv->grouping);
             if (conv->inputs.size() > 2) {
                 const OpDef* b = gp.get_op_at(conv->inputs[2].src_id);
-                if (b) b_slot = em.ensure_weight_slot(gp, b, wslots);
+                if (b) b_slot = em.ensure_weight_slot(gp, b, wslots, conv->grouping);
             }
         }
     }
@@ -515,7 +692,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         if (nm == "RmsNorm") {
             uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
-            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots) : em.dummy_slot_id;
+            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
             uint32_t out_t = em.fresh_temp(od->op_id);
             em.add_op(OP_RMSNORM_F16, {x_t, w_s, out_t, (uint32_t)elems_of(od)});
             break;
@@ -525,7 +702,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
             const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
-            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots) : em.dummy_slot_id;
+            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
             ExtraFc ef{};
             ExtraMatMul em2{};
             uint32_t m = 0, k = 0, nn = 0;
@@ -548,7 +725,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
         if (nm == "Gather") {
             const OpDef* tbl = od->inputs.size() > 0 ? gp.get_op_at(od->inputs[0].src_id) : nullptr;
-            uint32_t tbl_s = tbl ? em.ensure_weight_slot(gp, tbl, wslots) : em.dummy_slot_id;
+            uint32_t tbl_s = tbl ? em.ensure_weight_slot(gp, tbl, wslots, od->grouping) : em.dummy_slot_id;
             uint32_t idx_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
             uint32_t row_bytes = 0;
@@ -572,7 +749,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
             uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
-            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots) : em.dummy_slot_id;
+            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
             uint32_t out_t = em.fresh_temp(od->op_id);
             uint64_t ne = elems_of(od);
             uint32_t seq = 1, ch = (uint32_t)ne;
@@ -742,10 +919,25 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         wt_blob* wb = new wt_blob{};
         int rc = wt_parse(em.blob.data(), em.blob.size(), wb);
         if (rc != WT_OK) {
-            std::fprintf(stderr, "error: self-validate failed: %s\n", wt_err_str(rc));
+            std::fprintf(stderr, "error: self-validate failed: %s (blob=%zu weight_area=%zu)\n",
+                         wt_err_str(rc), em.blob.size(), em.weight_area.size());
+            uint64_t max_end = 0;
+            for (auto& sl : em.slots)
+                max_end = std::max<uint64_t>(max_end, (uint64_t)sl.offset + sl.len);
+            std::fprintf(stderr, "  max slot end=%llu n_slots=%zu\n",
+                         (unsigned long long)max_end, em.slots.size());
             return 3;
         }
-        std::printf("WTOP OK: slots=%u ops=%u bytes=%zu\n", (unsigned)em.slots.size(), (unsigned)em.ops.size(), em.blob.size());
+        std::printf("WTOP OK: slots=%u ops=%u bytes=%zu (gguf hits=%u miss=%u)\n",
+                    (unsigned)em.slots.size(), (unsigned)em.ops.size(), em.blob.size(),
+                    em.gguf_hits, em.gguf_miss);
+        if (have_gguf) {
+            std::set<std::string> used;
+            for (auto& [k, v] : gguf_map) {
+                (void)v;
+                // 未命中判定: 通过 wslots 值无法直接回溯键; 粗略列出非小权重
+            }
+        }
     }
     {
         FILE* f = std::fopen(out_path.c_str(), "wb");
@@ -775,7 +967,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 }
 
 int main(int argc, char** argv) {
-    std::string bin_path, in_f16, out_path, manifest_path;
+    std::string bin_path, in_f16, out_path, manifest_path, gguf_path, match_path;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -783,11 +975,13 @@ int main(int argc, char** argv) {
         else if (a == "--input-f16") in_f16 = next();
         else if (a == "--out") out_path = next();
         else if (a == "--manifest") manifest_path = next();
+        else if (a == "--gguf") gguf_path = next();
+        else if (a == "--match") match_path = next();
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (bin_path.empty() || out_path.empty()) {
-        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>]\n");
+        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>]\n");
         return 2;
     }
-    return emit(bin_path, in_f16, out_path, manifest_path);
+    return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path);
 }

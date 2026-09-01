@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "oplist_parse.h"
+#include <stdio.h>
 
 static uint32_t align_up(uint32_t x, uint32_t a) {
     return a * ((x + a - 1u) / a);
@@ -83,7 +84,11 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
         out->slots[i].count = wt_rd_u32(s + 4);
         out->slots[i].offset = wt_rd_u32(s + 8);
         out->slots[i].addr = wt_rd_u32(s + 12);
-        if (out->slots[i].len == 0) return WT_ERR_WEIGHT_OVERRUN;
+        if (out->slots[i].len == 0) {
+            fprintf(stderr, "[wt_parse] slot %u: len=0 off=%u count=%u\n",
+                    i, out->slots[i].offset, out->slots[i].count);
+            return WT_ERR_WEIGHT_OVERRUN;
+        }
         if (out->slots[i].offset % WT_WEIGHT_ALIGN != 0) return WT_ERR_ALIGN;
         if ((uint64_t)out->slots[i].offset + out->slots[i].len > 0xFFFFFFFFull)
             return WT_ERR_WEIGHT_OVERRUN;
@@ -107,13 +112,22 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
     }
 
     out->weight_off = align_up((uint32_t)p, WT_WEIGHT_ALIGN);
-    if ((size_t)out->weight_off > size) return WT_ERR_WEIGHT_OVERRUN;
+    if ((size_t)out->weight_off > size) {
+        fprintf(stderr, "[wt_parse] op 表 walk 越界: p=%zu weight_off=%u size=%zu (n_ops=%u)\n",
+                p, out->weight_off, size, out->n_ops);
+        return WT_ERR_WEIGHT_OVERRUN;
+    }
     out->weight_base = buf + out->weight_off;
     out->weight_bytes = size - out->weight_off;
 
     for (uint32_t i = 0; i < out->n_slots; i++) {
         uint64_t end = (uint64_t)out->slots[i].offset + out->slots[i].len;
-        if (end > out->weight_bytes) return WT_ERR_WEIGHT_OVERRUN;
+        if (end > out->weight_bytes) {
+            fprintf(stderr, "[wt_parse] slot %u: off=%u len=%u end=%llu weight_bytes=%zu weight_off=%u\n",
+                    i, out->slots[i].offset, out->slots[i].len,
+                    (unsigned long long)end, out->weight_bytes, out->weight_off);
+            return WT_ERR_WEIGHT_OVERRUN;
+        }
     }
     for (uint32_t i = 0; i < out->n_ops; i++) {
         const struct wt_op* op = &out->ops[i];

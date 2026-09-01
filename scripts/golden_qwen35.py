@@ -56,8 +56,8 @@ def _skip_value(data, pos, vtype):
     raise ValueError(f"unknown KV type {vtype}")
 
 
-def gguf_read(path):
-    """返回 (arch, tensors) — tensors: {name: (ggml_type, dims, data_bytes)}。"""
+def gguf_read_full(path):
+    """返回 (arch, tensors, data_start) — tensors: {name: (ggml_type, dims, data_bytes)}。"""
     with open(path, "rb") as f:
         data = f.read()
     magic, version = struct.unpack_from("<4sI", data, 0)
@@ -102,6 +102,16 @@ def gguf_read(path):
         tensors[name] = (gtype, dims, offset, nbytes)
     # GGUF tensor offset 相对数据段起点:数据段 = tensor info 表末尾,按 32 对齐
     data_start = (pos + 31) & ~31
+    for name, (gtype, dims, offset, nbytes) in tensors.items():
+        tensors[name] = (gtype, dims, offset, nbytes)
+    return arch, tensors, data_start
+
+
+def gguf_read(path):
+    """返回 (arch, tensors) — tensors: {name: (ggml_type, dims, data_bytes)}。"""
+    arch, tensors, data_start = gguf_read_full(path)
+    with open(path, "rb") as f:
+        data = f.read()
     for name, (gtype, dims, offset, nbytes) in tensors.items():
         tensors[name] = (gtype, dims, data[data_start + offset:data_start + offset + nbytes])
     return arch, tensors
