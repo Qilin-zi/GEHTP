@@ -227,6 +227,11 @@ class Serializer : public SerOpsInterface, public DeSerError {
     };
     void set_mode(Mode m) { f_108 = (m == Mode::Prescan) ? 1 : 0; } // 借 +0x108 (ctor-0 字节)
     Mode mode() const { return f_108 ? Mode::Prescan : Mode::Write; }
+    // 计量模式(独立于 mode): do_serialize 内部会自管 Prescan/Write 翻转
+    // (IO prescan 段 @graph_prepare.cpp 强制 set_mode(Write)), 外层两遍计长
+    // 必须用不随 mode 翻转的标志, 否则计量半途变实写
+    void set_measure_only(bool m) { f_109 = m ? 1 : 0; }
+    bool measure_only() const { return f_109 != 0; }
     void set_error(char const *msg) { errstr = msg; }               // DeSerError @+0x08
     bool has_error() const { return errstr != nullptr; }
     // bytes_written 虚槽同式 (@0x12f3f80): bytes_filled + bufp − bufstart
@@ -235,7 +240,8 @@ class Serializer : public SerOpsInterface, public DeSerError {
         return bytes_filled + size_t(bufp - bufstart);
     }
     void write_uint32(uint32_t val);            // 行为面 (见 serializer.cpp)
-    void write_tagged_record(uint32_t tag, const void *data, int data_size); // 行为面
+    void write_tagged_record(uint32_t tag, const void *data, size_t data_size);
+    // 行为面; data_size 用 size_t(0.8B const 池 3.58GB 溢出 int → 头部 wc 错乱)
     void serialize_uint32(uint32_t a, uint32_t b, uint32_t c);                // 行为面
     void do_insert_preload_op();                                              // 行为面 (+0x340 区)
 
@@ -299,6 +305,7 @@ class Serializer : public SerOpsInterface, public DeSerError {
     unsigned char f_e8[8];         // +0xe8..0xef ctor 未触及 (str2 前间隙)
     std::string str2;              // +0xf0 (尾字 0x100-0x107 即其 +0x10)
     unsigned char f_108 = 0;       // +0x108 字节 0 (重实现借作 Prescan 门控)
+    unsigned char f_109 = 0;       // +0x109 计量模式门控 (重实现自加)
     unsigned f_10c = 0;            // +0x10c u32 0 (ctor movq %rax,0x10c 合写)
     unsigned f_110 = 1;            // +0x110 u32 1 (同上 qword 高半)
     std::string str3;              // +0x118

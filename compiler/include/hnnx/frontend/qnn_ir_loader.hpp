@@ -19,12 +19,21 @@ struct QnnTensorInfo {
     bool is_param = false;     // true if tensor_param inside a node
 };
 
+struct QnnScalarParam {
+    std::string name;
+    uint32_t id = 0;
+    bool is_numeric = false;
+    double value_num = 0.0;
+    std::string value_str;  // 字符串值(数字也留原文, 保真)
+};
+
 struct QnnNodeInfo {
     std::string name;
     std::string type;          // "Transpose", "Reshape", "FullyConnected"
     std::vector<std::string> input_names;
     std::vector<std::string> output_names;
     std::vector<QnnTensorInfo> tensor_params;
+    std::vector<QnnScalarParam> scalar_params;  // scalar_params {name: {id: value}}
 };
 
 class QnnIRLoader {
@@ -73,6 +82,9 @@ private:
     void parse_tensors(const JsonValue& graph_json);
     void parse_nodes(const JsonValue& graph_json);
     void extract_tensor_params(QnnNodeInfo& node, const JsonValue& node_json);
+    void extract_scalar_params(QnnNodeInfo& node, const JsonValue& node_json);
+    // scalar_params → op_data 字节 blob(append_node 的 ops_data), 消费方解析
+    static std::vector<uint8_t> pack_scalar_params(const QnnNodeInfo& node);
     void build_tensor_opid_map();
     uint32_t build_graph();
 

@@ -1,4 +1,5 @@
 #include "hnnx/ops/ops.hpp"
+#include "hnnx/ir/scalar_params.hpp"
 #include "hnnx/ir/op_registry.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/cost/cost_model.hpp"
@@ -119,6 +120,72 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         for (size_t i = 0; i < n; ++i) out[i] = std::exp(in_float(0, i));
     } else if (op_type_name == "Neg") {
         for (size_t i = 0; i < n; ++i) out[i] = -in_float(0, i);
+
+    } else if (op_type_name == "Eltwise_Unary" || op_type_name == "ElementWiseNeuron") {
+        // operation 由 scalar_params 决定(QNN 2.48 net.json): Eltwise_Unary =
+        // NEG/EXP/SQRT/RSQRT/LOG/ABS/SIN/COS; ElementWiseNeuron = SWISH/SIGMOID/
+        // TANH/GELU/RELU 等。未知 operation → 恒等(host 参考路径, 逐 op 扩支持)
+        auto sp = unpack_scalar_params(params);
+        const ScalarParam* po = scalar_get(sp, "operation");
+        std::string oper = po ? po->value_str : "";
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        for (size_t i = 0; i < n; ++i) {
+            float x = in0 ? in0[i] : 0.0f;
+            if (oper == "NEG") out[i] = -x;
+            else if (oper == "EXP") out[i] = std::exp(x);
+            else if (oper == "SQRT") out[i] = (x >= 0) ? std::sqrt(x) : 0.0f;
+            else if (oper == "RSQRT") out[i] = (x > 0) ? 1.0f / std::sqrt(x) : 0.0f;
+            else if (oper == "LOG") out[i] = (x > 0) ? std::log(x) : 0.0f;
+            else if (oper == "ABS") out[i] = std::fabs(x);
+            else if (oper == "SIN") out[i] = std::sin(x);
+            else if (oper == "COS") out[i] = std::cos(x);
+            else if (oper == "SIGMOID" || oper == "SWISH" || oper == "HARD_SIGMOID")
+                out[i] = 1.0f / (1.0f + std::exp(-x));
+            else if (oper == "TANH") out[i] = std::tanh(x);
+            else if (oper == "GELU" || oper == "GELU_TANH")
+                out[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+            else if (oper == "RELU") out[i] = std::max(0.0f, x);
+            else out[i] = x;
+        }
+    } else if (op_type_name == "Eltwise_Ternary") {
+        // SELECT 语义(eltwise_type scalar): out = in0(cond) ? in1 : in2
+        // (GDN chunk 的 masked_fill → Where 展开)
+        auto sp = unpack_scalar_params(params);
+        const ScalarParam* pt = scalar_get(sp, "eltwise_type");
+        std::string t = pt ? pt->value_str : "";
+        const float* c = inputs.size() > 0 ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
+        const float* a = inputs.size() > 1 ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
+        const float* b = inputs.size() > 2 ? reinterpret_cast<const float*>(inputs[2]) : nullptr;
+        for (size_t i = 0; i < n; ++i) {
+            if (t == "SELECT") out[i] = (c && c[i] != 0.0f) ? (a ? a[i] : 0.0f) : (b ? b[i] : 0.0f);
+            else out[i] = (a ? a[i] : 0.0f);
+        }
+    } else if (op_type_name == "CumSum" || op_type_name == "CumulativeSum") {
+        // axis 由 scalar_params 决定; 输入形状取 in_defs[0](缺省 = out_def)
+        auto sp = unpack_scalar_params(params);
+        const ScalarParam* pa = scalar_get(sp, "axis");
+        int64_t axis = pa ? pa->as_int() : 0;
+        std::vector<size_t> dims;
+        const OutputDef* in_od = in_defs.empty() ? &out_def : &in_defs[0];
+        for (uint32_t i = 0; i < in_od->rank && i < 5; ++i) dims.push_back(in_od->dims[i]);
+        if (dims.empty()) dims.push_back(n);
+        if (axis < 0) axis += static_cast<int64_t>(dims.size());
+        size_t ax = static_cast<size_t>(std::max<int64_t>(axis, 0));
+        size_t outer = 1, inner = 1, axlen = 1;
+        for (size_t d = 0; d < dims.size(); ++d) {
+            if (d < ax) outer *= dims[d];
+            else if (d == ax) axlen = dims[d];
+            else inner *= dims[d];
+        }
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        for (size_t o = 0; o < outer; ++o)
+            for (size_t k = 0; k < inner; ++k) {
+                float acc = 0.0f;
+                for (size_t a = 0; a < axlen; ++a) {
+                    acc += in0 ? in0[(o * axlen + a) * inner + k] : 0.0f;
+                    out[(o * axlen + a) * inner + k] = acc;
+                }
+            }
 
     // ── Math ops (elementwise, single/dual input) ──
     } else if (op_type_name == "Power") {
@@ -340,7 +407,8 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         float sum = 0.0f;
         for (size_t i = 0; i < n; ++i) { out[i] = std::exp(in0[i] - mx); sum += out[i]; }
         if (sum > 0) for (size_t i = 0; i < n; ++i) out[i] /= sum;
-    } else if (op_type_name == "MatMul" || op_type_name == "Dense") {
+    } else if (op_type_name == "MatMul" || op_type_name == "Dense"
+               || op_type_name == "FullyConnected") {
         // MatMul: C[m,n] = A[m,k] @ B[k,n]
         // in_defs[0] = A shape [m,k], in_defs[1] = B shape [k,n]
         // output_def.dims = [m, n]
@@ -552,6 +620,9 @@ std::unique_ptr<Op> ScatterNdOp::construct(const OpIoPtrs& io, op_id_t id) { ret
 std::unique_ptr<Op> ReduceOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> ArgMinMaxOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> CumSumOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
+
+std::unique_ptr<Op> SelectUnaryOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
+std::unique_ptr<Op> SelectTernaryOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> CastOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> FpCastOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> QuantizeOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
@@ -632,6 +703,15 @@ void register_all_ops() {
         // MatMul
         reg.register_op_fn("MatMul", MatMulOp::construct);
         reg.register_op_fn("Dense", DenseOp::construct);
+        // QNN 2.48 实测 op type 名(M1, 0.8B net.json 20 型差集):
+        // FullyConnected=投影层(Dense 语义); CumulativeSum(注册名 "CumSum" 的 QNN 名);
+        // Eltwise_Unary/ElementWiseNeuron/Eltwise_Ternary 的 operation 由
+        // scalar_params 决定(execute 时从 params 解析)
+        reg.register_op_fn("FullyConnected", DenseOp::construct);
+        reg.register_op_fn("CumulativeSum", CumSumOp::construct);
+        reg.register_op_fn("Eltwise_Unary", SelectUnaryOp::construct);
+        reg.register_op_fn("ElementWiseNeuron", SelectUnaryOp::construct);
+        reg.register_op_fn("Eltwise_Ternary", SelectTernaryOp::construct);
         // Elementwise
         reg.register_op_fn("Add", AddOp::construct);
         // converter 的二元逐元素 op 类型名(2.48 实测 "Eltwise_Binary";旧版别名)

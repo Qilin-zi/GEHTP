@@ -848,12 +848,34 @@ bool GraphPrepare::serialize(uint8_t* buf, size_t buf_size, size_t& out_size) co
     hnnx::Allocator *ser_alloc = static_cast<hnnx::Allocator *>(allocator_);
     if (ser_alloc == nullptr) ser_alloc = hnnx::default_serializer_allocator();
 
-    // Create Serializer (真实签名 @0x12f1320: (GraphPrepare const&, Allocator*, char*, size_t))
-    Serializer ser(*const_cast<GraphPrepare*>(this), ser_alloc, reinterpret_cast<char*>(buf), buf_size);
+    // 容量安全(M1): Serializer 内存模式无边界检查,大图单缓冲直接堆溢出
+    // (0.8B 图 1MB 缓冲 ASAN 实锤)。两遍: Prescan 计长 → 不足则返回所需值。
+    // 两遍各用全新 Serializer(内部状态机 f_188 跨遍残留会改变输出)。
+    size_t required = 0;
+    {
+        // 计量遍: measure_only 不受 do_serialize 内部 mode 翻转影响
+        Serializer ser_prescan(*const_cast<GraphPrepare*>(this), ser_alloc,
+                               reinterpret_cast<char*>(buf), buf_size);
+        ser_prescan.set_measure_only(true);
+        if (!do_serialize(ser_prescan)) return false;
+        required = ser_prescan.current_position();
+    }
+    // out_size 最终对齐到 8, 计量值同步对齐, 调用方按此分配
+    required = (required + 7) & ~size_t(7);
+    if (buf_size == 0) {
+        // 无缓冲 = 仅计量(调用方按 out_size 再分配)
+        out_size = (required + 7) & ~size_t(7);
+        return true;
+    }
+    if (required > buf_size) {
+        out_size = required;  // 告诉调用方所需字节
+        return false;
+    }
 
-    // Call do_serialize(ser)
+    // 实写(全新 Serializer; do_serialize 内部自管 IO prescan)
+    Serializer ser(*const_cast<GraphPrepare*>(this), ser_alloc,
+                   reinterpret_cast<char*>(buf), buf_size);
     bool ok = do_serialize(ser);
-
     if (ok) {
         out_size = ser.current_position();
         // Align to 8 bytes: (out_size + 7) & ~7
@@ -1068,7 +1090,7 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
         // 常量数据�?(整块 4 字节对齐)
         if (!const_pool_.empty()) {
             ser.write_tagged_record(0xCF56, const_pool_.data(),
-                                    static_cast<int>(const_pool_.size()));
+                                    const_pool_.size());
         }
     }
 
@@ -1776,7 +1798,7 @@ void GraphPrepare::serialize_io(Serializer& ser, uint64_t& counter, bool is_pres
 op_id_t GraphPrepare::append_node(const std::string& name, uint32_t node_type,
                                     const InputDef* inputs, size_t num_inputs,
                                     const OutputDef* outputs, size_t num_outputs,
-                                    const uint8_t* ops_data) {
+                                    const uint8_t* ops_data, size_t ops_data_len) {
     // 1. Validate construction state
     // Source: graph_prepare.cc:2975 "append_node, not in construction phase. state %d"
     if (construction_state_ != 1) {
@@ -1878,14 +1900,9 @@ op_id_t GraphPrepare::append_node(const std::string& name, uint32_t node_type,
     // Store input connections
     opdef->inputs = std::move(input_conns);
 
-    // 10b. 保存 op_data 参数 blob �?op 构造时解析
-    if (ops_data && num_outputs > 0) {
-        // ops_data 长度未知; 真实库按 op 类型读固定字段。这里存�?256 字节
-        // 作为参数 blob 上限 (足够 stride/padding/dilation/axis 等常见参�?�?
-    size_t blob_len = 256;
-        opdef->op_data.assign(ops_data, ops_data + blob_len);
-    } else if (ops_data) {
-        opdef->op_data.assign(ops_data, ops_data + 256);
+    // 10b. 保存 op_data 参数 blob(loader 打包的 scalar_params 等)
+    if (ops_data && ops_data_len > 0) {
+        opdef->op_data.assign(ops_data, ops_data + ops_data_len);
     }
 
     // 10. Quantization validation
@@ -1912,6 +1929,15 @@ op_id_t GraphPrepare::append_node(const std::string& name, uint32_t node_type,
 }
 
 // Source: do_append_const_node @ 0xF776F0 (1441 bytes)
+// 旧签名兼容: 盲拷 256 字节(既有调用方语义不变; 新代码用带长度版)
+op_id_t GraphPrepare::append_node(const std::string& name, uint32_t node_type,
+                                    const InputDef* inputs, size_t num_inputs,
+                                    const OutputDef* outputs, size_t num_outputs,
+                                    const uint8_t* ops_data) {
+    return append_node(name, node_type, inputs, num_inputs, outputs, num_outputs,
+                       ops_data, ops_data ? 256 : 0);
+}
+
 op_id_t GraphPrepare::append_const_node(uint32_t node_type, const OutputDef& od,
                                           const uint8_t* data, size_t data_len) {
     // Validate construction state

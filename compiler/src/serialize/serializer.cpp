@@ -105,10 +105,11 @@ Serializer::~Serializer()
 
 void Serializer::serialize_fwrite(void const *data, size_t size, bool align4)
 {
-    if (mode() == Mode::Prescan) {
+    if (measure_only() || mode() == Mode::Prescan) {
+        // 与 Write 同语义: 先按当前位置对齐再写, 两遍长度严格一致
         int pad = 0;
         if (align4) {
-            uint32_t misalign = (static_cast<uint32_t>(current_position()) + static_cast<uint32_t>(size)) & 3;
+            uint32_t misalign = static_cast<uint32_t>(current_position()) & 3;
             if (misalign != 0) pad = 4 - misalign;
         }
         bytes_filled += size + pad;
@@ -146,13 +147,13 @@ void Serializer::serialize_uint32(uint32_t a, uint32_t b, uint32_t c)
 
 void Serializer::write_uint32(uint32_t val)
 {
-    if (mode() == Mode::Write)
+    if (!measure_only() && mode() == Mode::Write)
         serialize_fwrite(&val, 4, false);
     else
         bytes_filled += 4;
 }
 
-void Serializer::write_tagged_record(uint32_t tag, void const *data, int data_size)
+void Serializer::write_tagged_record(uint32_t tag, void const *data, size_t data_size)
 {
     // 状态机 (重实现侧, f_188): 0=idle 1=writing 2=aux_pending 3=aux_writing
     if (f_188 == 2) {
@@ -161,10 +162,10 @@ void Serializer::write_tagged_record(uint32_t tag, void const *data, int data_si
     }
 
     uint32_t encoded = encode_bin_tag(tag);
-    uint32_t word_count = (uint32_t(data_size) + 3) >> 2;
+    uint32_t word_count = static_cast<uint32_t>((data_size + 3) >> 2);
     serialize_uint32(encoded, word_count, word_count);
 
-    if (data && data_size > 0) serialize_fwrite(data, size_t(data_size), true);
+    if (data && data_size > 0) serialize_fwrite(data, data_size, true);
 
     if (f_188 == 0) f_188 = 1;
 }
@@ -182,7 +183,7 @@ void Serializer::rewrite_auxdata(unsigned long offset, unsigned n_words, void co
     (void)n_words;
     (void)a;
     (void)b;
-    if (mode() != Mode::Write || data == nullptr || words == 0) return;
+    if (measure_only() || mode() != Mode::Write || data == nullptr || words == 0) return;
     char *dst = bufstart + offset;
     size_t space = size_t(bufend - dst);
     size_t n = std::min(size_t(words) * 4u, space);

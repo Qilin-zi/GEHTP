@@ -261,3 +261,8 @@ target_include_directories(test_wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..
 target_compile_definitions(test_wtop_emit PRIVATE WTOP_EMIT_PATH="${CMAKE_BINARY_DIR}/wtop_emit")
 add_dependencies(test_wtop_emit wtop_emit)
 add_test(NAME test_wtop_emit COMMAND test_wtop_emit)
+
+# M1: Qwen3.5 IR 摄取 + scalar_params + 往返
+add_executable(test_qwen35_ir tests/test_qwen35_ir.cpp)
+target_link_libraries(test_qwen35_ir htp_core)
+add_test(NAME test_qwen35_ir COMMAND test_qwen35_ir)

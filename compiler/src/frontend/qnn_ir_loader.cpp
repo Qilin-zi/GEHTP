@@ -1,5 +1,6 @@
 #include "hnnx/frontend/qnn_ir_loader.hpp"
 #include "hnnx/frontend/json.hpp"
+#include "hnnx/ir/scalar_params.hpp"
 #include <cstring>
 #include <algorithm>
 #include <cstdio>
@@ -106,6 +107,43 @@ void QnnIRLoader::extract_tensor_params(QnnNodeInfo& node, const JsonValue& node
     }
 }
 
+void QnnIRLoader::extract_scalar_params(QnnNodeInfo& node, const JsonValue& node_json) {
+    if (!node_json.contains("scalar_params")) return;
+    const JsonValue& sp = node_json.at("scalar_params");
+    for (const auto& [pname, inner] : sp.obj_val) {
+        for (const auto& [pid, vjson] : inner.obj_val) {
+            QnnScalarParam p;
+            p.name = pname;
+            p.id = static_cast<uint32_t>(std::strtoul(pid.c_str(), nullptr, 10));
+            if (vjson.is_number()) {
+                p.is_numeric = true;
+                p.value_num = vjson.as_num();
+                double d = vjson.as_num();
+                p.value_str = (d == static_cast<double>(static_cast<int64_t>(d)))
+                                  ? std::to_string(static_cast<int64_t>(d))
+                                  : std::to_string(d);
+            } else if (vjson.is_string()) {
+                p.value_str = vjson.as_str();
+            }
+            node.scalar_params.push_back(std::move(p));
+        }
+    }
+}
+
+std::vector<uint8_t> QnnIRLoader::pack_scalar_params(const QnnNodeInfo& node) {
+    std::vector<ScalarParam> sp;
+    sp.reserve(node.scalar_params.size());
+    for (const auto& p : node.scalar_params) {
+        ScalarParam s;
+        s.name = p.name;
+        s.is_numeric = p.is_numeric;
+        s.value_num = p.value_num;
+        s.value_str = p.value_str;
+        sp.push_back(std::move(s));
+    }
+    return ::hnnx::pack_scalar_params(sp);
+}
+
 void QnnIRLoader::parse_nodes(const JsonValue& graph_json) {
     const JsonValue& nodes_json = graph_json.at("nodes");
     for (const auto& [name, njson] : nodes_json.obj_val) {
@@ -119,6 +157,7 @@ void QnnIRLoader::parse_nodes(const JsonValue& graph_json) {
         for (size_t i = 0; i < outs.size(); ++i)
             ni.output_names.push_back(outs.at(i).as_str());
         extract_tensor_params(ni, njson);
+        extract_scalar_params(ni, njson);
         nodes_.push_back(std::move(ni));
     }
 }
@@ -286,9 +325,11 @@ uint32_t QnnIRLoader::build_graph() {
             // 静默丢弃), 自动后移到空闲 id(通用防碰撞)。
             op_id_t target = ti.id;
             while (gp_.get_op_at(target) != nullptr) target++;
+            std::vector<uint8_t> op_blob = QnnIRLoader::pack_scalar_params(*node);
             gp_.append_node(node->type, target,
                             inputs.data(), inputs.size(),
-                            &od, 1, nullptr);
+                            &od, 1, op_blob.empty() ? nullptr : op_blob.data(),
+                            op_blob.size());
             // Set grouping = original node name (for before/after graph dump)
             OpDef* created = gp_.get_op_at(target);
             if (created) {

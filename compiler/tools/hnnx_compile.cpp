@@ -294,8 +294,11 @@ int main(int argc, char** argv) {
         if (!weights_bin_path.empty()) {
             // 2.48 params.bin(实测: 静态张量按 net.json 序 f16 拼接)自动识别并转 TAR
             std::string tar = adapt_weights_bin(net_json_path, weights_bin_path);
-            if (!tar.empty())
+            if (!tar.empty()) {
                 loader.set_weights(loader.load_weight_bin(tar));
+                // 临时 TAR 用完即删(0.8B f32 加宽后 ~4GB, 崩溃/失败路径泄漏会塞爆 /tmp)
+                if (tar.rfind("/tmp/hnnx_weights_", 0) == 0) std::remove(tar.c_str());
+            }
         }
         op_count = loader.load_net_json(net_json_path);
     } else {
@@ -340,10 +343,21 @@ int main(int argc, char** argv) {
 
     // ---- tagged 产品路径(阶段8): 跳过路径A重放, 直接我方 runlist ----
     if (output_format == "tagged") {
+        // serialize 两遍保护: 缓冲不足时返回所需字节, 增长重试(大图 1MB 必溢出)
         std::vector<uint8_t> buf(1u << 20, 0);
         size_t out_size = 0;
-        if (!gp.serialize(buf.data(), buf.size(), out_size)) {
-            std::fprintf(stderr, "Error: tagged serialize failed\n");
+        bool ok = false;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            ok = gp.serialize(buf.data(), buf.size(), out_size);
+            if (ok) break;
+            if (out_size == 0 || out_size <= buf.size()) {
+                std::fprintf(stderr, "Error: tagged serialize failed\n");
+                return 1;
+            }
+            buf.resize(out_size);
+        }
+        if (!ok) {
+            std::fprintf(stderr, "Error: tagged serialize failed (still too large: %zu)\n", out_size);
             return 1;
         }
         if (!write_file(output_path, std::vector<uint8_t>(buf.begin(), buf.begin() + out_size))) {

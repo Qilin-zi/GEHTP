@@ -133,6 +133,14 @@ struct DenseOp : TypicalOp {
     // Source: dense.cc
 };
 
+// QNN 2.48 实测 op 型(M1): operation 由 scalar_params 决定,execute 时从 params 解析
+struct SelectUnaryOp : TypicalOp {
+    static std::unique_ptr<Op> construct(const OpIoPtrs& io, op_id_t id);
+};
+struct SelectTernaryOp : TypicalOp {
+    static std::unique_ptr<Op> construct(const OpIoPtrs& io, op_id_t id);
+};
+
 // === Elementwise ops ===
 struct AddOp : TypicalOp {
     static std::unique_ptr<Op> construct(const OpIoPtrs& io, op_id_t id);

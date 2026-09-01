@@ -89,6 +89,11 @@ public:
                         const InputDef* inputs, size_t num_inputs,
                         const OutputDef* outputs, size_t num_outputs,
                         const uint8_t* ops_data);
+    // 显式长度版(旧版盲拷 256 字节, scalar_params blob 需精确长度)
+    op_id_t append_node(const std::string& name, uint32_t node_type,
+                        const InputDef* inputs, size_t num_inputs,
+                        const OutputDef* outputs, size_t num_outputs,
+                        const uint8_t* ops_data, size_t ops_data_len);
     op_id_t append_const_node(uint32_t node_type, const OutputDef& od,
                               const uint8_t* data, size_t data_len);
     void insert_op(std::unique_ptr<Op> op, bool before);
