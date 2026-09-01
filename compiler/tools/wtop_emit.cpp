@@ -771,9 +771,20 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 args.push_back(i < od->inputs.size()
                     ? em.src_ref(od->inputs[i], gp.get_input_node_id(), gp, wslots) : 0u);
             args.push_back(out_t);
-            args.push_back((uint32_t)(e.axis < 0 ? od->output_def.rank - 1 : e.axis));
+            uint32_t ax_c = (uint32_t)(e.axis < 0 ? od->output_def.rank - 1 : e.axis);
+            args.push_back(ax_c);
             args.push_back((uint32_t)od->inputs.size());
             args.push_back((uint32_t)elems_of(od));
+            // 每段 axis 维尺寸(≤4 段): 从各输入生产者 output_def 取
+            for (size_t i = 0; i < 4; i++) {
+                uint32_t sz = 0;
+                if (i < od->inputs.size()) {
+                    const OpDef* src = gp.get_op_at(od->inputs[i].src_id);
+                    if (src && ax_c < src->output_def.rank)
+                        sz = src->output_def.dims[ax_c];
+                }
+                args.push_back(sz);
+            }
             em.add_op(OP_CONCAT_F16, args);
             break;
         }
@@ -784,15 +795,20 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
             uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
-            std::vector<uint32_t> args{x_t, out_t, e.rank};
+            // 设备契约: rank≤3 通用切片(begin/end/stride 各 3; rank4 且 dim0=1 降 rank)
+            uint32_t rk = std::min<uint32_t>(e.rank, 3);
+            std::vector<uint32_t> args{x_t, out_t, (uint32_t)elems_of(od), rk};
             const auto& pool = gp.const_pool();
+            uint32_t b0 = 0, b1 = 0, b2 = 0, e0 = 0, e1 = 0, e2 = 0, s0 = 1, s1 = 1, s2 = 1;
             if (e.ranges_offset && e.ranges_offset + e.rank * 12 <= pool.size()) {
-                const uint32_t* rg = reinterpret_cast<const uint32_t*>(pool.data() + e.ranges_offset);
-                for (uint32_t i = 0; i < e.rank && i < 4; i++) args.push_back(rg[i]);
-                for (uint32_t i = 0; i < e.rank && i < 4; i++) args.push_back(rg[e.rank + i]);
-                for (uint32_t i = 0; i < e.rank && i < 4; i++) args.push_back(rg[2 * e.rank + i]);
+                const int32_t* rg = reinterpret_cast<const int32_t*>(pool.data() + e.ranges_offset);
+                if (rk >= 1) { b0 = (uint32_t)rg[0]; e0 = (uint32_t)rg[e.rank]; s0 = (uint32_t)rg[2 * e.rank]; }
+                if (rk >= 2) { b1 = (uint32_t)rg[1]; e1 = (uint32_t)rg[e.rank + 1]; s1 = (uint32_t)rg[2 * e.rank + 1]; }
+                if (rk >= 3) { b2 = (uint32_t)rg[2]; e2 = (uint32_t)rg[e.rank + 2]; s2 = (uint32_t)rg[2 * e.rank + 2]; }
             }
-            while (args.size() < 15) args.push_back(0);
+            args.push_back(b0); args.push_back(b1); args.push_back(b2);
+            args.push_back(e0); args.push_back(e1); args.push_back(e2);
+            args.push_back(s0); args.push_back(s1); args.push_back(s2);
             em.add_op(OP_STRIDED_SLICE_F16, args);
             break;
         }
@@ -809,6 +825,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             }
             args.push_back((uint32_t)(e.axis < 0 ? 0 : e.axis));
             args.push_back(e.num_splits);
+            for (size_t i = 0; i < 4; i++)
+                args.push_back(i < (size_t)e.num_splits ? e.sizes[i] : 0u);
             em.add_op(OP_SPLIT_F16, args);
             break;
         }
@@ -819,8 +837,16 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
             uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
             uint32_t out_t = em.fresh_temp(od->op_id);
-            em.add_op(OP_REDUCE_F16, {x_t, out_t, (uint32_t)elems_of(od),
-                                      (uint32_t)e.axis, e.reduce_type});
+            {
+                const OpDef* src_r = gp.get_op_at(od->inputs[0].src_id);
+                uint64_t n_in = src_r ? elems_of(src_r) : elems_of(od);
+                std::vector<uint32_t> args{x_t, out_t, (uint32_t)n_in,
+                                           (uint32_t)e.axis, e.reduce_type};
+                for (uint32_t i = 0; i < 4; i++)
+                    args.push_back(src_r && i < src_r->output_def.rank
+                                       ? src_r->output_def.dims[i] : 1u);
+                em.add_op(OP_REDUCE_F16, args);
+            }
             break;
         }
 
@@ -931,13 +957,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         std::printf("WTOP OK: slots=%u ops=%u bytes=%zu (gguf hits=%u miss=%u)\n",
                     (unsigned)em.slots.size(), (unsigned)em.ops.size(), em.blob.size(),
                     em.gguf_hits, em.gguf_miss);
-        if (have_gguf) {
-            std::set<std::string> used;
-            for (auto& [k, v] : gguf_map) {
-                (void)v;
-                // 未命中判定: 通过 wslots 值无法直接回溯键; 粗略列出非小权重
-            }
-        }
+
     }
     {
         FILE* f = std::fopen(out_path.c_str(), "wb");

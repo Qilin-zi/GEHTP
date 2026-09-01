@@ -56,8 +56,11 @@ static int run_one(const char* blob_path, const uint8_t* in, const uint8_t* gold
     size_t blob_len = 0;
     uint8_t* blob = read_file(blob_path, &blob_len);
     if (!blob) { ex_log("[FAIL] %s: read blob", tag); return 1; }
-    struct wt_blob w;
-    if (wt_parse(blob, blob_len, &w) != WT_OK) { ex_log("[FAIL] %s: wt_parse", tag); free(blob); return 1; }
+    /* wt_blob ≈4.5MB (WT_MAX_OPS=65536) —— ribbon 线程栈仅 256KB,
+     * 栈上声明 = 栈溢出 = PD 死 (M2 容量提升引入, 例 37/38 设备死因) */
+    struct wt_blob* w = calloc(1, sizeof(*w));
+    if (!w) { ex_log("[FAIL] %s: wt_blob alloc", tag); free(blob); return 1; }
+    if (wt_parse(blob, blob_len, w) != WT_OK) { ex_log("[FAIL] %s: wt_parse", tag); free(blob); free(w); return 1; }
 
     uint16_t* out_fused = malloc(N_ELEM * 2u);
     uint16_t* out_split = malloc(N_ELEM * 2u);
@@ -68,7 +71,7 @@ static int run_one(const char* blob_path, const uint8_t* in, const uint8_t* gold
 
     /* 整步 (baked slot0 数据跑 wt_exec_run; slot0 已标 EXT_IN 但 wt_exec_run
      * 不看 ext 指针 → 用 blob 内固化数据) */
-    int rc = wt_exec_run(&w, NULL, NULL, err, sizeof(err));
+    int rc = wt_exec_run(w, NULL, NULL, err, sizeof(err));
     if (rc) { ex_log("[FAIL] %s: fused run rc=%d %s", tag, rc, err); bad = 1; }
     else if (wt_exec_temp(OUT_TEMP)) memcpy(out_fused, wt_exec_temp(OUT_TEMP), N_ELEM * 2u);
     else { ex_log("[FAIL] %s: no out temp", tag); bad = 1; }
@@ -76,8 +79,8 @@ static int run_one(const char* blob_path, const uint8_t* in, const uint8_t* gold
 
     /* 逐 op (wt_exec_run_range 逐段) */
     int ok = 1;
-    for (uint32_t i = 0; i < w.n_ops && ok; i++) {
-        rc = wt_exec_run_range(&w, i, 1, NULL, NULL, err, sizeof(err));
+    for (uint32_t i = 0; i < w->n_ops && ok; i++) {
+        rc = wt_exec_run_range(w, i, 1, NULL, NULL, err, sizeof(err));
         if (rc) { ex_log("[FAIL] %s: split op%u rc=%d %s", tag, i, rc, err); ok = 0; }
     }
     if (ok) {
@@ -91,7 +94,7 @@ static int run_one(const char* blob_path, const uint8_t* in, const uint8_t* gold
     uint16_t* out_io = malloc(N_ELEM * 2u);
     if (!out_io) { ex_log("[FAIL] %s: io alloc", tag); bad = 1; }
     else {
-        rc = wt_exec_run_io(&w, in, out_io, OUT_TEMP, NULL, NULL, err, sizeof(err));
+        rc = wt_exec_run_io(w, in, out_io, OUT_TEMP, NULL, NULL, err, sizeof(err));
         if (rc) { ex_log("[FAIL] %s: run_io rc=%d %s", tag, rc, err); bad = 1; }
         wt_exec_shutdown();
     }
@@ -103,7 +106,7 @@ static int run_one(const char* blob_path, const uint8_t* in, const uint8_t* gold
             if (!within_1ulp(out_io[i], g2[i])) n_bad2++;
         if (n_bad2) { ex_log("[FAIL] %s: io golden 1ULP bad=%u", tag, (unsigned)n_bad2); bad = 1; }
         else ex_log("[PASS] %s: io golden <= 1 ULP", tag);
-        free(out_fused); free(out_split); free(out_io); free(blob);
+        free(out_fused); free(out_split); free(out_io); free(blob); free(w);
         return bad;
     }
 
@@ -129,7 +132,7 @@ static int run_one(const char* blob_path, const uint8_t* in, const uint8_t* gold
             ex_log("[PASS] %s: run_io(ext in) == fused byte-exact", tag);
     }
 
-    free(out_fused); free(out_split); free(out_io); free(blob);
+    free(out_fused); free(out_split); free(out_io); free(blob); free(w);
     return bad;
 }
 

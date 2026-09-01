@@ -14,6 +14,8 @@ void ex_open_result(const char *name)
     snprintf(path, sizeof(path), "/data/local/tmp/hvxhmx23/%s.txt", name);
     g_fp = fopen(path, "w");
     if (!g_fp) g_fp = stderr;
+    /* 无缓冲: 崩溃取证时每一行立即落盘(定位 PD 死点) */
+    if (g_fp != stderr) setvbuf(g_fp, NULL, _IONBF, 0);
     g_npass = g_nfail = 0;
     ex_log("=== %s ===", name);
 }

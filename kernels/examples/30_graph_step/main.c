@@ -36,6 +36,7 @@ int main(void) {
     ex_open_result("30_graph_step");
     uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0;
     uint8_t* blob = NULL;
+    struct wt_blob* b = NULL;    /* wt_blob ~4.5MB: 堆分配, out 统一 free */
     uint8_t* act = dc_read_file(A "/act_surface.raw", &b0);
     uint8_t* wt  = dc_read_file(A "/packed_weight.raw", &b1);
     uint8_t* bis = dc_read_file(A "/folded_bias.raw", &b2);
@@ -84,8 +85,9 @@ int main(void) {
     for (int i = 0; i < 6; i++) { memcpy(blob + woff + off, sdata[i], slen[i]); off += slen[i]; }
     dc_clean_ddr(blob, woff + wtot);                    /* 铁律①: DMA bypass 读 */
 
-    struct wt_blob b;
-    int prc = wt_parse(blob, woff + wtot, &b);
+    b = calloc(1, sizeof(*b));
+    if (!b) { ex_log("wt_blob alloc FAIL"); goto out; }
+    int prc = wt_parse(blob, woff + wtot, b);
     ex_check("blob_parse_ok", prc != WT_OK, 0);
     if (prc != WT_OK) { ex_log("parse: %s", wt_err_str(prc)); goto out; }
 
@@ -93,7 +95,7 @@ int main(void) {
     uint32_t em = 0; int64_t opus[8]; char err[128];
     uint8_t* snap0 = malloc(NE * 2); uint8_t* snap1 = malloc(NE * 2);
     uint8_t* snap2 = malloc(NE * 2);
-    int rc = wt_exec_run(&b, &em, opus, err, sizeof(err));
+    int rc = wt_exec_run(b, &em, opus, err, sizeof(err));
     ex_check("fused_run_ok", rc, 0);
     if (rc) { ex_log("fused fail @op%d: %s", rc, err); goto shut; }
     memcpy(snap0, wt_exec_temp(0), NE * 2);
@@ -116,7 +118,7 @@ int main(void) {
     int src = 0;
     for (uint32_t i = 0; i < 6 && !src; i++) {
         int64_t ou[1]; uint32_t em1 = 0;
-        src = wt_exec_run_range(&b, i, 1, &em1, ou, err, sizeof(err));
+        src = wt_exec_run_range(b, i, 1, &em1, ou, err, sizeof(err));
         if (src) ex_log("split fail @op%u: %s", i, err);
     }
     int64_t split_us = HAP_perf_get_time_us() - t0;
@@ -150,6 +152,7 @@ int main(void) {
 shut:
     wt_exec_shutdown();
 out:
+    free(b);
     if (blob) free(blob);
     return ex_summary();
 }

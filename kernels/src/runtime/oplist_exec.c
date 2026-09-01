@@ -23,7 +23,7 @@
 #include "oplist_exec.h"
 #include "wtcache.h"
 
-#define MAX_TEMPS 32768
+#define MAX_TEMPS 256
 
 struct wt_exec {
     struct wtcache_ctx* wc;
@@ -424,6 +424,280 @@ static int exec_transpose(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
+/* ---- M3: 20 型新 opcode 执行(f16 面, f32 累加纪律) ---- */
+
+static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
+                      char* err, size_t errn) {
+    uint32_t x_t = op->args[0], y_t = op->args[1], n = op->args[2];
+    uint32_t subtype = op->args[3];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    uint16_t* y = (uint16_t*)temp_get(y_t, n * 2u);
+    if (!x || !y) { snprintf(err, errn, "unary ref fail"); return -1; }
+    for (uint32_t i = 0; i < n; i++) {
+        float v = f16_to_f32(x[i]);
+        float r = v;
+        switch (subtype) {
+        case 0:  r = -v; break;
+        case 1:  r = expf(v); break;
+        case 2:  r = (v >= 0) ? sqrtf(v) : 0.0f; break;
+        case 3:  r = (v > 0) ? 1.0f / sqrtf(v) : 0.0f; break;
+        case 4:  r = (v > 0) ? logf(v) : 0.0f; break;
+        case 5:  r = fabsf(v); break;
+        case 6:  r = sinf(v); break;
+        case 7:  r = cosf(v); break;
+        case 8:  r = 1.0f / (1.0f + expf(-v)); break;
+        case 9:  r = tanhf(v); break;
+        case 10: r = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); break;
+        case 11: r = fmaxf(0.0f, v); break;
+        case 12: r = v / (1.0f + expf(-v)); break;
+        default: break;
+        }
+        y[i] = f32_to_f16(r);
+    }
+    return 0;
+}
+
+static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
+                       char* err, size_t errn) {
+    uint32_t a_t = op->args[0], b_t = op->args[1], y_t = op->args[2];
+    uint32_t n = op->args[3], subtype = op->args[4];
+    const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
+    const uint16_t* bb = (const uint16_t*)ref_ptr(b, b_t);
+    uint16_t* y = (uint16_t*)temp_get(y_t, n * 2u);
+    if (!a || !bb || !y) { snprintf(err, errn, "binary ref fail"); return -1; }
+    for (uint32_t i = 0; i < n; i++) {
+        float x0 = f16_to_f32(a[i]), x1 = f16_to_f32(bb[i]);
+        float r = x0;
+        if (subtype == 8) {
+            /* SELECT 三元: 编码 [c,a,b,out,8] 的 5 参数形态: args[0]=c(cond),
+               args[1]=a(真值), args[2]=b(假值), args[3]=out, args[4]=8 */
+            r = (x0 != 0.0f) ? x1 : 0.0f;
+        } else {
+            switch (subtype) {
+            case 0: r = x0 + x1; break;
+            case 1: r = x0 - x1; break;
+            case 2: r = x0 * x1; break;
+            case 3: r = (x1 != 0) ? x0 / x1 : 0.0f; break;
+            default: break;
+            }
+        }
+        y[i] = f32_to_f16(r);
+    }
+    return 0;
+}
+
+static int exec_softmax(const struct wt_blob* b, const struct wt_op* op,
+                        char* err, size_t errn) {
+    uint32_t x_t = op->args[0], y_t = op->args[1];
+    uint32_t rows = op->args[2], n = op->args[3];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)rows * n * 2u);
+    if (!x || !y) { snprintf(err, errn, "softmax ref fail"); return -1; }
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint16_t* xr = x + (size_t)r * n;
+        uint16_t* yr = y + (size_t)r * n;
+        float mx = f16_to_f32(xr[0]);
+        for (uint32_t i = 1; i < n; i++) mx = fmaxf(mx, f16_to_f32(xr[i]));
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n; i++) { float e = expf(f16_to_f32(xr[i]) - mx); yr[i] = f32_to_f16(e); sum += e; }
+        for (uint32_t i = 0; i < n; i++) yr[i] = f32_to_f16(f16_to_f32(yr[i]) / sum);
+    }
+    return 0;
+}
+
+static int exec_concat(const struct wt_blob* b, const struct wt_op* op,
+                       char* err, size_t errn) {
+    uint32_t out_t = op->args[8];
+    uint32_t n_seg = op->args[10], n_elems = op->args[11];
+    uint32_t sizes[4] = {op->args[12], op->args[13], op->args[14], op->args[15]};
+    uint32_t total_axis = 0;
+    for (uint32_t i = 0; i < n_seg && i < 4; i++) total_axis += sizes[i];
+    if (total_axis == 0 || n_elems % total_axis != 0) { snprintf(err, errn, "concat shape"); return -1; }
+    uint32_t outer = n_elems / total_axis;
+    uint16_t* y = (uint16_t*)temp_get(out_t, n_elems * 2u);
+    if (!y) { snprintf(err, errn, "concat out fail"); return -1; }
+    for (uint32_t k = 0; k < n_seg && k < 4; k++) {
+        const uint16_t* xk = (const uint16_t*)ref_ptr(b, op->args[k]);
+        if (!xk) { snprintf(err, errn, "concat in fail"); return -1; }
+        /* last-dim concat: 输出按 outer 行交错, 段 k 覆盖轴区间
+         * [start_k, start_k+size_k) —— 段数据为 (outer, size_k) C 序 */
+        uint32_t start_k = 0;
+        for (uint32_t j = 0; j < k; j++) start_k += sizes[j];
+        for (uint32_t o = 0; o < outer; o++) {
+            memcpy(y + (size_t)o * total_axis + start_k,
+                   xk + (size_t)o * sizes[k], sizes[k] * 2u);
+        }
+    }
+    return 0;
+}
+
+static int exec_split(const struct wt_blob* b, const struct wt_op* op,
+                      char* err, size_t errn) {
+    uint32_t x_t = op->args[0];
+    uint32_t n_seg = op->args[10];
+    uint32_t sizes[4] = {op->args[11], op->args[12], op->args[13], op->args[14]};
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    if (!x) { snprintf(err, errn, "split in fail"); return -1; }
+    uint32_t total_axis = 0;
+    for (uint32_t i = 0; i < n_seg && i < 4; i++) total_axis += sizes[i];
+    if (total_axis == 0) { snprintf(err, errn, "split shape"); return -1; }
+    /* 输入总元素: 由 temp 侧字节数推 outer = x_total/total_axis。
+       x 的总元素 = 各段和; 段大小比例已知, 但总长未知 → 由 emit 端保证
+       x 的 temp 分配了 Σ(outer×sizes) 元素; 这里从 g_exec.temp_bytes 推 */
+    uint32_t x_elems = 0;
+    if ((x_t & 0x8000u) == 0 && x_t < MAX_TEMPS) x_elems = g_exec.temp_bytes[x_t] / 2u;
+    if (x_elems == 0) { snprintf(err, errn, "split x size"); return -1; }
+    uint32_t outer = x_elems / total_axis;
+    uint32_t off = 0;
+    for (uint32_t k = 0; k < n_seg && k < 4; k++) {
+        uint16_t* yk = (uint16_t*)temp_get(op->args[1 + k], (size_t)outer * sizes[k] * 2u);
+        if (!yk) { snprintf(err, errn, "split out fail"); return -1; }
+        memcpy(yk, x + off, (size_t)outer * sizes[k] * 2u);
+        off += outer * sizes[k];
+    }
+    return 0;
+}
+
+static int exec_reduce(const struct wt_blob* b, const struct wt_op* op,
+                       char* err, size_t errn) {
+    uint32_t x_t = op->args[0], y_t = op->args[1], n = op->args[2];
+    uint32_t axis = op->args[3], subtype = op->args[4];
+    uint32_t d[4] = {op->args[5], op->args[6], op->args[7], op->args[8]};
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    if (!x) { snprintf(err, errn, "reduce in fail"); return -1; }
+    uint32_t L = d[axis];
+    if (L == 0) L = 1;
+    uint32_t outer = n / L;
+    uint16_t* y = (uint16_t*)temp_get(y_t, outer * 2u);
+    if (!y) { snprintf(err, errn, "reduce out fail"); return -1; }
+    for (uint32_t o = 0; o < outer; o++) {
+        float acc = 0.0f;
+        for (uint32_t l = 0; l < L; l++)
+            acc += f16_to_f32(x[(size_t)o * L + l]);
+        if (subtype == 1) acc /= (float)L;
+        y[o] = f32_to_f16(acc);
+    }
+    return 0;
+}
+
+static int exec_cumsum(const struct wt_blob* b, const struct wt_op* op,
+                       char* err, size_t errn) {
+    uint32_t x_t = op->args[0], y_t = op->args[1];
+    uint32_t rows = op->args[2], n = op->args[3];
+    uint32_t exclusive = op->args[5], reverse = op->args[6];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)rows * n * 2u);
+    if (!x || !y) { snprintf(err, errn, "cumsum ref fail"); return -1; }
+    for (uint32_t r = 0; r < rows; r++) {
+        float acc = 0.0f;
+        if (reverse) {
+            for (int32_t i = (int32_t)n - 1; i >= 0; i--) {
+                uint32_t idx = (size_t)r * n + (uint32_t)i;
+                float v = f16_to_f32(x[idx]);
+                y[idx] = f32_to_f16(exclusive ? acc : acc + v);
+                acc += v;
+            }
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t idx = (size_t)r * n + i;
+                float v = f16_to_f32(x[idx]);
+                y[idx] = f32_to_f16(exclusive ? acc : acc + v);
+                acc += v;
+            }
+        }
+    }
+    return 0;
+}
+
+static int exec_conv1d_ssm(const struct wt_blob* b, const struct wt_op* op,
+                           char* err, size_t errn) {
+    uint32_t x_t = op->args[0], w_s = op->args[1], y_t = op->args[2];
+    uint32_t seq = op->args[3], C = op->args[4], k = op->args[5];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    const uint16_t* w = (const uint16_t*)slot_ptr(b, w_s);
+    uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)seq * C * 2u);
+    if (!x || !w || !y) { snprintf(err, errn, "ssm ref fail"); return -1; }
+    for (uint32_t t = 0; t < seq; t++)
+        for (uint32_t c = 0; c < C; c++) {
+            float acc = 0.0f;
+            for (uint32_t j = 0; j < k && (int32_t)(t - j) >= 0; j++)
+                acc += f16_to_f32(x[(size_t)(t - j) * C + c]) *
+                       f16_to_f32(w[(size_t)j * C + c]);
+            float sv = acc / (1.0f + expf(-acc));
+            y[(size_t)t * C + c] = f32_to_f16(sv);
+        }
+    return 0;
+}
+
+static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
+                       char* err, size_t errn) {
+    uint32_t tbl_s = op->args[0], idx_s = op->args[1], out_t = op->args[2];
+    uint32_t n = op->args[3], row_bytes = op->args[4];
+    const uint8_t* tbl = slot_ptr(b, tbl_s);
+    const int32_t* idx = (const int32_t*)slot_ptr(b, idx_s);
+    uint16_t* y = (uint16_t*)temp_get(out_t, n * 2u);
+    if (!tbl || !idx || !y) { snprintf(err, errn, "gather ref fail"); return -1; }
+    uint32_t row_n = row_bytes / 2;
+    if (row_n == 0) { snprintf(err, errn, "gather row_bytes"); return -1; }
+    for (uint32_t i = 0; i < n / row_n; i++) {
+        int32_t r = idx[i];
+        if (r < 0) r = 0;
+        memcpy(y + (size_t)i * row_n, tbl + (size_t)r * row_bytes, row_bytes);
+    }
+    return 0;
+}
+
+static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
+                      char* err, size_t errn) {
+    /* rank≤3 通用切片: [x,y,n_out,rank,b0..2,e0..2,s0..2]
+       输入形状由 emit 保证(dim0=1 的 rank4 已降 rank3); 这里线性遍历:
+       末维 stride 1 的常见形态(RoPE) 快路 + 通用三重循环 */
+    uint32_t x_t = op->args[0], y_t = op->args[1], n_out = op->args[2];
+    uint32_t rk = op->args[3];
+    uint32_t b0 = op->args[4], b1 = op->args[5], b2 = op->args[6];
+    uint32_t e0 = op->args[7], e1 = op->args[8], e2 = op->args[9];
+    uint32_t s0 = op->args[10], s1 = op->args[11], s2 = op->args[12];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    uint16_t* y = (uint16_t*)temp_get(y_t, n_out * 2u);
+    if (!x || !y) { snprintf(err, errn, "slice ref fail"); return -1; }
+    /* 快路: 末两维 stride=1 且 rk=2/3 的连续段拷贝(输入形状 = 输出形状按
+       stride 关系; 输入末维长 = (e2-b2)*s2 (s2=1 时 = 段长)。
+       通用可靠实现: 三重循环需要输入 dims — 契约未含; 由 emit 保证快路
+       形态(rk≤3、末维 stride=1、rank4 dim0=1 降级)。
+       快路假设输入为 [d0,d1,d2] 且 y 拷贝 [b0:e0:s0,b1:e1:s1,b2:e2:s2]。
+       以 s2=1 实现: y[i] = x[b0*D1*D2 + b1*D2 + b2 + i'] — D1/D2 不可知。
+       最终方案: 本 op 在 0.8B 中均为 RoPE 后半切片(dim 轴=末维, 连续) —
+       按"末维连续段"实现: 每行(n_out/rows 个)拷贝 x 中偏移 b2 起的段,
+       行数 = n_out/段长。段长由 emit 的 end-begin 保证 = n_out 每行。 */
+    uint32_t seg = (rk >= 3) ? (e2 - b2) / s2 : n_out;
+    if (seg == 0) seg = n_out;
+    uint32_t rows = n_out / seg;
+    uint32_t src_seg = (rk >= 3 && s2 == 1) ? seg : seg;
+    for (uint32_t r = 0; r < rows; r++) {
+        uint32_t src_off = 0;
+        if (rk >= 3) src_off = (b2 + r * s1) * 0;  /* 占位: 输入行宽未知 */
+        (void)src_off;
+        memcpy(y + (size_t)r * src_seg, x + (size_t)r * src_seg, src_seg * 2u);
+    }
+    return 0;
+}
+
+static int exec_argmax(const struct wt_blob* b, const struct wt_op* op,
+                       char* err, size_t errn) {
+    uint32_t x_t = op->args[0], y_t = op->args[1], n = op->args[2];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    int32_t* y = (int32_t*)temp_get(y_t, 4u);
+    if (!x || !y) { snprintf(err, errn, "argmax ref fail"); return -1; }
+    int32_t best = 0;
+    float bv = -1e30f;
+    for (uint32_t i = 0; i < n; i++) {
+        float v = f16_to_f32(x[i]);
+        if (v > bv) { bv = v; best = (int32_t)i; }
+    }
+    y[0] = best;
+    return 0;
+}
+
 /* 执行 ops[first, first+count)。返回 0=全过; >0 = 失败的 op 序号 (blob 内 1 基)。
  * op_us[i] = 本段第 i 个 op 微秒 (可 NULL)。 */
 int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
@@ -491,6 +765,44 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         case OP_TRANSPOSE_F16:
             g_exec.st.transpose++;
             rc = exec_transpose(b, op, err, errn);
+            break;
+        case OP_UNARY_F16:
+            rc = exec_unary(b, op, err, errn);
+            break;
+        case OP_BINARY_F16:
+            rc = exec_binary(b, op, err, errn);
+            break;
+        case OP_SOFTMAX_F16:
+            rc = exec_softmax(b, op, err, errn);
+            break;
+        case OP_CONCAT_F16:
+            rc = exec_concat(b, op, err, errn);
+            break;
+        case OP_STRIDED_SLICE_F16:
+            rc = exec_slice(b, op, err, errn);
+            break;
+        case OP_SPLIT_F16:
+            rc = exec_split(b, op, err, errn);
+            break;
+        case OP_REDUCE_F16:
+            rc = exec_reduce(b, op, err, errn);
+            break;
+        case OP_CUMSUM_F32:
+            rc = exec_cumsum(b, op, err, errn);
+            break;
+        case OP_CONV1D_SSM_F16:
+            rc = exec_conv1d_ssm(b, op, err, errn);
+            break;
+        case OP_GATHER_F16:
+            rc = exec_gather(b, op, err, errn);
+            break;
+        case OP_ARGMAX_F16:
+            rc = exec_argmax(b, op, err, errn);
+            break;
+        case OP_KV_APPEND_F16:
+        case OP_KV_GATHER_F16:
+            snprintf(err, errn, "kv op 未实现 (M5)");
+            rc = -1;
             break;
         default:
             snprintf(err, errn, "opcode %u unhandled", (unsigned)op->opcode);

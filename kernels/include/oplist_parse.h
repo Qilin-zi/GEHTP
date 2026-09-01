@@ -70,10 +70,13 @@ enum {
     OP_UNARY_F16 = 11,      /* [x_t,y_t,n,subtype]   subtype: 0=NEG 1=EXP 2=SQRT 3=RSQRT 4=LOG 5=ABS 6=SIN 7=COS; (Neuron) 8=SIGMOID 9=TANH 10=GELU 11=RELU 12=SWISH */
     OP_BINARY_F16 = 12,     /* [a_t,b_t,y_t,n,subtype] subtype: 0=ADD 1=SUB 2=MUL 3=DIV */
     OP_SOFTMAX_F16 = 13,    /* [x_t,y_t,rows,n]       rows = 行数(每行 n 元素) */
-    OP_CONCAT_F16 = 14,     /* [in_t0..in_t7(8路),out_t,axis,n_segments,n_elems] 固定 12 参数 */
-    OP_STRIDED_SLICE_F16 = 15, /* [x_t,y_t,rank,begin0..3,end0..3,stride0..3] rank≤4 固定 15 参数 */
-    OP_SPLIT_F16 = 16,      /* [x_t,out_t0..out_t7(8路),axis,n_segments] 固定 11 参数 */
-    OP_REDUCE_F16 = 17,     /* [x_t,y_t,n,axis,subtype] subtype: 0=SUM 1=MEAN */
+    OP_CONCAT_F16 = 14,     /* [in_t0..7,out_t,axis,n_segments,n_elems,size0..3] arity 16
+                                (每段 axis 维尺寸显式; ≤4 段, 0.8B 实测 2-3 段) */
+    OP_STRIDED_SLICE_F16 = 15, /* [x_t,y_t,n_out,rank,b0..2,e0..2,s0..2] arity 13
+                                rank≤3 通用切片(rank4 且 dim0=1 由 emit 降 rank) */
+    OP_SPLIT_F16 = 16,      /* [x_t,out_t0..7,axis,n_segments,size0..3] arity 15 */
+    OP_REDUCE_F16 = 17,     /* [x_t,y_t,n,axis,subtype,dim0..3] arity 9
+                                n=输入元素数, dims=输入形状(rank≤4) */
     OP_CUMSUM_F32 = 18,     /* [x_t,y_t,rows,n,axis,exclusive,reverse] f32 保持 */
     OP_CONV1D_SSM_F16 = 19, /* [x_t,w_s,y_t,seq,C,k]    depthwise causal conv+SiLU(SSM) */
     OP_GATHER_F16 = 20,     /* [table_s,idx_s,out_t,n,row_bytes] idx_s 为 int32 槽 */
@@ -97,10 +100,10 @@ enum {
 #define WT_ARITY_UNARY_F16 4
 #define WT_ARITY_BINARY_F16 5
 #define WT_ARITY_SOFTMAX_F16 4
-#define WT_ARITY_CONCAT_F16 12
-#define WT_ARITY_STRIDED_SLICE_F16 15
-#define WT_ARITY_SPLIT_F16 11
-#define WT_ARITY_REDUCE_F16 5
+#define WT_ARITY_CONCAT_F16 16
+#define WT_ARITY_STRIDED_SLICE_F16 13
+#define WT_ARITY_SPLIT_F16 15
+#define WT_ARITY_REDUCE_F16 9
 #define WT_ARITY_CUMSUM_F32 7
 #define WT_ARITY_CONV1D_SSM_F16 6
 #define WT_ARITY_GATHER_F16 5

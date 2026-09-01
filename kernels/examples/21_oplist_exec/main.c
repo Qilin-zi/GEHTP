@@ -107,11 +107,12 @@ static uint8_t* read_all(const char* p, uint32_t* b) {
 
 /* 负例: 好 blob 拷贝 → 定点破坏 → wt_parse 必须返回期望错误码 */
 static int negative_cases(const uint8_t* good, size_t n) {
-    struct wt_blob w;
+    /* wt_blob ~4.5MB: 设备线程栈 256KB, 必须堆分配 */
+    struct wt_blob* w = calloc(1, sizeof(*w));
     uint8_t* c = malloc(n);
     int fails = 0;
 #define NEG(expect, mut) do { memcpy(c, good, n); do { mut; } while (0); \
-    int rc = wt_parse(c, n, &w); \
+    int rc = wt_parse(c, n, w); \
     if (rc != (expect)) { \
         ex_log("neg(%s): rc=%d expect=%d (%s)", #mut, rc, (int)(expect), wt_err_str(rc)); \
         fails++; \
@@ -123,6 +124,7 @@ static int negative_cases(const uint8_t* good, size_t n) {
     NEG(WT_ERR_NOPS,   { uint32_t no = 100000; memcpy(c + 12, &no, 4); });
 #undef NEG
     free(c);
+    free(w);
     return fails;
 }
 
@@ -130,15 +132,16 @@ static int negative_cases(const uint8_t* good, size_t n) {
  * t0_copy 非空时与 temp0 byte 比对 (重初始化确定性)。 */
 static int run_blob(const uint8_t* blob, uint32_t bb, const uint16_t* gold,
                     const uint16_t* w16, const uint8_t* t0_copy, int want_rms) {
-    struct wt_blob w;
-    if (wt_parse(blob, bb, &w) != WT_OK) { ex_log("wt_parse FAIL"); return 1; }
+    struct wt_blob* w = calloc(1, sizeof(*w));
+    if (wt_parse(blob, bb, w) != WT_OK) { ex_log("wt_parse FAIL"); free(w); return 1; }
     uint32_t em = 0;
     int64_t op_us[8] = {0};
     char err[128];
-    int rc = wt_exec_run(&w, &em, op_us, err, sizeof(err));
+    int rc = wt_exec_run(w, &em, op_us, err, sizeof(err));
     if (rc) {
         ex_log("wt_exec_run FAIL at op %d: %s", rc, err);
         wt_exec_shutdown();                 /* 铁律④: FAIL 路径也关 */
+        free(w);
         return 1;
     }
     uint8_t* t0 = wt_exec_temp(0);
@@ -203,6 +206,7 @@ static int run_blob(const uint8_t* blob, uint32_t bb, const uint16_t* gold,
     }
     free(dev);
     wt_exec_shutdown();                     /* 铁律④ */
+    free(w);
     return fret;
 }
 
@@ -224,21 +228,22 @@ int main(void) {
     dc_clean_ddr(blob5, b5);
 
     /* ---- 解析 + 负例 + W3 报告 (用 w5 blob, 覆盖 slot 最多形态) ---- */
-    struct wt_blob w;
-    if (wt_parse(blob5, b5, &w) != WT_OK) { ex_log("wt_parse(w5) FAIL"); goto out; }
+    struct wt_blob* w = calloc(1, sizeof(*w));
+    if (wt_parse(blob5, b5, w) != WT_OK) { ex_log("wt_parse(w5) FAIL"); goto out; }
     ex_check("negatives_rejected", negative_cases(blob5, b5), 0);
-    wt_w3_report("blob_w5.wtop", blob5, b5, &w, w3_emit, NULL);
+    wt_w3_report("blob_w5.wtop", blob5, b5, w, w3_emit, NULL);
 
     /* ---- W4: blob_w4 单 op 路径, 留 temp0 快照 ---- */
     {
-        struct wt_blob w4;
-        if (wt_parse(blob4, b4, &w4) != WT_OK) { ex_log("wt_parse(w4) FAIL"); goto out; }
+        struct wt_blob* w4 = calloc(1, sizeof(*w4));
+        if (wt_parse(blob4, b4, w4) != WT_OK) { ex_log("wt_parse(w4) FAIL"); free(w4); goto out; }
         uint32_t em = 0;
         int64_t op_us[8] = {0};
         char err[128];
-        if (wt_exec_run(&w4, &em, op_us, err, sizeof(err))) {
+        if (wt_exec_run(w4, &em, op_us, err, sizeof(err))) {
             ex_log("w4 exec FAIL: %s", err);
             wt_exec_shutdown();
+            free(w4);
             goto out;
         }
         uint8_t* t0 = wt_exec_temp(0);
@@ -254,12 +259,14 @@ int main(void) {
 
         /* ---- W4 数值 + W4+ 重初始化确定性 + W5 rmsnorm ---- */
         if (run_blob(blob5, b5, gold, (const uint16_t*)rmsw, snap, 1))
-            { free(snap); goto out; }
+            { free(snap); free(w4); goto out; }
         free(snap);
+        free(w4);
     }
     ex_check("suite_complete", 0, 0);
 
 out:
+    free(w);
     free(blob4); free(blob5); free(rmsw); free(gold);
     return ex_summary();
 }
