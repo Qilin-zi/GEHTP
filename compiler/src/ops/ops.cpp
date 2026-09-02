@@ -99,21 +99,24 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
      * 中间轴广播 —— 线性 i%n 展开是错的) */
     const auto in_bc = [&](size_t idx, size_t i) -> float {
         if (idx >= inputs.size() || !inputs[idx]) return 0.0f;
-        uint32_t r = out_def.rank;
-        while (r > 0 && out_def.dims[r - 1] == 1) r--;
-        uint32_t ork = r;
+        /* numpy 广播: 全 rank 右对齐(不去尾 1 —— 输入末维 1 广播到输出
+         * 大维时, 去尾会把它吃掉造成 64 vs 128 假冲突, oid 1231 实锤) */
+        uint32_t ork = out_def.rank;
+        if (ork > 8) ork = 8;
         uint32_t ir = (idx < in_defs.size()) ? in_defs[idx].rank : 0;
-        while (ir > 0 && in_defs[idx].dims[ir - 1] == 1) ir--;
-        if (ir > ork) ir = ork;
-        uint32_t istr[4] = {1, 1, 1, 1}, ostr[4] = {1, 1, 1, 1};
-        for (int d = (int)ir - 2; d >= 0; d--) istr[d] = istr[d + 1] * in_defs[idx].dims[d + 1];
+        if (ir > 8) ir = 8;
+        uint32_t lead = (ork > ir) ? (ork - ir) : 0;
+        uint32_t off = (ir > ork) ? (ir - ork) : 0;
+        uint32_t istr[8] = {1, 1, 1, 1, 1, 1, 1, 1}, ostr[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+        for (int d = (int)ir - 2; d >= 0; d--)
+            istr[d] = istr[d + 1] * in_defs[idx].dims[off + d + 1];
         for (int d = (int)ork - 2; d >= 0; d--) ostr[d] = ostr[d + 1] * out_def.dims[d + 1];
-        uint32_t rem = (uint32_t)i, in_lin = 0, lead = ork - ir;
+        uint32_t rem = (uint32_t)i, in_lin = 0;
         for (uint32_t d = 0; d < ork; d++) {
             uint32_t c = rem / ostr[d];
             rem %= ostr[d];
             if (d < lead) continue;
-            uint32_t idim = in_defs[idx].dims[d - lead];
+            uint32_t idim = in_defs[idx].dims[off + (d - lead)];
             if (idim > 1) in_lin += c * istr[d - lead];
         }
         return reinterpret_cast<const float*>(inputs[idx])[in_lin];
@@ -171,7 +174,8 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
          * Unary: ABS=0 ... COS=4 EXP=5 FLOOR=6 LOG=7 NEG=8 RECIPROCAL=10
          *        RSQRT=12 SIN=14 SQRT=15
          * Neuron: GELU=1 HARD_SWISH=3 RELU=4 SIGMOID=6 SOFTPLUS=7 TANH=8
-         * 未知 operation → 恒等(host 参考路径, 逐 op 扩支持) */
+         * 两族枚举值域重叠 → 按 op 类型分派, 不得共享 switch(GDN softplus
+         * 负输入实锤: 共享时 case 7 命中 Unary LOG → 负值输出 0) */
         auto sp = unpack_scalar_params(params);
         const ScalarParam* po = scalar_get(sp, "operation");
         int oper = -1;
@@ -179,6 +183,31 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             oper = (int)(po->is_numeric ? po->value_num
                                         : std::strtol(po->value_str.c_str(), nullptr, 10));
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        if (op_type_name == "ElementWiseNeuron") {
+            for (size_t i = 0; i < n; ++i) {
+                float x = in0 ? in0[i] : 0.0f;
+                switch (oper) {
+                case 1:  out[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608f *
+                            (x + 0.044715f * x * x * x))); break;          /* GELU */
+                case 3: { /* HARD_SWISH: x·relu6(x+3)/6 */
+                    float v = x + 3.0f;
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 6.0f) v = 6.0f;
+                    out[i] = x * v / 6.0f; break;
+                }
+                case 4:  out[i] = std::max(0.0f, x); break;               /* RELU */
+                case 6:  out[i] = 1.0f / (1.0f + std::exp(-x)); break;     /* SIGMOID */
+                case 7: { /* SOFTPLUS: 稳定化 log(1+e^x)(x 大时 exp 溢出) */
+                    if (x > 30.0f) out[i] = x;
+                    else if (x < -30.0f) out[i] = std::exp(x);
+                    else out[i] = std::log1pf(std::exp(x));
+                    break;
+                }
+                case 8:  out[i] = std::tanh(x); break;                     /* TANH */
+                default: out[i] = x; break;
+                }
+            }
+        } else {
         for (size_t i = 0; i < n; ++i) {
             float x = in0 ? in0[i] : 0.0f;
             switch (oper) {
@@ -187,25 +216,14 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             case 15: out[i] = (x >= 0) ? std::sqrt(x) : 0.0f; break;       /* SQRT */
             case 12: out[i] = (x > 0) ? 1.0f / std::sqrt(x) : 0.0f; break; /* RSQRT */
             case 7:  out[i] = (x > 0) ? std::log(x) : 0.0f; break;         /* LOG */
+            case 6:  out[i] = std::floor(x); break;                        /* FLOOR */
             case 0:  out[i] = std::fabs(x); break;                         /* ABS */
             case 14: out[i] = std::sin(x); break;                          /* SIN */
             case 4:  out[i] = std::cos(x); break;                          /* COS */
             case 10: out[i] = (x != 0.0f) ? 1.0f / x : 0.0f; break;        /* RECIPROCAL */
-            case 6:  out[i] = 1.0f / (1.0f + std::exp(-x)); break;         /* SIGMOID */
-            case 8 + 100: out[i] = std::tanh(x); break;                    /* TANH(neuron) */
-            case 1:  out[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608f *
-                        (x + 0.044715f * x * x * x))); break;              /* GELU */
-            case 4 + 100: out[i] = std::max(0.0f, x); break;               /* RELU(neuron) */
-            case 7 + 100: out[i] = std::log(1.0f + std::exp(x)); break;    /* SOFTPLUS */
             default: out[i] = x; break;
             }
         }
-        /* Neuron 的 TANH(8)/RELU(4)与 Unary 值冲突 —— 按 op 类型二次分派 */
-        if (op_type_name == "ElementWiseNeuron" && (oper == 8 || oper == 4)) {
-            for (size_t i = 0; i < n; ++i) {
-                float x = in0 ? in0[i] : 0.0f;
-                out[i] = (oper == 8) ? std::tanh(x) : std::max(0.0f, x);
-            }
         }
     } else if (op_type_name == "Eltwise_Ternary") {
         // SELECT 语义(eltwise_type scalar): out = in0(cond) ? in1 : in2
@@ -213,12 +231,21 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         auto sp = unpack_scalar_params(params);
         const ScalarParam* pt = scalar_get(sp, "eltwise_type");
         std::string t = pt ? pt->value_str : "";
-        const float* c = inputs.size() > 0 ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
-        const float* a = inputs.size() > 1 ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
-        const float* b = inputs.size() > 2 ? reinterpret_cast<const float*>(inputs[2]) : nullptr;
+        /* ElementWiseSelect(Where): 三输入 numpy 广播
+         * (GDN Trilu 链: cond [64,64] + 标量 zero + 5D 数据) */
+        if (getenv("GEHTP_EXDIAG")) {
+            std::fprintf(stderr, "[terdiag] n=%zu outr=%u in_defs=%zu",
+                         n, out_def.rank, in_defs.size());
+            for (size_t k = 0; k < in_defs.size(); k++)
+                std::fprintf(stderr, " [r%u:%u,%u,%u,%u,%u]",
+                             in_defs[k].rank, in_defs[k].dims[0],
+                             in_defs[k].dims[1], in_defs[k].dims[2],
+                             in_defs[k].dims[3], in_defs[k].dims[4]);
+            std::fprintf(stderr, "\n");
+        }
         for (size_t i = 0; i < n; ++i) {
-            if (t == "SELECT") out[i] = (c && c[i] != 0.0f) ? (a ? a[i] : 0.0f) : (b ? b[i] : 0.0f);
-            else out[i] = (a ? a[i] : 0.0f);
+            float cv = in_bc(0, i);
+            out[i] = (cv != 0.0f) ? in_bc(1, i) : in_bc(2, i);
         }
     } else if (op_type_name == "CumSum" || op_type_name == "CumulativeSum") {
         // axis 由 scalar_params 决定; 输入形状取 in_defs[0](缺省 = out_def)
@@ -328,17 +355,31 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             std::vector<uint32_t> out_dims(rank), perm(rank);
             for (uint32_t d = 0; d < rank; d++) out_dims[d] = out_def.dims[d];
             // Read perm from second input or from params
+            // perm 长度可能与 rank 不同(QNN 前导 1 填充): 前导维恒等, 尾部按 perm 平移
+            uint32_t p_elems = rank;
+            if (inputs.size() > 1 && inputs[1] && in_defs.size() > 1) {
+                p_elems = 1;
+                for (uint32_t d = 0; d < in_defs[1].rank && d < 5; ++d)
+                    p_elems *= in_defs[1].dims[d];
+                if (p_elems == 0 || p_elems > rank) p_elems = rank;
+            }
+            for (uint32_t d = 0; d < rank; d++) perm[d] = d;
             if (inputs.size() > 1 && inputs[1]) {
                 const int32_t* p = reinterpret_cast<const int32_t*>(inputs[1]);
-                for (uint32_t d = 0; d < rank; d++) perm[d] = static_cast<uint32_t>(p[d]);
+                uint32_t off = rank - p_elems;
+                for (uint32_t d = 0; d < p_elems; d++)
+                    perm[off + d] = static_cast<uint32_t>(p[d]) + off;
             } else {
                 for (uint32_t d = 0; d < rank; d++) perm[d] = rank - 1 - d;
             }
             // Compute input shape from in_defs or infer from output + perm
-            std::vector<uint32_t> in_dims(rank);
+            // (右对齐: 输入 rank 小于输出 rank 时前导 1 填充)
+            std::vector<uint32_t> in_dims(rank, 1);
             if (!in_defs.empty()) {
-                for (uint32_t d = 0; d < rank && d < in_defs[0].rank; d++)
-                    in_dims[d] = in_defs[0].dims[d];
+                uint32_t ir = in_defs[0].rank;
+                uint32_t off = rank > ir ? rank - ir : 0;
+                for (uint32_t d = 0; d < ir && off + d < rank; d++)
+                    in_dims[off + d] = in_defs[0].dims[d];
             } else {
                 for (uint32_t d = 0; d < rank; d++) in_dims[d] = out_dims[perm[d]];
             }
@@ -367,18 +408,31 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         else {
             uint32_t rank = out_def.rank;
             if (rank > 4) rank = 4;
-            int b[4] = {0, 0, 0, 0}, e[4] = {0, 0, 0, 0}, s[4] = {1, 1, 1, 1};
-            for (uint32_t ax = 0; ax < rank; ax++) {
-                b[ax] = (int)rg[ax * 3 + 0];
-                e[ax] = (int)rg[ax * 3 + 1];
-                s[ax] = (int)rg[ax * 3 + 2];
-                if (s[ax] == 0) s[ax] = 1;
+            /* ranges 轴数 = param 元素数/3; 与 rank 不同时右对齐(前导轴恒等,
+             * QNN 前导 1 填充) */
+            uint32_t n_axes = rank;
+            if (in_defs.size() > 1) {
+                size_t en = 1;
+                for (uint32_t d = 0; d < in_defs[1].rank && d < 5; ++d)
+                    en *= in_defs[1].dims[d];
+                if (en % 3 == 0 && en / 3 <= rank) n_axes = (uint32_t)(en / 3);
             }
-            /* 输入形状(in_defs[0], 4D 填充)与输出形状逐轴 */
+            uint32_t ax_off = rank - n_axes;
+            int b[4] = {0, 0, 0, 0}, e[4] = {0, 0, 0, 0}, s[4] = {1, 1, 1, 1};
+            for (uint32_t ax = 0; ax < n_axes; ax++) {
+                b[ax_off + ax] = (int)rg[ax * 3 + 0];
+                e[ax_off + ax] = (int)rg[ax * 3 + 1];
+                s[ax_off + ax] = (int)rg[ax * 3 + 2];
+                if (s[ax_off + ax] == 0) s[ax_off + ax] = 1;
+            }
+            /* 输入形状(in_defs[0])右对齐, 前导 1 填充 */
             uint32_t id_[4] = {1, 1, 1, 1};
-            if (!in_defs.empty())
-                for (uint32_t ax = 0; ax < in_defs[0].rank && ax < 4; ax++)
-                    id_[ax] = in_defs[0].dims[ax];
+            if (!in_defs.empty()) {
+                uint32_t ir = in_defs[0].rank;
+                uint32_t off = rank > ir ? rank - ir : 0;
+                for (uint32_t ax = 0; ax < ir && off + ax < 4; ax++)
+                    id_[off + ax] = in_defs[0].dims[ax];
+            }
             size_t in_strides[4] = {1, 1, 1, 1};
             for (int d = 2; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
             uint32_t od[4] = {1, 1, 1, 1};
@@ -393,6 +447,77 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                     src += (size_t)(b[d] + (int)c * s[d]) * in_strides[d];
                 }
                 out[i] = in0[src];
+            }
+        }
+    } else if (op_type_name == "Pad") {
+        // QNN Pad: scalar scheme(0=CONSTANT 1=REFLECT 2=SYMMETRIC 3=EDGE)
+        // + pad_constant_value; tensor_param pad_amount [n_axes,2] begin/end
+        // (内联 data, int32 经 float 缓冲传字节)。GDN 用例: 轴 1 前 pad 32(chunk)。
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        const int32_t* pads = (inputs.size() > 1) ? reinterpret_cast<const int32_t*>(inputs[1]) : nullptr;
+        float pad_val = 0.0f;
+        int scheme = 0;
+        auto sp2 = unpack_scalar_params(params);
+        if (const ScalarParam* p = scalar_get(sp2, "pad_constant_value"))
+            pad_val = (float)(p->is_numeric ? p->value_num
+                                            : std::strtod(p->value_str.c_str(), nullptr));
+        if (const ScalarParam* p = scalar_get(sp2, "scheme"))
+            scheme = (int)(p->is_numeric ? p->value_num
+                                         : std::strtol(p->value_str.c_str(), nullptr, 10));
+        if (scheme != 0) {
+            // 非 CONSTANT scheme 暂直通兜底(数值门兜底)
+            for (size_t i = 0; i < n; ++i) out[i] = in0 ? in0[i] : 0.0f;
+        } else if (!in0 || !pads) {
+            for (size_t i = 0; i < n; ++i) out[i] = pad_val;
+        } else {
+            if (getenv("GEHTP_EXDIAG")) {
+                std::fprintf(stderr, "[paddiag] n=%zu in_defs=%zu",
+                             n, in_defs.size());
+                for (size_t k = 0; k < in_defs.size(); k++)
+                    std::fprintf(stderr, " [r%u:%u,%u,%u,%u]",
+                                 in_defs[k].rank, in_defs[k].dims[0],
+                                 in_defs[k].dims[1], in_defs[k].dims[2],
+                                 in_defs[k].dims[3]);
+                std::fprintf(stderr, " outrank=%u\n", out_def.rank);
+            }
+            uint32_t rank = out_def.rank;
+            if (rank > 4) rank = 4;
+            uint32_t od[4] = {1, 1, 1, 1};
+            for (uint32_t ax = 0; ax < rank; ax++) od[ax] = out_def.dims[ax];
+            /* 输入形状右对齐(前导 1 填充) */
+            uint32_t id_[4] = {1, 1, 1, 1};
+            if (!in_defs.empty()) {
+                uint32_t ir = in_defs[0].rank;
+                uint32_t off = rank > ir ? rank - ir : 0;
+                for (uint32_t ax = 0; ax < ir && off + ax < 4; ax++)
+                    id_[off + ax] = in_defs[0].dims[ax];
+            }
+            /* pads 轴数 = param 元素数/2, 右对齐 */
+            uint32_t n_axes = rank;
+            if (in_defs.size() > 1) {
+                size_t en = 1;
+                for (uint32_t d = 0; d < in_defs[1].rank && d < 5; ++d)
+                    en *= in_defs[1].dims[d];
+                if (en % 2 == 0 && en / 2 <= rank) n_axes = (uint32_t)(en / 2);
+            }
+            uint32_t ax_off = rank - n_axes;
+            size_t in_strides[4] = {1, 1, 1, 1};
+            for (int d = 2; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
+            size_t out_strides[4] = {1, 1, 1, 1};
+            for (int d = 2; d >= 0; d--) out_strides[d] = out_strides[d + 1] * od[d + 1];
+            for (size_t i = 0; i < n; i++) {
+                size_t rem = i, src = 0;
+                bool valid = true;
+                for (uint32_t d = 0; d < rank; d++) {
+                    size_t c = rem / out_strides[d];
+                    rem %= out_strides[d];
+                    /* pads 按有效轴序(before0,after0,…); 前导填充轴无 pad */
+                    int64_t pbeg = (d >= ax_off) ? pads[(d - ax_off) * 2 + 0] : 0;
+                    int64_t ic = (int64_t)c - pbeg;
+                    if (ic < 0 || ic >= (int64_t)id_[d]) { valid = false; break; }
+                    src += (size_t)ic * in_strides[d];
+                }
+                out[i] = valid ? in0[src] : pad_val;
             }
         }
     } else if (op_type_name == "Concat") {
@@ -531,23 +656,187 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             }
         }
     } else if (op_type_name == "Gather") {
-        // Gather: inputs[0]=表 const, inputs[1]=索引(execute_host 中 int32
-        // 以 float 缓冲传递, 值在 2^24 内精确)。行宽 = 表末维; n = 输出元素。
+        // Gather 通用: axis(scalar, 缺省 0); indices = inputs[1](int32 经
+        // float 缓冲传递); 输出 = 输入把 axis 维替换为 indices 元素数。
+        // 覆盖 embedding(axis=0, idx [1,seq])与标量轴索引(axis=2 恒等面)。
         const float* tbl = inputs.size() > 0 ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
-        const float* idx = inputs.size() > 1 ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
+        const int32_t* idx = inputs.size() > 1 ? reinterpret_cast<const int32_t*>(inputs[1]) : nullptr;
         if (!tbl || !idx) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; }
         else {
-            uint32_t tr = (in_defs.size() > 0) ? in_defs[0].rank : 0;
-            while (tr > 0 && in_defs[0].dims[tr - 1] == 1) tr--;
-            size_t row_w = (tr >= 1) ? in_defs[0].dims[tr - 1] : 1;
-            if (row_w == 0) row_w = 1;
-            size_t rows = n / row_w;
-            for (size_t i = 0; i < rows; i++) {
-                int r = (int)idx[i];
-                if (r < 0) r = 0;
-                const float* src = tbl + (size_t)r * row_w;
-                for (size_t j = 0; j < row_w; j++) out[i * row_w + j] = src[j];
+            uint32_t orank = out_def.rank;
+            if (orank > 5) orank = 5;
+            uint32_t irank = (!in_defs.empty()) ? in_defs[0].rank : orank;
+            if (irank > 5) irank = 5;
+            int axis = 0;
+            auto sp2 = unpack_scalar_params(params);
+            if (const ScalarParam* p = scalar_get(sp2, "axis"))
+                axis = (int)(p->is_numeric ? p->value_num
+                                           : std::strtol(p->value_str.c_str(), nullptr, 10));
+            if (axis < 0) axis += (int)irank;
+            if (axis < 0 || axis >= (int)irank) axis = 0;
+            uint32_t od[5] = {1, 1, 1, 1, 1};
+            for (uint32_t ax = 0; ax < orank; ax++) od[ax] = out_def.dims[ax];
+            /* 输入形状: 输入 rank 可能大于输出 rank(axis 被 gather 掉) */
+            uint32_t id_[5] = {1, 1, 1, 1, 1};
+            if (!in_defs.empty())
+                for (uint32_t ax = 0; ax < irank; ax++) id_[ax] = in_defs[0].dims[ax];
+            size_t in_strides[5] = {1, 1, 1, 1, 1};
+            for (int d = 3; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
+            size_t out_strides[5] = {1, 1, 1, 1, 1};
+            for (int d = 3; d >= 0; d--) out_strides[d] = out_strides[d + 1] * od[d + 1];
+            size_t m = 1;
+            if (in_defs.size() > 1) {
+                for (uint32_t d = 0; d < in_defs[1].rank && d < 5; ++d)
+                    m *= in_defs[1].dims[d];
             }
+            if (m == 0) m = 1;
+            int r0 = (int)idx[0];  /* 标量 indices(GDN 用); m>1 时逐元素取 */
+            if (r0 < 0) r0 += (int)id_[axis];
+            bool bad0 = (r0 < 0 || r0 >= (int)id_[axis]);
+            /* 输出轴 d → 输入轴: d < axis → d; d ≥ axis → d + (irank-orank)
+             * (G144: 5D→4D 轴 3 被 gather 掉 shift=1; G147: rank 不变
+             * 轴 2 大小 1 被 idx 替换 shift=0) */
+            uint32_t shift = irank - orank;
+            for (size_t i = 0; i < n; i++) {
+                size_t rem = i, src = 0;
+                bool bad = bad0;
+                for (uint32_t d = 0; d < orank && !bad; d++) {
+                    size_t c = rem / out_strides[d];
+                    rem %= out_strides[d];
+                    uint32_t i_ax = ((int)d >= (int)axis) ? d + shift : d;
+                    if (i_ax >= irank) { bad = true; break; }
+                    src += c * in_strides[i_ax];
+                }
+                if (!bad) src += (size_t)r0 * in_strides[axis];
+                out[i] = bad ? 0.0f : tbl[src];
+            }
+        }
+    } else if (op_type_name == "Reduce") {
+        /* QNN Reduce: reduce_type 字符串(ReduceSum/Mean/Max/Min/Prod),
+         * axes = tensor_param(int32), keep_dims scalar。GDN l2norm 用
+         * ReduceSum(axis=末维)。 */
+        auto sp = unpack_scalar_params(params);
+        const ScalarParam* prt = scalar_get(sp, "reduce_type");
+        std::string rt = prt ? prt->value_str : "ReduceSum";
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        const int32_t* axes = (inputs.size() > 1) ? reinterpret_cast<const int32_t*>(inputs[1]) : nullptr;
+        if (!in0) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; return; }
+        uint32_t irank = (!in_defs.empty()) ? in_defs[0].rank : out_def.rank;
+        if (irank > 5) irank = 5;
+        uint32_t id_[5] = {1, 1, 1, 1, 1};
+        if (!in_defs.empty())
+            for (uint32_t ax = 0; ax < irank; ax++) id_[ax] = in_defs[0].dims[ax];
+        size_t in_strides[5] = {1, 1, 1, 1, 1};
+        for (int d = 3; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
+        /* axes: param 元素数(维积); 缺省 = 全轴 */
+        size_t n_axes = 0;
+        if (axes && in_defs.size() > 1) {
+            n_axes = 1;
+            for (uint32_t d = 0; d < in_defs[1].rank && d < 5; ++d)
+                n_axes *= in_defs[1].dims[d];
+        }
+        bool red[5] = {false, false, false, false, false};
+        bool have_axes = (axes != nullptr && n_axes > 0);
+        if (have_axes) {
+            for (size_t k = 0; k < n_axes; k++) {
+                int ax = (int)axes[k];
+                if (ax < 0) ax += (int)irank;
+                if (ax >= 0 && ax < (int)irank) red[ax] = true;
+            }
+        } else {
+            for (uint32_t ax = 0; ax < irank; ax++) red[ax] = true;
+        }
+        uint32_t orank = out_def.rank;
+        if (orank > 5) orank = 5;
+        uint32_t od[5] = {1, 1, 1, 1, 1};
+        for (uint32_t ax = 0; ax < orank; ax++) od[ax] = out_def.dims[ax];
+        size_t out_strides[5] = {1, 1, 1, 1, 1};
+        for (int d = 3; d >= 0; d--) out_strides[d] = out_strides[d + 1] * od[d + 1];
+        bool is_sum = (rt == "ReduceSum");
+        bool is_mean = (rt == "ReduceMean");
+        bool is_max = (rt == "ReduceMax");
+        bool is_min = (rt == "ReduceMin");
+        if (!(is_sum || is_mean || is_max || is_min)) {
+            for (size_t i = 0; i < n; ++i) out[i] = in0[i];  /* 未知 reduce → 直通 */
+            return;
+        }
+        /* 输出坐标 → 输入基址(非 reduce 维) */
+        for (size_t i = 0; i < n; i++) {
+            size_t rem = i;
+            size_t base = 0;
+            uint32_t oax = 0;
+            for (uint32_t d = 0; d < irank; d++) {
+                if (red[d]) continue;
+                size_t c = (oax < orank) ? (rem / out_strides[oax]) : 0;
+                if (oax < orank) rem %= out_strides[oax];
+                oax++;
+                base += c * in_strides[d];
+            }
+            /* 枚举 reduce 维 */
+            size_t cnt = 1;
+            for (uint32_t d = 0; d < irank; d++) if (red[d]) cnt *= id_[d];
+            float acc = is_max ? -INFINITY : (is_min ? INFINITY : 0.0f);
+            size_t rrem = 0;
+            for (size_t r = 0; r < cnt; r++) {
+                rrem = r;
+                size_t src = base;
+                for (uint32_t d = 0; d < irank; d++) {
+                    if (!red[d]) continue;
+                    size_t c = rrem % id_[d];
+                    rrem /= id_[d];
+                    src += c * in_strides[d];
+                }
+                float v = in0[src];
+                if (is_max) acc = (v > acc) ? v : acc;
+                else if (is_min) acc = (v < acc) ? v : acc;
+                else acc += v;
+            }
+            if (is_mean) acc /= (float)cnt;
+            out[i] = acc;
+        }
+    } else if (op_type_name == "ScatterNd" || op_type_name == "ScatterND") {
+        // ScatterND: out = data(零面); indices [.., K] 前 K 维坐标,
+        // updates [.., block] 每坐标一块写入(无 reduction 覆盖语义)。
+        // GDN chunk gated delta rule: 每头 (h,0,0) 坐标写 [64,128] 块。
+        const float* data = inputs.size() > 0 ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
+        const int32_t* idxs = inputs.size() > 1 ? reinterpret_cast<const int32_t*>(inputs[1]) : nullptr;
+        const float* upd = inputs.size() > 2 ? reinterpret_cast<const float*>(inputs[2]) : nullptr;
+        for (size_t i = 0; i < n; ++i) out[i] = data ? data[i] : 0.0f;
+        if (!idxs || !upd) return;
+        /* K = indices 末维; n_idx = 前导维积; block = updates/n_idx */
+        uint32_t K = 1;
+        size_t n_idx = 1;
+        if (in_defs.size() > 1 && in_defs[1].rank >= 1) {
+            K = in_defs[1].dims[in_defs[1].rank - 1];
+            for (uint32_t d = 0; d + 1 < in_defs[1].rank; ++d)
+                n_idx *= in_defs[1].dims[d];
+        }
+        if (K == 0 || K > 5) K = 1;
+        if (n_idx == 0) n_idx = 1;
+        size_t block = 1;
+        if (in_defs.size() > 2) {
+            block = 1;
+            for (uint32_t d = 0; d < in_defs[2].rank && d < 5; ++d)
+                block *= in_defs[2].dims[d];
+            block /= n_idx;
+        }
+        if (block == 0) block = n / n_idx;
+        uint32_t rank = out_def.rank;
+        if (rank > 5) rank = 5;
+        uint32_t od[5] = {1, 1, 1, 1, 1};
+        for (uint32_t ax = 0; ax < rank; ax++) od[ax] = out_def.dims[ax];
+        size_t ostr[5] = {1, 1, 1, 1, 1};
+        for (int d = 3; d >= 0; d--) ostr[d] = ostr[d + 1] * od[d + 1];
+        for (size_t e = 0; e < n_idx; e++) {
+            size_t base = 0;
+            bool bad = false;
+            for (uint32_t k = 0; k < K; k++) {
+                int c = (int)idxs[e * K + k];
+                if (c < 0 || c >= (int)od[k]) { bad = true; break; }
+                base += (size_t)c * ostr[k];
+            }
+            if (bad || base + block > n) continue;
+            for (size_t b = 0; b < block; b++) out[base + b] = upd[e * block + b];
         }
     } else if (op_type_name == "Split") {
         // Split(host 参考): 输入沿 axis(缺省末维)等段切; 本副本取
@@ -649,6 +938,12 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             if (ar >= 1) k = in_defs[0].dims[ar - 1];
         }
         if (k == 0) k = 1;
+        if (getenv("GEHTP_EXDIAG")) {
+            std::fprintf(stderr, "[mmdiag] m=%zu nn=%zu k=%zu t0=%d t1=%d batched=%d ork=%u A0=%g,%g,%g B0=%g,%g,%g\n",
+                         m, nn, k, (int)t0, (int)t1, (int)(ork >= 3 && in_defs.size() > 1), ork,
+                         A ? A[0] : -1.f, A ? A[1] : -1.f, A ? A[2] : -1.f,
+                         B ? B[0] : -1.f, B ? B[1] : -1.f, B ? B[2] : -1.f);
+        }
         /* A 侧转置: A 元素数 = m*k 自洽, 否则试 [k,m] */
         if (in_defs.size() > 0 && m * k > 1) {
             size_t a_n = 1;

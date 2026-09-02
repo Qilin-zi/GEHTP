@@ -22,6 +22,7 @@ DType QnnIRLoader::map_dtype(uint32_t qnn_dtype) {
         case 0x0132: return DType::Int32;   // QNN_DATATYPE_UINT_32 -> closest
         case 0x0832: return DType::Int8;    // QNN_DATATYPE_SINT_8 (guess)
         case 0x0732: return DType::UInt8;   // QNN_DATATYPE_UINT_8 (guess)
+        case 0x0508: return DType::Bool;    // QNN_DATATYPE_BOOL_8 (GDN Trilu 掩码)
         default:      return DType::Float32;
     }
 }

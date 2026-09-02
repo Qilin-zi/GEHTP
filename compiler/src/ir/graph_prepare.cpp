@@ -528,6 +528,12 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
         auto op = op_factory_generate(io, id);
         if (op) {
             ops_.push_back(std::move(op));
+        } else if (getenv("GEHTP_EXDIAG")) {
+            std::fprintf(stderr, "[skip] oid=%llu factory-null %s const=%d dead=%d out(r%u:%u,%u,%u)\n",
+                         (unsigned long long)id, opdef->name_tag->name(),
+                         (int)opdef->is_const(), (int)opdef->is_dead(),
+                         opdef->output_def.rank, opdef->output_def.dims[0],
+                         opdef->output_def.dims[1], opdef->output_def.dims[2]);
         }
     }
 
@@ -555,14 +561,54 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
     // Materialize const ops: copy their data from const_pool_ into tensor_map.
     // Const ops are not in ops_ (not registered), so we populate their outputs
     // here before the compute-op loop reads them.
+    // 按 element_size 拓宽到 float: bool(1B)/f16(2B)/int32(4B)/f32(4B)
+    // (GDN Trilu 掩码 = converter 折叠的 bool 静态张量, 4096B≠1024 float)。
     for (auto& [id, opdef] : opdef_map_) {
         if (!opdef || !opdef->is_const() || opdef->is_dead()) continue;
         if (opdef->const_data_size == 0) continue;
-        size_t elem_n = opdef->const_data_size / sizeof(float);
+        size_t es = opdef->output_def.element_size;
+        if (es == 0 || es > 4) es = 4;
+        size_t elem_n = opdef->const_data_size / es;
         auto& buf = tensor_map[id];
         buf.resize(elem_n, 0.0f);
-        if (opdef->const_data_offset > 0 && opdef->const_data_offset + opdef->const_data_size <= const_pool_.size()) {
-            std::memcpy(buf.data(), const_pool_.data() + opdef->const_data_offset, opdef->const_data_size);
+        bool in_pool = opdef->const_data_offset + opdef->const_data_size <= const_pool_.size();
+        const uint8_t* src = in_pool ? const_pool_.data() + opdef->const_data_offset : nullptr;
+        if (es == 4) {
+            if (src) std::memcpy(buf.data(), src, opdef->const_data_size);
+        } else if (es == 2) {
+            for (size_t i = 0; i < elem_n; i++) {
+                if (!src) break;
+                uint16_t h;
+                std::memcpy(&h, src + i * 2, 2);
+                // f16 → f32(次正规/Inf 保真)
+                uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+                uint32_t exp = (h >> 10) & 0x1F, mant = h & 0x3FF, u;
+                if (exp == 0) {
+                    if (mant == 0) u = sign;
+                    else {
+                        int e = -1;
+                        while (!(mant & 0x400)) { mant <<= 1; e--; }
+                        u = sign | ((uint32_t)(127 + 15 + e) << 23) | ((mant & 0x3FF) << 13);
+                    }
+                } else if (exp == 31) u = sign | 0x7F800000u | (mant << 13);
+                else u = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+                float f;
+                std::memcpy(&f, &u, 4);
+                buf[i] = f;
+            }
+        } else {  // es == 1: bool/uint8 → float
+            for (size_t i = 0; i < elem_n && src; i++)
+                buf[i] = (float)src[i];
+        }
+        if (getenv("GEHTP_EXDIAG") && (id == 117 || id == 118)) {
+            std::fprintf(stderr, "[const] id=%llu es=%zu size=%zu elem=%zu first16=",
+                         (unsigned long long)id, es, (size_t)opdef->const_data_size,
+                         elem_n);
+            for (size_t k = 0; k < 16 && k < elem_n; k++)
+                std::fprintf(stderr, "%.0f,", buf[k]);
+            std::fprintf(stderr, " nz=%zu\n",
+                         std::count_if(buf.begin(), buf.end(),
+                                       [](float x) { return x != 0.0f; }));
         }
     }
 
@@ -620,6 +666,23 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
             in_bufs.push_back(it != tensor_map.end() && !it->second.empty()
                 ? reinterpret_cast<const uint8_t*>(it->second.data()) : nullptr);
             in_ods.push_back(conn.src_out_def);
+            if (getenv("GEHTP_EXDIAG")) {
+                size_t bsz = (it != tensor_map.end()) ? it->second.size() : 0;
+                const OpDef* sp = get_op_at(conn.src_id);
+                std::fprintf(stderr, "[exsrc] oid=%llu in%zu <- src=%llu bufsz=%zu decl(r%u:%u,%u,%u,%u) srcdef(r%u:%u,%u,%u,%u) %s\n",
+                             (unsigned long long)oid, in_ods.size() - 1,
+                             (unsigned long long)conn.src_id, bsz,
+                             conn.src_out_def.rank, conn.src_out_def.dims[0],
+                             conn.src_out_def.dims[1], conn.src_out_def.dims[2],
+                             conn.src_out_def.dims[3],
+                             sp ? sp->output_def.rank : 0,
+                             sp ? sp->output_def.dims[0] : 0,
+                             sp ? sp->output_def.dims[1] : 0,
+                             sp ? sp->output_def.dims[2] : 0,
+                             sp ? sp->output_def.dims[3] : 0,
+                             sp && sp->name_tag && sp->name_tag->name()
+                                 ? sp->name_tag->name() : "?");
+            }
         }
         /* tensor_param const(ranges/perm/axes)追加到输入尾部 —
          * host 参考 StridedSlice/Transpose 等按名/按位消费
@@ -639,12 +702,15 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
                                     pc->const_data_size);
                 }
                 if (true) {
-                    std::fprintf(stderr, "[hostdiag] op %llu param %llu off=%llu size=%llu first4=%g %g %g %g\n",
+                    std::fprintf(stderr, "[hostdiag] op %llu param %llu off=%llu size=%llu first4=%g %g %g %g rank=%u dims=[%u,%u,%u,%u]\n",
                                  (unsigned long long)oid, (unsigned long long)tpid,
                                  (unsigned long long)pc->const_data_offset,
                                  (unsigned long long)pc->const_data_size,
                                  tbuf.size() > 0 ? tbuf[0] : -1.f, tbuf.size() > 1 ? tbuf[1] : -1.f,
-                                 tbuf.size() > 2 ? tbuf[2] : -1.f, tbuf.size() > 3 ? tbuf[3] : -1.f);
+                                 tbuf.size() > 2 ? tbuf[2] : -1.f, tbuf.size() > 3 ? tbuf[3] : -1.f,
+                                 pc->output_def.rank,
+                                 pc->output_def.dims[0], pc->output_def.dims[1],
+                                 pc->output_def.dims[2], pc->output_def.dims[3]);
                 }
                 in_bufs.push_back(reinterpret_cast<const uint8_t*>(tbuf.data()));
                 in_ods.push_back(pc->output_def);
@@ -660,6 +726,17 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
         auto& out_vec = tensor_map[oid];
         out_vec.resize(out_n, 0.0f);
 
+        if (getenv("GEHTP_EXDIAG")) {
+            std::fprintf(stderr, "[ex] seq=%zu oid=%llu %s n=%zu ins=%zu",
+                         seq_idx, (unsigned long long)oid,
+                         top->op_type_name.c_str(), out_n, in_bufs.size());
+            for (size_t k = 0; k < in_ods.size(); k++)
+                std::fprintf(stderr, " src(r%u:%u,%u,%u,%u)",
+                             in_ods[k].rank, in_ods[k].dims[0],
+                             in_ods[k].dims[1], in_ods[k].dims[2],
+                             in_ods[k].dims[3]);
+            std::fprintf(stderr, "\n");
+        }
         top->execute(in_bufs, reinterpret_cast<uint8_t*>(out_vec.data()), top->cached_out_def, in_ods);
         seq_idx++;
         if (oid == 3 || oid == 14 || oid == 45 || oid == 151) {
@@ -706,6 +783,13 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
     // Read Output's predecessor from opdef_map_ (Output is not in ops_).
     auto* output_def = get_op_at(output_id);
     if (output_def && !output_def->inputs.empty()) {
+        if (getenv("GEHTP_EXDIAG")) {
+            const OpDef* sp = get_op_at(output_def->inputs[0].src_id);
+            std::fprintf(stderr, "[outdiag] src=%llu %s dead=%d\n",
+                         (unsigned long long)output_def->inputs[0].src_id,
+                         sp && sp->name_tag && sp->name_tag->name() ? sp->name_tag->name() : "?",
+                         sp ? (int)sp->is_dead() : -1);
+        }
         auto src_it = tensor_map.find(output_def->inputs[0].src_id);
         if (src_it != tensor_map.end()) {
             ret.output = src_it->second;
@@ -3099,6 +3183,15 @@ int GraphPrepare::common_subexpr_eliminate(bool) {
         for (uint8_t b8 : opdef->op_data) {
             sig ^= (static_cast<uint64_t>(b8) + 0x9E3779B97F4A7C15ULL);
             sig = (sig << 8) | (sig >> 56);
+        }
+        /* 输出形状也是语义的一部分 —— 同输入无参数但输出形状不同的 op
+         * (GDN Unsqueeze_25/26: 同 CumSum 输入, axes 烘焙, 输出
+         * [1,16,1,64,1] vs [1,16,1,1,64])不得合并 */
+        sig ^= (static_cast<uint64_t>(opdef->output_def.rank) * 0x9E3779B97F4A7C15ULL);
+        sig ^= static_cast<uint64_t>(opdef->output_def.dtype) << 48;
+        for (uint32_t d = 0; d < opdef->output_def.rank && d < 5; ++d) {
+            sig ^= (static_cast<uint64_t>(opdef->output_def.dims[d]) + 0x9E3779B97F4A7C15ULL);
+            sig = (sig << 5) | (sig >> 59);
         }
         return sig;
     };

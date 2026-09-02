@@ -228,6 +228,10 @@ add_executable(wtop_emit tools/wtop_emit.cpp
 target_link_libraries(wtop_emit htp_core)
 target_include_directories(wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
 
+# M4: host_run —— net.json → prepare → execute_host 参考执行(对拍链枢纽)
+add_executable(host_run tools/host_run.cpp)
+target_link_libraries(host_run htp_core)
+
 # 阶段3: conv2d+add op 注册 + host 参考执行对拍
 add_executable(test_conv_add_host tests/test_conv_add_host.cpp)
 target_link_libraries(test_conv_add_host htp_core)

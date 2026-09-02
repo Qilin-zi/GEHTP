@@ -35,5 +35,6 @@ ONNX → qairt-converter → net.json (QNN IR)
 
 ## 里程碑
 
-M0 骨架+迁移 ✓ → M1 host 闭环(编译器产 .bin + wtop)→ M2 首次上板正确数值(本任务目标)
-→ M3 快路径(可选)→ M4 Level 2 持久会话。详见实施计划(项目内 plan 文档)。
+M0-M3c ✓(probe 全链上板 cos=1.0 top1 256/256,75a740f)→ M4 0.8B prefill → M5 decode
+→ M6 4B → M7 性能收敛 + 第 7 步编译期内存规划(阶段一静态 DDR 偏移 = M4/M5,
+阶段二 VTCM 驻留 + DMA 算子 runlist = M6 尾/M7)。详见实施计划(plan 文档)。
