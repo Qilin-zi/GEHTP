@@ -5,6 +5,7 @@
 #include "hnnx/ir/op_registry.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
 #include "hnnx/opt/optimization_passes.hpp"
+#include "hnnx/opt/pass_manager.hpp"
 #include "hnnx/vtcm/fancy_allocator.hpp"
 #include "hnnx/serialize/serializer.hpp"
 #include "hnnx/dma/spill_fill.hpp"
@@ -358,6 +359,12 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
         }
     }
 
+    // 3c. 图优化 pass(PassManager, 默认全开)
+    // 真实库位置: do_prepare1 内 const_prop_and_cse 之后、order_nodes 之前
+    // (M01 实证 do_prepare1 @0xf66550 调用序)。pass 使能统一由
+    // PassManager 管理(--no-pass 关单 pass); 结构不匹配 = 图不动。
+    run_optimize_passes(env);
+
     // 4. Initial node ordering
     order_nodes(true);
 
@@ -512,7 +519,9 @@ std::vector<const OpDef*> GraphPrepare::get_sorted_opdefs() const {
 }
 
 // Host-side reference execute: float buffers, topo order, tensor map.
-GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& input) {
+GraphPrepare::ExecResult GraphPrepare::execute_host(
+        const std::vector<float>& input,
+        const std::vector<std::vector<float>>* multi_inputs) {
     ExecResult ret{};
 
     /* ops_ 在 do_prepare2 的 prepare_op 填充后, Phase7 fixpoint 的 DCE 仍会
@@ -554,9 +563,46 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(const std::vector<float>& in
 
     // tensor_map: op_id -> float buffer
     std::unordered_map<op_id_t, std::vector<float>> tensor_map;
-    tensor_map[input_id].resize(input_n > 0 ? input_n : 1);
-    for (size_t i = 0; i < input_n && i < input.size(); ++i)
-        tensor_map[input_id][i] = input[i];
+    /* 多输入: 所有 Input 节点按 op_id 升序 = net.json 图输入声明序;
+     * multi 为空时单 input 喂第一个 Input(向后兼容)。 */
+    std::vector<op_id_t> in_ids;
+    for (auto& [id, opdef] : opdef_map_)
+        if (opdef && opdef->name_tag && opdef->name_tag->name() &&
+            std::string(opdef->name_tag->name()) == "Input")
+            in_ids.push_back(id);
+    std::sort(in_ids.begin(), in_ids.end());
+    if (in_ids.empty()) in_ids.push_back(input_id);
+    if (getenv("GEHTP_EXDIAG")) {
+        std::fprintf(stderr, "[mdiag] in_ids:");
+        for (op_id_t iid : in_ids) std::fprintf(stderr, " %llu", (unsigned long long)iid);
+        std::fprintf(stderr, " multi=%zu input=%zu\n",
+                     multi_inputs ? multi_inputs->size() : 0, input.size());
+        std::fprintf(stderr, "[mdiag] all nodes:");
+        for (auto& [id, opdef] : opdef_map_)
+            if (opdef)
+                std::fprintf(stderr, " %llu:%s%s%s%s", (unsigned long long)id,
+                             opdef->name_tag && opdef->name_tag->name() ? opdef->name_tag->name() : "?",
+                             opdef->is_const() ? "[c]" : "",
+                             opdef->is_enabled() ? "" : "[dis]",
+                             opdef->is_dead() ? "[DEAD]" : "");
+        std::fprintf(stderr, "\n");
+    }
+    for (size_t k = 0; k < in_ids.size(); k++) {
+        op_id_t iid = in_ids[k];
+        const std::vector<float>* src = nullptr;
+        if (multi_inputs && k < multi_inputs->size()) src = &(*multi_inputs)[k];
+        else if (k == 0 && !input.empty()) src = &input;
+        auto* idef = get_op_at(iid);
+        size_t in_n = 1;
+        if (idef)
+            for (uint32_t i = 0; i < idef->output_def.rank && i < 5; ++i)
+                in_n *= static_cast<size_t>(idef->output_def.dims[i]);
+        auto& buf = tensor_map[iid];
+        buf.resize(in_n > 0 ? in_n : 1, 0.0f);
+        if (src)
+            for (size_t i = 0; i < in_n && i < src->size(); ++i)
+                buf[i] = (*src)[i];
+    }
 
     // Materialize const ops: copy their data from const_pool_ into tensor_map.
     // Const ops are not in ops_ (not registered), so we populate their outputs
@@ -834,6 +880,36 @@ void GraphPrepare::run_optimize_passes_single_registry(
 
     (void)registries;
 
+    // 我方结构匹配 pass 框架(PassManager, 见 pass_manager.hpp)。
+    // 无条件跑、不设节点数阈值(与真实库阈值门不同: 结构不匹配即无副作用;
+    // 828/15129 图不因阈值跳过 pass —— 分歧已记录)。
+    // PHASE_0=常量折叠, PHASE_1=形状归一化; PHASE_3(激活融合)留空:
+    // exec_matmul 的 bias 槽实为 W4A16 scale 表((N/32)*512B, 非 dense bias),
+    // conv/add/binary 无后激活参数 —— 零设备改动约束下无准入规则, M7 内核
+    // 扩展后补。
+    static bool passes_registered = false;
+    if (!passes_registered) {
+        register_builtin_passes();
+        passes_registered = true;
+    }
+    PassManager& pm = PassManager::instance();
+    pm.reset_stats();
+    uint32_t before = 0;
+    for (auto& [id, opdef] : opdef_map_) {
+        if (opdef && opdef->is_enabled() && !opdef->is_dead()) before++;
+    }
+
+    uint32_t changed = pm.run_phase(this, PHASE_0);
+    if (changed > 0) run_phase_fixpoint_internal();
+    changed = pm.run_phase(this, PHASE_1);
+    if (changed > 0) run_phase_fixpoint_internal();
+
+    uint32_t after = 0;
+    for (auto& [id, opdef] : opdef_map_) {
+        if (opdef && opdef->is_enabled() && !opdef->is_dead()) after++;
+    }
+    pm.note_counts(before, after);
+
     // Build 8 phase descriptors with verified node-count thresholds
     struct PhaseInfo { uint32_t threshold; const char* name; };
     constexpr PhaseInfo phases[] = {
@@ -880,21 +956,9 @@ void GraphPrepare::run_optimize_passes_single_registry(
     // Phase 8 (�?: final cleanup (always executed)
     run_phase_fixpoint_internal();
 
-    // Fusion rules: applied after all phase fixpoints
-    static const std::vector<FusionRule> fusion_rules = {
-        {"Conv",    "Relu",    "ConvActivations"},
-        {"Conv",    "Clamp",   "ConvActivations"},
-        {"MatMul",  "Add",     "MatMul"},
-        {"MatMul",  "Gelu",    "MatMul"},
-        {"MatMul",  "Relu",    "MatMul"},
-        {"Add",     "Relu",    "Add"},
-        {"Add",     "Sigmoid", "Add"},
-        {"Dense",   "Add",     "Dense"},
-    };
-    int fused = apply_fusion_rules(this, fusion_rules);
-    if (fused > 0) {
-        run_phase_fixpoint_internal();
-    }
+    // 遗留 8-rule 融合表已移出主路径(自造且非设备准入: ConvActivations 等
+    // 名字 wtop_emit 无翻译, exec_conv2d/add/binary 无激活参数 —— 发射即错)。
+    // 契约保留在 kLegacyFusionRules, 由 test_e2e 直接调 apply_fusion_rules 验证。
 }
 
 // Fixpoint loop: DCE -> order_nodes -> CSE -> clear graph_dirty
@@ -2366,8 +2430,9 @@ op_id_t GraphPrepare::append_node(const std::string& name, uint32_t node_type,
     // Source: graph_prepare.cc:3041 "graph has second Input node"
     // Source: graph_prepare.cc:3048 "graph has second Output node"
     if (name == "Input") {
-        if (input_node_id_ != 0) return 0; // second Input
-        input_node_id_ = new_id;
+        // 真实库拒绝第二 Input; 我方多输入图每输入一个 Input 节点
+        // (id 序 = net.json 声明序, execute_host 按序喂)
+        if (input_node_id_ == 0) input_node_id_ = new_id;
     } else if (name == "Output") {
         if (output_node_id_ != 0) return 0; // second Output
         output_node_id_ = new_id;
@@ -2541,6 +2606,10 @@ int GraphPrepare::remove_dead_code(bool) {
                 // Mark as dead: flags |= 3 (OP_ENABLED | OP_DEAD)
                 opdef->flags |= OP_DEAD;
                 to_delete.push_back(id);
+                if (getenv("GEHTP_EXDIAG"))
+                    std::fprintf(stderr, "[dce] delete %llu:%s\n",
+                                 (unsigned long long)id,
+                                 opdef->name_tag && opdef->name_tag->name() ? opdef->name_tag->name() : "?");
                 changed = true;
             }
         }
@@ -3202,6 +3271,10 @@ int GraphPrepare::common_subexpr_eliminate(bool) {
         if (!opdef || !opdef->is_enabled() || opdef->is_const() || opdef->is_dead())
             continue;
         if (id == input_node_id_ || id == output_node_id_) continue;
+        /* 多输入图: 各 Input 节点(cos/sin 同形状)不得 CSE 合并 */
+        if (opdef->name_tag && opdef->name_tag->name() &&
+            std::string(opdef->name_tag->name()) == "Input")
+            continue;
 
         uint64_t sig = compute_signature(opdef.get());
 
@@ -3611,6 +3684,34 @@ void GraphPrepare::replace_opdef_with_opconst(OpDef& old, std::unique_ptr<OpDef>
         opdef_map_[replacement->op_id] = std::move(replacement);
         old.flags |= OP_DEAD;
     }
+}
+
+bool GraphPrepare::fold_op_to_const(OpDef* op, const uint8_t* data, size_t data_len) {
+    // 折叠基础设施(图优化 pass 共用): op → 持有值的 const 节点(同 op_id,
+    // 消费者 inputs 不用改线)。const_pool_ 追加 4 对齐(与 append_const_node
+    // 同约定, 反序列化直接 memcpy), const_extents_ 登记。
+    if (!op || !op->is_enabled() || op->is_dead() || op->is_const()) return false;
+    if (!data || data_len == 0) return false;
+
+    if (const_pool_.empty()) const_pool_.assign(4, 0);
+    uint64_t aligned_len = (data_len + 3) & ~uint64_t(3);
+    uint64_t offset = const_pool_.size();
+    const_pool_.resize(const_pool_.size() + aligned_len, 0);
+    std::memcpy(const_pool_.data() + offset, data, data_len);
+
+    auto replacement = std::make_unique<OpDef_Const>(*this, op->op_id,
+                                                     op->output_def, nullptr, 0);
+    replacement->const_data_offset = offset;
+    replacement->const_data_size = data_len;
+    // 继承消费者关系与 grouping —— 否则新 const 的 consumers 为空,
+    // DCE 当孤儿删掉 → 下游读空槽(测试[1] 实锤: after=1 只剩 Output)。
+    replacement->consumers = op->consumers;
+    replacement->grouping = op->grouping;
+    const_extents_.push_back({op->op_id, offset, data_len});
+
+    replace_opdef_with_opconst(*op, std::move(replacement));
+    graph_dirty_ = true;
+    return true;
 }
 
 void GraphPrepare::note_new_node(const OpDef& opdef, const char* str, uint32_t len) {

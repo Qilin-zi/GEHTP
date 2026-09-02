@@ -82,7 +82,8 @@ public:
         std::vector<float> output;
         bool ok = false;
     };
-    ExecResult execute_host(const std::vector<float>& input);  /* 内部重建 ops_ (DCE 后陈旧) */
+    ExecResult execute_host(const std::vector<float>& input,
+                            const std::vector<std::vector<float>>* multi_inputs = nullptr);  /* 多输入: Input 节点按 op_id 升序 */
 
     // Op management
     op_id_t append_node(const std::string& name, uint32_t node_type,
@@ -312,6 +313,11 @@ public:
     void change_input(OpDef* opdef, uint32_t idx, op_id_t new_src, const char* str, uint32_t len);
     void replace_with(OpDef* old, op_id_t new_id, const char* str, uint32_t len, bool keep);
     void replace_opdef_with_opconst(OpDef& old, std::unique_ptr<OpDef> replacement);
+    // 折叠基础设施: 把 op 替换为持有 data 的 const 节点(同 op_id)。
+    // const_pool_ 追加(4 对齐)+ OpDef_Const + replace_opdef_with_opconst。
+    // 铁律: 调用方必须先算出值 —— 无值不折叠(M3c: 只标 OP_CONST 不存值
+    // 会让 emit 跳过 op → 消费方读空槽 → 数值错)。返回 false = 图不动。
+    bool fold_op_to_const(OpDef* op, const uint8_t* data, size_t data_len);
     void note_new_node(const OpDef& opdef, const char* str, uint32_t len);
     void note_replace(op_id_t old, const std::vector<struct OpRef>& refs,
                       op_id_t new_id, uint32_t idx, const std::string& str);

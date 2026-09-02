@@ -12,6 +12,7 @@
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
 #include "hnnx/ops/ops.hpp"
+#include "hnnx/opt/pass_manager.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -48,16 +49,25 @@ static float widen_f16(uint16_t h) {
 
 static bool looks_like_tar(const std::vector<uint8_t>& buf) {
     if (buf.size() < 512) return false;
-    bool name_ok = false;
-    for (int i = 0; i < 100; i++) if (buf[i] >= 0x20 && buf[i] < 0x7F) { name_ok = true; break; }
+    // name: 以字母/下划线/点开头(2.48 params.bin 开头是权重字节,
+    // 恰好含可打印字符曾造成误判)
+    bool name_ok = (buf[0] >= 'A' && buf[0] <= 'Z') || (buf[0] >= 'a' && buf[0] <= 'z') ||
+                   buf[0] == '_' || buf[0] == '.';
     if (!name_ok) return false;
+    for (int i = 1; i < 100; i++)
+        if (buf[i] == 0) break;
+        else if (buf[i] < 0x20 || buf[i] >= 0x7F) return false;
+    // size: 跳过空格/NUL 后连续 >= 4 位八进制(单个 '0'-'7' 权重字节
+    // 不再误判)
+    int ndig = 0;
+    bool started = false;
     for (int i = 124; i < 136; i++) {
         char c = (char)buf[i];
-        if (c >= '0' && c <= '7') return true;
-        if (c == ' ' || c == 0) continue;
-        return false;
+        if (c >= '0' && c <= '7') { started = true; ndig++; continue; }
+        if ((c == ' ' || c == 0) && !started) continue;
+        break;
     }
-    return false;
+    return started && ndig >= 4;
 }
 
 static void tar_append(std::vector<uint8_t>& tar, const std::string& name,
@@ -232,6 +242,7 @@ int main(int argc, char** argv) {
         else if (a == "--weights-bin" && i + 1 < argc) weights_bin = argv[++i];
         else if (a == "--input-f32" && i + 1 < argc) in_path = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+        else if (a == "--no-pass" && i + 1 < argc) PassManager::instance().disable(argv[++i]);
         else { std::fprintf(stderr, "usage: host_run --net-json N [--weights-bin W] [--input-f32 I] --out O\n"); return 1; }
     }
     if (net_json.empty() || out_path.empty()) {
@@ -261,22 +272,32 @@ int main(int argc, char** argv) {
                  (unsigned long long)gp.get_output_node_id(),
                  gp.plan_order().size());
 
-    // 输入: 图输入元素数个 f32(raw); 缺省全零
-    const OpDef* iop = gp.get_op_at(gp.get_input_node_id());
-    size_t n_in = 1;
-    for (uint32_t i = 0; i < iop->output_def.rank && i < 5; ++i)
-        n_in *= (size_t)iop->output_def.dims[i];
-    std::vector<float> in(n_in, 0.0f);
+    // 输入: --input-f32 逗号分隔多文件(按图输入声明序); 缺省全零
+    // (全注意力层 4 输入: hidden/causal_mask/cos/sin)
+    std::vector<std::vector<float>> ins;
     if (!in_path.empty()) {
-        std::ifstream f(in_path, std::ios::binary);
-        if (!f) { std::fprintf(stderr, "Error: cannot open %s\n", in_path.c_str()); return 1; }
-        f.read(reinterpret_cast<char*>(in.data()), (std::streamsize)(n_in * 4));
-        std::fprintf(stderr, "input: %zu f32 from %s\n", n_in, in_path.c_str());
-    } else {
-        std::fprintf(stderr, "input: %zu zeros\n", n_in);
+        size_t pos = 0;
+        while (pos <= in_path.size()) {
+            size_t comma = in_path.find(',', pos);
+            std::string p = in_path.substr(pos, comma == std::string::npos
+                                                   ? std::string::npos : comma - pos);
+            std::ifstream f(p, std::ios::binary);
+            if (!f) { std::fprintf(stderr, "Error: cannot open %s\n", p.c_str()); return 1; }
+            f.seekg(0, std::ios::end);
+            size_t nbytes = (size_t)f.tellg();
+            f.seekg(0, std::ios::beg);
+            std::vector<float> v(nbytes / 4, 0.0f);
+            f.read(reinterpret_cast<char*>(v.data()), (std::streamsize)nbytes);
+            ins.push_back(std::move(v));
+            std::fprintf(stderr, "input[%zu]: %zu f32 from %s\n", ins.size() - 1,
+                         ins.back().size(), p.c_str());
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
     }
 
-    auto r = gp.execute_host(in);
+    auto r = gp.execute_host(ins.empty() ? std::vector<float>() : ins[0],
+                             ins.empty() ? nullptr : &ins);
     if (!r.ok) { std::fprintf(stderr, "Error: execute_host failed\n"); return 1; }
     std::fprintf(stderr, "host: ok, out=%zu f32\n", r.output.size());
     {

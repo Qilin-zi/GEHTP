@@ -238,6 +238,7 @@ uint32_t QnnIRLoader::build_graph() {
     std::sort(items.begin(), items.end(),
               [](const CreateItem& a, const CreateItem& b) { return a.tensor_id < b.tensor_id; });
 
+
     // Pre-pass: build const_by_N_ map for wscale dedup.
     // Maps N → first op_id of a 1D const tensor with dims=[N], dt=562, N>1.
     // When FC/MatMul (without bias) needs a per-axis scale of dimension N,
@@ -263,7 +264,10 @@ uint32_t QnnIRLoader::build_graph() {
             OutputDef od;
             fill_output_def(od, ti.dims, dt);
             InputDef no_input{};
-            gp_.append_node("Input", ti.id, &no_input, 0, &od, 1, nullptr);
+            op_id_t iid = gp_.append_node("Input", ti.id, &no_input, 0, &od, 1, nullptr);
+            if (iid == 0)
+                std::fprintf(stderr, "[loader] Input '%s' id=%u append FAILED\n",
+                             item.tensor_name.c_str(), ti.id);
             tensor_opids_[item.tensor_name] = ti.id;
         } else if (item.kind == 1) {
             // Skip tensor_params — they are created with dedup in kind==2
