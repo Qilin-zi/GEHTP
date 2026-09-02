@@ -32,6 +32,7 @@ void ex_log(const char *fmt, ...)
     va_list ap; va_start(ap, fmt);
     vfprintf(g_fp, fmt, ap);
     fputc('\n', g_fp);
+    fflush(g_fp);
     va_end(ap);
 }
 

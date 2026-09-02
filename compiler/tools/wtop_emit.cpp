@@ -312,10 +312,16 @@ struct Emitter {
     // 幻影占位(空名非 const, 如第二输入 position_ids) = 专用零槽
     // (M2 结构闭环; M4 改真注入: 幻影槽标 EXT_IN 由 host 供给)
     uint32_t dummy_slot_id = 0;  // 共享哑槽(幻影/参数 const/缺失生产者引用)
+    // 多输入图: 各 Input 节点 → 槽(主输入=EXT_IN 槽 0; 其余=固化 const 槽)
+    std::map<uint64_t, uint32_t> input_slots;
     uint32_t src_ref(const InputConn& c, uint64_t input_node_id, GraphPrepare& gp,
                      std::map<uint64_t, uint32_t>& wslots) {
         uint64_t op_id = c.src_id;
         if (op_id == input_node_id) return 0x8000u | 0u;
+        {
+            auto isl = input_slots.find(op_id);
+            if (isl != input_slots.end()) return 0x8000u | isl->second;
+        }
         const OpDef* p = gp.get_op_at(op_id);
         // 有池数据即按 const 槽(is_const 标志对 loader 的 tensor_param const 不可靠)
         if (p && (p->is_const() || p->const_data_size > 0)) {
@@ -477,21 +483,58 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
     Emitter em;
 
-    // slot 0 = 输入 f16(NCHW); Level 1: 阶段9 引擎将其标为 external
-    std::vector<uint8_t> in_f16;
-    size_t input_bytes = input_elems * input_elem_bytes;
-    if (!in_f16_path.empty()) {
-        if (!load_file(in_f16_path, in_f16)) { std::fprintf(stderr, "error: cannot open %s\n", in_f16_path.c_str()); return 2; }
-        if (in_f16.size() != input_bytes) {
-            std::fprintf(stderr, "error: input size %zu != %zu (elems=%zu × %zuB)\n",
-                         in_f16.size(), input_bytes, input_elems, input_elem_bytes);
-            return 2;
+    // 输入槽: 主输入 = slot0 EXT_IN; 其余图输入(--input-f16 逗号分隔
+    // 后续文件, 或全零)固化为普通槽 — 全注意力层 cos/sin/mask 静态化。
+    {
+        std::vector<std::string> in_paths;
+        if (!in_f16_path.empty()) {
+            size_t pos = 0;
+            while (pos <= in_f16_path.size()) {
+                size_t comma = in_f16_path.find(',', pos);
+                in_paths.push_back(in_f16_path.substr(
+                    pos, comma == std::string::npos ? std::string::npos : comma - pos));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
         }
-    } else {
-        in_f16.assign(input_bytes, 0);
+        // Input 节点按 op_id 升序(与 host_run 同约定)
+        std::vector<uint64_t> in_ids;
+        gp.for_each_op([&](OpDef* od) {
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::string(od->name_tag->name()) == "Input" && !od->is_dead())
+                in_ids.push_back(od->op_id);
+        });
+        std::sort(in_ids.begin(), in_ids.end());
+        if (in_ids.empty()) in_ids.push_back(gp.get_input_node_id());
+        for (size_t k = 0; k < in_ids.size(); k++) {
+            const OpDef* iop = gp.get_op_at(in_ids[k]);
+            if (!iop) continue;
+            size_t elems = 1;
+            for (uint32_t i = 0; i < iop->output_def.rank && i < 5; ++i)
+                elems *= (size_t)iop->output_def.dims[i];
+            size_t ebytes = (iop->output_def.dtype == 1 || iop->output_def.dtype == 0x21) ? 2 : 4;
+            size_t need = elems * ebytes;
+            std::vector<uint8_t> data;
+            if (k < in_paths.size()) {
+                if (!load_file(in_paths[k], data)) {
+                    std::fprintf(stderr, "error: cannot open %s\n", in_paths[k].c_str());
+                    return 2;
+                }
+                if (data.size() != need) {
+                    std::fprintf(stderr, "error: input %zu size %zu != %zu (elems=%zu × %zuB)\n",
+                                 k, data.size(), need, elems, ebytes);
+                    return 2;
+                }
+            } else {
+                data.assign(need, 0);
+            }
+            uint32_t sid = em.add_slot((uint32_t)data.size(), (uint32_t)elems, data.data());
+            if (k == 0) {
+                em.slots[sid].addr = WT_SLOT_EXT_IN;  // 主输入: run_io 注入
+            }
+            em.input_slots[in_ids[k]] = sid;
+        }
     }
-    em.add_slot((uint32_t)in_f16.size(), (uint32_t)input_elems, in_f16.data());
-    em.slots[0].addr = WT_SLOT_EXT_IN;  // Level 1: 输入槽标外部(wt_exec_run_io 注入)
 
     // 2b. GGUF 供给(M2c): 读 TSV 匹配表 + GGUF 文件
     std::map<std::string, GgufEntry> gguf_map;
@@ -1029,8 +1072,14 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             em.release_at(Emitter::tkey(c.src_id, c.out_idx), pos);
     }
 
-    // 5. spill/fill → OP_SPILL / OP_FILL(溢出张量; pool slot 惰性创建)
+    // 5. spill/fill 段跳过: M2 结构闭环曾 emit 占位 SPILL/FILL(固定
+    //    保留 temp 0xFFFFFFFE, 设备侧 ref_ptr 空 → "spill src empty" 死)。
+    //    真实溢出语义 = 第7步阶段一(静态 DDR 偏移)/阶段二(VTCM 驻留+
+    //    DMA 算子)重做; 设备 temp 池为 heap malloc, 正确性不依赖此段。
+    //    (blob 尾部 spill/fill 记录保留在 manifest op_ids/opcodes 观察
+    //     成本模型活跃集, 不再发射)
     for (const auto& r : gp.spill_fill_recs()) {
+        (void)r;
         if (spill_pool_slot == 0) {
             // DDR 池 slot: 尺寸 = 最大 ddr_offset+size, 128B 对齐
             uint64_t pool_end = 0;
@@ -1040,21 +1089,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::vector<uint8_t> zeros((size_t)pool_end, 0);
             spill_pool_slot = em.add_slot((uint32_t)pool_end, (uint32_t)pool_end / 2, zeros.data());
         }
-        uint32_t t;
-        if (r.op_id == gp.get_output_node_id()) {
-            // Output 节点的张量 = 其输入生产者的 temp
-            const OpDef* out = gp.get_op_at(r.op_id);
-            t = (out && !out->inputs.empty())
-                ? em.src_ref(out->inputs[0], gp.get_input_node_id(), gp, wslots)
-                : 0x8000u;
-        } else {
-            // M2 结构闭环: spill 段引用保留 temp(真实溢出语义 M4 重做)
-            t = em.fresh_temp(0xFFFFFFFEu);
-        }
-        // SPILL: 张量 → 池; FILL: 池 → 张量(设备执行序由引擎按 op 序串行;
-        // 输入节点的张量经 0x8000|slot 编码引用)
-        em.add_op(OP_SPILL, {t, spill_pool_slot, (uint32_t)r.ddr_offset, (uint32_t)(r.size / 2)});
-        em.add_op(OP_FILL, {spill_pool_slot, (uint32_t)r.ddr_offset, t, (uint32_t)(r.size / 2)});
+        continue;
     }
 
     // 6. 组装 blob

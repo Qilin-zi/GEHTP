@@ -994,6 +994,16 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         }
         g_exec.st.ops++;
         if (op_us) op_us[ii] = HAP_perf_get_time_us() - t0;
+        {
+            static FILE* gf = NULL;
+            if (!gf) gf = fopen("/data/local/tmp/hvxhmx23/optrace.txt", "w");
+            if (gf) {
+                fprintf(gf, "op%u code=%u rc=%d us=%lld\n",
+                        (unsigned)ii, (unsigned)op->opcode, rc,
+                        op_us ? (long long)op_us[ii] : -1);
+                fflush(gf);
+            }
+        }
         if (rc) return (int)i + 1;
     }
     return 0;
