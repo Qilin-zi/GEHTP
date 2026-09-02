@@ -404,10 +404,28 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
         /* ranges 是 int32 数据(execute_host 缓冲按 float 存字节, 位模式不变) */
         const int32_t* rg = (inputs.size() > 1) ? reinterpret_cast<const int32_t*>(inputs[1]) : nullptr;
+        if (getenv("GEHTP_EXDIAG") && (inputs.size() > 1)) {
+            size_t en = 1;
+            for (uint32_t d = 0; d < in_defs[1].rank && d < 5; ++d)
+                en *= in_defs[1].dims[d];
+            std::fprintf(stderr, "[ssdiag] oid=%llu n=%zu ranges=%zu [", (unsigned long long)op_id, n, en);
+            for (size_t k = 0; k < en && k < 30; k++)
+                std::fprintf(stderr, "%d%s", (int)rg[k], k + 1 == en ? "" : ",");
+            std::fprintf(stderr, "] in_rank=%u in_dims=[%u,%u,%u,%u] out_rank=%u\n",
+                         in_defs.empty() ? 0 : in_defs[0].rank,
+                         in_defs.empty() ? 0 : in_defs[0].dims[0],
+                         in_defs.empty() ? 0 : in_defs[0].dims[1],
+                         in_defs.empty() ? 0 : in_defs[0].dims[2],
+                         in_defs.empty() ? 0 : in_defs[0].dims[3],
+                         out_def.rank);
+        }
         if (!in0 || !rg) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; }
         else {
+            /* rank 5 支持: GDN 迭代链 131[1,16,1,64,64]→138[1,16,1,1,64]
+             * 类 rank5 切片(此前 rank 截 4 → 第 5 组 ranges 丢弃 + 输出
+             * 坐标按 4 维走, 138 内容错乱) */
             uint32_t rank = out_def.rank;
-            if (rank > 4) rank = 4;
+            if (rank > 5) rank = 5;
             /* ranges 轴数 = param 元素数/3; 与 rank 不同时右对齐(前导轴恒等,
              * QNN 前导 1 填充) */
             uint32_t n_axes = rank;
@@ -418,7 +436,7 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                 if (en % 3 == 0 && en / 3 <= rank) n_axes = (uint32_t)(en / 3);
             }
             uint32_t ax_off = rank - n_axes;
-            int b[4] = {0, 0, 0, 0}, e[4] = {0, 0, 0, 0}, s[4] = {1, 1, 1, 1};
+            int b[5] = {0, 0, 0, 0, 0}, e[5] = {0, 0, 0, 0, 0}, s[5] = {1, 1, 1, 1, 1};
             for (uint32_t ax = 0; ax < n_axes; ax++) {
                 b[ax_off + ax] = (int)rg[ax * 3 + 0];
                 e[ax_off + ax] = (int)rg[ax * 3 + 1];
@@ -426,19 +444,27 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                 if (s[ax_off + ax] == 0) s[ax_off + ax] = 1;
             }
             /* 输入形状(in_defs[0])右对齐, 前导 1 填充 */
-            uint32_t id_[4] = {1, 1, 1, 1};
+            uint32_t id_[5] = {1, 1, 1, 1, 1};
             if (!in_defs.empty()) {
                 uint32_t ir = in_defs[0].rank;
                 uint32_t off = rank > ir ? rank - ir : 0;
-                for (uint32_t ax = 0; ax < ir && off + ax < 4; ax++)
+                for (uint32_t ax = 0; ax < ir && off + ax < 5; ax++)
                     id_[off + ax] = in_defs[0].dims[ax];
             }
-            size_t in_strides[4] = {1, 1, 1, 1};
-            for (int d = 2; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
-            uint32_t od[4] = {1, 1, 1, 1};
+            size_t in_strides[5] = {1, 1, 1, 1, 1};
+            for (int d = 3; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
+            uint32_t od[5] = {1, 1, 1, 1, 1};
             for (uint32_t ax = 0; ax < rank; ax++) od[ax] = out_def.dims[ax];
-            size_t out_strides[4] = {1, 1, 1, 1};
-            for (int d = 2; d >= 0; d--) out_strides[d] = out_strides[d + 1] * od[d + 1];
+            size_t out_strides[5] = {1, 1, 1, 1, 1};
+            for (int d = 3; d >= 0; d--) out_strides[d] = out_strides[d + 1] * od[d + 1];
+            if (getenv("GEHTP_EXDIAG")) {
+                std::fprintf(stderr, "[ssb] oid=%llu rank=%u n_axes=%u ax_off=%u b=[%d,%d,%d,%d,%d] e=[%d,%d,%d,%d,%d] s=[%d,%d,%d,%d,%d] id=[%u,%u,%u,%u,%u] od=[%u,%u,%u,%u,%u]\n",
+                             (unsigned long long)op_id,
+                             rank, n_axes, ax_off, b[0], b[1], b[2], b[3], b[4],
+                             e[0], e[1], e[2], e[3], e[4], s[0], s[1], s[2], s[3], s[4],
+                             id_[0], id_[1], id_[2], id_[3], id_[4],
+                             od[0], od[1], od[2], od[3], od[4]);
+            }
             for (size_t i = 0; i < n; i++) {
                 size_t rem = i, src = 0;
                 for (uint32_t d = 0; d < rank; d++) {

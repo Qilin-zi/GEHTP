@@ -16,7 +16,8 @@ QnnIRLoader::QnnIRLoader(GraphPrepare& gp) : gp_(gp) {}
 DType QnnIRLoader::map_dtype(uint32_t qnn_dtype) {
     switch (qnn_dtype) {
         case 0x0232: return DType::Float32; // QNN_DATATYPE_FLOAT_32
-        case 0x0332: return DType::Float16; // QNN_DATATYPE_FLOAT_16
+        case 0x0216: return DType::Float16; // QNN_DATATYPE_FLOAT_16 (2.48 SDK QnnTypes.h:153 官方枚举)
+        case 0x0332: return DType::Float16; // 旧猜测(非 2.48 官方值, 保留兼容)
         case 0x0432: return DType::Int32;   // QNN_DATATYPE_INT_32
         case 0x0032: return DType::Int32;   // QNN_DATATYPE_INT_32 (alt encoding)
         case 0x0132: return DType::Int32;   // QNN_DATATYPE_UINT_32 -> closest
@@ -28,12 +29,20 @@ DType QnnIRLoader::map_dtype(uint32_t qnn_dtype) {
 }
 
 void QnnIRLoader::fill_output_def(OutputDef& od, const std::vector<uint32_t>& dims, DType dt) {
-    od.rank = static_cast<uint32_t>(dims.size());
+    // OutputDef 只有 5 个 dims 槽。rank>5 时压掉前导 1 维
+    // (GDN ScatterND indices [1,16,1,1,1,5] 类: 前导 1 维对坐标无影响,
+    //  压缩后末维 K=5 落进 dims[4], ScatterND 核才能读到真 K —
+    //  此前 rank=6 的 dims[5] 直接丢失, K 读垃圾值导致坐标错位)。
+    size_t start = 0;
+    while (start < dims.size() && dims[start] == 1 && dims.size() - start > 5)
+        start++;
+    od.rank = static_cast<uint32_t>(dims.size() - start);
     od.dtype = static_cast<uint32_t>(dt);
     od.flags = 0;
     od.quant_params = 0;
-    for (size_t i = 0; i < dims.size() && i < 5; ++i)
-        od.dims[i] = dims[i];
+    for (size_t i = 0; i < 5; ++i) od.dims[i] = 1;  // 清零防 rank<5 时垃圾残留
+    for (size_t i = 0; i + start < dims.size() && i < 5; ++i)
+        od.dims[i] = dims[i + start];
     uint32_t es = 4;
     switch (dt) {
         case DType::Float32: case DType::Int32: case DType::Float16: es = 4; break;
