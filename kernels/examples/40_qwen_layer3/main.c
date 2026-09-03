@@ -74,7 +74,21 @@ int main(void) {
 
     char err[128] = {0};
 
-    /* C2(调试辅助, 状态污染风险): 逐 op 跳过; 整段 run_io 即 C2+C3 */
+    /* C2(分段诊断): GEHTP_SPLIT_RUN=1 时把整段拆成两半跑, 定位崩溃 op 段 */
+    FILE* sflag = fopen("/data/local/tmp/hvxhmx23/split_flag", "r");
+    if (sflag) { fclose(sflag);
+        uint32_t half = w->n_ops / 2u;
+        ex_log("[split] run 0..%u", half - 1u);
+        rc = wt_exec_run_range(w, 0, half, NULL, NULL, err, sizeof(err));
+        ex_log("[split] first half rc=%d %s", rc, rc ? err : "");
+        wt_exec_shutdown();
+        ex_log("[split] run %u..%u", half, w->n_ops - 1u);
+        rc = wt_exec_run_range(w, half, w->n_ops - half, NULL, NULL, err, sizeof(err));
+        ex_log("[split] second half rc=%d %s", rc, rc ? err : "");
+        wt_exec_shutdown();
+        return 0;
+    }
+
     /* C3: run_io 注入输入, 输出 → out_io */
     ex_log("[milestone] before run_io");
     uint16_t* out_io = malloc(N_ELEM * 2u);

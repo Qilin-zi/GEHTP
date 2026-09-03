@@ -37,6 +37,8 @@ struct wt_exec {
 };
 
 static struct wt_exec g_exec;
+static FILE* g_rtrace = NULL;  /* 统一 trace 句柄(同路径双 FILE* 在 DSP farf
+                                   下句柄冲突崩溃, M4.2 实锤) */
 
 /* Level 1 输入注入: 外部输入缓冲 (run_io 设置) */
 static const uint8_t* g_ext_in = NULL;
@@ -1022,15 +1024,24 @@ int wt_exec_run(const struct wt_blob* b, uint32_t* engine_m,
 }
 
 /* GEHTP 阶段9 (Level 1): 外部输入注入 + 输出回传 */
+static void rtrace(const char* msg, int v) {
+    if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hvxhmx23/optrace.txt", "a");
+    if (g_rtrace) { fprintf(g_rtrace, "[run_io] %s %d\n", msg, v); fflush(g_rtrace); }
+}
+
 int wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
                    uint32_t out_temp,
                    uint32_t* engine_m, int64_t* op_us, char* err, size_t errn) {
+    rtrace("enter", 0);
     g_ext_in = (const uint8_t*)in_ptr;
     int rc = wt_exec_run(b, engine_m, op_us, err, errn);
+    rtrace("exec rc", rc);
     if (rc == 0 && out_ptr && out_temp < MAX_TEMPS && g_exec.temps[out_temp]) {
         uint32_t ob = g_exec.temp_bytes[out_temp];
+        rtrace("memcpy ob", (int)ob);
         memcpy(out_ptr, g_exec.temps[out_temp], ob);
     }
     g_ext_in = NULL;
+    rtrace("exit rc", rc);
     return rc;
 }
