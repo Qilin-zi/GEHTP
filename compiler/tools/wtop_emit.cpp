@@ -314,10 +314,14 @@ struct Emitter {
     uint32_t dummy_slot_id = 0;  // 共享哑槽(幻影/参数 const/缺失生产者引用)
     // 多输入图: 各 Input 节点 → 槽(主输入=EXT_IN 槽 0; 其余=固化 const 槽)
     std::map<uint64_t, uint32_t> input_slots;
+    uint64_t main_input_id = 0;  /* = in_ids[0](与 EXT_IN 槽分配一致) */
     uint32_t src_ref(const InputConn& c, uint64_t input_node_id, GraphPrepare& gp,
                      std::map<uint64_t, uint32_t>& wslots) {
         uint64_t op_id = c.src_id;
-        if (op_id == input_node_id) return 0x8000u | 0u;
+        (void)input_node_id;
+        /* 主输入判定必须与槽分配(in_ids 升序首项)一致:
+         * gp.get_input_node_id() 可能是别的 Input(cos 等) */
+        if (op_id == main_input_id) return 0x8000u | 0u;
         {
             auto isl = input_slots.find(op_id);
             if (isl != input_slots.end()) return 0x8000u | isl->second;
@@ -468,7 +472,19 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     if (!gp.deserialize(bin.data(), bin.size())) { std::fprintf(stderr, "error: deserialize failed\n"); return 2; }
 
     // 2. 图级信息
-    const OpDef* input_op = gp.get_op_at(gp.get_input_node_id());
+    // 主输入 = Input 节点按 op_id 升序首项(与输入槽分配同约定;
+    // gp.get_input_node_id() 可能指向 cos 等次输入)
+    std::vector<uint64_t> in_ids;
+    {
+        gp.for_each_op([&](OpDef* od) {
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::string(od->name_tag->name()) == "Input" && !od->is_dead())
+                in_ids.push_back(od->op_id);
+        });
+        std::sort(in_ids.begin(), in_ids.end());
+        if (in_ids.empty()) in_ids.push_back(gp.get_input_node_id());
+    }
+    const OpDef* input_op = gp.get_op_at(in_ids[0]);
     if (!input_op || input_op->output_def.rank == 0) { std::fprintf(stderr, "error: bad input node\n"); return 2; }
     // 输入形状/元素数: 任意 rank; dtype 决定字节/元素(f32/f16→2B 外部, int32→4B)
     size_t input_elems = 1;
@@ -497,36 +513,35 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 pos = comma + 1;
             }
         }
-        // Input 节点按 op_id 升序(与 host_run 同约定)
-        std::vector<uint64_t> in_ids;
-        gp.for_each_op([&](OpDef* od) {
-            if (od && od->name_tag && od->name_tag->name() &&
-                std::string(od->name_tag->name()) == "Input" && !od->is_dead())
-                in_ids.push_back(od->op_id);
-        });
-        std::sort(in_ids.begin(), in_ids.end());
-        if (in_ids.empty()) in_ids.push_back(gp.get_input_node_id());
+        /* Input 节点按 op_id 升序(与 host_run 同约定) — in_ids 已在图级信息段收集 */
+        em.main_input_id = in_ids[0];
         for (size_t k = 0; k < in_ids.size(); k++) {
             const OpDef* iop = gp.get_op_at(in_ids[k]);
             if (!iop) continue;
             size_t elems = 1;
             for (uint32_t i = 0; i < iop->output_def.rank && i < 5; ++i)
                 elems *= (size_t)iop->output_def.dims[i];
-            size_t ebytes = (iop->output_def.dtype == 1 || iop->output_def.dtype == 0x21) ? 2 : 4;
-            size_t need = elems * ebytes;
+            /* 设备槽面统一 f16: f32 文件(4B/元素)转 f16 后塞槽;
+             * 已是 f16(2B/元素)直塞。 */
             std::vector<uint8_t> data;
             if (k < in_paths.size()) {
                 if (!load_file(in_paths[k], data)) {
                     std::fprintf(stderr, "error: cannot open %s\n", in_paths[k].c_str());
                     return 2;
                 }
-                if (data.size() != need) {
-                    std::fprintf(stderr, "error: input %zu size %zu != %zu (elems=%zu × %zuB)\n",
-                                 k, data.size(), need, elems, ebytes);
+                if (data.size() == elems * 4) {
+                    const float* f = reinterpret_cast<const float*>(data.data());
+                    std::vector<uint8_t> h(elems * 2);
+                    uint16_t* d = reinterpret_cast<uint16_t*>(h.data());
+                    for (size_t i = 0; i < elems; i++) d[i] = f32_to_f16_rne(f[i]);
+                    data = std::move(h);
+                } else if (data.size() != elems * 2) {
+                    std::fprintf(stderr, "error: input %zu size %zu != %zu×2/4 (elems=%zu)\n",
+                                 k, data.size(), elems, elems);
                     return 2;
                 }
             } else {
-                data.assign(need, 0);
+                data.assign(elems * 2, 0);
             }
             uint32_t sid = em.add_slot((uint32_t)data.size(), (uint32_t)elems, data.data());
             if (k == 0) {
@@ -652,7 +667,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     for (size_t pos = 0; pos < order.size(); pos++) {
         op_id_t id = order[pos];
         em.cur_op = id;
-        if (pos < 8) {
+        if (pos < 8 || id < 100) {
             const OpDef* dbg = gp.get_op_at(id);
             std::fprintf(stderr, "[dbg] pos=%zu id=%llu name=%s const=%d\n", pos,
                          (unsigned long long)id,
@@ -770,19 +785,60 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
              * 逐轴广播), 保持 ADD/BINARY 纯元素语义 */
             const OpDef* bb = gp.get_op_at(od->inputs[1].src_id);
             uint64_t b_elems = bb ? elems_of(bb) : n;
-            if (b_elems < n && b_elems > 0) {
-                /* out_idx 7: 不与 op 自身输出(0)抢 tkey 注册 —
+            if (getenv("GEHTP_BDIAG")) {
+                const OpDef* aa = gp.get_op_at(od->inputs[0].src_id);
+                std::fprintf(stderr, "[bdiag] op %llu %s: od.rank=%u od.dims=",
+                             (unsigned long long)od->op_id,
+                             od->name_tag && od->name_tag->name() ? od->name_tag->name() : "?",
+                             od->output_def.rank);
+                for (uint32_t i = 0; i < od->output_def.rank && i < 8; i++)
+                    std::fprintf(stderr, "%u ", od->output_def.dims[i]);
+                std::fprintf(stderr, "| a(%s).rank=%u dims=",
+                             aa && aa->name_tag && aa->name_tag->name() ? aa->name_tag->name() : "?",
+                             aa ? aa->output_def.rank : 0);
+                if (aa) for (uint32_t i = 0; i < aa->output_def.rank && i < 8; i++)
+                    std::fprintf(stderr, "%u ", aa->output_def.dims[i]);
+                std::fprintf(stderr, "| bb(%s).rank=%u dims=",
+                             bb && bb->name_tag && bb->name_tag->name() ? bb->name_tag->name() : "?",
+                             bb ? bb->output_def.rank : 0);
+                if (bb) for (uint32_t i = 0; i < bb->output_def.rank && i < 8; i++)
+                    std::fprintf(stderr, "%u ", bb->output_def.dims[i]);
+                std::fprintf(stderr, "| n=%llu b_elems=%llu\n",
+                             (unsigned long long)n, (unsigned long long)b_elems);
+            }
+            /* 广播物化: a/b 任一输入元素数 < 输出即物化为全尺寸 temp
+             * (numpy 广播; Expand 的 a [1,2,1,32,256]→[1,2,4,32,256] 同款) */
+            {
+                /* out_idx 6/7: 不与 op 自身输出(0)抢 tkey 注册 —
                  * 否则覆盖 op_temp → 下游 src_ref 拿错 temp(probe 实锤) */
-                uint32_t btmp = em.fresh_temp(od->op_id, 7);
-                uint32_t in_d[4] = {1, 1, 1, 1}, out_d[4] = {1, 1, 1, 1};
-                for (uint32_t i = 0; i < bb->output_def.rank && i < 4; i++)
-                    in_d[i] = bb->output_def.dims[i];
-                for (uint32_t i = 0; i < od->output_def.rank && i < 4; i++)
-                    out_d[i] = od->output_def.dims[i];
-                em.add_op(OP_BROADCAST_F16, {b_t, btmp, (uint32_t)n, (uint32_t)b_elems,
-                                             in_d[0], in_d[1], in_d[2], in_d[3],
-                                             out_d[0], out_d[1], out_d[2], out_d[3]});
-                b_t = btmp;
+                auto fold4 = [](const OutputDef& odef, uint32_t d4[4]) {
+                    /* 折叠前导 1 后右对齐到 4 轴(设备契约; numpy 广播语义,
+                     * 与 host in_bc 同款) */
+                    uint32_t s = 0;
+                    while (s + 1 < odef.rank && odef.dims[s] == 1) s++;
+                    uint32_t rr = odef.rank - s;
+                    if (rr == 0) rr = 1;
+                    uint32_t take = rr < 4 ? rr : 4;
+                    uint32_t t[4] = {1, 1, 1, 1};
+                    for (uint32_t i = 0; i < take; i++)
+                        t[4 - take + i] = odef.dims[s + rr - take + i];
+                    for (int i = 0; i < 4; i++) d4[i] = t[i];
+                };
+                auto materialize = [&](uint32_t& t, const OpDef* src_op, uint32_t out_idx) {
+                    if (!src_op) return;
+                    uint64_t s_elems = elems_of(src_op);
+                    if (s_elems == 0 || s_elems >= n) return;
+                    uint32_t tmp = em.fresh_temp(od->op_id, out_idx);
+                    uint32_t in_d[4] = {1, 1, 1, 1}, out_d[4] = {1, 1, 1, 1};
+                    fold4(src_op->output_def, in_d);
+                    fold4(od->output_def, out_d);
+                    em.add_op(OP_BROADCAST_F16, {t, tmp, (uint32_t)n, (uint32_t)s_elems,
+                                                 in_d[0], in_d[1], in_d[2], in_d[3],
+                                                 out_d[0], out_d[1], out_d[2], out_d[3]});
+                    t = tmp;
+                };
+                materialize(a_t, gp.get_op_at(od->inputs[0].src_id), 6);
+                materialize(b_t, bb, 7);
             }
             uint32_t sub = qnn_binary_to_sub(subtype);
             if (sub == 0) em.add_op(OP_ADD_F16, {a_t, b_t, out_t, (uint32_t)n});

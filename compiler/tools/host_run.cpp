@@ -235,17 +235,18 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
 }
 
 int main(int argc, char** argv) {
-    std::string net_json, weights_bin, in_path, out_path;
+    std::string net_json, weights_bin, bin_path, in_path, out_path;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--net-json" && i + 1 < argc) net_json = argv[++i];
         else if (a == "--weights-bin" && i + 1 < argc) weights_bin = argv[++i];
+        else if (a == "--bin" && i + 1 < argc) bin_path = argv[++i];
         else if (a == "--input-f32" && i + 1 < argc) in_path = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
         else if (a == "--no-pass" && i + 1 < argc) PassManager::instance().disable(argv[++i]);
         else { std::fprintf(stderr, "usage: host_run --net-json N [--weights-bin W] [--input-f32 I] --out O\n"); return 1; }
     }
-    if (net_json.empty() || out_path.empty()) {
+    if (out_path.empty() || (net_json.empty() && bin_path.empty())) {
         std::fprintf(stderr, "usage: host_run --net-json N [--weights-bin W] [--input-f32 I] --out O\n");
         return 1;
     }
@@ -253,7 +254,18 @@ int main(int argc, char** argv) {
     register_all_ops();
     GraphPrepare gp;
     QnnIRLoader loader(gp);
-    if (!weights_bin.empty()) {
+    if (!bin_path.empty()) {
+        /* 从 tagged.bin 反序列化图(与 wtop_emit 同图对象, 逐 op 对拍用) */
+        std::ifstream bf(bin_path, std::ios::binary);
+        if (!bf) { std::fprintf(stderr, "Error: cannot open %s\n", bin_path.c_str()); return 1; }
+        std::vector<uint8_t> bin((std::istreambuf_iterator<char>(bf)),
+                                 std::istreambuf_iterator<char>());
+        if (!gp.deserialize(bin.data(), bin.size())) {
+            std::fprintf(stderr, "Error: deserialize failed\n");
+            return 1;
+        }
+        std::fprintf(stderr, "graph from %s: %zu ops\n", bin_path.c_str(), bin.size());
+    } else if (!weights_bin.empty()) {
         std::string tar = adapt_weights_bin(net_json, weights_bin);
         if (!tar.empty()) {
             loader.set_weights(loader.load_weight_bin(tar));
@@ -262,8 +274,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "Warning: weight adaptation failed, proceeding without weights\n");
         }
     }
-    uint32_t op_count = loader.load_net_json(net_json);
-    if (op_count == 0) { std::fprintf(stderr, "Error: no ops loaded\n"); return 1; }
+    if (bin_path.empty()) {
+        uint32_t op_count = loader.load_net_json(net_json);
+        if (op_count == 0) { std::fprintf(stderr, "Error: no ops loaded\n"); return 1; }
+    }
     HexagonNNEnv env;
     GraphStatus st = gp.prepare(env);
     if (st != GraphStatus::Success) { std::fprintf(stderr, "Error: prepare=%d\n", (int)st); return 1; }

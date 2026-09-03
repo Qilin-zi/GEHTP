@@ -34,9 +34,19 @@ struct wt_exec {
     struct wt_exec_stats st;
     uint8_t* temps[MAX_TEMPS];
     uint32_t temp_bytes[MAX_TEMPS];
+    /* temp 单块池(第7步阶段一前置): 一次 memalign + bump, 替代 per-temp
+     * malloc(每 run 少 ~256 次 malloc/free)。静态偏移表路径就绪后
+     * (wt_exec_pool_init), bump 只做兜底, 地址全部来自编译期表。 */
+    uint8_t* pool;
+    uint32_t pool_cap;
+    uint32_t pool_used;
+    const uint32_t* static_offsets; /* 编译期 temp→池内偏移表 (bin 提供; NULL=运行时 bump) */
 };
 
 static struct wt_exec g_exec;
+static uint32_t g_last_bytes[MAX_TEMPS];  /* 每 temp 最后写入的字节数
+    (temp 复用只扩容不缩容, temp_bytes 是分配大小; run_io 输出回传需
+    用最后写入大小, 否则历史大值 memcpy 越界 = PD 死, M4.2 实锤) */
 static FILE* g_rtrace = NULL;  /* 统一 trace 句柄(同路径双 FILE* 在 DSP farf
                                    下句柄冲突崩溃, M4.2 实锤) */
 
@@ -73,14 +83,51 @@ static void cpu_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
 
 static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
     if (id >= MAX_TEMPS) return NULL;
-    /* liveness 复用下同 id 可被更大输出接管(恒等 Reshape 等):
-     * 需要 > 已分配时必须扩容, 否则写越界 = PD 死(M3c probe 实锤) */
+    /* 路径 1: 编译期静态偏移表(第7步阶段一; wt_exec_pool_init 提供池+表)。
+     * 表内偏移必须 128 对齐且不越池 —— 正确性由编译期重叠检查器保证
+     * (host 工具), 这里只做硬边界检查。 */
+    if (g_exec.static_offsets && g_exec.pool) {
+        uint32_t off = g_exec.static_offsets[id];
+        if (off + bytes > g_exec.pool_cap) return NULL;
+        g_exec.temps[id] = g_exec.pool + off;
+        g_exec.temp_bytes[id] = bytes;
+        g_last_bytes[id] = bytes;
+        return g_exec.temps[id];
+    }
+    /* 路径 2: 运行时 bump(现状语义等价):
+     * 同 id 扩容只增不缩 —— 新 bump 区, 旧区不回收(与旧 per-temp
+     * free+memalign 的"仅保留最新"语义一致; 池内旧区被水位保留,
+     * 不 release, 避免 liveness 复用误读(M3c probe 实锤) */
     if (!g_exec.temps[id] || g_exec.temp_bytes[id] < bytes) {
-        free(g_exec.temps[id]);
-        g_exec.temps[id] = memalign(128, bytes);
+        uint32_t aligned = (bytes + 127u) & ~127u;
+        if (g_exec.pool_used + aligned > g_exec.pool_cap) {
+            uint32_t ncap = g_exec.pool_cap ? g_exec.pool_cap : (8u << 20);
+            while (ncap < g_exec.pool_used + aligned) ncap *= 2;
+            uint8_t* np = memalign(128, ncap);
+            if (!np) return NULL;
+            if (g_exec.pool) memcpy(np, g_exec.pool, g_exec.pool_used);
+            free(g_exec.pool);
+            g_exec.pool = np;
+            g_exec.pool_cap = ncap;
+        }
+        g_exec.temps[id] = g_exec.pool + g_exec.pool_used;
+        g_exec.pool_used += aligned;
         g_exec.temp_bytes[id] = bytes;
     }
+    g_last_bytes[id] = bytes;
     return g_exec.temps[id];
+}
+
+/* 第7步阶段一插槽: 外部(blob 解析层)提供静态池与编译期偏移表。
+ * 传入后 temp_get 走路径 1; 传 NULL/NULL 恢复运行时 bump。
+ * base 若为 NULL 且 cap>0 表示由引擎自建池(偏移表照用)。 */
+void wt_exec_pool_init(uint8_t* base, uint32_t cap, const uint32_t* offsets) {
+    if (base) {
+        g_exec.pool = base;
+        g_exec.pool_cap = cap;
+        g_exec.pool_used = cap; /* 静态池: bump 禁用(越界由路径 1 边界检查兜底) */
+    }
+    g_exec.static_offsets = offsets;
 }
 
 /* f16 ↔ f32 (IEEE 754 binary16, 与 vendor host 实现同算法) */
@@ -218,11 +265,17 @@ void wt_exec_shutdown(void) {
         g_exec.wc = NULL;
         g_exec.engine_ready = 0;
     }
+    /* 单块池: 一次释放(旧 per-temp free ×256 全删) */
+    free(g_exec.pool);
+    g_exec.pool = NULL;
+    g_exec.pool_cap = 0;
+    g_exec.pool_used = 0;
+    g_exec.static_offsets = NULL;
     for (uint32_t i = 0; i < MAX_TEMPS; i++) {
-        free(g_exec.temps[i]);
         g_exec.temps[i] = NULL;
         g_exec.temp_bytes[i] = 0;
     }
+    memset(g_last_bytes, 0, sizeof(g_last_bytes));
 }
 
 static int exec_rmsnorm(const struct wt_blob* b, const struct wt_op* op,
@@ -752,8 +805,8 @@ static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
     if (!x || !y || b_elems == 0) { snprintf(err, errn, "broadcast ref fail"); return -1; }
     uint32_t r = 4;
     while (r > 0 && out_d[r - 1] == 1) r--;
+    /* in 不去尾 1(末维 1 广播到 out 大维必须保留; host in_bc oid 1231 同款) */
     uint32_t ir = 4;
-    while (ir > 0 && in_d[ir - 1] == 1) ir--;
     if (r == 0) r = 1;
     if (ir > r) ir = r;  /* 输入 rank 不得高于输出(右对齐前导 1 已折叠) */
     uint32_t istr[4] = {1, 1, 1, 1};
@@ -768,7 +821,7 @@ static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
             rem %= ostr[d];
             if (d < lead) continue;
             uint32_t idim = in_d[d - lead];
-            if (idim > 1) in_lin += c * istr[d - lead];
+            if (idim > 1) in_lin += (c % idim) * istr[d - lead];
         }
         y[i] = x[in_lin];
     }
@@ -1037,7 +1090,7 @@ int wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
     int rc = wt_exec_run(b, engine_m, op_us, err, errn);
     rtrace("exec rc", rc);
     if (rc == 0 && out_ptr && out_temp < MAX_TEMPS && g_exec.temps[out_temp]) {
-        uint32_t ob = g_exec.temp_bytes[out_temp];
+        uint32_t ob = g_last_bytes[out_temp];
         rtrace("memcpy ob", (int)ob);
         memcpy(out_ptr, g_exec.temps[out_temp], ob);
     }

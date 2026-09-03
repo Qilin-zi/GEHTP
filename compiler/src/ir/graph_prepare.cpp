@@ -2099,7 +2099,11 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
         uint32_t third = r.r32();  // third field (== word_count for our writer)
         (void)third;
         size_t data_size = static_cast<size_t>(word_count) * 4;
-        if (data_size > r.remaining()) return false;
+        if (data_size > r.remaining()) {
+            std::fprintf(stderr, "[deser] tag=0x%04x data_size=%zu remaining=%zu\n",
+                         word0 ^ 0xFFFF, data_size, r.remaining());
+            return false;
+        }
         const uint8_t* rec = r.p;
         r.p += data_size;
 

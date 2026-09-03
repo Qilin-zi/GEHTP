@@ -36,6 +36,12 @@ uint32_t  wt_exec_temp_bytes(uint32_t id);
 /* 收尾: wtcache_close + temps 释放。任何路径退出前必须调。 */
 void wt_exec_shutdown(void);
 
+/* 第7步阶段一插槽: 编译期静态 temp 池 + 偏移表。
+ * base=NULL && cap=0 && offsets=NULL 恢复运行时 bump 路径(默认)。
+ * base!=NULL: 池由调用方提供, temp 地址全部 = base + offsets[id]
+ *   (偏移正确性由编译期重叠检查器保证, 设备只做边界检查)。 */
+void wt_exec_pool_init(uint8_t* base, uint32_t cap, const uint32_t* offsets);
+
 /* ---- V2.3 U16: 分段执行 + 统计 ----
  * run_range 只执行 ops[first, first+count): 整步下发 vs 逐算子下发共用
  * 同一执行体 (fused=run 一次; split=按 op 逐段), 输出必须恒等。 */
