@@ -40,7 +40,13 @@ struct wt_exec {
     uint8_t* pool;
     uint32_t pool_cap;
     uint32_t pool_used;
-    const uint32_t* static_offsets; /* 编译期 temp→池内偏移表 (bin 提供; NULL=运行时 bump) */
+    const uint32_t* static_offsets; /* 编译期 temp→池内偏移表 (TEMPOFF 槽; NULL=运行时 bump) */
+    uint32_t static_off_arr[MAX_TEMPS]; /* 表本体(哨兵 0xFFFFFFFF = 表外) */
+    /* 第7步阶段二: VTCM 驻留池(0x4000|temp 编码)。vtcm_off_arr[temp] =
+     * VTCM 偏移(哨兵 0xFFFFFFFF = 无驻留); vtcm_pool = wtcache 的 VTCM 基址。 */
+    uint8_t* vtcm_pool;
+    uint32_t vtcm_pool_size;
+    uint32_t vtcm_off_arr[MAX_TEMPS];
 };
 
 static struct wt_exec g_exec;
@@ -49,6 +55,10 @@ static uint32_t g_last_bytes[MAX_TEMPS];  /* 每 temp 最后写入的字节数
     用最后写入大小, 否则历史大值 memcpy 越界 = PD 死, M4.2 实锤) */
 static FILE* g_rtrace = NULL;  /* 统一 trace 句柄(同路径双 FILE* 在 DSP farf
                                    下句柄冲突崩溃, M4.2 实锤) */
+static void rtrace(const char* msg, int v) {
+    if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hvxhmx23/optrace.txt", "a");
+    if (g_rtrace) { fprintf(g_rtrace, "[run_io] %s %d\n", msg, v); fflush(g_rtrace); }
+}
 
 /* Level 1 输入注入: 外部输入缓冲 (run_io 设置) */
 static const uint8_t* g_ext_in = NULL;
@@ -61,9 +71,16 @@ static const uint8_t* slot_ptr(const struct wt_blob* b, uint32_t s) {
     return b->weight_base + b->slots[s].offset;
 }
 
-/* temp/slot 引用解码: 0x8000|slot_id → slot; 否则 temp */
+/* temp/slot 引用解码: 0x8000|slot_id → slot; 0x4000|temp_id → VTCM 驻留;
+ * 否则 temp */
 static const uint8_t* ref_ptr(const struct wt_blob* b, uint32_t arg) {
     if (arg & 0x8000u) return slot_ptr(b, arg & 0x7FFFu);
+    if (arg & 0x4000u) {
+        uint32_t t = arg & 0x3FFFu;
+        if (t < MAX_TEMPS && g_exec.vtcm_pool && g_exec.vtcm_off_arr[t] != 0xFFFFFFFFu)
+            return g_exec.vtcm_pool + g_exec.vtcm_off_arr[t];
+        return NULL;
+    }
     return (arg < MAX_TEMPS) ? g_exec.temps[arg] : NULL;
 }
 
@@ -83,24 +100,49 @@ static void cpu_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
 
 static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
     if (id >= MAX_TEMPS) return NULL;
-    /* 路径 1: 编译期静态偏移表(第7步阶段一; wt_exec_pool_init 提供池+表)。
-     * 表内偏移必须 128 对齐且不越池 —— 正确性由编译期重叠检查器保证
-     * (host 工具), 这里只做硬边界检查。 */
-    if (g_exec.static_offsets && g_exec.pool) {
-        uint32_t off = g_exec.static_offsets[id];
-        if (off + bytes > g_exec.pool_cap) return NULL;
-        g_exec.temps[id] = g_exec.pool + off;
+    /* 第7步阶段二: VTCM 驻留 temp(0x4000|temp 引用的同款判定) ——
+     * 驻留张量直接放 VTCM 基址+编译期偏移, 不进 DDR 池。 */
+    if (g_exec.vtcm_off_arr[id] != 0xFFFFFFFFu) {
+        uint32_t off = g_exec.vtcm_off_arr[id];
+        if (off + bytes > g_exec.vtcm_pool_size) return NULL;
+        if (!g_exec.vtcm_pool) {
+            /* 懒初始化: 首个 VTCM 驻留消费时开 wtcache 拿 VTCM 基址 */
+            if (!g_exec.engine_ready) {
+                if (wtcache_open(&g_exec.wc, 4096) != WTC_OK) return NULL;
+                g_exec.engine_ready = 1;
+            }
+            void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+            if (!vb || vs < g_exec.vtcm_pool_size) return NULL;
+            g_exec.vtcm_pool = (uint8_t*)vb;
+        }
+        g_exec.temps[id] = g_exec.vtcm_pool + off;
         g_exec.temp_bytes[id] = bytes;
         g_last_bytes[id] = bytes;
         return g_exec.temps[id];
     }
-    /* 路径 2: 运行时 bump(现状语义等价):
-     * 同 id 扩容只增不缩 —— 新 bump 区, 旧区不回收(与旧 per-temp
-     * free+memalign 的"仅保留最新"语义一致; 池内旧区被水位保留,
-     * 不 release, 避免 liveness 复用误读(M3c probe 实锤) */
+    /* 路径 1: 编译期静态偏移表(第7步阶段一; TEMPOFF 槽提供池+表)。
+     * 偏移正确性由编译期重叠检查器保证(host 工具), 这里只做硬边界检查:
+     * 静态区 = [0, pool_used), 表外哨兵 0xFFFFFFFF 回落路径 2。 */
+    if (g_exec.static_offsets && g_exec.pool) {
+        uint32_t off = g_exec.static_offsets[id];
+        if (off != 0xFFFFFFFFu) {
+            if (off + bytes > g_exec.pool_used) return NULL;
+            g_exec.temps[id] = g_exec.pool + off;
+            g_exec.temp_bytes[id] = bytes;
+            g_last_bytes[id] = bytes;
+            return g_exec.temps[id];
+        }
+        /* 表外 temp(广播物化/多输出等): 回落池尾预留区 bump */
+    }
+    /* 路径 2: bump。同 id 扩容只增不缩 —— 新 bump 区, 旧区不回收
+     * (与旧 per-temp 的"仅保留最新"语义一致; M3c probe 实锤)。
+     * 纯 bump 模式可倍增扩容; 静态模式下池含编译期偏移, 扩容会搬坏
+     * 静态区 → 超预留区即失败(fail loud, 不静默错位)。 */
     if (!g_exec.temps[id] || g_exec.temp_bytes[id] < bytes) {
         uint32_t aligned = (bytes + 127u) & ~127u;
         if (g_exec.pool_used + aligned > g_exec.pool_cap) {
+            if (g_exec.static_offsets) return NULL;  /* 静态模式: 预留区耗尽 */
             uint32_t ncap = g_exec.pool_cap ? g_exec.pool_cap : (8u << 20);
             while (ncap < g_exec.pool_used + aligned) ncap *= 2;
             uint8_t* np = memalign(128, ncap);
@@ -118,14 +160,15 @@ static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
     return g_exec.temps[id];
 }
 
-/* 第7步阶段一插槽: 外部(blob 解析层)提供静态池与编译期偏移表。
- * 传入后 temp_get 走路径 1; 传 NULL/NULL 恢复运行时 bump。
- * base 若为 NULL 且 cap>0 表示由引擎自建池(偏移表照用)。 */
-void wt_exec_pool_init(uint8_t* base, uint32_t cap, const uint32_t* offsets) {
+/* 第7步阶段一插槽: TEMPOFF 槽解析层提供静态池与编译期偏移表。
+ * static_cap = 表内静态区大小(表外 temp 在 [static_cap, total_cap) bump)。
+ * 传入后 temp_get 走路径 1(表外哨兵回落路径 2); 传 NULL/NULL 恢复纯 bump。 */
+void wt_exec_pool_init(uint8_t* base, uint32_t total_cap, uint32_t static_cap,
+                       const uint32_t* offsets) {
     if (base) {
         g_exec.pool = base;
-        g_exec.pool_cap = cap;
-        g_exec.pool_used = cap; /* 静态池: bump 禁用(越界由路径 1 边界检查兜底) */
+        g_exec.pool_cap = total_cap;
+        g_exec.pool_used = static_cap ? static_cap : total_cap;
     }
     g_exec.static_offsets = offsets;
 }
@@ -271,7 +314,13 @@ void wt_exec_shutdown(void) {
     g_exec.pool_cap = 0;
     g_exec.pool_used = 0;
     g_exec.static_offsets = NULL;
+    /* VTCM 驻留: wtcache_close 后基址悬空, 必须清零 —— 否则下一个 run
+     * 用残基址读悬空 VTCM = 挂死(diag/8-token 间反复 shutdown/re-run 实锤) */
+    g_exec.vtcm_pool = NULL;
+    g_exec.vtcm_pool_size = 0;
     for (uint32_t i = 0; i < MAX_TEMPS; i++) {
+        g_exec.static_off_arr[i] = 0xFFFFFFFFu;
+        g_exec.vtcm_off_arr[i] = 0xFFFFFFFFu;
         g_exec.temps[i] = NULL;
         g_exec.temp_bytes[i] = 0;
     }
@@ -1050,13 +1099,14 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         g_exec.st.ops++;
         if (op_us) op_us[ii] = HAP_perf_get_time_us() - t0;
         {
-            static FILE* gf = NULL;
-            if (!gf) gf = fopen("/data/local/tmp/hvxhmx23/optrace.txt", "w");
-            if (gf) {
-                fprintf(gf, "op%u code=%u rc=%d us=%lld\n",
+            /* 统一 trace 句柄铁律(M4.2 实锤: 同路径双 FILE* 在 DSP farf
+             * 下句柄冲突挂死) —— 与 rtrace 共用 g_rtrace, 禁止自建 gf。 */
+            if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hvxhmx23/optrace.txt", "a");
+            if (g_rtrace) {
+                fprintf(g_rtrace, "op%u code=%u rc=%d us=%lld\n",
                         (unsigned)ii, (unsigned)op->opcode, rc,
                         op_us ? (long long)op_us[ii] : -1);
-                fflush(gf);
+                fflush(g_rtrace);
             }
         }
         if (rc) return (int)i + 1;
@@ -1073,15 +1123,68 @@ void wt_exec_get_stats(struct wt_exec_stats* st) {
 int wt_exec_run(const struct wt_blob* b, uint32_t* engine_m,
                 int64_t* op_us, char* err, size_t errn) {
     memset(&g_exec.st, 0, sizeof(g_exec.st));
+    /* 第7步阶段一: TEMPOFF 槽 = 静态 temp 偏移表。
+     * [cap u32][reserve u32][n u32][n × {temp_id u32, offset u32, size u32}]
+     * 表内 temp 静态定址 [0, cap); 表外回落 [cap, cap+reserve) bump。
+     * 第7步阶段二: reserve 高 16 位 = VTCM 池大小(0=无驻留);
+     * 同槽 n 项中 temp_id 带 0x4000 标记的进 VTCM 偏移表。 */
+    {
+        for (uint32_t i = 0; i < MAX_TEMPS; i++) {
+            g_exec.static_off_arr[i] = 0xFFFFFFFFu;
+            g_exec.vtcm_off_arr[i] = 0xFFFFFFFFu;
+        }
+        for (uint32_t s = 0; s < b->n_slots; s++) {
+            if (b->slots[s].addr != WT_SLOT_TEMPOFF) continue;
+            const uint8_t* p = b->weight_base + b->slots[s].offset;
+            uint32_t len = b->slots[s].len;
+            if (len < 12u) { snprintf(err, errn, "tempoff slot short"); return -1; }
+            uint32_t cap, reserve, n;
+            memcpy(&cap, p, 4); memcpy(&reserve, p + 4, 4); memcpy(&n, p + 8, 4);
+            if (len < 12u + n * 12u) { snprintf(err, errn, "tempoff table short"); return -1; }
+            if (cap == 0 || cap > 0x80000000u) { snprintf(err, errn, "tempoff cap bad"); return -1; }
+            uint32_t vtcm_cap = reserve >> 16;
+            reserve &= 0xFFFFu;
+            uint8_t* pool = memalign(128, (size_t)cap + reserve);
+            if (!pool) { snprintf(err, errn, "tempoff pool alloc"); return -1; }
+            for (uint32_t i = 0; i < n; i++) {
+                const uint8_t* e = p + 12 + i * 12;
+                uint32_t tid, off, sz;
+                memcpy(&tid, e, 4); memcpy(&off, e + 4, 4); memcpy(&sz, e + 8, 4);
+                uint32_t tid_clean = tid & 0x3FFFu;
+                if (tid_clean >= MAX_TEMPS) {
+                    free(pool);
+                    snprintf(err, errn, "tempoff tid bad %u", tid_clean);
+                    return -1;
+                }
+                if (tid & WT_REF_VTCM_FLAG) {
+                    if (vtcm_cap == 0 || off + sz > vtcm_cap) {
+                        free(pool);
+                        snprintf(err, errn, "tempoff vtcm entry bad (tid %u off %u sz %u vtcm_cap %u)",
+                                 tid_clean, off, sz, vtcm_cap);
+                        return -1;
+                    }
+                    g_exec.vtcm_off_arr[tid_clean] = off;
+                } else {
+                    if (off + sz > cap) {
+                        free(pool);
+                        snprintf(err, errn, "tempoff entry bad (tid %u off %u sz %u cap %u)",
+                                 tid_clean, off, sz, cap);
+                        return -1;
+                    }
+                    g_exec.static_off_arr[tid_clean] = off;
+                }
+            }
+            wt_exec_pool_init(pool, cap + reserve, cap, g_exec.static_off_arr);
+            /* VTCM 驻留池: wtcache 布局(引擎初始化时补 VTCM 基址) */
+            g_exec.vtcm_pool_size = vtcm_cap;
+            g_exec.vtcm_pool = NULL;  /* 懒初始化: 首个 VTCM 消费 op 时开 wtcache */
+            break;
+        }
+    }
     return wt_exec_run_range(b, 0, b->n_ops, engine_m, op_us, err, errn);
 }
 
 /* GEHTP 阶段9 (Level 1): 外部输入注入 + 输出回传 */
-static void rtrace(const char* msg, int v) {
-    if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hvxhmx23/optrace.txt", "a");
-    if (g_rtrace) { fprintf(g_rtrace, "[run_io] %s %d\n", msg, v); fflush(g_rtrace); }
-}
-
 int wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
                    uint32_t out_temp,
                    uint32_t* engine_m, int64_t* op_us, char* err, size_t errn) {

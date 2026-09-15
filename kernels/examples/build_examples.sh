@@ -41,7 +41,7 @@ EXAMPLES=(01_runtime_init 02_convf16_gemm 03_convbbb_int8 04_convhbh_u16 \
           22_dualcore_threads 23_fence 24_arena 25_harness 26_wpool \
           27_pxbridge 28_gdn_tree 29_kvcache 30_graph_step 31_gemm_dispatch 32_rbr \
           33_bledger 34_dmaring 35_btrack 36_absoak 37_conv2d_add 38_transformer_ops \
-          39_probe 40_qwen_layer3)
+          39_probe 40_qwen_layer3 41_qwen_layer0)
 
 adb() { command adb -s "$DEVICE" "$@"; }
 
@@ -77,6 +77,14 @@ if [ -f "$G39_DIR/probe_t0.wtop" ]; then
     for i in 0 1 2 3 4 5 6 7; do
         adb push "$G39_DIR/tokens_$i.raw" "$DEVDIR/g39/" >/dev/null 2>&1 || true
     done
+fi
+# GEHTP 例41 资产(M4.2b: L0 GDN 层 blob + 输入/金标)
+G41_DIR="${GEHTP_41_DIR:-$LIB/../test_models/qwen35_08b/layers/layer_0}"
+if [ -f "$G41_DIR/layer_0.wtop" ]; then
+    adb shell "mkdir -p $DEVDIR/g41" >/dev/null 2>&1
+    adb push "$G41_DIR/layer_0.wtop" "$DEVDIR/g41/layer_0.wtop" >/dev/null 2>&1
+    adb push "$G41_DIR/in_ncf.f16.raw" "$DEVDIR/g41/in_ncf.f16.raw" >/dev/null 2>&1 || true
+    adb push "$G41_DIR/gold_ncf.f16.raw" "$DEVDIR/g41/gold_ncf.f16.raw" >/dev/null 2>&1 || true
 fi
 # GEHTP 例40 资产(M4.2: L3 单层 blob + 输入/金标)
 G40_DIR="${GEHTP_40_DIR:-$LIB/../test_models/qwen35_08b/layers/layer_3}"

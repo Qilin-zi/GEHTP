@@ -52,6 +52,14 @@ extern "C" {
  * slot.addr == EXT_OUT → 输出 temp 拷贝目标由 run_io 的 out_ptr 提供 */
 #define WT_SLOT_EXT_IN  0xFFFFFFFFu
 #define WT_SLOT_EXT_OUT 0xFFFFFFFEu
+/* 第7步阶段一: 静态 temp 偏移表槽(wtop_emit 打包, wt_exec_run 消费)
+ * 槽数据 = [cap u32][reserve u32][n u32][n × {temp_id u32, offset u32,
+ * size u32}]。表内 temp 静态定址, 表外 temp 回落池尾预留区 bump。 */
+#define WT_SLOT_TEMPOFF  0xFFFFFFFDu
+/* 第7步阶段二: VTCM 驻留编码(0x4000|temp_id, 与 0x8000|slot 同族不冲突)
+ * 驻留张量 = VTCM 静态偏移表内的 temp; 用时由引擎放 VTCM 基址+偏移。
+ * TEMPOFF 槽第 2 字段 reserve 高 16 位 = VTCM 池大小(字节, 0=无 VTCM 驻留)。 */
+#define WT_REF_VTCM_FLAG 0x4000u
 
 enum {
     OP_NOP = 0,

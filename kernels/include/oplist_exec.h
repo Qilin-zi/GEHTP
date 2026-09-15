@@ -37,10 +37,13 @@ uint32_t  wt_exec_temp_bytes(uint32_t id);
 void wt_exec_shutdown(void);
 
 /* 第7步阶段一插槽: 编译期静态 temp 池 + 偏移表。
- * base=NULL && cap=0 && offsets=NULL 恢复运行时 bump 路径(默认)。
- * base!=NULL: 池由调用方提供, temp 地址全部 = base + offsets[id]
- *   (偏移正确性由编译期重叠检查器保证, 设备只做边界检查)。 */
-void wt_exec_pool_init(uint8_t* base, uint32_t cap, const uint32_t* offsets);
+ * base=NULL && offsets=NULL 恢复运行时 bump 路径(默认)。
+ * base!=NULL: 池由调用方提供, static_cap = 表内静态区大小,
+ *   表内 temp 地址 = base + offsets[id](哨兵 0xFFFFFFFF = 表外,
+ *   回落在 [static_cap, total_cap) bump; 偏移正确性由编译期重叠
+ *   检查器保证, 设备只做边界检查)。 */
+void wt_exec_pool_init(uint8_t* base, uint32_t total_cap, uint32_t static_cap,
+                       const uint32_t* offsets);
 
 /* ---- V2.3 U16: 分段执行 + 统计 ----
  * run_range 只执行 ops[first, first+count): 整步下发 vs 逐算子下发共用
