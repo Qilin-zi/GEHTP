@@ -483,6 +483,530 @@ static uint32_t qnn_neuron_to_sub(uint32_t op) {
     }
 }
 
+
+/* ===================== 算子发射注册表 =====================
+ * 每 op 一个 handler(QNN OpPackage 同构): 从 IR OpDef 读语义(serialized_extra/
+ * dims/const 池), 编码为设备 opcode + args 并接线 slot/temp 引用。
+ * 加新 op = 写一个 handler + op_table 加一项, 不动 emit 主循环。
+ * 返回 0=成功; 非 0=emit 致命错误码(原样上抛)。 */
+/* 跨 handler 共享的 emit() 函数域状态(重构前 Conv2d 分支隐式捕获):
+ * H/W/C = 图输入 NCHW 几何; w_slot/b_slot = 首个 Conv2d 的权重/偏置槽
+ * (op 循环前预登记, 槽序敏感勿移)。 */
+struct WtopEmitShared {
+    uint32_t H = 1, W = 1, C = 1;
+    uint32_t w_slot = 0, b_slot = 0;
+};
+using WtopOpHandler = int (*)(Emitter& em, GraphPrepare& gp, const OpDef* od,
+                              std::map<uint64_t, uint32_t>& wslots,
+                              const std::string& nm, const WtopEmitShared& sh);
+
+static int op_transpose(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    const OpDef* src = gp.get_op_at(od->inputs[0].src_id);
+    if (!src) { std::fprintf(stderr, "error: transpose src missing\n"); return 2; }
+    uint32_t rk = src->output_def.rank;
+    if (rk > 5) { std::fprintf(stderr, "error: transpose rank %u > 5\n", rk); return 4; }
+    uint32_t dims[5] = {1, 1, 1, 1, 1};
+    for (uint32_t i = 0; i < rk; i++) dims[i] = src->output_def.dims[i];
+    // 读完整 perm(最多 5 轴; 缺省单位)
+    int32_t pv[5] = {0, 1, 2, 3, 4};
+    uint32_t pc = 0;
+    const OpDef* permc = (od->inputs.size() > 1) ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
+    if (permc && permc->const_data_size >= 4 && permc->const_data_size % 4 == 0) {
+        pc = permc->const_data_size / 4;
+        if (pc > 5) { std::fprintf(stderr, "error: transpose perm 轴数 %u > 5\n", pc); return 4; }
+        const int32_t* p = reinterpret_cast<const int32_t*>(
+            gp.const_pool().data() + permc->const_data_offset);
+        for (uint32_t i = 0; i < pc; i++) pv[i] = p[i];
+    }
+    if (pc == 0) pc = rk;  // 无 const: 单位 perm
+    /* 秩对齐: 图 rank-4 填充 vs rank-3 perm 契约(L3 实测 [1,1,X,Y]
+     * pc=3) —— 折前导 size-1 维至 perm 参照系。旧码 >=16B 门槛漏读
+     * 12B perm, 回落"单位"实为 reverse(0x00010203 字节序), 因前两轴
+     * 恒 1 恰好等价, M4.2 81/81 是侥幸通过。 */
+    while (rk > pc && dims[0] == 1) {
+        for (uint32_t i = 0; i + 1 < rk; i++) dims[i] = dims[i + 1];
+        rk--;
+    }
+    if (rk != pc) {
+        std::fprintf(stderr, "error: transpose perm 轴数 %u 与输入秩 %u 不可对齐\n", pc, rk);
+        return 4;
+    }
+    /* rank>4: 折叠任意 size-1 轴(对转置线性布局无影响), perm 重映射。
+     * M4.2b 首撞: [1,16,1,128,64] perm[0,1,2,4,3]。 */
+    int keep[5]; uint32_t nd[4] = {1, 1, 1, 1}, nrk = 0;
+    for (uint32_t ax = 0; ax < rk; ax++) {
+        if (rk > 4 && dims[ax] == 1) { keep[ax] = -1; continue; }
+        keep[ax] = (int)nrk;
+        if (nrk < 4) nd[nrk] = dims[ax];
+        nrk++;
+    }
+    if (nrk > 4) {
+        std::fprintf(stderr, "error: transpose rank %u 无 size-1 轴可折\n", rk);
+        return 4;
+    }
+    int32_t np[4] = {0, 1, 2, 3}; uint32_t npi = 0;
+    for (uint32_t i = 0; i < rk && npi < 4; i++) {
+        int32_t ax = pv[i];
+        if (ax < 0 || ax >= (int32_t)rk) { npi = 0xFFFFFFFFu; break; }
+        if (keep[ax] < 0) continue;
+        np[npi++] = keep[ax];
+    }
+    if (npi != nrk) {
+        std::fprintf(stderr, "error: transpose perm 与折叠不一致(npi=%u nrk=%u)\n", npi, nrk);
+        return 4;
+    }
+    uint32_t perm = 0;
+    for (uint32_t i = 0; i < nrk; i++) perm |= ((uint32_t)np[i] << (8 * i));
+    uint32_t src_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    /* 统一走通用 N-D 转置(形状全参数化); opcode 10 的 4D NCHW
+     * 契约(H/W/C 源自图输入)对 transformer 张量全错(probe 实锤) */
+    em.add_op(OP_TRANSPOSE_GEN_F16,
+              {src_t, out_t, nrk, nd[0], nd[1], nd[2], nd[3], perm});
+    return 0;
+}
+
+static int op_conv2d(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared& sh) {
+    (void)nm;
+    // extra_info: 60B fixed + tiling 段
+    if (od->serialized_extra.size() < sizeof(ExtraConv) + 16) {
+        std::fprintf(stderr, "error: conv extra too short\n"); return 2;
+    }
+    ExtraConv e;
+    std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t hdr[4];
+    std::memcpy(hdr, od->serialized_extra.data() + sizeof(ExtraConv), 16);
+
+    // 受支持几何门(特性门): dh=dw=1、s1、group=1、same-pad
+    if (e.dh != 1 || e.dw != 1 || e.sh != 1 || e.sw != 1 || e.group != 1) {
+        std::fprintf(stderr, "error: unsupported conv geometry (sh=%u sw=%u dh=%u dw=%u group=%u)\n",
+                     e.sh, e.sw, e.dh, e.dw, e.group);
+        return 4;
+    }
+    uint32_t ph = e.kh / 2, pw = e.kw / 2;
+    if (e.ph_begin != ph || e.ph_end != ph || e.pw_begin != pw || e.pw_end != pw) {
+        std::fprintf(stderr, "error: unsupported conv pad (%u,%u,%u,%u) vs same-pad (%u,%u)\n",
+                     e.ph_begin, e.ph_end, e.pw_begin, e.pw_end, ph, pw);
+        return 4;
+    }
+
+    uint32_t num_tiles = hdr[3];
+    const uint32_t* descs = reinterpret_cast<const uint32_t*>(
+        od->serialized_extra.data() + sizeof(ExtraConv) + 16);
+    if (num_tiles == 0) {  // 旧流/未分块: 整图单 tile
+        num_tiles = 1;
+    }
+    // 无分块时的整图 tile 描述(字段序同 ConvTileDesc 19×u32)
+    const uint32_t full_desc[19] = {0, 0, sh.H, sh.W, 0, 0, sh.H, sh.W,
+                                    e.kh, e.kw, e.sh, e.sw, e.ph_begin, e.pw_begin,
+                                    sh.C, sh.C, 0, sh.C, 0};
+    uint32_t src_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    uint32_t cols_t = em.fresh_temp(0xFFFFFFF0);  // 专用 cols 槽
+    for (uint32_t t = 0; t < num_tiles; t++) {
+        const uint32_t* d = (hdr[3] == 0) ? full_desc : descs + t * 19;
+        uint32_t iy0 = d[4], ix0 = d[5], ih = d[6], iw = d[7];
+        uint32_t oy0 = d[0], ox0 = d[1], th = d[2], tw = d[3];
+        uint32_t co0 = d[16], co_n = d[17];
+        // im2col: 输入切片(含 halo) → cols [th*tw × K]
+        em.add_op(OP_IM2COL, {src_t, cols_t, sh.H, sh.W, sh.C, e.kh, e.kw,
+                              e.ph_begin, e.pw_begin, e.sh, e.sw,
+                              iy0, ix0, th, tw});
+        // GEMM: cols [M,K] @ W [K,N] → 输出 tile 写入全图 out_temp
+        em.add_op(OP_CONV2D_F16, {cols_t, sh.w_slot, sh.b_slot, out_t,
+                                  th * tw, e.kh * e.kw * sh.C, sh.C,
+                                  oy0, ox0, sh.H, sh.W, co0, co_n});
+    }
+    return 0;
+}
+
+static int op_eltwise_binary(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    // operation 从 serialized_extra 读(0=ADD 1=SUB 2=MUL 3=DIV)
+    uint32_t subtype = 0;
+    if (od->serialized_extra.size() >= sizeof(ExtraEltwise)) {
+        ExtraEltwise e;
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+        subtype = e.operation;
+    }
+    uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t b_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    uint64_t n = elems_of(od);
+    /* numpy 广播: b 元素 < 输出时先物化为全尺寸 temp(带形状的
+     * 逐轴广播), 保持 ADD/BINARY 纯元素语义 */
+    const OpDef* bb = gp.get_op_at(od->inputs[1].src_id);
+    uint64_t b_elems = bb ? elems_of(bb) : n;
+    if (getenv("GEHTP_BDIAG")) {
+        const OpDef* aa = gp.get_op_at(od->inputs[0].src_id);
+        std::fprintf(stderr, "[bdiag] op %llu %s: od.rank=%u od.dims=",
+                     (unsigned long long)od->op_id,
+                     od->name_tag && od->name_tag->name() ? od->name_tag->name() : "?",
+                     od->output_def.rank);
+        for (uint32_t i = 0; i < od->output_def.rank && i < 8; i++)
+            std::fprintf(stderr, "%u ", od->output_def.dims[i]);
+        std::fprintf(stderr, "| a(%s).rank=%u dims=",
+                     aa && aa->name_tag && aa->name_tag->name() ? aa->name_tag->name() : "?",
+                     aa ? aa->output_def.rank : 0);
+        if (aa) for (uint32_t i = 0; i < aa->output_def.rank && i < 8; i++)
+            std::fprintf(stderr, "%u ", aa->output_def.dims[i]);
+        std::fprintf(stderr, "| bb(%s).rank=%u dims=",
+                     bb && bb->name_tag && bb->name_tag->name() ? bb->name_tag->name() : "?",
+                     bb ? bb->output_def.rank : 0);
+        if (bb) for (uint32_t i = 0; i < bb->output_def.rank && i < 8; i++)
+            std::fprintf(stderr, "%u ", bb->output_def.dims[i]);
+        std::fprintf(stderr, "| n=%llu b_elems=%llu\n",
+                     (unsigned long long)n, (unsigned long long)b_elems);
+    }
+    /* 广播物化: a/b 任一输入元素数 < 输出即物化为全尺寸 temp
+     * (numpy 广播; Expand 的 a [1,2,1,32,256]→[1,2,4,32,256] 同款) */
+    {
+        /* out_idx 6/7: 不与 op 自身输出(0)抢 tkey 注册 —
+         * 否则覆盖 op_temp → 下游 src_ref 拿错 temp(probe 实锤) */
+        auto fold4 = [](const OutputDef& odef, uint32_t d4[4]) {
+            /* 折叠前导 1 后右对齐到 4 轴(设备契约; numpy 广播语义,
+             * 与 host in_bc 同款) */
+            uint32_t s = 0;
+            while (s + 1 < odef.rank && odef.dims[s] == 1) s++;
+            uint32_t rr = odef.rank - s;
+            if (rr == 0) rr = 1;
+            uint32_t take = rr < 4 ? rr : 4;
+            uint32_t t[4] = {1, 1, 1, 1};
+            for (uint32_t i = 0; i < take; i++)
+                t[4 - take + i] = odef.dims[s + rr - take + i];
+            for (int i = 0; i < 4; i++) d4[i] = t[i];
+        };
+        auto materialize = [&](uint32_t& t, const OpDef* src_op, uint32_t out_idx) {
+            if (!src_op) return;
+            uint64_t s_elems = elems_of(src_op);
+            if (s_elems == 0 || s_elems >= n) return;
+            uint32_t tmp = em.fresh_temp(od->op_id, out_idx);
+            uint32_t in_d[4] = {1, 1, 1, 1}, out_d[4] = {1, 1, 1, 1};
+            fold4(src_op->output_def, in_d);
+            fold4(od->output_def, out_d);
+            em.add_op(OP_BROADCAST_F16, {t, tmp, (uint32_t)n, (uint32_t)s_elems,
+                                         in_d[0], in_d[1], in_d[2], in_d[3],
+                                         out_d[0], out_d[1], out_d[2], out_d[3]});
+            t = tmp;
+        };
+        materialize(a_t, gp.get_op_at(od->inputs[0].src_id), 6);
+        materialize(b_t, bb, 7);
+    }
+    uint32_t sub = qnn_binary_to_sub(subtype);
+    if (sub == 0) em.add_op(OP_ADD_F16, {a_t, b_t, out_t, (uint32_t)n});
+    else if (sub != 0xFFFFFFFFu)
+        em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, (uint32_t)n, sub});
+    else
+        em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, (uint32_t)n, 0});
+    return 0;
+}
+
+static int op_unary(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    ExtraEltwise e{};
+    if (od->serialized_extra.size() >= sizeof(e))
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    uint32_t sub = (nm == "Eltwise_Unary") ? qnn_unary_to_sub(e.operation)
+                                           : qnn_neuron_to_sub(e.operation);
+    em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od),
+                             sub == 0xFFFFFFFFu ? 0xFFFFFFFFu : sub});
+    return 0;
+}
+
+static int op_eltwise_ternary(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    // SELECT 语义: out = in0(cond) ? in1 : in2
+    uint32_t c_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t a_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
+    uint32_t b_t = em.src_ref(od->inputs[2], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    em.add_op(OP_BINARY_F16, {c_t, a_t, b_t, out_t, 8});  // 8=SELECT(cond,a,b)
+    return 0;
+}
+
+static int op_softmax(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    ExtraAxis e{};
+    if (od->serialized_extra.size() >= sizeof(e))
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    uint64_t n_elems = elems_of(od);
+    uint32_t ax = (e.axis < 0) ? od->output_def.rank - 1 : (uint32_t)e.axis;
+    uint64_t row_w = 1;
+    if (ax < od->output_def.rank) row_w = od->output_def.dims[ax];
+    em.add_op(OP_SOFTMAX_F16, {x_t, out_t, (uint32_t)(n_elems / row_w), (uint32_t)row_w});
+    return 0;
+}
+
+static int op_rmsnorm(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
+    uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
+    const OpDef* bs = od->inputs.size() > 2 ? gp.get_op_at(od->inputs[2].src_id) : nullptr;
+    uint32_t b_s = bs ? em.ensure_weight_slot(gp, bs, wslots, od->grouping) : em.dummy_slot_id;
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    em.add_op(OP_RMSNORM2_F16, {x_t, w_s, b_s, out_t, (uint32_t)elems_of(od)});
+    return 0;
+}
+
+static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
+    /* B 为 const(权重)→ 槽; 运行时(q·kᵀ 的 k)→ temp 引用 */
+    bool w_is_const = w && (w->is_const() || w->const_data_size > 0);
+    uint32_t w_s = w_is_const
+        ? (0x8000u | em.ensure_weight_slot(gp, w, wslots, od->grouping))
+        : (od->inputs.size() > 1
+               ? em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots)
+               : em.dummy_slot_id);
+    ExtraFc ef{};
+    ExtraMatMul em2{};
+    uint32_t m = 0, k = 0, nn = 0;
+    if (nm == "FullyConnected") {
+        if (od->serialized_extra.size() >= sizeof(ef))
+            std::memcpy(&ef, od->serialized_extra.data(), sizeof(ef));
+        m = ef.m; k = ef.k; nn = ef.n;
+    } else {
+        if (od->serialized_extra.size() >= sizeof(em2))
+            std::memcpy(&em2, od->serialized_extra.data(), sizeof(em2));
+        m = em2.m; k = em2.k; nn = em2.n;
+    }
+    if (m == 0 || k == 0 || nn == 0) {
+        std::fprintf(stderr, "error: %s extra 未提取 (M/K/N=0)\n", nm.c_str());
+        return 4;
+    }
+    /* Q4_0 打包权重(K*N/2 字节)→ W4A16;f16 池权重 → MATMUL_F16
+     * (float 图; probe 首撞: f16 权重被按 W4A16 执行直接失败) */
+    bool w4 = w_is_const && (w_s != em.dummy_slot_id) &&
+              (em.slots[w_s & 0x7FFFu].len == (k * nn / 2u));
+    if (w4) {
+        em.add_op(OP_MATMUL_W4A16, {a_t, w_s, out_t, m, k, nn});
+    } else {
+        uint32_t flags = 0;
+        if (nm == "MatMul")
+            flags = (em2.transpose_in0 & 1u) | ((em2.transpose_in1 & 1u) << 1);
+        else
+            flags = 2u;  /* FC: 权重存 [N,K] */
+        /* batched BMM: bit2 置位, 批数入高 16 位 */
+        if (em2.batched) {
+            flags |= 4u;
+            uint32_t rk = od->output_def.rank;
+            while (rk > 0 && od->output_def.dims[rk - 1] == 1) rk--;
+            uint64_t bn = 1;
+            for (uint32_t i = 0; i + 2 < rk; i++) bn *= od->output_def.dims[i];
+            flags |= ((uint32_t)bn & 0xFFFFu) << 16;
+        }
+        em.add_op(OP_MATMUL_F16, {a_t, w_s, out_t, m, k, nn, flags});
+    }
+    return 0;
+}
+
+static int op_gather(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    const OpDef* tbl = od->inputs.size() > 0 ? gp.get_op_at(od->inputs[0].src_id) : nullptr;
+    uint32_t tbl_s = tbl ? em.ensure_weight_slot(gp, tbl, wslots, od->grouping) : em.dummy_slot_id;
+    uint32_t idx_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    uint32_t row_bytes = 0;
+    if (tbl && tbl->output_def.rank >= 1)
+        row_bytes = (uint32_t)tbl->output_def.dims[tbl->output_def.rank - 1] * 2;
+    em.add_op(OP_GATHER_F16, {tbl_s, idx_t, out_t, (uint32_t)elems_of(od), row_bytes});
+    return 0;
+}
+
+static int op_copy_sem(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    // 数据搬运/常量填充/状态更新语义 → 恒等(设备 M4 数值门兜底)
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od), 0xFFFFFFFFu});
+    return 0;
+}
+
+static int op_dwconv(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    ExtraDepthwiseConv e{};
+    if (od->serialized_extra.size() >= sizeof(e))
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
+    uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    uint64_t ne = elems_of(od);
+    uint32_t seq = 1, ch = (uint32_t)ne;
+    if (od->output_def.rank >= 2) {
+        seq = od->output_def.dims[od->output_def.rank - 2];
+        ch = od->output_def.dims[od->output_def.rank - 1];
+    }
+    em.add_op(OP_CONV1D_SSM_F16, {x_t, w_s, out_t, seq, ch, e.kw});
+    return 0;
+}
+
+static int op_concat(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    ExtraAxis e{};
+    if (od->serialized_extra.size() >= sizeof(e))
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    std::vector<uint32_t> args;
+    for (size_t i = 0; i < 8; i++)
+        args.push_back(i < od->inputs.size()
+            ? em.src_ref(od->inputs[i], gp.get_input_node_id(), gp, wslots) : 0u);
+    args.push_back(out_t);
+    uint32_t ax_c = (uint32_t)(e.axis < 0 ? od->output_def.rank - 1 : e.axis);
+    args.push_back(ax_c);
+    args.push_back((uint32_t)od->inputs.size());
+    args.push_back((uint32_t)elems_of(od));
+    // 每段 axis 维尺寸(≤4 段): 从各输入生产者 output_def 取
+    for (size_t i = 0; i < 4; i++) {
+        uint32_t sz = 0;
+        if (i < od->inputs.size()) {
+            const OpDef* src = gp.get_op_at(od->inputs[i].src_id);
+            if (src && ax_c < src->output_def.rank)
+                sz = src->output_def.dims[ax_c];
+        }
+        args.push_back(sz);
+    }
+    em.add_op(OP_CONCAT_F16, args);
+    return 0;
+}
+
+static int op_strided_slice(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    ExtraStridedSlice e{};
+    if (od->serialized_extra.size() >= sizeof(e))
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    // 设备契约: rank≤3 通用切片(begin/end/stride 各 3; rank4 且 dim0=1 降 rank)
+    /* rank4 且 dim0=1: 降 rank3, 取轴 1..3(batch 轴恒 0:1:1) */
+    uint32_t rk = std::min<uint32_t>(e.rank, 4);
+    if (rk == 4) rk = 3;
+    std::vector<uint32_t> args{x_t, out_t, (uint32_t)elems_of(od), rk};
+    const auto& pool = gp.const_pool();
+    uint32_t b0 = 0, b1 = 0, b2 = 0, e0 = 0, e1 = 0, e2 = 0, s0 = 1, s1 = 1, s2 = 1;
+    if (e.ranges_offset && e.ranges_offset + e.rank * 12 <= pool.size()) {
+        const int32_t* rg = reinterpret_cast<const int32_t*>(pool.data() + e.ranges_offset);
+        uint32_t ax0 = (e.rank == 4) ? 1u : 0u;  /* 降 rank: 跳 batch 轴 */
+        /* ranges 布局 = 每轴三元组交错 [b,e,s]×rank(JSON 实测) */
+        b0 = (uint32_t)rg[ax0 * 3 + 0]; e0 = (uint32_t)rg[ax0 * 3 + 1]; s0 = (uint32_t)rg[ax0 * 3 + 2];
+        b1 = (uint32_t)rg[(ax0 + 1) * 3 + 0]; e1 = (uint32_t)rg[(ax0 + 1) * 3 + 1]; s1 = (uint32_t)rg[(ax0 + 1) * 3 + 2];
+        b2 = (uint32_t)rg[(ax0 + 2) * 3 + 0]; e2 = (uint32_t)rg[(ax0 + 2) * 3 + 1]; s2 = (uint32_t)rg[(ax0 + 2) * 3 + 2];
+    }
+    args.push_back(b0); args.push_back(b1); args.push_back(b2);
+    args.push_back(e0); args.push_back(e1); args.push_back(e2);
+    args.push_back(s0); args.push_back(s1); args.push_back(s2);
+    /* 输入 dims(轴 1..3, C 序) */
+    uint32_t d0 = 1, d1 = 1, d2 = 1;
+    const OpDef* srcp = gp.get_op_at(od->inputs[0].src_id);
+    if (srcp) {
+        uint32_t ar = srcp->output_def.rank;
+        while (ar > 0 && srcp->output_def.dims[ar - 1] == 1) ar--;
+        if (ar >= 1) d0 = srcp->output_def.dims[ar - 3 < ar ? ar - 3 : ar - 1];
+        if (ar >= 2) d1 = srcp->output_def.dims[ar - 2];
+        if (ar >= 1) d2 = srcp->output_def.dims[ar - 1];
+        if (ar == 1) d0 = 1;
+        if (ar == 2) { d1 = srcp->output_def.dims[0]; d2 = srcp->output_def.dims[1]; }
+        if (ar == 1) { d2 = srcp->output_def.dims[0]; d1 = 1; }
+    }
+    args.push_back(d0); args.push_back(d1); args.push_back(d2);
+    em.add_op(OP_STRIDED_SLICE_F16, args);
+    return 0;
+}
+
+static int op_split(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    ExtraSplit e{};
+    if (od->serialized_extra.size() >= sizeof(e))
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    std::vector<uint32_t> args{x_t};
+    for (size_t i = 0; i < 8; i++) {
+        /* 副本语义: 只建 out0(exec 只写 args[1]); 多余 temp 会
+         * 污染 free list(probe: Reshape 错拿 split 的 out2) */
+        uint32_t t = (i == 0 && e.num_splits > 0)
+                         ? em.fresh_temp(od->op_id, 0) : 0u;
+        args.push_back(t);
+    }
+    args.push_back((uint32_t)(e.axis < 0 ? 0 : e.axis));
+    args.push_back(e.num_splits);
+    for (size_t i = 0; i < 4; i++)
+        args.push_back(i < (size_t)e.num_splits ? e.sizes[i] : 0u);
+    args.push_back(e.split_index);  /* 副本 op 取自己的段写 out0 */
+    em.add_op(OP_SPLIT_F16, args);
+    return 0;
+}
+
+static int op_reduce(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    ExtraAxis e{};
+    if (od->serialized_extra.size() >= sizeof(e))
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    {
+        const OpDef* src_r = gp.get_op_at(od->inputs[0].src_id);
+        uint64_t n_in = src_r ? elems_of(src_r) : elems_of(od);
+        std::vector<uint32_t> args{x_t, out_t, (uint32_t)n_in,
+                                   (uint32_t)e.axis, e.reduce_type};
+        for (uint32_t i = 0; i < 4; i++)
+            args.push_back(src_r && i < src_r->output_def.rank
+                               ? src_r->output_def.dims[i] : 1u);
+        em.add_op(OP_REDUCE_F16, args);
+    }
+    return 0;
+}
+
+static int op_cumsum(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
+    (void)nm;
+    ExtraAxis e{};
+    if (od->serialized_extra.size() >= sizeof(e))
+        std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+    uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
+    uint32_t out_t = em.fresh_temp(od->op_id);
+    uint64_t ne = elems_of(od);
+    uint32_t ax = (e.axis < 0) ? od->output_def.rank - 1 : (uint32_t)e.axis;
+    uint32_t rows = 1, n_ax = 1;
+    if (ax < od->output_def.rank) {
+        rows = (uint32_t)(ne / od->output_def.dims[ax]);
+        n_ax = od->output_def.dims[ax];
+    }
+    em.add_op(OP_CUMSUM_F32, {x_t, out_t, rows, n_ax, ax, e.exclusive, e.reverse});
+    return 0;
+}
+
+static const std::unordered_map<std::string, WtopOpHandler>& op_table() {
+    static const std::unordered_map<std::string, WtopOpHandler> t = {
+        {"Transpose", op_transpose},
+        {"Conv2d", op_conv2d},
+        {"Eltwise_Binary", op_eltwise_binary},
+        {"Eltwise_Unary", op_unary},
+        {"ElementWiseNeuron", op_unary},
+        {"Eltwise_Ternary", op_eltwise_ternary},
+        {"Softmax", op_softmax},
+        {"RmsNorm", op_rmsnorm},
+        {"FullyConnected", op_matmul},
+        {"MatMul", op_matmul},
+        {"Gather", op_gather},
+        {"Reshape", op_copy_sem},
+        {"Pad", op_copy_sem},
+        {"ScatterNd", op_copy_sem},
+        {"Cast", op_copy_sem},
+        {"DepthWiseConv2d", op_dwconv},
+        {"Concat", op_concat},
+        {"StridedSlice", op_strided_slice},
+        {"Split", op_split},
+        {"Reduce", op_reduce},
+        {"CumulativeSum", op_cumsum},
+    };
+    return t;
+}
+
 int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& out_path, const std::string& manifest_path,
          const std::string& gguf_path, const std::string& match_path,
@@ -731,6 +1255,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     // spill/fill 不钉 temp: 0.8B 默认预算下全图溢出 → 上千 spill 记录,
     // 钉住会把整个活跃集抬到 16879。spill 段(循环后)用保留 temp 引用。
     uint32_t spill_pool_slot = 0;  // 0 = 未创建
+    WtopEmitShared sh{H, W, C, w_slot, b_slot};
     for (size_t pos = 0; pos < order.size(); pos++) {
         op_id_t id = order[pos];
         em.cur_op = id;
@@ -767,481 +1292,13 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                                     tit->second, (uint32_t)(sit->second.second / 2)});
             }
         }
-        do {
-
-        if (nm == "Transpose") {
-            const OpDef* src = gp.get_op_at(od->inputs[0].src_id);
-            if (!src) { std::fprintf(stderr, "error: transpose src missing\n"); return 2; }
-            uint32_t rk = src->output_def.rank;
-            if (rk > 5) { std::fprintf(stderr, "error: transpose rank %u > 5\n", rk); return 4; }
-            uint32_t dims[5] = {1, 1, 1, 1, 1};
-            for (uint32_t i = 0; i < rk; i++) dims[i] = src->output_def.dims[i];
-            // 读完整 perm(最多 5 轴; 缺省单位)
-            int32_t pv[5] = {0, 1, 2, 3, 4};
-            uint32_t pc = 0;
-            const OpDef* permc = (od->inputs.size() > 1) ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
-            if (permc && permc->const_data_size >= 4 && permc->const_data_size % 4 == 0) {
-                pc = permc->const_data_size / 4;
-                if (pc > 5) { std::fprintf(stderr, "error: transpose perm 轴数 %u > 5\n", pc); return 4; }
-                const int32_t* p = reinterpret_cast<const int32_t*>(
-                    gp.const_pool().data() + permc->const_data_offset);
-                for (uint32_t i = 0; i < pc; i++) pv[i] = p[i];
-            }
-            if (pc == 0) pc = rk;  // 无 const: 单位 perm
-            /* 秩对齐: 图 rank-4 填充 vs rank-3 perm 契约(L3 实测 [1,1,X,Y]
-             * pc=3) —— 折前导 size-1 维至 perm 参照系。旧码 >=16B 门槛漏读
-             * 12B perm, 回落"单位"实为 reverse(0x00010203 字节序), 因前两轴
-             * 恒 1 恰好等价, M4.2 81/81 是侥幸通过。 */
-            while (rk > pc && dims[0] == 1) {
-                for (uint32_t i = 0; i + 1 < rk; i++) dims[i] = dims[i + 1];
-                rk--;
-            }
-            if (rk != pc) {
-                std::fprintf(stderr, "error: transpose perm 轴数 %u 与输入秩 %u 不可对齐\n", pc, rk);
-                return 4;
-            }
-            /* rank>4: 折叠任意 size-1 轴(对转置线性布局无影响), perm 重映射。
-             * M4.2b 首撞: [1,16,1,128,64] perm[0,1,2,4,3]。 */
-            int keep[5]; uint32_t nd[4] = {1, 1, 1, 1}, nrk = 0;
-            for (uint32_t ax = 0; ax < rk; ax++) {
-                if (rk > 4 && dims[ax] == 1) { keep[ax] = -1; continue; }
-                keep[ax] = (int)nrk;
-                if (nrk < 4) nd[nrk] = dims[ax];
-                nrk++;
-            }
-            if (nrk > 4) {
-                std::fprintf(stderr, "error: transpose rank %u 无 size-1 轴可折\n", rk);
-                return 4;
-            }
-            int32_t np[4] = {0, 1, 2, 3}; uint32_t npi = 0;
-            for (uint32_t i = 0; i < rk && npi < 4; i++) {
-                int32_t ax = pv[i];
-                if (ax < 0 || ax >= (int32_t)rk) { npi = 0xFFFFFFFFu; break; }
-                if (keep[ax] < 0) continue;
-                np[npi++] = keep[ax];
-            }
-            if (npi != nrk) {
-                std::fprintf(stderr, "error: transpose perm 与折叠不一致(npi=%u nrk=%u)\n", npi, nrk);
-                return 4;
-            }
-            uint32_t perm = 0;
-            for (uint32_t i = 0; i < nrk; i++) perm |= ((uint32_t)np[i] << (8 * i));
-            uint32_t src_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            /* 统一走通用 N-D 转置(形状全参数化); opcode 10 的 4D NCHW
-             * 契约(H/W/C 源自图输入)对 transformer 张量全错(probe 实锤) */
-            em.add_op(OP_TRANSPOSE_GEN_F16,
-                      {src_t, out_t, nrk, nd[0], nd[1], nd[2], nd[3], perm});
-            break;
+        auto hit = op_table().find(nm);
+        if (hit == op_table().end()) {
+            std::fprintf(stderr, "error: unsupported op '%s' in wtop_emit\n", nm.c_str());
+            return 4;
         }
-
-        if (nm == "Conv2d") {
-            // extra_info: 60B fixed + tiling 段
-            if (od->serialized_extra.size() < sizeof(ExtraConv) + 16) {
-                std::fprintf(stderr, "error: conv extra too short\n"); return 2;
-            }
-            ExtraConv e;
-            std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t hdr[4];
-            std::memcpy(hdr, od->serialized_extra.data() + sizeof(ExtraConv), 16);
-
-            // 受支持几何门(特性门): dh=dw=1、s1、group=1、same-pad
-            if (e.dh != 1 || e.dw != 1 || e.sh != 1 || e.sw != 1 || e.group != 1) {
-                std::fprintf(stderr, "error: unsupported conv geometry (sh=%u sw=%u dh=%u dw=%u group=%u)\n",
-                             e.sh, e.sw, e.dh, e.dw, e.group);
-                return 4;
-            }
-            uint32_t ph = e.kh / 2, pw = e.kw / 2;
-            if (e.ph_begin != ph || e.ph_end != ph || e.pw_begin != pw || e.pw_end != pw) {
-                std::fprintf(stderr, "error: unsupported conv pad (%u,%u,%u,%u) vs same-pad (%u,%u)\n",
-                             e.ph_begin, e.ph_end, e.pw_begin, e.pw_end, ph, pw);
-                return 4;
-            }
-
-            uint32_t num_tiles = hdr[3];
-            const uint32_t* descs = reinterpret_cast<const uint32_t*>(
-                od->serialized_extra.data() + sizeof(ExtraConv) + 16);
-            if (num_tiles == 0) {  // 旧流/未分块: 整图单 tile
-                num_tiles = 1;
-            }
-            // 无分块时的整图 tile 描述(字段序同 ConvTileDesc 19×u32)
-            const uint32_t full_desc[19] = {0, 0, H, W, 0, 0, H, W,
-                                            e.kh, e.kw, e.sh, e.sw, e.ph_begin, e.pw_begin,
-                                            C, C, 0, C, 0};
-            uint32_t src_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            uint32_t cols_t = em.fresh_temp(0xFFFFFFF0);  // 专用 cols 槽
-            for (uint32_t t = 0; t < num_tiles; t++) {
-                const uint32_t* d = (hdr[3] == 0) ? full_desc : descs + t * 19;
-                uint32_t iy0 = d[4], ix0 = d[5], ih = d[6], iw = d[7];
-                uint32_t oy0 = d[0], ox0 = d[1], th = d[2], tw = d[3];
-                uint32_t co0 = d[16], co_n = d[17];
-                // im2col: 输入切片(含 halo) → cols [th*tw × K]
-                em.add_op(OP_IM2COL, {src_t, cols_t, H, W, C, e.kh, e.kw,
-                                      e.ph_begin, e.pw_begin, e.sh, e.sw,
-                                      iy0, ix0, th, tw});
-                // GEMM: cols [M,K] @ W [K,N] → 输出 tile 写入全图 out_temp
-                em.add_op(OP_CONV2D_F16, {cols_t, w_slot, b_slot, out_t,
-                                          th * tw, e.kh * e.kw * C, C,
-                                          oy0, ox0, H, W, co0, co_n});
-            }
-            break;
-        }
-
-        if (nm == "Eltwise_Binary") {
-            // operation 从 serialized_extra 读(0=ADD 1=SUB 2=MUL 3=DIV)
-            uint32_t subtype = 0;
-            if (od->serialized_extra.size() >= sizeof(ExtraEltwise)) {
-                ExtraEltwise e;
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-                subtype = e.operation;
-            }
-            uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t b_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            uint64_t n = elems_of(od);
-            /* numpy 广播: b 元素 < 输出时先物化为全尺寸 temp(带形状的
-             * 逐轴广播), 保持 ADD/BINARY 纯元素语义 */
-            const OpDef* bb = gp.get_op_at(od->inputs[1].src_id);
-            uint64_t b_elems = bb ? elems_of(bb) : n;
-            if (getenv("GEHTP_BDIAG")) {
-                const OpDef* aa = gp.get_op_at(od->inputs[0].src_id);
-                std::fprintf(stderr, "[bdiag] op %llu %s: od.rank=%u od.dims=",
-                             (unsigned long long)od->op_id,
-                             od->name_tag && od->name_tag->name() ? od->name_tag->name() : "?",
-                             od->output_def.rank);
-                for (uint32_t i = 0; i < od->output_def.rank && i < 8; i++)
-                    std::fprintf(stderr, "%u ", od->output_def.dims[i]);
-                std::fprintf(stderr, "| a(%s).rank=%u dims=",
-                             aa && aa->name_tag && aa->name_tag->name() ? aa->name_tag->name() : "?",
-                             aa ? aa->output_def.rank : 0);
-                if (aa) for (uint32_t i = 0; i < aa->output_def.rank && i < 8; i++)
-                    std::fprintf(stderr, "%u ", aa->output_def.dims[i]);
-                std::fprintf(stderr, "| bb(%s).rank=%u dims=",
-                             bb && bb->name_tag && bb->name_tag->name() ? bb->name_tag->name() : "?",
-                             bb ? bb->output_def.rank : 0);
-                if (bb) for (uint32_t i = 0; i < bb->output_def.rank && i < 8; i++)
-                    std::fprintf(stderr, "%u ", bb->output_def.dims[i]);
-                std::fprintf(stderr, "| n=%llu b_elems=%llu\n",
-                             (unsigned long long)n, (unsigned long long)b_elems);
-            }
-            /* 广播物化: a/b 任一输入元素数 < 输出即物化为全尺寸 temp
-             * (numpy 广播; Expand 的 a [1,2,1,32,256]→[1,2,4,32,256] 同款) */
-            {
-                /* out_idx 6/7: 不与 op 自身输出(0)抢 tkey 注册 —
-                 * 否则覆盖 op_temp → 下游 src_ref 拿错 temp(probe 实锤) */
-                auto fold4 = [](const OutputDef& odef, uint32_t d4[4]) {
-                    /* 折叠前导 1 后右对齐到 4 轴(设备契约; numpy 广播语义,
-                     * 与 host in_bc 同款) */
-                    uint32_t s = 0;
-                    while (s + 1 < odef.rank && odef.dims[s] == 1) s++;
-                    uint32_t rr = odef.rank - s;
-                    if (rr == 0) rr = 1;
-                    uint32_t take = rr < 4 ? rr : 4;
-                    uint32_t t[4] = {1, 1, 1, 1};
-                    for (uint32_t i = 0; i < take; i++)
-                        t[4 - take + i] = odef.dims[s + rr - take + i];
-                    for (int i = 0; i < 4; i++) d4[i] = t[i];
-                };
-                auto materialize = [&](uint32_t& t, const OpDef* src_op, uint32_t out_idx) {
-                    if (!src_op) return;
-                    uint64_t s_elems = elems_of(src_op);
-                    if (s_elems == 0 || s_elems >= n) return;
-                    uint32_t tmp = em.fresh_temp(od->op_id, out_idx);
-                    uint32_t in_d[4] = {1, 1, 1, 1}, out_d[4] = {1, 1, 1, 1};
-                    fold4(src_op->output_def, in_d);
-                    fold4(od->output_def, out_d);
-                    em.add_op(OP_BROADCAST_F16, {t, tmp, (uint32_t)n, (uint32_t)s_elems,
-                                                 in_d[0], in_d[1], in_d[2], in_d[3],
-                                                 out_d[0], out_d[1], out_d[2], out_d[3]});
-                    t = tmp;
-                };
-                materialize(a_t, gp.get_op_at(od->inputs[0].src_id), 6);
-                materialize(b_t, bb, 7);
-            }
-            uint32_t sub = qnn_binary_to_sub(subtype);
-            if (sub == 0) em.add_op(OP_ADD_F16, {a_t, b_t, out_t, (uint32_t)n});
-            else if (sub != 0xFFFFFFFFu)
-                em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, (uint32_t)n, sub});
-            else
-                em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, (uint32_t)n, 0});
-            break;
-        }
-
-        // ---- M2: 0.8B 20 型新分支(参数全从 serialized_extra 读) ----
-
-        if (nm == "Eltwise_Unary" || nm == "ElementWiseNeuron") {
-            ExtraEltwise e{};
-            if (od->serialized_extra.size() >= sizeof(e))
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            uint32_t sub = (nm == "Eltwise_Unary") ? qnn_unary_to_sub(e.operation)
-                                                   : qnn_neuron_to_sub(e.operation);
-            em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od),
-                                     sub == 0xFFFFFFFFu ? 0xFFFFFFFFu : sub});
-            break;
-        }
-
-        if (nm == "Eltwise_Ternary") {
-            // SELECT 语义: out = in0(cond) ? in1 : in2
-            uint32_t c_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t a_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
-            uint32_t b_t = em.src_ref(od->inputs[2], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            em.add_op(OP_BINARY_F16, {c_t, a_t, b_t, out_t, 8});  // 8=SELECT(cond,a,b)
-            break;
-        }
-
-        if (nm == "Softmax") {
-            ExtraAxis e{};
-            if (od->serialized_extra.size() >= sizeof(e))
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            uint64_t n_elems = elems_of(od);
-            uint32_t ax = (e.axis < 0) ? od->output_def.rank - 1 : (uint32_t)e.axis;
-            uint64_t row_w = 1;
-            if (ax < od->output_def.rank) row_w = od->output_def.dims[ax];
-            em.add_op(OP_SOFTMAX_F16, {x_t, out_t, (uint32_t)(n_elems / row_w), (uint32_t)row_w});
-            break;
-        }
-
-        if (nm == "RmsNorm") {
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
-            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
-            const OpDef* bs = od->inputs.size() > 2 ? gp.get_op_at(od->inputs[2].src_id) : nullptr;
-            uint32_t b_s = bs ? em.ensure_weight_slot(gp, bs, wslots, od->grouping) : em.dummy_slot_id;
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            em.add_op(OP_RMSNORM2_F16, {x_t, w_s, b_s, out_t, (uint32_t)elems_of(od)});
-            break;
-        }
-
-        if (nm == "FullyConnected" || nm == "MatMul") {
-            uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
-            /* B 为 const(权重)→ 槽; 运行时(q·kᵀ 的 k)→ temp 引用 */
-            bool w_is_const = w && (w->is_const() || w->const_data_size > 0);
-            uint32_t w_s = w_is_const
-                ? (0x8000u | em.ensure_weight_slot(gp, w, wslots, od->grouping))
-                : (od->inputs.size() > 1
-                       ? em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots)
-                       : em.dummy_slot_id);
-            ExtraFc ef{};
-            ExtraMatMul em2{};
-            uint32_t m = 0, k = 0, nn = 0;
-            if (nm == "FullyConnected") {
-                if (od->serialized_extra.size() >= sizeof(ef))
-                    std::memcpy(&ef, od->serialized_extra.data(), sizeof(ef));
-                m = ef.m; k = ef.k; nn = ef.n;
-            } else {
-                if (od->serialized_extra.size() >= sizeof(em2))
-                    std::memcpy(&em2, od->serialized_extra.data(), sizeof(em2));
-                m = em2.m; k = em2.k; nn = em2.n;
-            }
-            if (m == 0 || k == 0 || nn == 0) {
-                std::fprintf(stderr, "error: %s extra 未提取 (M/K/N=0)\n", nm.c_str());
-                return 4;
-            }
-            /* Q4_0 打包权重(K*N/2 字节)→ W4A16;f16 池权重 → MATMUL_F16
-             * (float 图; probe 首撞: f16 权重被按 W4A16 执行直接失败) */
-            bool w4 = w_is_const && (w_s != em.dummy_slot_id) &&
-                      (em.slots[w_s & 0x7FFFu].len == (k * nn / 2u));
-            if (w4) {
-                em.add_op(OP_MATMUL_W4A16, {a_t, w_s, out_t, m, k, nn});
-            } else {
-                uint32_t flags = 0;
-                if (nm == "MatMul")
-                    flags = (em2.transpose_in0 & 1u) | ((em2.transpose_in1 & 1u) << 1);
-                else
-                    flags = 2u;  /* FC: 权重存 [N,K] */
-                /* batched BMM: bit2 置位, 批数入高 16 位 */
-                if (em2.batched) {
-                    flags |= 4u;
-                    uint32_t rk = od->output_def.rank;
-                    while (rk > 0 && od->output_def.dims[rk - 1] == 1) rk--;
-                    uint64_t bn = 1;
-                    for (uint32_t i = 0; i + 2 < rk; i++) bn *= od->output_def.dims[i];
-                    flags |= ((uint32_t)bn & 0xFFFFu) << 16;
-                }
-                em.add_op(OP_MATMUL_F16, {a_t, w_s, out_t, m, k, nn, flags});
-            }
-            break;
-        }
-
-        if (nm == "Gather") {
-            const OpDef* tbl = od->inputs.size() > 0 ? gp.get_op_at(od->inputs[0].src_id) : nullptr;
-            uint32_t tbl_s = tbl ? em.ensure_weight_slot(gp, tbl, wslots, od->grouping) : em.dummy_slot_id;
-            uint32_t idx_t = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            uint32_t row_bytes = 0;
-            if (tbl && tbl->output_def.rank >= 1)
-                row_bytes = (uint32_t)tbl->output_def.dims[tbl->output_def.rank - 1] * 2;
-            em.add_op(OP_GATHER_F16, {tbl_s, idx_t, out_t, (uint32_t)elems_of(od), row_bytes});
-            break;
-        }
-
-        if (nm == "Reshape" || nm == "Pad" || nm == "ScatterNd" || nm == "Cast") {
-            // 数据搬运/常量填充/状态更新语义 → 恒等(设备 M4 数值门兜底)
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od), 0xFFFFFFFFu});
-            break;
-        }
-
-        if (nm == "DepthWiseConv2d") {
-            ExtraDepthwiseConv e{};
-            if (od->serialized_extra.size() >= sizeof(e))
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
-            uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            uint64_t ne = elems_of(od);
-            uint32_t seq = 1, ch = (uint32_t)ne;
-            if (od->output_def.rank >= 2) {
-                seq = od->output_def.dims[od->output_def.rank - 2];
-                ch = od->output_def.dims[od->output_def.rank - 1];
-            }
-            em.add_op(OP_CONV1D_SSM_F16, {x_t, w_s, out_t, seq, ch, e.kw});
-            break;
-        }
-
-        if (nm == "Concat") {
-            ExtraAxis e{};
-            if (od->serialized_extra.size() >= sizeof(e))
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            std::vector<uint32_t> args;
-            for (size_t i = 0; i < 8; i++)
-                args.push_back(i < od->inputs.size()
-                    ? em.src_ref(od->inputs[i], gp.get_input_node_id(), gp, wslots) : 0u);
-            args.push_back(out_t);
-            uint32_t ax_c = (uint32_t)(e.axis < 0 ? od->output_def.rank - 1 : e.axis);
-            args.push_back(ax_c);
-            args.push_back((uint32_t)od->inputs.size());
-            args.push_back((uint32_t)elems_of(od));
-            // 每段 axis 维尺寸(≤4 段): 从各输入生产者 output_def 取
-            for (size_t i = 0; i < 4; i++) {
-                uint32_t sz = 0;
-                if (i < od->inputs.size()) {
-                    const OpDef* src = gp.get_op_at(od->inputs[i].src_id);
-                    if (src && ax_c < src->output_def.rank)
-                        sz = src->output_def.dims[ax_c];
-                }
-                args.push_back(sz);
-            }
-            em.add_op(OP_CONCAT_F16, args);
-            break;
-        }
-
-        if (nm == "StridedSlice") {
-            ExtraStridedSlice e{};
-            if (od->serialized_extra.size() >= sizeof(e))
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            // 设备契约: rank≤3 通用切片(begin/end/stride 各 3; rank4 且 dim0=1 降 rank)
-            /* rank4 且 dim0=1: 降 rank3, 取轴 1..3(batch 轴恒 0:1:1) */
-            uint32_t rk = std::min<uint32_t>(e.rank, 4);
-            if (rk == 4) rk = 3;
-            std::vector<uint32_t> args{x_t, out_t, (uint32_t)elems_of(od), rk};
-            const auto& pool = gp.const_pool();
-            uint32_t b0 = 0, b1 = 0, b2 = 0, e0 = 0, e1 = 0, e2 = 0, s0 = 1, s1 = 1, s2 = 1;
-            if (e.ranges_offset && e.ranges_offset + e.rank * 12 <= pool.size()) {
-                const int32_t* rg = reinterpret_cast<const int32_t*>(pool.data() + e.ranges_offset);
-                uint32_t ax0 = (e.rank == 4) ? 1u : 0u;  /* 降 rank: 跳 batch 轴 */
-                /* ranges 布局 = 每轴三元组交错 [b,e,s]×rank(JSON 实测) */
-                b0 = (uint32_t)rg[ax0 * 3 + 0]; e0 = (uint32_t)rg[ax0 * 3 + 1]; s0 = (uint32_t)rg[ax0 * 3 + 2];
-                b1 = (uint32_t)rg[(ax0 + 1) * 3 + 0]; e1 = (uint32_t)rg[(ax0 + 1) * 3 + 1]; s1 = (uint32_t)rg[(ax0 + 1) * 3 + 2];
-                b2 = (uint32_t)rg[(ax0 + 2) * 3 + 0]; e2 = (uint32_t)rg[(ax0 + 2) * 3 + 1]; s2 = (uint32_t)rg[(ax0 + 2) * 3 + 2];
-            }
-            args.push_back(b0); args.push_back(b1); args.push_back(b2);
-            args.push_back(e0); args.push_back(e1); args.push_back(e2);
-            args.push_back(s0); args.push_back(s1); args.push_back(s2);
-            /* 输入 dims(轴 1..3, C 序) */
-            uint32_t d0 = 1, d1 = 1, d2 = 1;
-            const OpDef* srcp = gp.get_op_at(od->inputs[0].src_id);
-            if (srcp) {
-                uint32_t ar = srcp->output_def.rank;
-                while (ar > 0 && srcp->output_def.dims[ar - 1] == 1) ar--;
-                if (ar >= 1) d0 = srcp->output_def.dims[ar - 3 < ar ? ar - 3 : ar - 1];
-                if (ar >= 2) d1 = srcp->output_def.dims[ar - 2];
-                if (ar >= 1) d2 = srcp->output_def.dims[ar - 1];
-                if (ar == 1) d0 = 1;
-                if (ar == 2) { d1 = srcp->output_def.dims[0]; d2 = srcp->output_def.dims[1]; }
-                if (ar == 1) { d2 = srcp->output_def.dims[0]; d1 = 1; }
-            }
-            args.push_back(d0); args.push_back(d1); args.push_back(d2);
-            em.add_op(OP_STRIDED_SLICE_F16, args);
-            break;
-        }
-
-        if (nm == "Split") {
-            ExtraSplit e{};
-            if (od->serialized_extra.size() >= sizeof(e))
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            std::vector<uint32_t> args{x_t};
-            for (size_t i = 0; i < 8; i++) {
-                /* 副本语义: 只建 out0(exec 只写 args[1]); 多余 temp 会
-                 * 污染 free list(probe: Reshape 错拿 split 的 out2) */
-                uint32_t t = (i == 0 && e.num_splits > 0)
-                                 ? em.fresh_temp(od->op_id, 0) : 0u;
-                args.push_back(t);
-            }
-            args.push_back((uint32_t)(e.axis < 0 ? 0 : e.axis));
-            args.push_back(e.num_splits);
-            for (size_t i = 0; i < 4; i++)
-                args.push_back(i < (size_t)e.num_splits ? e.sizes[i] : 0u);
-            args.push_back(e.split_index);  /* 副本 op 取自己的段写 out0 */
-            em.add_op(OP_SPLIT_F16, args);
-            break;
-        }
-
-        if (nm == "Reduce") {
-            ExtraAxis e{};
-            if (od->serialized_extra.size() >= sizeof(e))
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            {
-                const OpDef* src_r = gp.get_op_at(od->inputs[0].src_id);
-                uint64_t n_in = src_r ? elems_of(src_r) : elems_of(od);
-                std::vector<uint32_t> args{x_t, out_t, (uint32_t)n_in,
-                                           (uint32_t)e.axis, e.reduce_type};
-                for (uint32_t i = 0; i < 4; i++)
-                    args.push_back(src_r && i < src_r->output_def.rank
-                                       ? src_r->output_def.dims[i] : 1u);
-                em.add_op(OP_REDUCE_F16, args);
-            }
-            break;
-        }
-
-        if (nm == "CumulativeSum") {
-            ExtraAxis e{};
-            if (od->serialized_extra.size() >= sizeof(e))
-                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
-            uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-            uint32_t out_t = em.fresh_temp(od->op_id);
-            uint64_t ne = elems_of(od);
-            uint32_t ax = (e.axis < 0) ? od->output_def.rank - 1 : (uint32_t)e.axis;
-            uint32_t rows = 1, n_ax = 1;
-            if (ax < od->output_def.rank) {
-                rows = (uint32_t)(ne / od->output_def.dims[ax]);
-                n_ax = od->output_def.dims[ax];
-            }
-            em.add_op(OP_CUMSUM_F32, {x_t, out_t, rows, n_ax, ax, e.exclusive, e.reverse});
-            break;
-        }
-
-        if (nm == "Input" || nm == "Output" || nm.empty()) continue;
-
-        std::fprintf(stderr, "error: unsupported op '%s' in wtop_emit\n", nm.c_str());
-        return 4;
-        } while (0);
+        int hrc = hit->second(em, gp, od, wslots, nm, sh);
+        if (hrc) return hrc;
         // 阶段二插桩(后): 溢出张量的生产 op 后插 SPILL(scratch temp → 溢出区)
         // 必须在 release 之前: release 会回收 temp 复用到后续 op。
         if (em.ddr_static && !em.ddr_spill_map.empty()) {
@@ -1412,6 +1469,13 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
         if (a == "--bin") bin_path = next();
+        else if (a == "--list-ops") {
+            std::vector<std::string> names;
+            for (const auto& kv : op_table()) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (const auto& n : names) std::printf("%s\n", n.c_str());
+            return 0;
+        }
         else if (a == "--input-f16") in_f16 = next();
         else if (a == "--out") out_path = next();
         else if (a == "--manifest") manifest_path = next();
