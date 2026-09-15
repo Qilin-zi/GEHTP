@@ -174,9 +174,12 @@ struct Emitter {
         op_temp[tkey(op_id, out_idx)] = t;
         if (ddr_static) {
             /* 静态模式: 表内(op_id 命中且 out_idx==0)登记编译期偏移;
-             * 表外(广播物化/cols/多输出)不登记 → 设备侧回落池尾 bump */
+             * temp id 复用(生命期不重叠)时不覆盖已登记项 —— 分配器的
+             * 事件扫描保证两 op 不共活, 共享同一偏移正确; 覆盖会把两 op
+             * 都指到后一 op 的偏移(上板实测 op2/op9 都变 offset 0 互相踩) */
             auto dit = ddr_op_map.find(op_id);
-            if (dit != ddr_op_map.end() && out_idx == 0) {
+            if (dit != ddr_op_map.end() && out_idx == 0 &&
+                ddr_temp_tab.find(t) == ddr_temp_tab.end()) {
                 ddr_temp_tab[t] = dit->second;
                 auto vit = ddr_op_vtcm.find(op_id);
                 if (vit != ddr_op_vtcm.end() && vit->second)
