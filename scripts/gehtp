@@ -1,0 +1,154 @@
+#!/bin/bash
+# gehtp — GEHTP 用户正门: 编译 + 上板 两命令
+# =====================================================================
+#   gehtp compile model.onnx -o model.wtop [--vtcm-budget N] [--input-f16 f]
+#   gehtp run model.wtop --input in.f16.raw --output out.f16.raw [--device 52f67807]
+#   gehtp setup [--device ...]    一次性: 构建/签名/推送 内核库 + 通用 runner
+#
+# 设备侧约定: run_main_on_hexagon 装载器已在 /data/local/tmp/hvxhmx23;
+# runner 读 job.txt(定值路径), 跑 wt_parse→wt_exec_run_io→写输出文件。
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CB="$ROOT/compiler/build_linux"
+KD="$ROOT/kernels"
+SDK=/disk2/QCtools/qairt_2.48.40.260702
+PY=/disk2/Qwen35dev/revlibHtpPrepare/venv310/bin/python3
+HEX=/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0
+HT="$HEX/tools/HEXAGON_Tools/19.0.07"
+SWIV=/disk2/QCtools/swiv_build_utility.py
+DEVROOT=/data/local/tmp/hvxhmx23
+GDIR="$DEVROOT/gehtp"
+
+die() { echo "gehtp: $*" >&2; exit 1; }
+
+cmd_compile() {
+    local onnx="" out="" vtcm="" ddr="" in_f16=""
+    while [ $# -gt 0 ]; do case "$1" in
+        -o|--output) out="$2"; shift 2;;
+        --vtcm-budget) vtcm="$2"; shift 2;;
+        --ddr-budget) ddr="$2"; shift 2;;
+        --input-f16) in_f16="$2"; shift 2;;
+        -*) die "unknown flag $1";;
+        *) [ -z "$onnx" ] && onnx="$1" || die "unexpected arg $1"; shift;;
+    esac; done
+    [ -n "$onnx" ] && [ -n "$out" ] || die "usage: gehtp compile model.onnx -o model.wtop [--vtcm-budget N] [--ddr-budget N] [--input-f16 f]"
+    onnx="$(realpath "$onnx" 2>/dev/null)" || die "not found: $onnx"
+    case "$out" in /*) ;; *) out="$(pwd)/$out";; esac
+    [ -n "$in_f16" ] && in_f16="$(realpath "$in_f16")"
+    [ -x "$CB/hnnx_compile" ] || die "compiler not built: cmake --build $CB"
+    local name; name="$(basename "$out" .wtop)"
+    local work="$out.work"
+    mkdir -p "$work"
+
+    echo "== [1/5] qairt-converter (ONNX → DLC) =="
+    PYTHONPATH="$SDK/lib/python" $PY "$SDK/bin/x86_64-linux-clang/qairt-converter" \
+        -i "$onnx" --float_bitwidth 16 -o "$work/$name.cpp" 2>&1 | tail -1
+
+    echo "== [2/5] dlc_repair + dlc-to-json =="
+    "$ROOT/scripts/dlc_repair.sh" "$work/$name.cpp" "$work/$name.dlc"
+    PYTHONPATH="$SDK/lib/python" $PY "$SDK/bin/x86_64-linux-clang/qairt-dlc-to-json" \
+        -i "$work/$name.dlc" -o "$work/${name}_net.json" 2>&1 | tail -1
+    unzip -p "$work/$name.cpp" model.params.bin > "$work/model.params.bin" 2>/dev/null || true
+    [ -s "$work/model.params.bin" ] || die "model.params.bin missing in DLC"
+
+    echo "== [3/5] hnnx_compile (tagged runlist) =="
+    "$CB/hnnx_compile" --net-json "$work/${name}_net.json" \
+        --weights-bin "$work/model.params.bin" --format tagged \
+        --output "$work/$name.tagged.bin" | tail -1
+
+    echo "== [4/5] wtop_emit (blob) =="
+    local in_args=()
+    [ -n "$in_f16" ] && in_args+=(--input-f16 "$in_f16")
+    [ -n "$vtcm" ] && in_args+=(--vtcm-budget "$vtcm")
+    [ -n "$ddr" ] && in_args+=(--ddr-budget "$ddr")
+    "$CB/wtop_emit" --bin "$work/$name.tagged.bin" "${in_args[@]}" \
+        --out "$out" --manifest "$out.manifest.json" | tail -1
+
+    echo "== [5/5] done =="
+    echo "blob:     $out ($(wc -c < "$out") bytes)"
+    echo "manifest: $out.manifest.json"
+    echo "workdir:  $work (net.json / tagged.bin 等中间产物)"
+}
+
+cmd_run() {
+    local blob="" input="" output="" device="${ANDROID_SERIAL:-52f67807}"
+    while [ $# -gt 0 ]; do case "$1" in
+        --input) input="$2"; shift 2;;
+        --output) output="$2"; shift 2;;
+        --device) device="$2"; shift 2;;
+        -*) die "unknown flag $1";;
+        *) [ -z "$blob" ] && blob="$1" || die "unexpected arg $1"; shift;;
+    esac; done
+    [ -n "$blob" ] && [ -n "$input" ] && [ -n "$output" ] || \
+        die "usage: gehtp run model.wtop --input in.f16.raw --output out.f16.raw [--device 52f67807]"
+    blob="$(realpath "$blob" 2>/dev/null)"; input="$(realpath "$input" 2>/dev/null)"
+    [ -f "$blob" ] && [ -f "$input" ] || die "blob/input not found"
+    case "$output" in /*) ;; *) output="$(pwd)/$output";; esac
+    local manifest="$blob.manifest.json"
+    [ -f "$manifest" ] || die "manifest missing: $manifest (compile 同目录产出)"
+    local out_temp
+    out_temp="$(python3 -c "import json;print(json.load(open('$manifest'))['output_temp'])")"
+
+    command -v adb >/dev/null || die "adb not in PATH"
+    adb -s "$device" shell "test -x $DEVROOT/run_main_on_hexagon && test -f $DEVROOT/gehtp_runner.so" 2>/dev/null \
+        || die "device side not ready — run: gehtp setup --device $device"
+
+    local bname; bname="$(basename "$blob")"
+    echo "== push =="
+    adb -s "$device" shell "mkdir -p $GDIR" >/dev/null
+    adb -s "$device" push "$blob" "$GDIR/$bname" >/dev/null
+    adb -s "$device" push "$input" "$GDIR/input.f16.raw" >/dev/null
+    printf 'blob %s/%s\ninput %s/input.f16.raw\noutput %s/output.f16.raw\nout_temp %s\n' \
+        "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" > /tmp/gehtp_job.txt
+    adb -s "$device" push /tmp/gehtp_job.txt "$GDIR/job.txt" >/dev/null
+
+    echo "== run on $device =="
+    adb -s "$device" shell "cd $DEVROOT && ADSP_LIBRARY_PATH=$DEVROOT CDSP_LIBRARY_PATH=$DEVROOT ./run_main_on_hexagon 3 gehtp_runner.so" 2>&1 | tail -5
+
+    echo "== pull =="
+    adb -s "$device" pull "$GDIR/output.f16.raw" "$output" >/dev/null \
+        || die "no output on device (runner log above)"
+    echo "output: $output ($(wc -c < "$output") bytes)"
+}
+
+cmd_setup() {
+    local device="${ANDROID_SERIAL:-52f67807}"
+    while [ $# -gt 0 ]; do case "$1" in
+        --device) device="$2"; shift 2;;
+        *) die "unknown arg $1";;
+    esac; done
+    local CC="$HT/Tools/bin/hexagon-clang"
+    [ -x "$CC" ] || die "Hexagon SDK toolchain missing: $CC"
+
+    echo "== [1/4] kernels lib =="
+    [ -f "$KD/lib/libhvxhmx_v23.signed.so" ] || (cd "$KD" && ./build_libs.sh >/dev/null)
+
+    echo "== [2/4] generic runner (42_gehtp_runner) =="
+    local INC_HEX="-I$HEX/incs -I$HEX/incs/stddef \
+        -I$HEX/rtos/qurt/computev81/include -I$HEX/rtos/qurt/computev81/include/qurt"
+    $CC -mv81 -O2 -mhvx -mhmx -shared -fPIC -std=gnu11 -Wall -mhvx-length=128B \
+        $INC_HEX -I"$KD/include" -I"$KD/examples/common" \
+        -o /tmp/gehtp_runner.so "$KD/examples/42_gehtp_runner/main.c" \
+        "$KD/examples/common/example_util.c" -L"$KD/lib" -lhvxhmx_v23 -lc -ldl -lgcc
+    local ng
+    ng=$("$HT/Tools/bin/hexagon-llvm-objdump" -d /tmp/gehtp_runner.so | grep -c vgather || true)
+    [ "$ng" = "0" ] || die "vgather 铁律违反 ($ng)"
+    python3 "$SWIV" -i /tmp/gehtp_runner.so -o /tmp/gehtp_runner.so.signed 2>&1 | tail -1
+
+    echo "== [3/4] push to $device =="
+    adb -s "$device" shell "mkdir -p $GDIR" >/dev/null
+    adb -s "$device" push "$KD/lib/libhvxhmx_v23.signed.so" "$DEVROOT/libhvxhmx_v23.so" >/dev/null
+    adb -s "$device" push /tmp/gehtp_runner.so.signed "$DEVROOT/gehtp_runner.so" >/dev/null
+    adb -s "$device" shell "test -x $DEVROOT/run_main_on_hexagon" 2>/dev/null \
+        || die "run_main_on_hexagon 装载器不在 $DEVROOT (从既有部署拷贝)"
+
+    echo "== [4/4] done =="
+    echo "device side ready: $DEVROOT/{libhvxhmx_v23.so, gehtp_runner.so, run_main_on_hexagon}"
+}
+
+case "${1:-}" in
+    compile) shift; cmd_compile "$@";;
+    run)     shift; cmd_run "$@";;
+    setup)   shift; cmd_setup "$@";;
+    *) echo "usage: gehtp {compile|run|setup} ..." >&2; exit 1;;
+esac
