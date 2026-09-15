@@ -176,6 +176,18 @@ void run_phase_fixpoint(GraphPrepare* gp) {
     }
 }
 
+// 遗留 8-rule 融合表(见头文件注释: 自造、非设备准入、已移出主路径)
+const std::vector<FusionRule> kLegacyFusionRules = {
+    {"Conv",    "Relu",    "ConvActivations"},
+    {"Conv",    "Clamp",   "ConvActivations"},
+    {"MatMul",  "Add",     "MatMul"},
+    {"MatMul",  "Gelu",    "MatMul"},
+    {"MatMul",  "Relu",    "MatMul"},
+    {"Add",     "Relu",    "Add"},
+    {"Add",     "Sigmoid", "Add"},
+    {"Dense",   "Add",     "Dense"},
+};
+
 // Merge optimization registries
 // Source: merge_optimization_passes @ 0x11C0640 (13787 bytes)
 std::map<uint32_t, GraphOptPass> merge_optimization_passes(

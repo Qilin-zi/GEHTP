@@ -37,11 +37,6 @@ using namespace hnnx;
 
 namespace {
 
-struct ConvExtraInfoFixed {
-    uint32_t sh, sw, ph_begin, ph_end, pw_begin, pw_end, dh, dw, group, kh, kw;
-    uint64_t weight_src, bias_src;
-};
-
 // f32 → f16 (round-to-nearest-even, 软件实现; 与 numpy astype 语义一致)
 uint16_t f32_to_f16_rne(float f) {
     uint32_t u;
@@ -137,6 +132,18 @@ struct Emitter {
     std::vector<uint32_t> free_temps;      // 活性分析释放的 temp(M2)
     std::map<uint64_t, uint32_t> last_use; // 复合键 → 最后消费位置(plan_order 下标)
 
+    // 第7步阶段一: 静态 DDR 偏移表(emit 层注入)
+    bool ddr_static = false;
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> ddr_op_map;  // op_id → {offset, size}
+    std::unordered_map<uint64_t, bool> ddr_op_vtcm;                          // op_id → in_vtcm
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> ddr_temp_tab;          // temp_id → {offset, size}
+    std::map<uint32_t, bool> ddr_temp_vtcm;                                  // temp_id → in_vtcm
+    uint64_t ddr_static_cap = 0;   // 编译期静态区大小(表外 temp 池尾 bump)
+    uint64_t ddr_vtcm_cap = 0;     // VTCM 驻留池大小(0=无驻留)
+    // 阶段二: 溢出张量 → SPILL/FILL 插桩
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> ddr_spill_map;  // op_id → {溢出区偏移, size}
+    uint32_t spill_pool_slot = 0;
+
     static uint64_t tkey(uint64_t op_id, uint32_t out_idx) {
         return (op_id << 32) | out_idx;
     }
@@ -165,6 +172,17 @@ struct Emitter {
         if (!free_temps.empty()) { t = free_temps.back(); free_temps.pop_back(); }
         else { t = next_temp++; }
         op_temp[tkey(op_id, out_idx)] = t;
+        if (ddr_static) {
+            /* 静态模式: 表内(op_id 命中且 out_idx==0)登记编译期偏移;
+             * 表外(广播物化/cols/多输出)不登记 → 设备侧回落池尾 bump */
+            auto dit = ddr_op_map.find(op_id);
+            if (dit != ddr_op_map.end() && out_idx == 0) {
+                ddr_temp_tab[t] = dit->second;
+                auto vit = ddr_op_vtcm.find(op_id);
+                if (vit != ddr_op_vtcm.end() && vit->second)
+                    ddr_temp_vtcm[t] = true;
+            }
+        }
         if (next_temp > 32768) {
             std::fprintf(stderr, "error: >32768 live temps (live=%zu free=%zu released=%llu calls=%llu miss=%llu kept=%llu)\n",
                          op_temp.size(), free_temps.size(),
@@ -464,12 +482,16 @@ static uint32_t qnn_neuron_to_sub(uint32_t op) {
 
 int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& out_path, const std::string& manifest_path,
-         const std::string& gguf_path, const std::string& match_path) {
+         const std::string& gguf_path, const std::string& match_path,
+         uint64_t ddr_budget = 0, uint64_t vtcm_budget = 0) {
     // 1. deserialize .bin
     std::vector<uint8_t> bin;
     if (!load_file(bin_path, bin)) { std::fprintf(stderr, "error: cannot open %s\n", bin_path.c_str()); return 2; }
     GraphPrepare gp;
     if (!gp.deserialize(bin.data(), bin.size())) { std::fprintf(stderr, "error: deserialize failed\n"); return 2; }
+
+    // 1b. 第7步阶段一: 静态 DDR 偏移(编译期生命期分配, 打包进 TEMPOFF 槽)。
+    //     compute 在 Emitter em 声明后执行(见下方 ddr_static 块)。
 
     // 2. 图级信息
     // 主输入 = Input 节点按 op_id 升序首项(与输入槽分配同约定;
@@ -498,6 +520,36 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     uint32_t C = input_op->output_def.rank >= 4 ? (uint32_t)input_op->output_def.dims[3] : 1;
 
     Emitter em;
+    if (ddr_budget > 0) {
+        std::vector<GraphPrepare::DdrTempEntry> ddr_entries;
+        uint64_t ddr_cap = 0;
+        std::vector<GraphPrepare::DdrSpillEntry> ddr_spills;
+        uint64_t spill_total = 0;
+        if (gp.compute_ddr_offsets(ddr_budget, &ddr_entries, &ddr_cap,
+                                   &ddr_spills, &spill_total,
+                                   vtcm_budget, &em.ddr_vtcm_cap) != 0) {
+            std::fprintf(stderr, "error: compute_ddr_offsets failed\n");
+            return 2;
+        }
+        for (const auto& e : ddr_entries) {
+            em.ddr_op_map[e.op_id] = {(uint32_t)e.offset, (uint32_t)e.size};
+            if (e.in_vtcm) em.ddr_op_vtcm[e.op_id] = true;
+        }
+        em.ddr_static_cap = ddr_cap;
+        em.ddr_static = true;
+        std::fprintf(stderr, "[ddr] static pool cap=%llu vtcm_cap=%llu n_temps=%zu\n",
+                     (unsigned long long)ddr_cap, (unsigned long long)em.ddr_vtcm_cap,
+                     ddr_entries.size());
+        // 阶段二: 溢出张量的独立溢出区(SPILL/FILL 搬运目标)。
+        // spill 池槽的 add_slot 延迟到输入段之后 —— 槽 0 必须是主输入
+        // (src_ref 对 input_node_id 硬编码 0x8000|0), 提前建会占位错位。
+        for (const auto& e : ddr_spills)
+            em.ddr_spill_map[e.op_id] = {(uint32_t)e.offset, (uint32_t)e.size};
+        if (spill_total > 0) {
+            std::fprintf(stderr, "[ddr] spill pool total=%llu n_spilled=%zu\n",
+                         (unsigned long long)spill_total, ddr_spills.size());
+        }
+    }
 
     // 输入槽: 主输入 = slot0 EXT_IN; 其余图输入(--input-f16 逗号分隔
     // 后续文件, 或全零)固化为普通槽 — 全注意力层 cos/sin/mask 静态化。
@@ -549,6 +601,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             }
             em.input_slots[in_ids[k]] = sid;
         }
+    }
+
+    // 2a2. 阶段二: spill 池槽(必须在输入段之后; 槽 0 = 主输入不可占)
+    if (em.ddr_static && !em.ddr_spill_map.empty() && em.spill_pool_slot == 0) {
+        uint64_t spill_total = 0;
+        for (const auto& [k, v] : em.ddr_spill_map)
+            spill_total = std::max<uint64_t>(spill_total, (uint64_t)v.first + v.second);
+        std::vector<uint8_t> zeros((size_t)spill_total, 0);
+        em.spill_pool_slot = em.add_slot((uint32_t)spill_total,
+                                         (uint32_t)(spill_total / 2), zeros.data());
+        std::fprintf(stderr, "[ddr] spill pool slot=%u total=%llu\n",
+                     em.spill_pool_slot, (unsigned long long)spill_total);
     }
 
     // 2b. GGUF 供给(M2c): 读 TSV 匹配表 + GGUF 文件
@@ -689,6 +753,17 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             }
             if (is_param) continue;
         }
+        // 阶段二插桩(前): 消费溢出张量的 op 前插 FILL(溢出区 → scratch temp)
+        if (em.ddr_static && !em.ddr_spill_map.empty()) {
+            for (const auto& c : od->inputs) {
+                auto sit = em.ddr_spill_map.find(c.src_id);
+                if (sit == em.ddr_spill_map.end()) continue;
+                auto tit = em.op_temp.find(Emitter::tkey(c.src_id, c.out_idx));
+                if (tit == em.op_temp.end()) continue;  // 未物化(如 const 引用)
+                em.add_op(OP_FILL, {em.spill_pool_slot, (uint32_t)sit->second.first,
+                                    tit->second, (uint32_t)(sit->second.second / 2)});
+            }
+        }
         do {
 
         if (nm == "Transpose") {
@@ -718,13 +793,13 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
         if (nm == "Conv2d") {
             // extra_info: 60B fixed + tiling 段
-            if (od->serialized_extra.size() < sizeof(ConvExtraInfoFixed) + 16) {
+            if (od->serialized_extra.size() < sizeof(ExtraConv) + 16) {
                 std::fprintf(stderr, "error: conv extra too short\n"); return 2;
             }
-            ConvExtraInfoFixed e;
+            ExtraConv e;
             std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
             uint32_t hdr[4];
-            std::memcpy(hdr, od->serialized_extra.data() + sizeof(ConvExtraInfoFixed), 16);
+            std::memcpy(hdr, od->serialized_extra.data() + sizeof(ExtraConv), 16);
 
             // 受支持几何门(特性门): dh=dw=1、s1、group=1、same-pad
             if (e.dh != 1 || e.dw != 1 || e.sh != 1 || e.sw != 1 || e.group != 1) {
@@ -741,7 +816,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
             uint32_t num_tiles = hdr[3];
             const uint32_t* descs = reinterpret_cast<const uint32_t*>(
-                od->serialized_extra.data() + sizeof(ConvExtraInfoFixed) + 16);
+                od->serialized_extra.data() + sizeof(ExtraConv) + 16);
             if (num_tiles == 0) {  // 旧流/未分块: 整图单 tile
                 num_tiles = 1;
             }
@@ -1123,6 +1198,19 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         std::fprintf(stderr, "error: unsupported op '%s' in wtop_emit\n", nm.c_str());
         return 4;
         } while (0);
+        // 阶段二插桩(后): 溢出张量的生产 op 后插 SPILL(scratch temp → 溢出区)
+        // 必须在 release 之前: release 会回收 temp 复用到后续 op。
+        if (em.ddr_static && !em.ddr_spill_map.empty()) {
+            auto sit = em.ddr_spill_map.find(id);
+            if (sit != em.ddr_spill_map.end()) {
+                auto tit = em.op_temp.find(Emitter::tkey(id, 0));
+                if (tit != em.op_temp.end()) {
+                    em.add_op(OP_SPILL, {tit->second, em.spill_pool_slot,
+                                         (uint32_t)sit->second.first,
+                                         (uint32_t)(sit->second.second / 2)});
+                }
+            }
+        }
         // 活性: 本 op 的输入已消费, 释放其 temp
         for (const auto& c : od->inputs)
             em.release_at(Emitter::tkey(c.src_id, c.out_idx), pos);
@@ -1146,6 +1234,38 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             spill_pool_slot = em.add_slot((uint32_t)pool_end, (uint32_t)pool_end / 2, zeros.data());
         }
         continue;
+    }
+
+    // 5b. 第7步阶段一: 静态 temp 偏移表 → TEMPOFF 槽
+    // [cap u32][reserve u32][n u32][n × {temp_id u32, offset u32, size u32}]
+    // 第7步阶段二: reserve 高 16 位 = VTCM 池大小; VTCM 驻留项 temp_id
+    // 带 0x4000 标记(WT_REF_VTCM_FLAG)。
+    if (em.ddr_static) {
+        uint32_t reserve = (uint32_t)std::max<uint64_t>(4u << 20, em.ddr_static_cap / 4);
+        reserve &= 0xFFFFu;
+        reserve |= ((uint32_t)em.ddr_vtcm_cap & 0xFFFFu) << 16;
+        std::vector<uint8_t> tab;
+        auto put32 = [&](uint32_t v) {
+            for (int i = 0; i < 4; i++) tab.push_back((uint8_t)(v >> (8 * i)));
+        };
+        put32((uint32_t)em.ddr_static_cap);
+        put32(reserve);
+        put32((uint32_t)em.ddr_temp_tab.size());
+        for (const auto& [tid, offsz] : em.ddr_temp_tab) {
+            uint32_t tagged_tid = tid;
+            if (em.ddr_temp_vtcm.count(tid) && em.ddr_temp_vtcm.at(tid))
+                tagged_tid |= WT_REF_VTCM_FLAG;
+            put32(tagged_tid);
+            put32(offsz.first);
+            put32(offsz.second);
+        }
+        uint32_t sid = em.add_slot((uint32_t)tab.size(),
+                                   (uint32_t)(tab.size() / 4), tab.data());
+        em.slots[sid].addr = WT_SLOT_TEMPOFF;
+        std::fprintf(stderr, "[ddr] TEMPOFF slot %u: cap=%llu vtcm_cap=%llu n_temps=%zu (vtcm=%zu)\n",
+                     sid, (unsigned long long)em.ddr_static_cap,
+                     (unsigned long long)em.ddr_vtcm_cap,
+                     em.ddr_temp_tab.size(), em.ddr_temp_vtcm.size());
     }
 
     // 6. 组装 blob
@@ -1240,6 +1360,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
 int main(int argc, char** argv) {
     std::string bin_path, in_f16, out_path, manifest_path, gguf_path, match_path;
+    uint64_t ddr_budget = 0;   // --ddr-budget: 第7步阶段一静态 DDR 池(0=禁用)
+    uint64_t vtcm_budget = 0;  // --vtcm-budget: 第7步阶段二 VTCM 驻留池(0=禁用)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -1249,11 +1371,14 @@ int main(int argc, char** argv) {
         else if (a == "--manifest") manifest_path = next();
         else if (a == "--gguf") gguf_path = next();
         else if (a == "--match") match_path = next();
+        else if (a == "--ddr-budget") ddr_budget = strtoull(next().c_str(), nullptr, 0);
+        else if (a == "--vtcm-budget") vtcm_budget = strtoull(next().c_str(), nullptr, 0);
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (bin_path.empty() || out_path.empty()) {
-        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>]\n");
+        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ddr-budget <bytes>] [--vtcm-budget <bytes>]\n");
         return 2;
     }
-    return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path);
+    return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path,
+                ddr_budget, vtcm_budget);
 }

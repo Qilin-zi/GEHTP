@@ -318,6 +318,45 @@ public:
     // 铁律: 调用方必须先算出值 —— 无值不折叠(M3c: 只标 OP_CONST 不存值
     // 会让 emit 跳过 op → 消费方读空槽 → 数值错)。返回 false = 图不动。
     bool fold_op_to_const(OpDef* op, const uint8_t* data, size_t data_len);
+    // 第7步阶段一: 静态 DDR 偏移。
+    struct DdrTempEntry {
+        op_id_t op_id;
+        uint64_t offset;  // 池内字节偏移 (128 对齐)
+        uint64_t size;    // 字节数 (128 对齐)
+        bool in_vtcm;     // true=VTCM 驻留池; false=DDR 池
+    };
+    // 溢出张量(预算装不下): 独立溢出区偏移(确定性 bump, 按 op_id 升序)。
+    // 阶段二: 生产 op 后插 SPILL(scratch→溢出区), 消费 op 前插 FILL。
+    struct DdrSpillEntry {
+        op_id_t op_id;
+        uint64_t offset;  // 溢出区字节偏移 (128 对齐)
+        uint64_t size;    // 字节数 (128 对齐)
+    };
+    // 按执行序生命期做两级区间分配(复用 FancyAllocator
+    // allocate_with_lifetime, 各池独立算):
+    //   - vtcm_budget>0: 先跑 VTCM 池(驻留, in_vtcm=true);
+    //     装不下的进 DDR 池(budget), 再装不下的进溢出区。
+    //   - vtcm_budget=0: 全 DDR(budget)。
+    // entries = 表内张量(生命期复用); spilled_out = 溢出张量(独占溢出区)。
+    // 返回 0=成功; -1=无执行序。cap_out/vtcm_cap_out/spill_total_out 回填。
+    int compute_ddr_offsets(uint64_t budget, std::vector<DdrTempEntry>* entries,
+                            uint64_t* cap_out,
+                            std::vector<DdrSpillEntry>* spilled_out = nullptr,
+                            uint64_t* spill_total_out = nullptr,
+                            uint64_t vtcm_budget = 0,
+                            uint64_t* vtcm_cap_out = nullptr);
+    // 同上 + 写 TSV(kernels/host/check_offsets 消费)。
+    // 返回 0=成功; -1=无执行序; -2=写文件失败。注意: 必须在全部图变换
+    // (opt pass/融合)之后调用 —— 生命期依赖最终图。
+    int emit_ddr_offset_table(const char* path, uint64_t budget);
+
+private:
+    void finalize_spills(
+        const std::vector<const fa::FancyAllocator::AllocRequest*>& spill_reqs,
+        std::vector<DdrSpillEntry>* spilled_out,
+        uint64_t* spill_total_out,
+        uint64_t total);
+public:
     void note_new_node(const OpDef& opdef, const char* str, uint32_t len);
     void note_replace(op_id_t old, const std::vector<struct OpRef>& refs,
                       op_id_t new_id, uint32_t idx, const std::string& str);

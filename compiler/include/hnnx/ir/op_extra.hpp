@@ -71,7 +71,16 @@ struct ExtraTranspose {
     int64_t perm[5];         // +4..+43
 };
 
-// DepthWiseConv2d(SSM conv 等): 几何字段(ConvExtraInfoFixed 的缩减版)
+// Conv2d: 60B 固定头(全小端 u32/u64, 设备侧同构解析), 后随 tiling 段
+// [u32 tile_h][u32 tile_w][u32 co_per_tile][u32 num_tiles][ConvTileDesc × num_tiles]
+struct ExtraConv {
+    uint32_t sh = 1, sw = 1;
+    uint32_t ph_begin = 0, ph_end = 0, pw_begin = 0, pw_end = 0;
+    uint32_t dh = 1, dw = 1, group = 1, kh = 1, kw = 1;
+    uint64_t weight_src = 0, bias_src = 0;
+};
+
+// DepthWiseConv2d(SSM conv 等): 几何字段(ExtraConv 的缩减版)
 struct ExtraDepthwiseConv {
     uint32_t kh;             // +0
     uint32_t kw;             // +4

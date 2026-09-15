@@ -17,6 +17,7 @@
 
 #include "hnnx/frontend/qnn_ir_loader.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
+#include "hnnx/opt/pass_manager.hpp"
 #include "hnnx/schedule/scheduler.hpp"
 #include "hnnx/serialize/context_binary_writer.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
@@ -48,6 +49,10 @@ static void usage() {
         "  --vtcm-budget <n>  VTCM 预算字节(0=默认 8MB; 小值强制溢出)\n"
         "  --output <path>     Output context binary path (default: output.bin)\n"
         "  --graph-name <name>  Graph name (default: from net.json or 'compiled_graph')\n"
+        "  --no-pass <name>    关闭单个图优化 pass(可重复; 默认全开)\n"
+        "  --opt-stats         打印各 pass 匹配/折叠统计与前后条目数\n"
+        "  --ddr-offsets <tsv> 第7步阶段一: 导出静态 DDR 偏移表 TSV(check_offsets 消费)\n"
+        "  --ddr-budget <n>    DDR 池字节(0=总尺寸和)\n"
         "  --verbose           Print detailed compilation info\n"
         "  --help              Show this help\n");
 }
@@ -253,6 +258,9 @@ int main(int argc, char** argv) {
     std::string output_format = "qnn";   // qnn=路径A | tagged=我方 runlist
     uint64_t vtcm_budget = 0;           // 0=默认 8MB; 阶段7: 小预算强制溢出(spill/fill)
     bool verbose = false;
+    bool opt_stats = false;             // --opt-stats: prepare 后打印 pass 统计
+    std::string ddr_offsets_path;       // --ddr-offsets: 第7步阶段一静态偏移表 TSV
+    uint64_t ddr_budget = 0;            // --ddr-budget: DDR 池字节(0=总尺寸和)
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -264,6 +272,10 @@ int main(int argc, char** argv) {
         else if (arg == "--format" && i+1 < argc) output_format = argv[++i];
         else if (arg == "--vtcm-budget" && i+1 < argc) vtcm_budget = strtoull(argv[++i], nullptr, 0);
         else if (arg == "--graph-name" && i+1 < argc) graph_name = argv[++i];
+        else if (arg == "--no-pass" && i+1 < argc) PassManager::instance().disable(argv[++i]);
+        else if (arg == "--opt-stats") opt_stats = true;
+        else if (arg == "--ddr-offsets" && i+1 < argc) ddr_offsets_path = argv[++i];
+        else if (arg == "--ddr-budget" && i+1 < argc) ddr_budget = strtoull(argv[++i], nullptr, 0);
         else if (arg == "--verbose" || arg == "-v") verbose = true;
         else {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
@@ -340,6 +352,22 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("[2] Graph prepared (optimized)\n");
+    if (opt_stats) {
+        std::printf("[opt-stats] %s\n",
+                    PassManager::instance().stats_line().c_str());
+    }
+    if (!ddr_offsets_path.empty()) {
+        // 第7步阶段一: 静态 DDR 偏移表(必须在全部图变换之后 —— 生命期
+        // 依赖最终图, prepare 已含 opt pass/融合)
+        int rc = gp.emit_ddr_offset_table(ddr_offsets_path.c_str(), ddr_budget);
+        if (rc != 0) {
+            std::fprintf(stderr, "Error: emit_ddr_offset_table failed (%d)\n", rc);
+            return 1;
+        }
+        std::printf("[ddr-offsets] %s (budget=%llu)\n",
+                    ddr_offsets_path.c_str(),
+                    (unsigned long long)ddr_budget);
+    }
 
     // ---- tagged 产品路径(阶段8): 跳过路径A重放, 直接我方 runlist ----
     if (output_format == "tagged") {

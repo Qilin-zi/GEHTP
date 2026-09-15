@@ -121,4 +121,9 @@ struct FusionRule {
 // 应用所有 fusion 规则，返回融合的 op 数。
 int apply_fusion_rules(GraphPrepare* gp, const std::vector<FusionRule>& rules);
 
+// 遗留 8-rule 融合表(自造, 非设备准入: 产出的 ConvActivations/Add 激活
+// 变体 wtop_emit 无翻译, exec_conv2d/add/binary 无激活参数)。已移出主路径,
+// 保留为 test_e2e 与历史对拍的契约。
+extern const std::vector<FusionRule> kLegacyFusionRules;
+
 } // namespace hnnx

@@ -239,10 +239,6 @@ void GraphPrepare::inject_htp_prepare_inputs() {
         } else if (nm == "ElementWiseBinary") {
             add_input(opdef, get_or_create("or_" + nm, 50, 1,1,1,1, 4, 4));
 
-        } else if (nm == "Transpose") {
-            for (op_id_t tpid : opdef->tensor_param_ids)
-                add_input(opdef, tpid);
-
         } else if (nm == "Reshape") {
             // [data] — no injected inputs
         }
@@ -1490,16 +1486,6 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
 namespace {
 using ExtraInfoFn = std::vector<uint8_t>(*)(const GraphPrepare& gp, const OpDef& opdef);
 
-// ConvExtraInfo 固定二进制布局(全小端 u32/u64, 设备侧同构解析):
-//   [sh][sw][ph_begin][ph_end][pw_begin][pw_end][dh][dw][group][kh][kw]
-//   [u64 weight_src][u64 bias_src]
-struct ConvExtraInfo {
-    uint32_t sh = 1, sw = 1;
-    uint32_t ph_begin = 0, ph_end = 0, pw_begin = 0, pw_end = 0;
-    uint32_t dh = 1, dw = 1, group = 1, kh = 1, kw = 1;
-    uint64_t weight_src = 0, bias_src = 0;
-};
-
 const OpDef* find_param_const(const GraphPrepare& gp, const OpDef& opdef, const char* key) {
     for (const auto& c : opdef.inputs) {
         const OpDef* s = gp.get_op_at(c.src_id);
@@ -1531,7 +1517,7 @@ std::vector<uint32_t> read_param_u32(const GraphPrepare& gp, const OpDef* p, siz
 }
 
 std::vector<uint8_t> extract_conv_extra(const GraphPrepare& gp, const OpDef& opdef) {
-    ConvExtraInfo e;
+    ExtraConv e;
     // kh/kw 来自权重 const 的 output_def (inputs[1] = W, dims [Kh,Kw,Cin,Cout])
     if (opdef.inputs.size() > 1) {
         e.weight_src = opdef.inputs[1].src_id;
@@ -1603,8 +1589,8 @@ std::vector<uint8_t> extract_conv_extra(const GraphPrepare& gp, const OpDef& opd
         }
     }
 
-    std::vector<uint8_t> out(sizeof(ConvExtraInfo));
-    std::memcpy(out.data(), &e, sizeof(ConvExtraInfo));
+    std::vector<uint8_t> out(sizeof(ExtraConv));
+    std::memcpy(out.data(), &e, sizeof(ExtraConv));
 
     // Tiling 段(阶段6, 通用): [u32 tile_h][u32 tile_w][u32 co_per_tile]
     //                          [u32 num_tiles][ConvTileDesc × num_tiles]

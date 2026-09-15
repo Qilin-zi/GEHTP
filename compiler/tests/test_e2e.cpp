@@ -1,5 +1,6 @@
 ﻿#include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/ir/op_registry.hpp"
+#include "hnnx/opt/optimization_passes.hpp"  // kLegacyFusionRules / apply_fusion_rules
 #include "hnnx/api/hexagon_nn_env.hpp"
 #include "hnnx/vtcm/fancy_allocator.hpp"
 #include "hnnx/serialize/serializer.hpp"
@@ -100,8 +101,11 @@ int main() {
     assert(conv_op->inputs[1].src_id == 1);
     std::cout << "[6c] Graph structure verified: Conv has 2 inputs\n";
 
-    // 4. Run optimization passes
+    // 4. Run optimization passes (PassManager 结构匹配 pass, 本图无匹配不动)
     gp.run_optimize_passes(env);
+    // 4b. 遗留 8-rule 融合表已移出主路径(自造且非设备准入), 契约保留:
+    //     直接调 apply_fusion_rules 验证(见 kLegacyFusionRules 注释)。
+    apply_fusion_rules(&gp, kLegacyFusionRules);
     std::cout << "[7] Optimization passes complete\n";
 
     // 6b. Verify fusion: Conv+Relu should have fused into ConvActivations.

@@ -21,6 +21,9 @@ add_library(htp_core STATIC
     src/ir/op_registry.cpp
     src/opt/optimization_passes.cpp
     src/opt/fixpoint.cpp
+    src/opt/pass_manager.cpp
+    src/opt/pass_const_fold.cpp
+    src/opt/pass_shape_fold.cpp
     src/cost/cost_model.cpp
     src/vtcm/fancy_allocator.cpp
     src/vtcm/cp_solver.cpp
@@ -44,6 +47,7 @@ add_library(htp_core STATIC
     src/tens/interface_table.cpp
     src/tens/shape.cpp
     src/vtcm/alloc_io_tensors_m38.cpp
+    src/vtcm/ddr_offsets.cpp
     src/vtcm/create_supertiles_m36.cpp
     src/vtcm/phys_alloc_m37.cpp
     src/vtcm/spillfill_g4.cpp
@@ -80,6 +84,10 @@ add_test(NAME test_ir COMMAND test_ir)
 add_executable(test_e2e tests/test_e2e.cpp)
 target_link_libraries(test_e2e htp_core)
 add_test(NAME test_e2e COMMAND test_e2e)
+
+add_executable(test_opt_passes tests/test_opt_passes.cpp)
+target_link_libraries(test_opt_passes htp_core)
+add_test(NAME test_opt_passes COMMAND test_opt_passes)
 
 add_executable(test_execute_chain tests/test_execute_chain.cpp)
 target_link_libraries(test_execute_chain htp_core)
