@@ -84,12 +84,23 @@ static const uint8_t* ref_ptr(const struct wt_blob* b, uint32_t arg) {
     return (arg < MAX_TEMPS) ? g_exec.temps[arg] : NULL;
 }
 
+/* 引用元素数(f16 元素): slot → count; temp → temp_bytes/2; VTCM 未跟踪=0 */
+static uint32_t ref_elem_count(const struct wt_blob* b, uint32_t arg) {
+    if (arg & 0x8000u) { uint32_t s = arg & 0x7FFFu; return (s < b->n_slots) ? b->slots[s].count : 0; }
+    if (arg & 0x4000u) return 0;
+    return (arg < MAX_TEMPS) ? g_exec.temp_bytes[arg] / 2u : 0;
+}
+
 uint8_t* wt_exec_temp(uint32_t id) {
     return (id < MAX_TEMPS) ? g_exec.temps[id] : NULL;
 }
 
 uint32_t wt_exec_temp_bytes(uint32_t id) {
     return (id < MAX_TEMPS) ? g_exec.temp_bytes[id] : 0;
+}
+
+uint32_t wt_exec_temp_last_bytes(uint32_t id) {
+    return (id < MAX_TEMPS) ? g_last_bytes[id] : 0;
 }
 
 static void cpu_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
@@ -568,6 +579,25 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
                        char* err, size_t errn) {
     uint32_t a_t = op->args[0], b_t = op->args[1], y_t = op->args[2];
     uint32_t n = op->args[3], subtype = op->args[4];
+    if (subtype == 8) {
+        /* SELECT 三元: 编码 [c,a,b,out,8] 5 参数形态(无 n): args[0]=c(cond),
+           args[1]=a(真值), args[2]=b(假值), args[3]=out。n=真值元素数;
+           cond/假值允许标量(count==1)广播。M4.2b 首撞: 通用解码会把
+           假值 slot 当 y_t → temp_get NULL → binary ref fail。 */
+        const uint16_t* c = (const uint16_t*)ref_ptr(b, a_t);
+        const uint16_t* tv = (const uint16_t*)ref_ptr(b, b_t);
+        const uint16_t* fv = (const uint16_t*)ref_ptr(b, y_t);
+        uint32_t cn = ref_elem_count(b, a_t), an = ref_elem_count(b, b_t);
+        uint32_t fn = ref_elem_count(b, y_t);
+        uint16_t* y = (uint16_t*)temp_get(op->args[3], an * 2u);
+        if (!c || !tv || !fv || !y || an == 0) { snprintf(err, errn, "select ref fail"); return -1; }
+        for (uint32_t i = 0; i < an; i++) {
+            float cv = f16_to_f32(c[cn <= 1u ? 0 : i]);
+            float r = (cv != 0.0f) ? f16_to_f32(tv[i]) : f16_to_f32(fv[fn <= 1u ? 0 : i]);
+            y[i] = f32_to_f16(r);
+        }
+        return 0;
+    }
     const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
     const uint16_t* bb = (const uint16_t*)ref_ptr(b, b_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, n * 2u);
@@ -575,18 +605,12 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
     for (uint32_t i = 0; i < n; i++) {
         float x0 = f16_to_f32(a[i]), x1 = f16_to_f32(bb[i]);
         float r = x0;
-        if (subtype == 8) {
-            /* SELECT 三元: 编码 [c,a,b,out,8] 的 5 参数形态: args[0]=c(cond),
-               args[1]=a(真值), args[2]=b(假值), args[3]=out, args[4]=8 */
-            r = (x0 != 0.0f) ? x1 : 0.0f;
-        } else {
-            switch (subtype) {
-            case 0: r = x0 + x1; break;
-            case 1: r = x0 - x1; break;
-            case 2: r = x0 * x1; break;
-            case 3: r = (x1 != 0) ? x0 / x1 : 0.0f; break;
-            default: break;
-            }
+        switch (subtype) {
+        case 0: r = x0 + x1; break;
+        case 1: r = x0 - x1; break;
+        case 2: r = x0 * x1; break;
+        case 3: r = (x1 != 0) ? x0 / x1 : 0.0f; break;
+        default: break;
         }
         y[i] = f32_to_f16(r);
     }
@@ -976,12 +1000,73 @@ static int exec_argmax(const struct wt_blob* b, const struct wt_op* op,
 
 /* 执行 ops[first, first+count)。返回 0=全过; >0 = 失败的 op 序号 (blob 内 1 基)。
  * op_us[i] = 本段第 i 个 op 微秒 (可 NULL)。 */
+/* 第7步阶段一: TEMPOFF 槽解析(run_range 共用) —— 从 blob 槽表扫 TEMPOFF
+ * 槽, 建静态偏移表 + VTCM 偏移表 + 池。init-once: 同一 blob 的 diag 逐 op
+ * 重复调用 run_range 只解析一次(槽数据在 blob 内, 跨 run 不变); shutdown
+ * 清 static_offsets 后下一个 run 重新解析。 */
+static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn) {
+    if (g_exec.static_offsets) return 0;  /* init-once */
+    for (uint32_t i = 0; i < MAX_TEMPS; i++) {
+        g_exec.static_off_arr[i] = 0xFFFFFFFFu;
+        g_exec.vtcm_off_arr[i] = 0xFFFFFFFFu;
+    }
+    for (uint32_t s = 0; s < b->n_slots; s++) {
+        if (b->slots[s].addr != WT_SLOT_TEMPOFF) continue;
+        const uint8_t* p = b->weight_base + b->slots[s].offset;
+        uint32_t len = b->slots[s].len;
+        if (len < 12u) { snprintf(err, errn, "tempoff slot short"); return -1; }
+        uint32_t cap, reserve, n;
+        memcpy(&cap, p, 4); memcpy(&reserve, p + 4, 4); memcpy(&n, p + 8, 4);
+        if (len < 12u + n * 12u) { snprintf(err, errn, "tempoff table short"); return -1; }
+        if (cap == 0 || cap > 0x80000000u) { snprintf(err, errn, "tempoff cap bad"); return -1; }
+        uint32_t vtcm_cap = (reserve >> 16) * 1024u;
+        reserve = (reserve & 0xFFFFu) * 1024u;
+        uint8_t* pool = memalign(128, (size_t)cap + reserve);
+        if (!pool) { snprintf(err, errn, "tempoff pool alloc"); return -1; }
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t* e = p + 12 + i * 12;
+            uint32_t tid, off, sz;
+            memcpy(&tid, e, 4); memcpy(&off, e + 4, 4); memcpy(&sz, e + 8, 4);
+            uint32_t tid_clean = tid & 0x3FFFu;
+            if (tid_clean >= MAX_TEMPS) {
+                free(pool);
+                snprintf(err, errn, "tempoff tid bad %u", tid_clean);
+                return -1;
+            }
+            if (tid & WT_REF_VTCM_FLAG) {
+                if (vtcm_cap == 0 || off + sz > vtcm_cap) {
+                    free(pool);
+                    snprintf(err, errn, "tempoff vtcm entry bad (tid %u off %u sz %u vtcm_cap %u)",
+                             tid_clean, off, sz, vtcm_cap);
+                    return -1;
+                }
+                g_exec.vtcm_off_arr[tid_clean] = off;
+            } else {
+                if (off + sz > cap) {
+                    free(pool);
+                    snprintf(err, errn, "tempoff entry bad (tid %u off %u sz %u cap %u)",
+                             tid_clean, off, sz, cap);
+                    return -1;
+                }
+                g_exec.static_off_arr[tid_clean] = off;
+            }
+        }
+        wt_exec_pool_init(pool, cap + reserve, cap, g_exec.static_off_arr);
+        /* VTCM 驻留池: wtcache 布局(引擎初始化时补 VTCM 基址) */
+        g_exec.vtcm_pool_size = vtcm_cap;
+        g_exec.vtcm_pool = NULL;  /* 懒初始化: 首个 VTCM 消费 op 时开 wtcache */
+        break;
+    }
+    return 0;
+}
+
 int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                       uint32_t* engine_m, int64_t* op_us, char* err, size_t errn) {
     uint32_t dummy_m = 0;
     if (!engine_m) engine_m = &dummy_m;
     *engine_m = g_exec.engine_ready ? g_exec.e.m : 0;
     if (first + count > b->n_ops) { snprintf(err, errn, "range oob"); return -1; }
+    if (wt_exec_load_tempoff(b, err, errn) != 0) return -1;
     for (uint32_t ii = 0; ii < count; ii++) {
         uint32_t i = first + ii;
         const struct wt_op* op = &b->ops[i];
@@ -1123,64 +1208,6 @@ void wt_exec_get_stats(struct wt_exec_stats* st) {
 int wt_exec_run(const struct wt_blob* b, uint32_t* engine_m,
                 int64_t* op_us, char* err, size_t errn) {
     memset(&g_exec.st, 0, sizeof(g_exec.st));
-    /* 第7步阶段一: TEMPOFF 槽 = 静态 temp 偏移表。
-     * [cap u32][reserve u32][n u32][n × {temp_id u32, offset u32, size u32}]
-     * 表内 temp 静态定址 [0, cap); 表外回落 [cap, cap+reserve) bump。
-     * 第7步阶段二: reserve 高 16 位 = VTCM 池大小(0=无驻留);
-     * 同槽 n 项中 temp_id 带 0x4000 标记的进 VTCM 偏移表。 */
-    {
-        for (uint32_t i = 0; i < MAX_TEMPS; i++) {
-            g_exec.static_off_arr[i] = 0xFFFFFFFFu;
-            g_exec.vtcm_off_arr[i] = 0xFFFFFFFFu;
-        }
-        for (uint32_t s = 0; s < b->n_slots; s++) {
-            if (b->slots[s].addr != WT_SLOT_TEMPOFF) continue;
-            const uint8_t* p = b->weight_base + b->slots[s].offset;
-            uint32_t len = b->slots[s].len;
-            if (len < 12u) { snprintf(err, errn, "tempoff slot short"); return -1; }
-            uint32_t cap, reserve, n;
-            memcpy(&cap, p, 4); memcpy(&reserve, p + 4, 4); memcpy(&n, p + 8, 4);
-            if (len < 12u + n * 12u) { snprintf(err, errn, "tempoff table short"); return -1; }
-            if (cap == 0 || cap > 0x80000000u) { snprintf(err, errn, "tempoff cap bad"); return -1; }
-            uint32_t vtcm_cap = reserve >> 16;
-            reserve &= 0xFFFFu;
-            uint8_t* pool = memalign(128, (size_t)cap + reserve);
-            if (!pool) { snprintf(err, errn, "tempoff pool alloc"); return -1; }
-            for (uint32_t i = 0; i < n; i++) {
-                const uint8_t* e = p + 12 + i * 12;
-                uint32_t tid, off, sz;
-                memcpy(&tid, e, 4); memcpy(&off, e + 4, 4); memcpy(&sz, e + 8, 4);
-                uint32_t tid_clean = tid & 0x3FFFu;
-                if (tid_clean >= MAX_TEMPS) {
-                    free(pool);
-                    snprintf(err, errn, "tempoff tid bad %u", tid_clean);
-                    return -1;
-                }
-                if (tid & WT_REF_VTCM_FLAG) {
-                    if (vtcm_cap == 0 || off + sz > vtcm_cap) {
-                        free(pool);
-                        snprintf(err, errn, "tempoff vtcm entry bad (tid %u off %u sz %u vtcm_cap %u)",
-                                 tid_clean, off, sz, vtcm_cap);
-                        return -1;
-                    }
-                    g_exec.vtcm_off_arr[tid_clean] = off;
-                } else {
-                    if (off + sz > cap) {
-                        free(pool);
-                        snprintf(err, errn, "tempoff entry bad (tid %u off %u sz %u cap %u)",
-                                 tid_clean, off, sz, cap);
-                        return -1;
-                    }
-                    g_exec.static_off_arr[tid_clean] = off;
-                }
-            }
-            wt_exec_pool_init(pool, cap + reserve, cap, g_exec.static_off_arr);
-            /* VTCM 驻留池: wtcache 布局(引擎初始化时补 VTCM 基址) */
-            g_exec.vtcm_pool_size = vtcm_cap;
-            g_exec.vtcm_pool = NULL;  /* 懒初始化: 首个 VTCM 消费 op 时开 wtcache */
-            break;
-        }
-    }
     return wt_exec_run_range(b, 0, b->n_ops, engine_m, op_us, err, errn);
 }
 

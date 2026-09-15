@@ -32,6 +32,8 @@ int wt_exec_run(const struct wt_blob* b, uint32_t* engine_m,
 /* temp id 读取 (MATMUL 写 crouton16 面 / RMSNORM 写 f16 面) */
 uint8_t*  wt_exec_temp(uint32_t id);
 uint32_t  wt_exec_temp_bytes(uint32_t id);
+/* 每 temp 最后写入字节数 (temp_bytes=分配大小, 复用只扩不缩可能大于实际) */
+uint32_t  wt_exec_temp_last_bytes(uint32_t id);
 
 /* 收尾: wtcache_close + temps 释放。任何路径退出前必须调。 */
 void wt_exec_shutdown(void);

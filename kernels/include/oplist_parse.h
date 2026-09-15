@@ -58,7 +58,8 @@ extern "C" {
 #define WT_SLOT_TEMPOFF  0xFFFFFFFDu
 /* 第7步阶段二: VTCM 驻留编码(0x4000|temp_id, 与 0x8000|slot 同族不冲突)
  * 驻留张量 = VTCM 静态偏移表内的 temp; 用时由引擎放 VTCM 基址+偏移。
- * TEMPOFF 槽第 2 字段 reserve 高 16 位 = VTCM 池大小(字节, 0=无 VTCM 驻留)。 */
+ * TEMPOFF 槽 reserve 字段拆两段(u32): [低 16 位=表外 bump 预留 KB] |
+ * [高 16 位=VTCM 池大小 KB](0=无 VTCM 驻留)。 */
 #define WT_REF_VTCM_FLAG 0x4000u
 
 enum {
