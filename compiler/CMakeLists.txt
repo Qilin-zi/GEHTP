@@ -231,10 +231,29 @@ add_executable(hnnx_compile tools/hnnx_compile.cpp)
 target_link_libraries(hnnx_compile htp_core)
 
 # 阶段8: wtop_emit —— tagged .bin → WTOP blob(WTOP 契约头/解析器取 kernels)
+# 算子三件套·host 发射侧: 每算子一文件 tools/wtop_ops/op_<name>.cpp
+# (自注册进 wtop::op_registry; 须直编进目标 — 静态库会被链接器死条带化)
 add_executable(wtop_emit tools/wtop_emit.cpp
+               tools/wtop_ops/op_transpose.cpp
+               tools/wtop_ops/op_conv2d.cpp
+               tools/wtop_ops/op_eltwise_binary.cpp
+               tools/wtop_ops/op_unary.cpp
+               tools/wtop_ops/op_eltwise_ternary.cpp
+               tools/wtop_ops/op_softmax.cpp
+               tools/wtop_ops/op_rmsnorm.cpp
+               tools/wtop_ops/op_matmul.cpp
+               tools/wtop_ops/op_gather.cpp
+               tools/wtop_ops/op_copy_sem.cpp
+               tools/wtop_ops/op_dwconv.cpp
+               tools/wtop_ops/op_concat.cpp
+               tools/wtop_ops/op_strided_slice.cpp
+               tools/wtop_ops/op_split.cpp
+               tools/wtop_ops/op_reduce.cpp
+               tools/wtop_ops/op_cumsum.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
 target_link_libraries(wtop_emit htp_core)
 target_include_directories(wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
+target_include_directories(wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 
 # M4: host_run —— net.json → prepare → execute_host 参考执行(对拍链枢纽)
 add_executable(host_run tools/host_run.cpp)
