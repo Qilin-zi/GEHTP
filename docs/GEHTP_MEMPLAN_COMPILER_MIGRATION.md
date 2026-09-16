@@ -130,7 +130,17 @@ shadow 校验，M3 删除。（历史注脚：旧 `conv_add_pipeline.sh` 本就�
   仍用 bin 序）。
 - **门**：tagged round-trip 测试全绿；conv_add byte-exact ×3；quickstart `SAMPLE ALL GREEN`。
 
-### M2 静态规划收编（核心阶段）
+### M2 静态规划收编（核心阶段）【已落地 db7d2ee】
+
+- 状态：已提交。门全绿——host：conv_add 默认/spill 变体/旧 bin 回退三项 blob 与基线
+  **逐字节全同**（spill 变体全程 TAG_MEM_PLAN 新路径，shadow 重算静默一致）；ctest 44/44。
+  设备：quickstart `SAMPLE ALL GREEN`（3× 32768/32768）；spill 变体（OP_SPILL/FILL 上板）
+  32768/32768 逐字节；**VTCM 双池变体**（--plan-vtcm-budget 262144 → in_vtcm 项 →
+  0x4000 驻留引用）32768/32768 逐字节——TAG_MEM_PLAN → TEMPOFF → 设备 VTCM 驻留
+  全链验证。
+- 偏差注记：开放问题 1 采纳方案 A（hnnx_compile --ddr-budget + 新增 --plan-vtcm-budget，
+  --vtcm-budget 保持阶段7 override 语义不混）；gehtp 第 3 步转发、第 4 步 shadow 期保留。
+- 实施记录：VL 线 152 行已暂存内容提交前被 reset 退回未暂存（工作区无损，已通报）。
 
 - do_prepare2_late：Kahn 后调 `compute_ddr_offsets`（预算来自新旗标）→ 填 `mem_plan_` 成员。
 - serialize：`do_serialize` 在 TAG_PLAN_ORDER 后写 TAG_MEM_PLAN；deserialize 对称读。
