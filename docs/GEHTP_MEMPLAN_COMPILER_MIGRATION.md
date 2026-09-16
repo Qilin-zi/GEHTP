@@ -119,10 +119,10 @@ shadow 校验，M3 删除。（历史注脚：旧 `conv_add_pipeline.sh` 本就�
 
 ### M1 拓扑定稿上提（顺序唯一真相源）【已落地】
 
-- 状态：已提交。host 门全绿——conv_add/spill 变体 blob 与基线**逐字节全同**
+- 状态：已提交（44d5ab8）。门全绿——conv_add/spill 变体 blob 与基线**逐字节全同**
   （tagged.bin 按预期变化：TAG_PLAN_ORDER 改载定稿序）；ctest 44/44
-  （test_scheduler_integration 断言 2 改 M1 语义：同集合+拓扑性）。
-  设备 quickstart 门因设备多窗口互斥待补跑（blob 与已知绿基线逐字节同，风险为零）。
+  （test_scheduler_integration 断言 2 改 M1 语义：同集合+拓扑性）；
+  设备 quickstart `=== SAMPLE ALL GREEN ===`（3× 32768/32768 逐字节）。
 
 - do_prepare2_late（`graph_prepare.cpp:481`，现近空壳）内对 `plan_order_` 做 Kahn 定稿
   （代码从 `wtop_emit.cpp:282-306` 平移，含 orphan 回退与确定性 sort）。
