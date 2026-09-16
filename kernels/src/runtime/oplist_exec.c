@@ -1,4 +1,4 @@
-/* oplist_exec.c — 设备端 op 执行器 (switch 分发, 无图; host 已按依赖序排好)
+/* oplist_exec.c — 设备端 op 执行器 (函数指针表分派, 无图; host 已按依赖序排好)
  *
  * 约定 (对齐 PLAN.md §3; 供给面按字节尺寸认领 — t10 供给栈约定):
  *   MATMUL 的 bias / act_table / out_table 不进 op args, 执行器在 slot 表里按
@@ -1084,6 +1084,187 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
     return 0;
 }
 
+/* ---- 算子执行注册表(算子三件套·设备侧) ----
+ * 每 opcode 一个 xop_* 入口(签名统一 wt_op_exec_fn), 注册进 g_op_exec_table[]。
+ * 加新算子 = 写一个 exec_* 实现 + 一个 xop_* 薄壳 + 表加一项,
+ * 不动 run_range 主循环。语义与旧 switch 逐字等价(统计计数/engine_m
+ * 回传时机/NOP/PIN 内联体/KV 占位)。 */
+struct wt_op_ctx {
+    const struct wt_blob* b;
+    const struct wt_op* op;
+    uint32_t* engine_m;
+    char* err;
+    size_t errn;
+};
+typedef int (*wt_op_exec_fn)(const struct wt_op_ctx* cx);
+
+static int xop_nop(const struct wt_op_ctx* cx) {
+    (void)cx;
+    g_exec.st.nop++;
+    return 0;
+}
+
+static int xop_pin(const struct wt_op_ctx* cx) {
+    const struct wt_blob* b = cx->b;
+    const struct wt_op* op = cx->op;
+    uint32_t s = op->args[0];
+    if (s >= b->n_slots) { snprintf(cx->err, cx->errn, "pin slot oob"); return -1; }
+    g_exec.st.pin++;
+    if (!g_exec.engine_ready) { g_exec.st.pin_skipped++; return 0; }
+    const uint8_t* p = b->weight_base + b->slots[s].offset;
+    uint32_t L = b->slots[s].len;
+    if (L == g_exec.e.k * g_exec.e.n / 2u)
+        cpu_to_vtcm(g_exec.e.wt, p, L);
+    else if (L == (g_exec.e.n / 32u) * 512u)
+        cpu_to_vtcm(g_exec.e.bias, p, L);
+    g_exec.pinned_count++;
+    return 0;
+}
+
+static int xop_matmul_w4a16(const struct wt_op_ctx* cx) {
+    g_exec.st.matmul++;
+    int rc = exec_matmul(cx->b, cx->op, cx->err, cx->errn);
+    *cx->engine_m = g_exec.engine_ready ? g_exec.e.m : 0;
+    return rc;
+}
+
+static int xop_rmsnorm(const struct wt_op_ctx* cx) {
+    g_exec.st.rmsnorm++;
+    return exec_rmsnorm(cx->b, cx->op, *cx->engine_m, cx->err, cx->errn);
+}
+
+static int xop_silu(const struct wt_op_ctx* cx) {
+    g_exec.st.silu++;
+    return exec_silu(cx->op, cx->err, cx->errn);
+}
+
+static int xop_im2col(const struct wt_op_ctx* cx) {
+    g_exec.st.im2col++;
+    return exec_im2col(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_conv2d(const struct wt_op_ctx* cx) {
+    g_exec.st.conv2d++;
+    return exec_conv2d(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_add(const struct wt_op_ctx* cx) {
+    g_exec.st.add++;
+    return exec_add(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_spill(const struct wt_op_ctx* cx) {
+    g_exec.st.spill++;
+    return exec_spill(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_fill(const struct wt_op_ctx* cx) {
+    g_exec.st.fill++;
+    return exec_fill(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_transpose(const struct wt_op_ctx* cx) {
+    g_exec.st.transpose++;
+    return exec_transpose(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_unary(const struct wt_op_ctx* cx) {
+    return exec_unary(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_binary(const struct wt_op_ctx* cx) {
+    return exec_binary(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_softmax(const struct wt_op_ctx* cx) {
+    return exec_softmax(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_concat(const struct wt_op_ctx* cx) {
+    return exec_concat(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_slice(const struct wt_op_ctx* cx) {
+    return exec_slice(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_split(const struct wt_op_ctx* cx) {
+    return exec_split(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_reduce(const struct wt_op_ctx* cx) {
+    return exec_reduce(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_cumsum(const struct wt_op_ctx* cx) {
+    return exec_cumsum(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_conv1d_ssm(const struct wt_op_ctx* cx) {
+    return exec_conv1d_ssm(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_gather(const struct wt_op_ctx* cx) {
+    return exec_gather(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_argmax(const struct wt_op_ctx* cx) {
+    return exec_argmax(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_kv_unimpl(const struct wt_op_ctx* cx) {
+    (void)cx;
+    snprintf(cx->err, cx->errn, "kv op 未实现 (M5)");
+    return -1;
+}
+
+static int xop_matmul_f16(const struct wt_op_ctx* cx) {
+    return exec_matmul_f16(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_rmsnorm2(const struct wt_op_ctx* cx) {
+    return exec_rmsnorm2(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_broadcast(const struct wt_op_ctx* cx) {
+    return exec_broadcast(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_transpose_gen(const struct wt_op_ctx* cx) {
+    return exec_transpose_gen(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static const wt_op_exec_fn g_op_exec_table[] = {
+    [OP_NOP] = xop_nop,
+    [OP_PIN] = xop_pin,
+    [OP_MATMUL_W4A16] = xop_matmul_w4a16,
+    [OP_RMSNORM_F16] = xop_rmsnorm,
+    [OP_SILU_F16] = xop_silu,
+    [OP_IM2COL] = xop_im2col,
+    [OP_CONV2D_F16] = xop_conv2d,
+    [OP_ADD_F16] = xop_add,
+    [OP_SPILL] = xop_spill,
+    [OP_FILL] = xop_fill,
+    [OP_TRANSPOSE_F16] = xop_transpose,
+    [OP_UNARY_F16] = xop_unary,
+    [OP_BINARY_F16] = xop_binary,
+    [OP_SOFTMAX_F16] = xop_softmax,
+    [OP_CONCAT_F16] = xop_concat,
+    [OP_STRIDED_SLICE_F16] = xop_slice,
+    [OP_SPLIT_F16] = xop_split,
+    [OP_REDUCE_F16] = xop_reduce,
+    [OP_CUMSUM_F32] = xop_cumsum,
+    [OP_CONV1D_SSM_F16] = xop_conv1d_ssm,
+    [OP_GATHER_F16] = xop_gather,
+    [OP_ARGMAX_F16] = xop_argmax,
+    [OP_KV_APPEND_F16] = xop_kv_unimpl,
+    [OP_KV_GATHER_F16] = xop_kv_unimpl,
+    [OP_MATMUL_F16] = xop_matmul_f16,
+    [OP_RMSNORM2_F16] = xop_rmsnorm2,
+    [OP_BROADCAST_F16] = xop_broadcast,
+    [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,
+};
+
 int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                       uint32_t* engine_m, int64_t* op_us, char* err, size_t errn) {
     uint32_t dummy_m = 0;
@@ -1095,115 +1276,14 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         uint32_t i = first + ii;
         const struct wt_op* op = &b->ops[i];
         int64_t t0 = HAP_perf_get_time_us();
-        int rc = 0;
-        switch (op->opcode) {
-        case OP_NOP:
-            g_exec.st.nop++;
-            break;
-        case OP_PIN: {
-            uint32_t s = op->args[0];
-            if (s >= b->n_slots) { snprintf(err, errn, "pin slot oob"); rc = -1; break; }
-            g_exec.st.pin++;
-            if (!g_exec.engine_ready) { g_exec.st.pin_skipped++; break; }
-            const uint8_t* p = b->weight_base + b->slots[s].offset;
-            uint32_t L = b->slots[s].len;
-            if (L == g_exec.e.k * g_exec.e.n / 2u)
-                cpu_to_vtcm(g_exec.e.wt, p, L);
-            else if (L == (g_exec.e.n / 32u) * 512u)
-                cpu_to_vtcm(g_exec.e.bias, p, L);
-            g_exec.pinned_count++;
-            break;
-        }
-        case OP_MATMUL_W4A16:
-            g_exec.st.matmul++;
-            rc = exec_matmul(b, op, err, errn);
-            *engine_m = g_exec.engine_ready ? g_exec.e.m : 0;
-            break;
-        case OP_RMSNORM_F16:
-            g_exec.st.rmsnorm++;
-            rc = exec_rmsnorm(b, op, *engine_m, err, errn);
-            break;
-        case OP_SILU_F16:
-            g_exec.st.silu++;
-            rc = exec_silu(op, err, errn);
-            break;
-        case OP_IM2COL:
-            g_exec.st.im2col++;
-            rc = exec_im2col(b, op, err, errn);
-            break;
-        case OP_CONV2D_F16:
-            g_exec.st.conv2d++;
-            rc = exec_conv2d(b, op, err, errn);
-            break;
-        case OP_ADD_F16:
-            g_exec.st.add++;
-            rc = exec_add(b, op, err, errn);
-            break;
-        case OP_SPILL:
-            g_exec.st.spill++;
-            rc = exec_spill(b, op, err, errn);
-            break;
-        case OP_FILL:
-            g_exec.st.fill++;
-            rc = exec_fill(b, op, err, errn);
-            break;
-        case OP_TRANSPOSE_F16:
-            g_exec.st.transpose++;
-            rc = exec_transpose(b, op, err, errn);
-            break;
-        case OP_UNARY_F16:
-            rc = exec_unary(b, op, err, errn);
-            break;
-        case OP_BINARY_F16:
-            rc = exec_binary(b, op, err, errn);
-            break;
-        case OP_SOFTMAX_F16:
-            rc = exec_softmax(b, op, err, errn);
-            break;
-        case OP_CONCAT_F16:
-            rc = exec_concat(b, op, err, errn);
-            break;
-        case OP_STRIDED_SLICE_F16:
-            rc = exec_slice(b, op, err, errn);
-            break;
-        case OP_SPLIT_F16:
-            rc = exec_split(b, op, err, errn);
-            break;
-        case OP_REDUCE_F16:
-            rc = exec_reduce(b, op, err, errn);
-            break;
-        case OP_CUMSUM_F32:
-            rc = exec_cumsum(b, op, err, errn);
-            break;
-        case OP_CONV1D_SSM_F16:
-            rc = exec_conv1d_ssm(b, op, err, errn);
-            break;
-        case OP_GATHER_F16:
-            rc = exec_gather(b, op, err, errn);
-            break;
-        case OP_ARGMAX_F16:
-            rc = exec_argmax(b, op, err, errn);
-            break;
-        case OP_KV_APPEND_F16:
-        case OP_KV_GATHER_F16:
-            snprintf(err, errn, "kv op 未实现 (M5)");
-            rc = -1;
-            break;
-        case OP_MATMUL_F16:
-            rc = exec_matmul_f16(b, op, err, errn);
-            break;
-        case OP_RMSNORM2_F16:
-            rc = exec_rmsnorm2(b, op, err, errn);
-            break;
-        case OP_BROADCAST_F16:
-            rc = exec_broadcast(b, op, err, errn);
-            break;
-        case OP_TRANSPOSE_GEN_F16:
-            rc = exec_transpose_gen(b, op, err, errn);
-            break;
-        default:
+        int rc;
+        if (op->opcode >= sizeof(g_op_exec_table) / sizeof(g_op_exec_table[0]) ||
+            !g_op_exec_table[op->opcode]) {
             snprintf(err, errn, "opcode %u unhandled", (unsigned)op->opcode);
             rc = -1;
+        } else {
+            const struct wt_op_ctx cx = {b, op, engine_m, err, errn};
+            rc = g_op_exec_table[op->opcode](&cx);
         }
         g_exec.st.ops++;
         if (op_us) op_us[ii] = HAP_perf_get_time_us() - t0;
