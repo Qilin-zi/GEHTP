@@ -379,6 +379,9 @@ public:
     }
     bool has_mem_plan() const { return has_mem_plan_; }
     const MemPlan& mem_plan() const { return mem_plan_; }
+    // 路线B(4B 权重外置): true 时 do_serialize 跳过 0xCF56 常量数据块
+    // (19.48GB 超单记录 u32 词数限); TAG_CONST_EXTENT 描述符表照常写。
+    void set_const_pool_external(bool v) { const_pool_external_ = v; }
 
 private:
     void finalize_spills(
@@ -497,6 +500,7 @@ private:
     uint64_t plan_vtcm_budget_ = 0;  // M2: VTCM 驻留池预算
     MemPlan mem_plan_;               // M2: 定稿规划(TAG_MEM_PLAN 载体)
     bool has_mem_plan_ = false;
+    bool const_pool_external_ = false;  // 路线B: 权重外置, 跳过 0xCF56
     struct TimePoint { const char* name; uint64_t timestamp; };
     std::vector<TimePoint> time_points_;
 

@@ -22,7 +22,7 @@ GDIR="$DEVROOT/gehtp"
 die() { echo "gehtp: $*" >&2; exit 1; }
 
 cmd_compile() {
-    local onnx="" out="" vtcm="" ddr="" in_f16="" net_json="" weights="" gguf="" match=""
+    local onnx="" out="" vtcm="" ddr="" in_f16="" net_json="" weights="" gguf="" match="" external=""
     while [ $# -gt 0 ]; do case "$1" in
         -o|--output) out="$2"; shift 2;;
         --vtcm-budget) vtcm="$2"; shift 2;;
@@ -32,6 +32,7 @@ cmd_compile() {
         --weights-bin) weights="$2"; shift 2;;
         --gguf) gguf="$2"; shift 2;;
         --match) match="$2"; shift 2;;
+        --external-weights) external=1; shift;;
         -*) die "unknown flag $1";;
         *) [ -z "$onnx" ] && onnx="$1" || die "unexpected arg $1"; shift;;
     esac; done
@@ -71,6 +72,7 @@ cmd_compile() {
     local c_args=()
     [ -n "$ddr" ] && c_args+=(--ddr-budget "$ddr")
     [ -n "$vtcm" ] && c_args+=(--plan-vtcm-budget "$vtcm")
+    [ -n "$external" ] && c_args+=(--external-weights)
     "$CB/hnnx_compile" --net-json "$work/${name}_net.json" \
         --weights-bin "$work/model.params.bin" --format tagged \
         "${c_args[@]}" \

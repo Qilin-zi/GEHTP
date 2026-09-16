@@ -1387,8 +1387,9 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
         }
         ser.write_tagged_record(TAG_CONST_EXTENT, ext_buf.data(),
                                 static_cast<int>(ext_buf.size()));
-        // 常量数据�?(整块 4 字节对齐)
-        if (!const_pool_.empty()) {
+        // 常量数据�?(整块 4 字节对齐); 路线B 权重外置时跳过
+        // (19.48GB 超单记录 u32 词数限, 权重字节走独立文件)
+        if (!const_pool_.empty() && !const_pool_external_) {
             ser.write_tagged_record(0xCF56, const_pool_.data(),
                                     const_pool_.size());
         }

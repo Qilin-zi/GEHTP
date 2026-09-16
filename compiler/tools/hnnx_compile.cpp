@@ -295,6 +295,7 @@ int main(int argc, char** argv) {
     std::string ddr_offsets_path;       // --ddr-offsets: 第7步阶段一静态偏移表 TSV
     uint64_t ddr_budget = 0;            // --ddr-budget: DDR 池字节(0=不规划; M2 起喂 TAG_MEM_PLAN)
     uint64_t plan_vtcm_budget = 0;      // --plan-vtcm-budget: M2 VTCM 驻留池字节(静态规划用)
+    bool external_weights = false;      // --external-weights: 路线B 权重外置(跳过 0xCF56)
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -311,6 +312,7 @@ int main(int argc, char** argv) {
         else if (arg == "--ddr-offsets" && i+1 < argc) ddr_offsets_path = argv[++i];
         else if (arg == "--ddr-budget" && i+1 < argc) ddr_budget = strtoull(argv[++i], nullptr, 0);
         else if (arg == "--plan-vtcm-budget" && i+1 < argc) plan_vtcm_budget = strtoull(argv[++i], nullptr, 0);
+        else if (arg == "--external-weights") external_weights = true;
         else if (arg == "--verbose" || arg == "-v") verbose = true;
         else {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
@@ -381,6 +383,7 @@ int main(int argc, char** argv) {
     HexagonNNEnv env;
     if (vtcm_budget != 0) gp.set_vtcm_budget(vtcm_budget);
     gp.set_plan_budgets(ddr_budget, plan_vtcm_budget);  // M2: 静态规划预算(0=不规划)
+    if (external_weights) gp.set_const_pool_external(true);  // 路线B: 权重外置
     GraphStatus s = gp.prepare(env);
     if (s != GraphStatus::Success) {
         std::fprintf(stderr, "Error: prepare() failed with status %d\n",
