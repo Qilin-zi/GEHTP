@@ -29,7 +29,8 @@ struct wt_exec {
     struct wtcache_ctx* wc;
     struct dc_arena arena;
     struct dc_w4 e;
-    int engine_ready;
+    int engine_ready;   /* wtcache 已开(懒初始化/exec_matmul 共用) */
+    int matmul_carved;  /* exec_matmul 的 arena/carve 已完成(0=未 carve) */
     uint32_t pinned_count;
     struct wt_exec_stats st;
     uint8_t* temps[MAX_TEMPS];
@@ -125,11 +126,24 @@ static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
             void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
             wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
             if (!vb || vs < g_exec.vtcm_pool_size) return NULL;
-            g_exec.vtcm_pool = (uint8_t*)vb;
+            /* 驻留池从 VTCM 尾部倒划 —— exec_matmul 的 dc_arena_init 每次
+             * 从 (pc+2047)&~2047 重零起划 carve, 若驻留池从同一起点正向
+             * bump 会被 carve 踩。倒划到 VTCM 尾部, 且不超过 VTCM 总容量:
+             * 容量 = vs - carve_end, 驻留池放 [vs - vtcm_pool_size, vs)。
+             * 注意: 懒初始化只拿 VTCM 基址, 不做 arena/carve —— matmul 的
+             * carve 由 exec_matmul 自己的初始化完成(engine_ready 已置 1
+             * 时 exec_matmul 跳过初始化, 用悬空 arena → binary ref fail) */
+            uint32_t carve_end = (pc + 2047u) & ~2047u;
+            if (carve_end + g_exec.vtcm_pool_size > vs) return NULL;
+            g_exec.vtcm_pool = (uint8_t*)vb + (vs - g_exec.vtcm_pool_size);
         }
         g_exec.temps[id] = g_exec.vtcm_pool + off;
         g_exec.temp_bytes[id] = bytes;
         g_last_bytes[id] = bytes;
+        /* VTCM 驻留写入: CPU/HVX 写进 VTCM 后 flush, 否则后续 op 读到的
+         * 可能是 cache 里残留的旧 VTCM 内容(上板实测数值不一致根因) */
+        qurt_mem_cache_clean((qurt_addr_t)g_exec.temps[id], bytes,
+                             QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
         return g_exec.temps[id];
     }
     /* 路径 1: 编译期静态偏移表(第7步阶段一; TEMPOFF 槽提供池+表)。
@@ -148,8 +162,9 @@ static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
     }
     /* 路径 2: bump。同 id 扩容只增不缩 —— 新 bump 区, 旧区不回收
      * (与旧 per-temp 的"仅保留最新"语义一致; M3c probe 实锤)。
-     * 纯 bump 模式可倍增扩容; 静态模式下池含编译期偏移, 扩容会搬坏
-     * 静态区 → 超预留区即失败(fail loud, 不静默错位)。 */
+     * 静态模式下: 静态区 = [0, cap), 表外 bump 区 = [cap, cap+reserve);
+     * bump 从 pool_used 起(已被 TEMPOFF 槽初始化设为 cap, 即 bump 区起点)。
+     * 静态模式禁扩容(池含编译期偏移, 搬坏静态区)。 */
     if (!g_exec.temps[id] || g_exec.temp_bytes[id] < bytes) {
         uint32_t aligned = (bytes + 127u) & ~127u;
         if (g_exec.pool_used + aligned > g_exec.pool_cap) {
@@ -275,9 +290,12 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "act/w slot size mismatch");
         return -1;
     }
-    if (!g_exec.engine_ready) {
-        int rc = wtcache_open(&g_exec.wc, 4096);
-        if (rc != WTC_OK) { snprintf(err, errn, "wtcache 0x%X", rc); return -1; }
+    if (!g_exec.matmul_carved) {
+        int rc = 0;
+        if (!g_exec.engine_ready) {
+            rc = wtcache_open(&g_exec.wc, 4096);
+            if (rc != WTC_OK) { snprintf(err, errn, "wtcache 0x%X", rc); return -1; }
+        }
         void* vb = NULL; uint32_t vs = 0; void* pb = NULL; uint32_t pc = 0;
         wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
         uint32_t off = (pc + 2047u) & ~2047u;
@@ -290,6 +308,7 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
          * (dualdomain run3 同根因); FLUSH 全 VTCM 一次清干净 */
         qurt_mem_cache_clean((qurt_addr_t)vb, vs, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
         g_exec.engine_ready = 1;
+        g_exec.matmul_carved = 1;
     }
     uint8_t* out_ddr = temp_get(out_t, out_b);
     if (!out_ddr) { snprintf(err, errn, "temp %u alloc", (unsigned)out_t); return -1; }
@@ -318,6 +337,7 @@ void wt_exec_shutdown(void) {
         wtcache_close(g_exec.wc);
         g_exec.wc = NULL;
         g_exec.engine_ready = 0;
+        g_exec.matmul_carved = 0;
     }
     /* 单块池: 一次释放(旧 per-temp free ×256 全删) */
     free(g_exec.pool);
@@ -601,7 +621,11 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
     const uint16_t* bb = (const uint16_t*)ref_ptr(b, b_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, n * 2u);
-    if (!a || !bb || !y) { snprintf(err, errn, "binary ref fail"); return -1; }
+    if (!a || !bb || !y) {
+        rtrace("bin null", (int)(a == NULL) | ((int)(bb == NULL) << 1) | ((int)(y == NULL) << 2));
+        snprintf(err, errn, "binary ref fail");
+        return -1;
+    }
     for (uint32_t i = 0; i < n; i++) {
         float x0 = f16_to_f32(a[i]), x1 = f16_to_f32(bb[i]);
         float r = x0;
