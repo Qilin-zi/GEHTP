@@ -365,7 +365,7 @@ struct Emitter {
         bool param_const_name = false;
         if (p && p->name_tag && p->name_tag->name()) {
             const char* nm2 = p->name_tag->name();
-            static const char* suf[] = {"_shape", "_axes", "_pad_amount", "_ranges"};
+            static const char* suf[] = {"_shape", "_axes", "_pad_amount", "_ranges", "_perm", "_multiples", "_split_index", "_dilation", "_stride"};
             for (const char* sfx : suf) {
                 size_t l = std::strlen(sfx), n2 = std::strlen(nm2);
                 if (n2 >= l && std::strcmp(nm2 + n2 - l, sfx) == 0) param_const_name = true;
@@ -1376,7 +1376,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         // loader 合成的 tensor_param const(非 is_const 标志): *_shape/*_axes/
         // *_pad_amount/*_ranges 后缀, 无发射语义
         {
-            static const char* suf[] = {"_shape", "_axes", "_pad_amount", "_ranges"};
+            static const char* suf[] = {"_shape", "_axes", "_pad_amount", "_ranges", "_perm", "_multiples", "_split_index", "_dilation", "_stride"};
             bool is_param = false;
             for (const char* sfx : suf) {
                 size_t l = std::strlen(sfx);
