@@ -22,17 +22,20 @@ GDIR="$DEVROOT/gehtp"
 die() { echo "gehtp: $*" >&2; exit 1; }
 
 cmd_compile() {
-    local onnx="" out="" vtcm="" ddr="" in_f16=""
+    local onnx="" out="" vtcm="" ddr="" in_f16="" net_json="" weights="" gguf="" match=""
     while [ $# -gt 0 ]; do case "$1" in
         -o|--output) out="$2"; shift 2;;
         --vtcm-budget) vtcm="$2"; shift 2;;
         --ddr-budget) ddr="$2"; shift 2;;
         --input-f16) in_f16="$2"; shift 2;;
+        --net-json) net_json="$2"; shift 2;;
+        --weights-bin) weights="$2"; shift 2;;
+        --gguf) gguf="$2"; shift 2;;
+        --match) match="$2"; shift 2;;
         -*) die "unknown flag $1";;
         *) [ -z "$onnx" ] && onnx="$1" || die "unexpected arg $1"; shift;;
     esac; done
-    [ -n "$onnx" ] && [ -n "$out" ] || die "usage: gehtp compile model.onnx -o model.wtop [--vtcm-budget N] [--ddr-budget N] [--input-f16 f]"
-    onnx="$(realpath "$onnx" 2>/dev/null)" || die "not found: $onnx"
+    [ -n "$out" ] || die "usage: gehtp compile model.onnx -o model.wtop [旗标]  (大模型免重复转换: --net-json X --weights-bin Y 跳 converter)"
     case "$out" in /*) ;; *) out="$(pwd)/$out";; esac
     [ -n "$in_f16" ] && in_f16="$(realpath "$in_f16")"
     [ -x "$CB/hnnx_compile" ] || die "compiler not built: cmake --build $CB"
@@ -40,20 +43,37 @@ cmd_compile() {
     local work="$out.work"
     mkdir -p "$work"
 
-    echo "== [1/5] qairt-converter (ONNX → DLC) =="
-    PYTHONPATH="$SDK/lib/python" $PY "$SDK/bin/x86_64-linux-clang/qairt-converter" \
-        -i "$onnx" --float_bitwidth 16 -o "$work/$name.cpp" 2>&1 | tail -1
+    if [ -n "$net_json" ]; then
+        # 直通模式: 复用已有 net.json/params (大模型转换产物, 跳 qairt-converter)
+        net_json="$(realpath "$net_json")"; weights="$(realpath "$weights" 2>/dev/null || true)"
+        [ -f "$net_json" ] && [ -s "$weights" ] || die "--net-json/--weights-bin 需同时给且存在"
+        echo "== [1-2/5] 直通: 复用 $net_json =="
+        ln -sf "$net_json" "$work/${name}_net.json"
+        ln -sf "$weights" "$work/model.params.bin"
+    else
+        [ -n "$onnx" ] || die "need model.onnx (或 --net-json 直通)"
+        onnx="$(realpath "$onnx" 2>/dev/null)" || die "not found: $onnx"
+        echo "== [1/5] qairt-converter (ONNX → DLC) =="
+        PYTHONPATH="$SDK/lib/python" $PY "$SDK/bin/x86_64-linux-clang/qairt-converter" \
+            -i "$onnx" --float_bitwidth 16 -o "$work/$name.cpp" 2>&1 | tail -1
 
-    echo "== [2/5] dlc_repair + dlc-to-json =="
-    "$ROOT/scripts/dlc_repair.sh" "$work/$name.cpp" "$work/$name.dlc"
-    PYTHONPATH="$SDK/lib/python" $PY "$SDK/bin/x86_64-linux-clang/qairt-dlc-to-json" \
-        -i "$work/$name.dlc" -o "$work/${name}_net.json" 2>&1 | tail -1
-    unzip -p "$work/$name.cpp" model.params.bin > "$work/model.params.bin" 2>/dev/null || true
-    [ -s "$work/model.params.bin" ] || die "model.params.bin missing in DLC"
+        echo "== [2/5] dlc_repair + dlc-to-json =="
+        "$ROOT/scripts/dlc_repair.sh" "$work/$name.cpp" "$work/$name.dlc"
+        PYTHONPATH="$SDK/lib/python" $PY "$SDK/bin/x86_64-linux-clang/qairt-dlc-to-json" \
+            -i "$work/$name.dlc" -o "$work/${name}_net.json" 2>&1 | tail -1
+        unzip -p "$work/$name.cpp" model.params.bin > "$work/model.params.bin" 2>/dev/null || true
+        [ -s "$work/model.params.bin" ] || die "model.params.bin missing in DLC"
+    fi
 
     echo "== [3/5] hnnx_compile (tagged runlist) =="
+    # M2: 静态规划预算随编译进 TAG_MEM_PLAN(wtop_emit 照抄); 第 4 步旗标
+    # 在 shadow 期保留作比对, M3 删。
+    local c_args=()
+    [ -n "$ddr" ] && c_args+=(--ddr-budget "$ddr")
+    [ -n "$vtcm" ] && c_args+=(--plan-vtcm-budget "$vtcm")
     "$CB/hnnx_compile" --net-json "$work/${name}_net.json" \
         --weights-bin "$work/model.params.bin" --format tagged \
+        "${c_args[@]}" \
         --output "$work/$name.tagged.bin" | tail -1
 
     echo "== [4/5] wtop_emit (blob) =="
@@ -100,8 +120,16 @@ cmd_run() {
 
     local bname; bname="$(basename "$blob")"
     echo "== push =="
-    adb -s "$device" shell "mkdir -p $GDIR" >/dev/null
-    adb -s "$device" push "$blob" "$GDIR/$bname" >/dev/null
+    adb -s "$device" shell "mkdir -p $GDIR && rm -f $GDIR/output.f16.raw" >/dev/null
+    # 大 blob 免重推: 设备侧同名尺寸一致即跳过 (1.67GB 重试省 ~3min)
+    local local_size dev_size
+    local_size="$(wc -c < "$blob")"
+    dev_size="$(adb -s "$device" shell "wc -c < $GDIR/$bname 2>/dev/null" 2>/dev/null | tr -d '\r' || true)"
+    if [ "$dev_size" = "$local_size" ]; then
+        echo "  $bname 已在设备且尺寸一致, 跳过推送"
+    else
+        adb -s "$device" push "$blob" "$GDIR/$bname" >/dev/null
+    fi
     adb -s "$device" push "$input" "$GDIR/input.f16.raw" >/dev/null
     printf 'blob %s/%s\ninput %s/input.f16.raw\noutput %s/output.f16.raw\nout_temp %s\n' \
         "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" > /tmp/gehtp_job.txt

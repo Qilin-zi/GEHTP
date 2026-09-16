@@ -1,0 +1,7 @@
+{
+  "input_slot": 0,
+  "input_elems": 32768,
+  "output_temp": 1,
+  "n_slots": 24,
+  "n_ops": 81
+}
