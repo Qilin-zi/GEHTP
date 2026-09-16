@@ -350,6 +350,36 @@ public:
     // (opt pass/融合)之后调用 —— 生命期依赖最终图。
     int emit_ddr_offset_table(const char* path, uint64_t budget);
 
+    // M2 内存规划收编: 编译器定稿的静态内存规划(wtop_emit 照抄不再自算)。
+    // do_prepare2_late 在 plan_order_ 拓扑定稿后计算(预算 = set_plan_budgets),
+    // do_serialize 以 TAG_MEM_PLAN(0x4D50) 写出; deserialize 对称回读。
+    struct MemPlanEntry {   // wire 20B: {u32 op_id}{u32 out_idx}{u32 offset}{u32 size}{u32 flags bit0=in_vtcm}
+        op_id_t op_id;
+        uint32_t out_idx;
+        uint64_t offset;
+        uint64_t size;
+        bool in_vtcm;
+    };
+    struct MemPlanSpill {   // wire 16B: {u32 op_id}{u32 spill_off}{u32 size}{u32 pad}
+        op_id_t op_id;
+        uint64_t offset;
+        uint64_t size;
+    };
+    struct MemPlan {
+        uint64_t ddr_cap = 0;       // DDR 池静态区大小(字节)
+        uint64_t vtcm_cap = 0;      // VTCM 驻留池大小(字节, 0=无驻留)
+        uint64_t bump_reserve = 0;  // 表外 bump 预留(字节, max(4MB, cap/4))
+        std::vector<MemPlanEntry> entries;
+        std::vector<MemPlanSpill> spills;
+    };
+    // 静态规划预算(字节): ddr>0 才触发规划(与 wtop_emit --ddr-budget 缺省同语义)
+    void set_plan_budgets(uint64_t ddr, uint64_t vtcm) {
+        plan_ddr_budget_ = ddr;
+        plan_vtcm_budget_ = vtcm;
+    }
+    bool has_mem_plan() const { return has_mem_plan_; }
+    const MemPlan& mem_plan() const { return mem_plan_; }
+
 private:
     void finalize_spills(
         const std::vector<const fa::FancyAllocator::AllocRequest*>& spill_reqs,
@@ -463,6 +493,10 @@ private:
     TilingConfig tiling_cfg_;          // 单算子分块配置(阶段6)
     uint64_t vtcm_budget_override_ = 0;  // 阶段7: 0=默认 8MB
     std::vector<SpillFillRec> spill_fill_recs_;  // 阶段7: spill/fill 记录
+    uint64_t plan_ddr_budget_ = 0;   // M2: DDR 静态池预算(0=不规划)
+    uint64_t plan_vtcm_budget_ = 0;  // M2: VTCM 驻留池预算
+    MemPlan mem_plan_;               // M2: 定稿规划(TAG_MEM_PLAN 载体)
+    bool has_mem_plan_ = false;
     struct TimePoint { const char* name; uint64_t timestamp; };
     std::vector<TimePoint> time_points_;
 

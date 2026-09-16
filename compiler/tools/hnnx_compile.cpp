@@ -52,7 +52,8 @@ static void usage() {
         "  --no-pass <name>    关闭单个图优化 pass(可重复; 默认全开)\n"
         "  --opt-stats         打印各 pass 匹配/折叠统计与前后条目数\n"
         "  --ddr-offsets <tsv> 第7步阶段一: 导出静态 DDR 偏移表 TSV(check_offsets 消费)\n"
-        "  --ddr-budget <n>    DDR 池字节(0=总尺寸和)\n"
+        "  --ddr-budget <n>    DDR 池字节(0=不规划; M2 起喂 TAG_MEM_PLAN)\n"
+        "  --plan-vtcm-budget <n>  M2: VTCM 驻留池字节(静态规划用, 0=无驻留)\n"
         "  --verbose           Print detailed compilation info\n"
         "  --help              Show this help\n");
 }
@@ -84,7 +85,7 @@ static float widen_f16(uint16_t h) {
             int e = -1;
             while (!(mant & 0x400)) { mant <<= 1; e--; }
             mant &= 0x3FF;
-            u = sign | ((uint32_t)(127 + 15 + e) << 23) | (mant << 13);
+            u = sign | ((uint32_t)(114 + e) << 23) | (mant << 13);
         }
     } else if (exp == 31) {
         u = sign | 0x7F800000u | (mant << 13);  // Inf/NaN
@@ -149,7 +150,7 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
     if (looks_like_tar(raw)) return weights_bin_path;  // 已是 TAR
 
     // net.json: 提取 "tensors" 对象里每个条目的 dims(最小解析, 容 schema 变体)
-    struct Cand { std::string name; size_t bytes; };
+    struct Cand { std::string name; size_t bytes; uint32_t dtype; };
     std::vector<Cand> cands;
     {
         std::string js;
@@ -167,12 +168,23 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
         size_t depth = 1;      // tensors 对象内部
         std::string cur_name;
         bool cur_static = false;
+        uint32_t cur_dtype = 0x0232;  // 缺省 f32(仅静态张量用它定宽)
         auto parse_dims = [&](size_t from) -> size_t {
             size_t lb = js.find('[', from);
             size_t rb = js.find(']', lb);
             if (lb == std::string::npos || rb == std::string::npos) return from;
             std::string dimstr = js.substr(lb + 1, rb - lb - 1);
-            size_t bytes = 2;  // 2.48 fp16 模型按 2B/元素
+            /* 字节/元素按 data_type(与 host_run 同款): int32 变体=4,
+             * f32=4, bool=1, 其余 f16=2 —— 0.8B 全图静态张量混 i32/f16,
+             * 全 f16 假设会把 Concat_100 类 i32 常量尺寸砍半导致漂移 */
+            size_t eb = 2;
+            if (cur_dtype == 0x0232 || cur_dtype == 0x0132 || cur_dtype == 0x0032 ||
+                cur_dtype == 0x0432 || cur_dtype == 306 || cur_dtype == 0x0532 ||
+                cur_dtype == 0x0632)
+                eb = 4;
+            else if (cur_dtype == 0x0508)
+                eb = 1;
+            size_t bytes = eb;
             bool any = false;
             size_t start = 0;
             while (start < dimstr.size()) {
@@ -184,7 +196,7 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
                 start = comma + 1;
             }
             if (any && cur_static && !cur_name.empty())
-                cands.push_back({cur_name, bytes});
+                cands.push_back({cur_name, bytes, cur_dtype});
             return rb;
         };
         while (i < js.size()) {
@@ -195,13 +207,18 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
                 size_t q2 = js.find('"', i + 1);
                 if (q2 == std::string::npos) break;
                 std::string key = js.substr(i + 1, q2 - i - 1);
-                if (depth == 1) { cur_name = key; cur_static = false; }
+                if (depth == 1) { cur_name = key; cur_static = false; cur_dtype = 0x0232; }
                 else if (depth == 2 && key == "dims") { i = parse_dims(q2 + 1); continue; }
                 else if (depth == 2 && key == "type") {
                     size_t colon = js.find(':', q2);
                     size_t comma2 = js.find_first_of(",}\n", colon);
                     if (colon != std::string::npos)
                         cur_static = (std::atoi(js.substr(colon + 1, comma2 - colon - 1).c_str()) == 4);
+                } else if (depth == 2 && key == "data_type") {
+                    size_t colon = js.find(':', q2);
+                    size_t comma2 = js.find_first_of(",}\n", colon);
+                    if (colon != std::string::npos)
+                        cur_dtype = (uint32_t)std::strtoul(js.substr(colon + 1, comma2 - colon - 1).c_str(), nullptr, 0);
                 }
                 i = q2 + 1;
                 continue;
@@ -219,17 +236,33 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
     }
     cands = uniq;
 
-    // 顺序分配(阶段1 字节级实证: params.bin = 静态张量按 net.json 出现序的
-    // f16 拼接, 无对齐填充; [B][W][尾] 即此序)。此前用 |值|幅度启发式挑偏移,
+    // 顺序分配(字节级实证: params.bin = 静态张量按 net.json 出现序拼接,
+    // 字节宽 = 张量自身 dtype, 每张量 4 字节对齐 —— 旧"全 f16 无对齐"模型
+    // 被 0.8B 全图头部 8 张量证伪)。此前用 |值|幅度启发式挑偏移,
     // 在全部 N(0,1) 值域下不可靠(实测 W 匹配到偏移 32 错位)——弃用。
     std::vector<uint8_t> tar;
     size_t off = 0;
     size_t n_hits = 0;
     for (const auto& c : cands) {
+        off = (off + 3) & ~size_t(3);
         if (off + c.bytes > raw.size() || c.bytes == 0) continue;
-        const uint16_t* h = reinterpret_cast<const uint16_t*>(raw.data() + off);
-        std::vector<float> f32(c.bytes / 2);
-        for (size_t k = 0; k < f32.size(); k++) f32[k] = widen_f16(h[k]);
+        const bool d4 = (c.dtype == 0x0232 || c.dtype == 0x0132 || c.dtype == 0x0032 ||
+                         c.dtype == 0x0432 || c.dtype == 306 || c.dtype == 0x0532 ||
+                         c.dtype == 0x0632);
+        const bool d1 = (c.dtype == 0x0508);
+        std::vector<float> f32;
+        if (d4) {
+            /* f32/int32 → 4B 直拷(位模式保留, int32 消费者按位读) */
+            f32.resize(c.bytes / 4);
+            std::memcpy(f32.data(), raw.data() + off, c.bytes);
+        } else if (d1) {
+            f32.resize(c.bytes);
+            for (size_t k = 0; k < f32.size(); k++) f32[k] = (float)raw[off + k];
+        } else {
+            const uint16_t* h = reinterpret_cast<const uint16_t*>(raw.data() + off);
+            f32.resize(c.bytes / 2);
+            for (size_t k = 0; k < f32.size(); k++) f32[k] = widen_f16(h[k]);
+        }
         tar_append(tar, c.name + ".raw",
                    reinterpret_cast<const uint8_t*>(f32.data()), f32.size() * 4);
         off += c.bytes;
@@ -260,7 +293,8 @@ int main(int argc, char** argv) {
     bool verbose = false;
     bool opt_stats = false;             // --opt-stats: prepare 后打印 pass 统计
     std::string ddr_offsets_path;       // --ddr-offsets: 第7步阶段一静态偏移表 TSV
-    uint64_t ddr_budget = 0;            // --ddr-budget: DDR 池字节(0=总尺寸和)
+    uint64_t ddr_budget = 0;            // --ddr-budget: DDR 池字节(0=不规划; M2 起喂 TAG_MEM_PLAN)
+    uint64_t plan_vtcm_budget = 0;      // --plan-vtcm-budget: M2 VTCM 驻留池字节(静态规划用)
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -276,6 +310,7 @@ int main(int argc, char** argv) {
         else if (arg == "--opt-stats") opt_stats = true;
         else if (arg == "--ddr-offsets" && i+1 < argc) ddr_offsets_path = argv[++i];
         else if (arg == "--ddr-budget" && i+1 < argc) ddr_budget = strtoull(argv[++i], nullptr, 0);
+        else if (arg == "--plan-vtcm-budget" && i+1 < argc) plan_vtcm_budget = strtoull(argv[++i], nullptr, 0);
         else if (arg == "--verbose" || arg == "-v") verbose = true;
         else {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
@@ -345,6 +380,7 @@ int main(int argc, char** argv) {
     if (verbose) std::printf("[2a] Preparing graph...\n");
     HexagonNNEnv env;
     if (vtcm_budget != 0) gp.set_vtcm_budget(vtcm_budget);
+    gp.set_plan_budgets(ddr_budget, plan_vtcm_budget);  // M2: 静态规划预算(0=不规划)
     GraphStatus s = gp.prepare(env);
     if (s != GraphStatus::Success) {
         std::fprintf(stderr, "Error: prepare() failed with status %d\n",

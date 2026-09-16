@@ -110,7 +110,49 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     uint32_t C = input_op->output_def.rank >= 4 ? (uint32_t)input_op->output_def.dims[3] : 1;
 
     Emitter em;
-    if (ddr_budget > 0) {
+    if (gp.has_mem_plan()) {
+        // M2: 静态规划由编译器定稿(TAG_MEM_PLAN)——照抄, 不再自算。
+        const auto& mp = gp.mem_plan();
+        for (const auto& e : mp.entries) {
+            em.ddr_op_map[e.op_id] = {(uint32_t)e.offset, (uint32_t)e.size};
+            if (e.in_vtcm) em.ddr_op_vtcm[e.op_id] = true;
+        }
+        em.ddr_static_cap = mp.ddr_cap;
+        em.ddr_vtcm_cap = mp.vtcm_cap;
+        em.bump_reserve = mp.bump_reserve;
+        em.ddr_static = true;
+        for (const auto& s : mp.spills)
+            em.ddr_spill_map[s.op_id] = {(uint32_t)s.offset, (uint32_t)s.size};
+        std::fprintf(stderr, "[ddr] TAG_MEM_PLAN: cap=%llu vtcm_cap=%llu n_temps=%zu n_spills=%zu\n",
+                     (unsigned long long)em.ddr_static_cap, (unsigned long long)em.ddr_vtcm_cap,
+                     mp.entries.size(), mp.spills.size());
+        if (ddr_budget > 0) {
+            // shadow 期(M2): 旗标重算与 plan 比对, 不一致 warn(以 plan 为准)
+            std::vector<GraphPrepare::DdrTempEntry> se;
+            std::vector<GraphPrepare::DdrSpillEntry> ss;
+            uint64_t scap = 0, stotal = 0, svcap = 0;
+            if (gp.compute_ddr_offsets(ddr_budget, &se, &scap, &ss, &stotal,
+                                       vtcm_budget, &svcap) == 0) {
+                size_t nd = 0;
+                if (scap != em.ddr_static_cap || svcap != em.ddr_vtcm_cap ||
+                    se.size() != mp.entries.size() || ss.size() != mp.spills.size()) nd++;
+                for (const auto& e : se) {
+                    auto it = em.ddr_op_map.find(e.op_id);
+                    if (it == em.ddr_op_map.end() || it->second.first != (uint32_t)e.offset ||
+                        it->second.second != (uint32_t)e.size) nd++;
+                }
+                for (const auto& s : ss) {
+                    auto it = em.ddr_spill_map.find(s.op_id);
+                    if (it == em.ddr_spill_map.end() || it->second.first != (uint32_t)s.offset ||
+                        it->second.second != (uint32_t)s.size) nd++;
+                }
+                if (nd)
+                    std::fprintf(stderr,
+                                 "warn: TAG_MEM_PLAN 与 --ddr-budget 本地重算不一致 (%zu 处)——以 plan 为准\n", nd);
+            }
+        }
+    } else if (ddr_budget > 0) {
+        // 旧 bin(无 TAG_MEM_PLAN): 本地自算(M2 前路径, 一个版本周期后退役)
         std::vector<GraphPrepare::DdrTempEntry> ddr_entries;
         uint64_t ddr_cap = 0;
         std::vector<GraphPrepare::DdrSpillEntry> ddr_spills;
@@ -126,6 +168,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (e.in_vtcm) em.ddr_op_vtcm[e.op_id] = true;
         }
         em.ddr_static_cap = ddr_cap;
+        em.bump_reserve = std::max<uint64_t>(4u << 20, ddr_cap / 4);
         em.ddr_static = true;
         std::fprintf(stderr, "[ddr] static pool cap=%llu vtcm_cap=%llu n_temps=%zu\n",
                      (unsigned long long)ddr_cap, (unsigned long long)em.ddr_vtcm_cap,
@@ -428,9 +471,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     // 上取整 —— probe VTCM 驻留 256KB = 256 单位)。VTCM 驻留项 temp_id
     // 带 0x4000 标记(WT_REF_VTCM_FLAG)。
     if (em.ddr_static) {
-        uint64_t bump_reserve = std::max<uint64_t>(4u << 20, em.ddr_static_cap / 4);
+        uint64_t bump_res = em.bump_reserve ? em.bump_reserve
+                                            : std::max<uint64_t>(4u << 20, em.ddr_static_cap / 4);
         uint32_t reserve = ((uint32_t)((em.ddr_vtcm_cap + 1023) / 1024) << 16)
-                         | ((uint32_t)((bump_reserve + 1023) / 1024) & 0xFFFFu);
+                         | ((uint32_t)((bump_res + 1023) / 1024) & 0xFFFFu);
         std::vector<uint8_t> tab;
         auto put32 = [&](uint32_t v) {
             for (int i = 0; i < 4; i++) tab.push_back((uint8_t)(v >> (8 * i)));

@@ -61,6 +61,11 @@ cmd_compile() {
     [ -n "$in_f16" ] && in_args+=(--input-f16 "$in_f16")
     [ -n "$vtcm" ] && in_args+=(--vtcm-budget "$vtcm")
     [ -n "$ddr" ] && in_args+=(--ddr-budget "$ddr")
+    if [ -n "$gguf" ]; then
+        gguf="$(realpath "$gguf")"; match="$(realpath "$match" 2>/dev/null || true)"
+        [ -f "$gguf" ] && [ -f "$match" ] || die "--gguf 需配 --match <tsv>"
+        in_args+=(--gguf "$gguf" --match "$match")
+    fi
     "$CB/wtop_emit" --bin "$work/$name.tagged.bin" "${in_args[@]}" \
         --out "$out" --manifest "$out.manifest.json" | tail -1
 

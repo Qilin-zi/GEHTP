@@ -129,6 +129,7 @@ enum BinFormatTag : uint32_t {
     TAG_CONST_EXTENT         = 0x4345, // 'CE' const extent descriptor table
     TAG_PLAN_ORDER           = 0x504C, // 'PL' Scheduler(ST-Cut)计划执行序: [u32 count][u32 ids...]
     TAG_SPILL_FILL_OP        = 0x5346, // 'SF' 单张量 spill/fill 记录: [u64 op_id][u32 block_id][u64 ddr_offset][u64 size]
+    TAG_MEM_PLAN             = 0x4D50, // 'MP' M2 编译器定稿静态内存规划(wtop_emit 照抄)
 };
 
 constexpr uint32_t SEPARATOR_NORMAL  = 0xFA0000FA;

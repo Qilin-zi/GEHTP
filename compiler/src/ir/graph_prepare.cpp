@@ -523,6 +523,30 @@ GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) 
         if (topo.size() == plan_order_.size()) plan_order_ = topo;  // 环图回退原序
     }
 
+    // 6. 静态内存规划定稿 (M2 内存规划收编): plan_order_ 拓扑定稿后按定稿序
+    //    算两级池偏移(算法 = compute_ddr_offsets 原样, 与 emit 时代逐字节同),
+    //    经 TAG_MEM_PLAN 进 tagged.bin; wtop_emit 照抄不再自算。
+    //    ddr 预算 0 = 不规划(与 emit --ddr-budget 缺省同语义)。
+    has_mem_plan_ = false;
+    mem_plan_ = MemPlan{};
+    if (plan_ddr_budget_ > 0) {
+        std::vector<DdrTempEntry> entries;
+        std::vector<DdrSpillEntry> spills;
+        uint64_t cap = 0, spill_total = 0, vcap = 0;
+        if (compute_ddr_offsets(plan_ddr_budget_, &entries, &cap,
+                                &spills, &spill_total,
+                                plan_vtcm_budget_, &vcap) == 0) {
+            mem_plan_.ddr_cap = cap;
+            mem_plan_.vtcm_cap = plan_vtcm_budget_ ? vcap : 0;
+            mem_plan_.bump_reserve = std::max<uint64_t>(4u << 20, cap / 4);
+            for (const auto& e : entries)
+                mem_plan_.entries.push_back({e.op_id, 0, e.offset, e.size, e.in_vtcm});
+            for (const auto& s : spills)
+                mem_plan_.spills.push_back({s.op_id, s.offset, s.size});
+            has_mem_plan_ = true;
+        }
+    }
+
     return GraphStatus::Success;
 }
 
@@ -1441,6 +1465,37 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
         ser.write_tagged_record(TAG_PLAN_ORDER, pl.data(), static_cast<int>(pl.size()));
     }
 
+    // TAG_MEM_PLAN(M2 内存规划收编): 编译器定稿的静态内存规划, wtop_emit 照抄。
+    // [u32 ver=1][u32 ddr_cap][u32 vtcm_cap][u32 bump_reserve][u32 n_entries]
+    //   n×20B {u32 op_id}{u32 out_idx}{u32 offset}{u32 size}{u32 flags bit0=in_vtcm}
+    // [u32 n_spills] n×16B {u32 op_id}{u32 spill_off}{u32 size}{u32 pad}
+    if (has_mem_plan_) {
+        const MemPlan& mp = mem_plan_;
+        std::vector<uint8_t> buf(20 + mp.entries.size() * 20 + 4 + mp.spills.size() * 16, 0);
+        size_t o = 0;
+        auto w32 = [&](uint32_t v) { std::memcpy(buf.data() + o, &v, 4); o += 4; };
+        w32(1);
+        w32(static_cast<uint32_t>(mp.ddr_cap));
+        w32(static_cast<uint32_t>(mp.vtcm_cap));
+        w32(static_cast<uint32_t>(mp.bump_reserve));
+        w32(static_cast<uint32_t>(mp.entries.size()));
+        for (const auto& e : mp.entries) {
+            w32(static_cast<uint32_t>(e.op_id));
+            w32(e.out_idx);
+            w32(static_cast<uint32_t>(e.offset));
+            w32(static_cast<uint32_t>(e.size));
+            w32(e.in_vtcm ? 1u : 0u);
+        }
+        w32(static_cast<uint32_t>(mp.spills.size()));
+        for (const auto& s : mp.spills) {
+            w32(static_cast<uint32_t>(s.op_id));
+            w32(static_cast<uint32_t>(s.offset));
+            w32(static_cast<uint32_t>(s.size));
+            w32(0);
+        }
+        ser.write_tagged_record(TAG_MEM_PLAN, buf.data(), static_cast<int>(buf.size()));
+    }
+
     // Spill/fill(阶段7): 溢出张量 → 0x4453 配置记录 + 每张量 0x5346 DMA 记录。
     // 收集来源: ①allocator spilled(vtcm_allocations_)②tcm_migration 标记
     // (flags2 & SPILL_TO_DDR=0x40, 未在①中)。DDR 池偏移按 op_id 升序确定性
@@ -2166,6 +2221,45 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
                 plan_order_.clear();
                 for (uint32_t i = 0; i < cnt && rr.remaining() >= 4; i++)
                     plan_order_.push_back(static_cast<op_id_t>(rr.r32()));
+            }
+            continue;
+        }
+        if (tag == TAG_MEM_PLAN) {
+            // M2: 对称回读编译器定稿规划(字段序同写侧; 坏记录不置 has_)
+            BinReader rr(rec, data_size);
+            if (rr.remaining() >= 20 && rr.r32() == 1) {
+                MemPlan mp;
+                mp.ddr_cap = rr.r32();
+                mp.vtcm_cap = rr.r32();
+                mp.bump_reserve = rr.r32();
+                uint32_t ne = rr.r32();
+                bool ok = true;
+                for (uint32_t i = 0; i < ne; i++) {
+                    if (rr.remaining() < 20) { ok = false; break; }
+                    MemPlanEntry e{};
+                    e.op_id = rr.r32();
+                    e.out_idx = rr.r32();
+                    e.offset = rr.r32();
+                    e.size = rr.r32();
+                    e.in_vtcm = (rr.r32() & 1) != 0;
+                    mp.entries.push_back(e);
+                }
+                if (ok) {
+                    if (rr.remaining() < 4) { ok = false; }
+                    else {
+                        uint32_t ns = rr.r32();
+                        for (uint32_t i = 0; i < ns; i++) {
+                            if (rr.remaining() < 16) { ok = false; break; }
+                            MemPlanSpill s{};
+                            s.op_id = rr.r32();
+                            s.offset = rr.r32();
+                            s.size = rr.r32();
+                            (void)rr.r32();
+                            mp.spills.push_back(s);
+                        }
+                    }
+                }
+                if (ok) { mem_plan_ = mp; has_mem_plan_ = true; }
             }
             continue;
         }

@@ -73,7 +73,7 @@ inline float f16_to_f32(uint16_t h) {
             int e = -1;
             while (!(mant & 0x400)) { mant <<= 1; e--; }
             mant &= 0x3FF;
-            u = sign | ((uint32_t)(127 + 15 + e) << 23) | (mant << 13);
+            u = sign | ((uint32_t)(114 + e) << 23) | (mant << 13);
         }
     } else if (exp == 31) {
         u = sign | 0x7F800000u | (mant << 13);
@@ -106,6 +106,7 @@ struct Emitter {
     std::map<uint32_t, bool> ddr_temp_vtcm;                                  // temp_id → in_vtcm
     uint64_t ddr_static_cap = 0;   // 编译期静态区大小(表外 temp 池尾 bump)
     uint64_t ddr_vtcm_cap = 0;     // VTCM 驻留池大小(0=无驻留)
+    uint64_t bump_reserve = 0;     // 表外 bump 预留(字节; M2 起由 TAG_MEM_PLAN 供给)
     // 阶段二: 溢出张量 → SPILL/FILL 插桩
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> ddr_spill_map;  // op_id → {溢出区偏移, size}
     uint32_t spill_pool_slot = 0;
