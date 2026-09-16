@@ -492,6 +492,37 @@ GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) 
     // 4. Final allocation
     // phys_alloc_in_runlist(ops)
 
+    // 5. plan_order_ 拓扑定稿 (内存规划收编 M1: 执行序唯一真相源上提编译器)
+    //    ST-Cut 产出为调度序, 非保证拓扑; 原定稿在 wtop_emit Kahn 重排
+    //    (probe: Split 15 排消费者 Reshape 18 后 → src_ref 查无 temp)。
+    //    算法与 emit 侧既有实现逐语句一致(orphan 殿后 / ready 升序+pop_back /
+    //    环图回退原序), blob op 序列零变化; emit 侧降级为校验+旧 bin 兜底。
+    if (!plan_order_.empty()) {
+        std::unordered_map<op_id_t, size_t> indeg;
+        std::unordered_map<op_id_t, std::vector<op_id_t>> succ;
+        std::vector<op_id_t> orphans;  // plan_order_ 里已无 OpDef 的 id(DCE 后)
+        for (op_id_t id : plan_order_) {
+            const OpDef* od = get_op_at(id);
+            if (!od) { orphans.push_back(id); continue; }
+            indeg[id] = 0;
+            for (const auto& c : od->inputs)
+                if (indeg.count(c.src_id)) { ++indeg[id]; succ[c.src_id].push_back(id); }
+        }
+        std::vector<op_id_t> ready;
+        for (auto& [id, d] : indeg) if (d == 0) ready.push_back(id);
+        std::sort(ready.begin(), ready.end());  // 确定性(与 emit/host 对拍同序)
+        std::vector<op_id_t> topo;
+        while (!ready.empty()) {
+            op_id_t id = ready.back();
+            ready.pop_back();
+            topo.push_back(id);
+            for (op_id_t s : succ[id])
+                if (--indeg[s] == 0) ready.push_back(s);
+        }
+        for (op_id_t id : orphans) topo.push_back(id);
+        if (topo.size() == plan_order_.size()) plan_order_ = topo;  // 环图回退原序
+    }
+
     return GraphStatus::Success;
 }
 

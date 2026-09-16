@@ -2,7 +2,7 @@
 //
 // 验收:
 //   1. do_prepare2 计算 plan_order_(ST-Cut 计划序), 非空且覆盖全部图 op
-//   2. Scheduler::schedule(gp).op_order == gp.plan_order()
+//   2. M1 后 plan_order_ = Scheduler 产出经 Kahn 定稿: 同集合 + 拓扑(生产者先)
 //   3. serialize 的 op 记录发射序 == plan_order_(含 TAG_PLAN_ORDER 记录)
 //   4. deserialize 恢复 plan_order_; re-serialize 两次字节全同
 //   5. 既有 ST-Cut 测试保持绿(ctest 全量)
@@ -131,14 +131,25 @@ int main() {
         covers &= (std::find(po.begin(), po.end(), id) != po.end());
     CHECK(covers, "plan_order 覆盖全部计算 op");
 
-    // 2. Scheduler::schedule == gp.plan_order()
+    // 2. M1(内存规划收编)后: plan_order_ = Scheduler 产出经 do_prepare2_late
+    //    Kahn 定稿, 不再与 Scheduler 原序逐位相等。断言(a) 同集合(只重排不
+    //    增删); (b) 拓扑定稿(生产者先于消费者)。
     Scheduler sched;
     Scheduler::Plan plan = sched.schedule(gp);
-    bool same = (plan.op_order.size() == po.size());
-    if (same)
-        for (size_t i = 0; i < po.size(); i++)
-            same &= (plan.op_order[i] == static_cast<uint32_t>(po[i]));
-    CHECK(same, "Scheduler::schedule(gp).op_order == gp.plan_order()");
+    std::multiset<op_id_t> po_ms(po.begin(), po.end());
+    std::multiset<op_id_t> raw_ms(plan.op_order.begin(), plan.op_order.end());
+    CHECK(po_ms == raw_ms, "plan_order_ 与 Scheduler 产出同集合(Kahn 只重排)");
+    std::unordered_map<op_id_t, size_t> ppos;
+    for (size_t i = 0; i < po.size(); i++) ppos[po[i]] = i;
+    bool topo_ok = true;
+    for (op_id_t id : po) {
+        const OpDef* od = gp.get_op_at(id);
+        if (!od) continue;
+        for (const auto& c : od->inputs)
+            if (ppos.count(c.src_id) && ppos[c.src_id] > ppos[id] && gp.get_op_at(c.src_id))
+                topo_ok = false;
+    }
+    CHECK(topo_ok, "plan_order_ 拓扑定稿(生产者先于消费者)");
 
     // 3. serialize 发射序 == plan_order_
     std::vector<uint8_t> buf(1u << 18, 0);

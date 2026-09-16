@@ -276,33 +276,54 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
     // 4. 按 plan_order 发射 op
     std::vector<op_id_t> order = gp.plan_order();
-    /* plan_order 是调度序, 非保证拓扑(probe: Split 副本 15 排在消费者
-     * Reshape 18 之后 → src_ref 查无 temp)。按输入依赖 Kahn 重排;
-     * 环图回退原序。 */
+    /* M1(内存规划收编)起: plan_order 由编译器 do_prepare2_late Kahn 定稿
+     * (保证拓扑), 本块不再重排。仅做拓扑性校验: 发现"消费者排在生产者前"
+     * = 未经 M1 定稿的旧 bin → warn 并退回本地 Kahn 重排(保旧行为);
+     * 无违反则直接用 bin 序。 */
     {
-        std::unordered_map<op_id_t, size_t> indeg;
-        std::unordered_map<op_id_t, std::vector<op_id_t>> succ;
-        std::vector<op_id_t> orphans;  /* plan_order 里已无 OpDef 的 id */
+        std::unordered_map<op_id_t, size_t> pos;
+        for (size_t i = 0; i < order.size(); i++) pos[order[i]] = i;
+        bool violated = false;
         for (op_id_t id : order) {
             const OpDef* od = gp.get_op_at(id);
-            if (!od) { orphans.push_back(id); continue; }
-            indeg[id] = 0;
-            for (const auto& c : od->inputs)
-                if (indeg.count(c.src_id)) { ++indeg[id]; succ[c.src_id].push_back(id); }
+            if (!od) continue;
+            for (const auto& c : od->inputs) {
+                auto it = pos.find(c.src_id);
+                if (it != pos.end() && it->second > pos[id] && gp.get_op_at(c.src_id)) {
+                    std::fprintf(stderr,
+                                 "warn: plan_order 拓扑违反: op %llu 先于其生产者 %llu (旧 bin?)\n",
+                                 (unsigned long long)id, (unsigned long long)c.src_id);
+                    violated = true;
+                }
+            }
         }
-        std::vector<op_id_t> ready;
-        for (auto& [id, d] : indeg) if (d == 0) ready.push_back(id);
-        std::sort(ready.begin(), ready.end());  /* 确定性(与 host 对拍同序) */
-        std::vector<op_id_t> topo;
-        while (!ready.empty()) {
-            op_id_t id = ready.back();
-            ready.pop_back();
-            topo.push_back(id);
-            for (op_id_t s : succ[id])
-                if (--indeg[s] == 0) ready.push_back(s);
+        if (violated) {
+            /* 旧 bin 兜底: 原 Kahn 重排(与编译器定稿算法逐语句一致;
+             * 环图回退原序) */
+            std::unordered_map<op_id_t, size_t> indeg;
+            std::unordered_map<op_id_t, std::vector<op_id_t>> succ;
+            std::vector<op_id_t> orphans;
+            for (op_id_t id : order) {
+                const OpDef* od = gp.get_op_at(id);
+                if (!od) { orphans.push_back(id); continue; }
+                indeg[id] = 0;
+                for (const auto& c : od->inputs)
+                    if (indeg.count(c.src_id)) { ++indeg[id]; succ[c.src_id].push_back(id); }
+            }
+            std::vector<op_id_t> ready;
+            for (auto& [id, d] : indeg) if (d == 0) ready.push_back(id);
+            std::sort(ready.begin(), ready.end());
+            std::vector<op_id_t> topo;
+            while (!ready.empty()) {
+                op_id_t id = ready.back();
+                ready.pop_back();
+                topo.push_back(id);
+                for (op_id_t s : succ[id])
+                    if (--indeg[s] == 0) ready.push_back(s);
+            }
+            for (op_id_t id : orphans) topo.push_back(id);
+            if (topo.size() == order.size()) order = topo;
         }
-        for (op_id_t id : orphans) topo.push_back(id);
-        if (topo.size() == order.size()) order = topo;
     }
     if (order.empty()) {
         for (op_id_t id = 1; id <= 10; id++) order.push_back(id);  // 兜底(常规图 id 1..10)
