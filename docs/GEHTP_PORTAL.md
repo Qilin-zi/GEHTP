@@ -74,6 +74,17 @@ gehtp run m.wtop --input x0_new.f16.raw --output out.f16.raw   # x1 用编译时
 
 两个输入都要运行时变 = 当前**不支持**（引擎单注入指针），扩展方案已设计（引擎指针数组化 + emit 多 EXT_IN + CLI 逗号输入），待排期。
 
+## 2.1 host_run 输入铁律（全模型 host 参考链；2026-09-17 C1 线双实锤）
+
+- **多输入顺序 = 图张量 id 升序，不是命名直觉序**。0.8B 三输入张量 id：input_ids=1、
+  attention_mask=2、position_ids=3 → 喂法 `ids,mask,pos`；按直觉 `ids,pos,mask`
+  喂反 = pad 掩码列 0 -inf → 注意力 row 0 全 NaN → logits 全 NaN（无报错）。
+- **布局 = 图声明布局**（ncf 族）。资产文件与图声明不一致时须先转置：
+  L3 的 hidden（声明 [1,1024,32]）与 cos/sin（声明 [1,64,32]，文件 [1,32,64]）
+  都要转置喂入；不转 = RoPE 全烂（cos 0.97 级假绿，无报错）。
+- f16 权重域与 fp32 golden 的差异已实测：bf16 源权重 f16 往返恒等（scripts/golden_f16_weights.py），
+  host 链 vs fp32 golden 的 cos 漂移来自 f32 归约序积累（0.9987 级均匀漂移，top1 保）。
+
 ## 3. 输出规则
 
 - 输出 = manifest `output_temp` 指定的 temp，f16 raw 字节流（元素数 × 2 字节，由引擎最后写入大小定长）
@@ -86,6 +97,12 @@ gehtp run m.wtop --input x0_new.f16.raw --output out.f16.raw   # x1 用编译时
 2. `adb devices` 列表突然空 = host adb server 抽风，`adb kill-server` 即愈，**板子没坏**，别重启板
 3. adb 掉线会孤儿设备侧 `run_main_on_hexagon` + DSP main（卡 fastrpc 无进展）；排查设备异常先 ps 看有没有上个窗口的孤儿
 4. CMA 耗尽 / `failed to get map da` → 停下通知用户，不自行 reboot
+5. **0x39 全域 unsigned PD 拒绝**（"FastRPC Capability API failed ... Unsigned PD is not
+   supported on domain 3"）= CDSP (gunyah VM) 未启动（remoteproc 未注册），板方恢复，
+   勿自重启（2026-09-17 双会话独立实锤；与 SELinux/skel 无关——两版 skel
+   380f3cb 正典/d0bfbc third_party 同败）。预检：`ls /sys/class/remoteproc/` 非空。
+6. `build_examples.sh` 会推 `third_party/run_main_on_hexagon/ship/` 装载器+skel 覆盖设备
+   正典件（md5 与全 V81Dev 谱系不同）；设备套件异常时先核 md5。
 
 ## 5. 排错速查
 
