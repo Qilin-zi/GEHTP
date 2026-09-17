@@ -11,11 +11,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CB="$ROOT/compiler/build_linux"
 KD="$ROOT/kernels"
-SDK=/disk2/QCtools/qairt_2.48.40.260702
-PY=/disk2/Qwen35dev/revlibHtpPrepare/venv310/bin/python3
+SDK=/4090disk2/QCtools/qairt_2.48.40.260702
+PY=/4090disk2/Qwen35dev/revlibHtpPrepare/venv310/bin/python3
 HEX=/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0
 HT="$HEX/tools/HEXAGON_Tools/19.0.07"
-SWIV=/disk2/QCtools/swiv_build_utility.py
+SWIV=/4090disk2/QCtools/swiv_build_utility.py
 DEVROOT=/data/local/tmp/hvxhmx23
 GDIR="$DEVROOT/gehtp"
 
@@ -38,7 +38,13 @@ cmd_compile() {
     esac; done
     [ -n "$out" ] || die "usage: gehtp compile model.onnx -o model.wtop [旗标]  (大模型免重复转换: --net-json X --weights-bin Y 跳 converter)"
     case "$out" in /*) ;; *) out="$(pwd)/$out";; esac
-    [ -n "$in_f16" ] && in_f16="$(realpath "$in_f16")"
+    # 逗号多输入: 逐个 realpath 再逗号重组 (单文件 realpath 整串即死, E2 坑)
+    if [ -n "$in_f16" ]; then
+        local _rp=() _IFS="$IFS"; IFS=','
+        read -ra _parts <<< "$in_f16"; IFS="$_IFS"
+        for _p in "${_parts[@]}"; do _rp+=("$(realpath "$_p")"); done
+        in_f16="$(IFS=,; echo "${_rp[*]}")"
+    fi
     [ -x "$CB/hnnx_compile" ] || die "compiler not built: cmake --build $CB"
     local name; name="$(basename "$out" .wtop)"
     local work="$out.work"
