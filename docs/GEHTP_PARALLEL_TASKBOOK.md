@@ -222,6 +222,14 @@
 
 ## 8. 战役日志（追加区，新进展置顶）
 
+### 2026-09-17 C1 线 (105 会话) — VL Gather 回归定罪 + A3 判决 + A3② 落地 + 设备楔死旁证
+
+1. **VL 在途 Gather 通用化重写 = host 链回归源（bisect 三组对照定案）**：compact 剥前导 size-1 维后 axis 未同步左移。L0 GDN tbl `[1,16,1,64,64]` axis=3（converter 按原始 rank 写）→ 压缩 `[16,1,64,64]` 后真轴=2，VL 用 axis=3 取末维 → 全层错位。现行链 L0 host vs HF 锚点 cos=**0.53**（pre-VL=1.0 / VL minus Gather=1.0 / 4090 VL 二进制=0.53，三方对照）。**修复 = `axis -= (原始rank - 压缩rank)`**（105 提交 ef5869e），修复链 cos=1.0、vs gold_ncf 0.999999。**104 基线树 host_run 对全模型 GDN 层输出当前不可信（66 gather/层 × 18 层同型），修复须回灌。**
+2. **A3 判决（数值实锤，docs/A3_COPY_SEM_AUDIT.md）**：ScatterNd 恒等拷贝 → L0 cos **0.102 死刑**（GEHTP_HOST_*_IDENTITY 仿真旗标已入 ops.cpp）；Pad 恒等 L0 无害（尾部垃圾挂账）；Cast 待全模型；**"L3 恒等安全"是伪命题——L3 含 0 个 ScatterNd/Pad/Cast**，从未考验该路径。0.8B 全部 1245 copy-sem 站点（除 Reshape）均可达 logits，无死端。
+3. **A3② 已落地**（c3f6e7f+52bf1d3）：OP_SCATTER_ND_F16=28 三件套（emit op_scatter_nd.cpp 自注册 / parse arity+arg_is_slot / exec_scatter_nd 坐标块写与 host 同口径）。L0 重编 blob 含真 scatter ×64。设备门待 DSP 恢复。
+4. **设备楔死独立旁证**（与 C4 §8.13 同判）：0x39 全域失败=CDSP (gunyah VM) 本次未启动——remoteproc 未注册、boot_adsp/boot_cdsp 60s 超时 exit 1、SELinux 已 Permissive、两版 skel（380f3cb 正典/d0bfbc third_party）同败、adb root 同败。**非 skel/装载器问题，恢复=板主物理上电**。另：build_examples.sh 会推 third_party skel 覆盖设备正典件（md5 不同），已记坑。
+5. **P1 host 全模型**：修复后链跑通但 logits **全 NaN**（m5 时代则是 cos≈0 无 NaN——全模型 host 链从未正确过）；dump+看门狗二分 NaN 首现 op 进行中。L3 注意力层 host vs HF 锚点 cos=0.966（mask/cos/sin 布线已核），残差集中 channel 0 区（RMSNorm 约定候选），精确定位续查。
+
 ### 2026-09-17 C4 线 (104 会话) 中段发现
 
 1. **loader 撞 id 根因（四模型共享）已双向定案**：tensor_params(perm/axes) 与权重 const 共用 JSON id 编号空间，`append_const_node` 撞 id **静默返 0**（不覆盖不后移），旧码不查返回值且把占用者 name_tag 改写为 perm 名 → Transpose.inputs[1] 接到权重 const。minicpm 11 处、4B/VL 同款（"perm 轴数 0xA00000/0xC00000>5" 实为权重字节数/4）、0.8B 也藏 1 处（layers.0/linear_attn/Transpose_5_perm id=155 撞 onnx::MatMul_188646 [1024,2048]——C1 线全模型编译必经此雷）。VL 在途（已入 T0=04ea082）含同款根治（"0.8B 全图 88 处撞号"实锤 + op156 SIGSEGV 实锤），本线独立复证。emit 侧 perm 形状贪心推断（VL, op_transpose.cpp）为缺属性兜底，两层互补。
