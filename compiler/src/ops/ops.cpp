@@ -99,11 +99,14 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
      * 中间轴广播 —— 线性 i%n 展开是错的) */
     const auto in_bc = [&](size_t idx, size_t i) -> float {
         if (idx >= inputs.size() || !inputs[idx]) return 0.0f;
+        /* 无形状信息的调用方(单测/裸 execute): 线性直读, 与 in_float 同款。
+         * 否则 lead=ork 全轴跳过 → 恒读元素 0 (test_e2e Add 断言实锤)。 */
+        uint32_t ir = (idx < in_defs.size()) ? in_defs[idx].rank : 0;
+        if (ir == 0) return reinterpret_cast<const float*>(inputs[idx])[i];
         /* numpy 广播: 全 rank 右对齐(不去尾 1 —— 输入末维 1 广播到输出
          * 大维时, 去尾会把它吃掉造成 64 vs 128 假冲突, oid 1231 实锤) */
         uint32_t ork = out_def.rank;
         if (ork > 8) ork = 8;
-        uint32_t ir = (idx < in_defs.size()) ? in_defs[idx].rank : 0;
         if (ir > 8) ir = 8;
         uint32_t lead = (ork > ir) ? (ork - ir) : 0;
         uint32_t off = (ir > ork) ? (ir - ork) : 0;
