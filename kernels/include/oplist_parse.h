@@ -122,6 +122,10 @@ enum {
     OP_TRANSPOSE_GEN_F16 = 27, /* [x_ref,y_t,rank,d0..d3,perm4B] 通用 N-D C 序转置
                                (rank 2/3/4; dims 为输入形状; opcode 10 保留
                                conv 管线 4-D NCHW 契约不动) */
+    OP_SCATTER_ND_F16 = 28, /* [data_ref,idx_s,upd_ref,out_t,n_out,rank,d0..d4,K,n_idx,block]
+                               arity 14 (A3② 真语义; 恒等拷贝=数值死刑, docs/A3 判决)
+                               data/upd f16, idx i32 (0x8000|slot 或 temp 引用);
+                               out=data 拷贝后按 n_idx 组 K 维坐标写 block 块 */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -153,11 +157,12 @@ enum {
 #define WT_ARITY_RMSNORM2_F16 5
 #define WT_ARITY_BROADCAST_F16 12
 #define WT_ARITY_TRANSPOSE_GEN_F16 8
+#define WT_ARITY_SCATTER_ND_F16 14
 
 struct wt_slot {
     uint32_t len;
     uint32_t count;
-    uint64_t offset;   /* 内存侧恒为字节偏移; 线格式 v1=u32 字节, v2=u32 128B 块号(>4GB 模型) */
+    uint64_t offset;   /* 内存侧恒为字节偏移; 线格式 v1=u32 字节, v2=u64(24B 记录) */
     uint32_t addr;
 };
 

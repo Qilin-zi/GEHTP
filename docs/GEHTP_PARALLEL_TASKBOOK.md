@@ -236,3 +236,11 @@
 7. **WTOP v2 格式登记（接口冻结点 §2.1）**：slot 线记录 16B→24B {len,count,offset_lo,offset_hi,addr,reserved}，offset 升 u64。动因：minicpm f16 全模型 blob 5.15GB 撞 v1 u32 偏移 4GB 天花板（emit 自校验 max_slot_end=4309975296 实锤；旧树 split 即此限制的历史绕行）。emit 仅在权重区（内联/外置）>0xFFFFFF00 时写 v2，小模型继续 v1（conv_add blob 逐字节回归已验）；`--force-v2` 供小模型走 v2 通路做回归。改动：oplist_parse.h/.c（parse 双版本）、wtop_emit.cpp（编码）、wt_slot.offset 内存侧 u64。引擎/上游工具全指针算术自动兼容。附带修复：manifest op_names 多引号 bug（T0 引入，quickstart 判据脚本 JSON 解析实锤）。
 8. **设备事故（2026-09-17 ~17:55）**：52f67807 被重启（uptime 4min 实锤，非本线操作），重启后 **SELinux 回弹 Enforcing** → FastRPC Capability API 失败 + unsigned PD dom3 拒绝（0x72）。重启前同二进制同流程全绿（16:30/17:50）。设备文件（装载器/skel/库/runner）均幸存。**恢复需要 root 权限操作（setenforce 0 或等价 sepolicy 处置），本线无 adb root 权限（策略拦截），设备段挂起等待。** 教训入坑表：设备门禁应加 `getenforce` 预检。
 9. minicpm 全模型 compile 实证：hnnx_compile 32min/32.7GB RSS 通过（2492 op）；tagged.bin 10.07GB（修复后比修复前多 2.2GB = 撞 id 被静默丢弃的权重全数回收——**修复前任何全模型 tagged.bin 都在静默丢权重**）。
+
+### 2026-09-17 C4 线 (续二) — host 门全绿 + 设备套件就位(等楔死恢复)
+
+10. **C4 host 全链闭合**: hnnx_compile ✓(2492 op, 10.07GB, 32min) → wtop_emit v2 ✓(641 slots/2532 ops/5.15GB, host 三方校验) → **host_run 全模型参考链 vs gold.f16.raw: PASS — cos=0.9999887, top1 16/16, max|d|=0.048(相对 0.25%)**(判据 scripts/judge_minicpm.py)。剩唯一门=设备 run。
+11. **设备套件已就位(身份制合规)**: 设备 gehtp/ 内有 minicpm5_2b.wtop(5153758080B 尺寸核验)+ in_c4.ids32.raw + **job_c4.txt + gehtp_runner_c4.so**(独立 job 路径/二进制名, 不共享 job.txt; vgather=0)。恢复后一条命令: `adb -s 52f67807 shell "cd /data/local/tmp/hvxhmx23 && ADSP_LIBRARY_PATH=. CDSP_LIBRARY_PATH=. ./run_main_on_hexagon 3 gehtp_runner_c4.so"` → 拉回 out_c4.f16.raw → `python3 scripts/judge_minicpm.py --out out_c4.f16.raw --gold .../gold.f16.raw`。
+12. **ABI 注意(v2 结构 widen)**: wt_slot.offset u32→u64 使 wt_blob 内存布局变化; **旧 ABI runner(如板上 gehtp_runner_prof.so @09-17 早)+ 新 libhvxhmx_v23.so = 读错位**。板上标准 lib 已是 HEAD(v2)构建; 各位面 runner 必须随 HEAD 重编(默认=旧行为条款的例外, 特此通报)。
+13. **CDSP 楔死定罪(板方问题, 与本线流程无关)**: 失败在装载器 `remote_handle_control(DSPRPC_GET_DSP_INFO)`(payload 未加载即败); 未碰过的 8-17 老 payload 同败; 内核日志 `boot_cdsp` 服务 60s 超时 exit 1(CDSP 本次没起来); SELinux 已是 Permissive(排除); 槽位 _a 未切(排除)。与 [[v81-board-shared-session-traps]] 的 0x39 楔死同族 → **恢复=板主/物理上电, 勿自重启**。
+14. VL-4B 编译探测(A1 证据, 顺带): 用 T0(含 VL 撞 id 修复)重编 qwen3vl_4b 中(旧 tagged.bin 系修复前产物, 静默丢权重不可用)。
