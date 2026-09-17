@@ -1241,6 +1241,48 @@ static int xop_softmax(const struct wt_op_ctx* cx) {
     return exec_softmax(cx->b, cx->op, cx->err, cx->errn);
 }
 
+/* 真 ScatterND (A3 暗雷收口): out = data 拷贝, 再对 n_idx 个坐标
+ * (每坐标 K 维, idx_s 为 int32 槽) 把 upd[e] 写到 out[base], block=1。
+ * GDN attn_iter: data [16,64,64] f16, 每步写一个衰减更新点; 恒等拷贝冒充
+ * (op_copy_sem) 使 attn_iter 在设备上退化为 attn_pre, 0.8B 全链数值错。 */
+static int exec_scatter_nd(const struct wt_blob* b, const struct wt_op* op,
+                           char* err, size_t errn) {
+    uint32_t data_t = op->args[0], idx_s = op->args[1] & 0x7FFFu, upd_t = op->args[2];
+    uint32_t out_t = op->args[3];
+    uint32_t n_idx = op->args[4], K = op->args[5];
+    if (K == 0 || K > 5) { snprintf(err, errn, "scatter_nd K=%u", (unsigned)K); return -1; }
+    const uint16_t* data = (const uint16_t*)ref_ptr(b, data_t);
+    const int32_t* idx = (const int32_t*)slot_ptr(b, idx_s);
+    const uint16_t* upd = (const uint16_t*)ref_ptr(b, upd_t);
+    /* out 元素数 = data 元素数 (与 data 同形); od[0..4] 为 data 形状 */
+    uint32_t od[5] = {1, 1, 1, 1, 1};
+    for (uint32_t k = 0; k < K && k < 5; k++) od[k] = op->args[6 + k];
+    uint32_t n = 1;
+    for (uint32_t k = 0; k < K && k < 5; k++) n *= od[k];
+    uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)n * 2u);
+    if (!data || !idx || !upd || !y) { snprintf(err, errn, "scatter_nd ref fail"); return -1; }
+    memcpy(y, data, (size_t)n * 2u);
+    /* strides (C 序) */
+    uint32_t ostr[5] = {1, 1, 1, 1, 1};
+    for (int d = (int)K - 2; d >= 0; d--) ostr[d] = ostr[d + 1] * od[d + 1];
+    for (uint32_t e = 0; e < n_idx; e++) {
+        uint32_t base = 0;
+        int bad = 0;
+        for (uint32_t k = 0; k < K; k++) {
+            int32_t c = idx[e * K + k];
+            if (c < 0 || c >= (int32_t)od[k]) { bad = 1; break; }
+            base += (uint32_t)c * ostr[k];
+        }
+        if (bad || base >= n) continue;
+        y[base] = upd[e];
+    }
+    return 0;
+}
+
+static int xop_scatter_nd(const struct wt_op_ctx* cx) {
+    return exec_scatter_nd(cx->b, cx->op, cx->err, cx->errn);
+}
+
 static int xop_concat(const struct wt_op_ctx* cx) {
     return exec_concat(cx->b, cx->op, cx->err, cx->errn);
 }
@@ -1324,6 +1366,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_RMSNORM2_F16] = xop_rmsnorm2,
     [OP_BROADCAST_F16] = xop_broadcast,
     [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,
+    [OP_SCATTER_ND_F16] = xop_scatter_nd,
 };
 
 int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,

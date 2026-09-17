@@ -113,6 +113,11 @@ enum {
     OP_TRANSPOSE_GEN_F16 = 27, /* [x_ref,y_t,rank,d0..d3,perm4B] 通用 N-D C 序转置
                                (rank 2/3/4; dims 为输入形状; opcode 10 保留
                                conv 管线 4-D NCHW 契约不动) */
+    OP_SCATTER_ND_F16 = 28,   /* [data_t,idx_s,upd_t,out_t,n_idx,K,d0..d4] arity 12
+                               真 ScatterND (A3 暗雷收口): out=data 拷贝后,
+                               对 n_idx 个坐标 (每坐标 K 维, idx_s int32 槽)
+                               写 upd[e] 到 out[base]; block=1 (GDN attn_iter
+                               每步写单点; 恒等拷贝冒充在 0.8B 1154 处全错) */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -144,6 +149,7 @@ enum {
 #define WT_ARITY_RMSNORM2_F16 5
 #define WT_ARITY_BROADCAST_F16 12
 #define WT_ARITY_TRANSPOSE_GEN_F16 8
+#define WT_ARITY_SCATTER_ND_F16 12
 
 struct wt_slot {
     uint32_t len;
