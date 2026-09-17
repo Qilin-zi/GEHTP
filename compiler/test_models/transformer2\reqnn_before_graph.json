@@ -1,0 +1,24 @@
+{
+ "header": {
+      "header_version": {
+          "major": 1,
+         "minor": 0,
+          "patch": 0
+      },
+       "version": {
+           "major": 1,
+           "minor": 0,
+           "patch": 0
+       },
+       "artifact_type": "HTP_GRAPH"
+    },
+   "model.cpp": "htp_graph",
+   "graph": {
+    "tensors": {
+
+    },
+    "nodes": {
+
+    }
+   }
+}

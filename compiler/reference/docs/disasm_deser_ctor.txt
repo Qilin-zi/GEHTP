@@ -1,0 +1,12 @@
+﻿
+C:\Users\RQILIN\Documents\Default Project\REQNN\reference\skel_crc\libQnnHtpV73Skel.so:     file format elf32-little
+
+objdump.exe : C:\Users\RQILIN\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget
+.Source_8wekyb3d8bbwe\mingw64\bin\objdump.exe: can't disassemble for architecture UNKNOWN!
+At line:16 char:1
++ & objdump -d --start-address=0x26b5c0 --stop-address=0x26b800 $f 2>&1 ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\RQILIN...ecture UNKNOWN!:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+

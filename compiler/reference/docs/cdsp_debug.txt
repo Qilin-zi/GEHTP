@@ -1,0 +1,2053 @@
+﻿python.exe : Ignoring wrong pointing object 210 0 (offset 0)
+At line:2 char:1
++ & $py -u -c @"
++ ~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Ignoring wrong ...10 0 (offset 0):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Ignoring wrong pointing object 211 0 (offset 0)
+Ignoring wrong pointing object 212 0 (offset 0)
+Ignoring wrong pointing object 213 0 (offset 0)
+Ignoring wrong pointing object 214 0 (offset 0)
+Ignoring wrong pointing object 215 0 (offset 0)
+Ignoring wrong pointing object 216 0 (offset 0)
+Ignoring wrong pointing object 217 0 (offset 0)
+Ignoring wrong pointing object 218 0 (offset 0)
+Ignoring wrong pointing object 220 0 (offset 0)
+Ignoring wrong pointing object 221 0 (offset 0)
+Ignoring wrong pointing object 222 0 (offset 0)
+Ignoring wrong pointing object 223 0 (offset 0)
+Ignoring wrong pointing object 224 0 (offset 0)
+Ignoring wrong pointing object 225 0 (offset 0)
+Ignoring wrong pointing object 226 0 (offset 0)
+Ignoring wrong pointing object 227 0 (offset 0)
+Ignoring wrong pointing object 228 0 (offset 0)
+Ignoring wrong pointing object 229 0 (offset 0)
+Ignoring wrong pointing object 230 0 (offset 0)
+Ignoring wrong pointing object 231 0 (offset 0)
+Ignoring wrong pointing object 232 0 (offset 0)
+Ignoring wrong pointing object 233 0 (offset 0)
+Ignoring wrong pointing object 234 0 (offset 0)
+Ignoring wrong pointing object 235 0 (offset 0)
+Ignoring wrong pointing object 236 0 (offset 0)
+Ignoring wrong pointing object 237 0 (offset 0)
+Ignoring wrong pointing object 238 0 (offset 0)
+Ignoring wrong pointing object 239 0 (offset 0)
+Ignoring wrong pointing object 240 0 (offset 0)
+Ignoring wrong pointing object 241 0 (offset 0)
+Ignoring wrong pointing object 242 0 (offset 0)
+Ignoring wrong pointing object 243 0 (offset 0)
+Ignoring wrong pointing object 244 0 (offset 0)
+Ignoring wrong pointing object 245 0 (offset 0)
+Ignoring wrong pointing object 246 0 (offset 0)
+Ignoring wrong pointing object 247 0 (offset 0)
+Ignoring wrong pointing object 248 0 (offset 0)
+Ignoring wrong pointing object 249 0 (offset 0)
+Ignoring wrong pointing object 250 0 (offset 0)
+Ignoring wrong pointing object 251 0 (offset 0)
+Ignoring wrong pointing object 252 0 (offset 0)
+Ignoring wrong pointing object 253 0 (offset 0)
+Ignoring wrong pointing object 254 0 (offset 0)
+Ignoring wrong pointing object 255 0 (offset 0)
+Ignoring wrong pointing object 256 0 (offset 0)
+Ignoring wrong pointing object 257 0 (offset 0)
+Ignoring wrong pointing object 258 0 (offset 0)
+Ignoring wrong pointing object 259 0 (offset 0)
+Ignoring wrong pointing object 260 0 (offset 0)
+Ignoring wrong pointing object 261 0 (offset 0)
+Ignoring wrong pointing object 262 0 (offset 0)
+Ignoring wrong pointing object 263 0 (offset 0)
+Ignoring wrong pointing object 264 0 (offset 0)
+Ignoring wrong pointing object 265 0 (offset 0)
+Ignoring wrong pointing object 266 0 (offset 0)
+Ignoring wrong pointing object 267 0 (offset 0)
+Ignoring wrong pointing object 268 0 (offset 0)
+Ignoring wrong pointing object 269 0 (offset 0)
+Ignoring wrong pointing object 270 0 (offset 0)
+Ignoring wrong pointing object 271 0 (offset 0)
+Ignoring wrong pointing object 272 0 (offset 0)
+Ignoring wrong pointing object 273 0 (offset 0)
+Ignoring wrong pointing object 274 0 (offset 0)
+Ignoring wrong pointing object 275 0 (offset 0)
+Ignoring wrong pointing object 276 0 (offset 0)
+Ignoring wrong pointing object 277 0 (offset 0)
+Ignoring wrong pointing object 278 0 (offset 0)
+Ignoring wrong pointing object 279 0 (offset 0)
+Ignoring wrong pointing object 280 0 (offset 0)
+Ignoring wrong pointing object 281 0 (offset 0)
+Ignoring wrong pointing object 282 0 (offset 0)
+Ignoring wrong pointing object 283 0 (offset 0)
+Ignoring wrong pointing object 284 0 (offset 0)
+Ignoring wrong pointing object 285 0 (offset 0)
+Ignoring wrong pointing object 286 0 (offset 0)
+Ignoring wrong pointing object 287 0 (offset 0)
+Ignoring wrong pointing object 288 0 (offset 0)
+Ignoring wrong pointing object 289 0 (offset 0)
+Ignoring wrong pointing object 290 0 (offset 0)
+Ignoring wrong pointing object 291 0 (offset 0)
+Ignoring wrong pointing object 292 0 (offset 0)
+Ignoring wrong pointing object 293 0 (offset 0)
+Ignoring wrong pointing object 294 0 (offset 0)
+Ignoring wrong pointing object 295 0 (offset 0)
+Ignoring wrong pointing object 296 0 (offset 0)
+Ignoring wrong pointing object 297 0 (offset 0)
+Ignoring wrong pointing object 298 0 (offset 0)
+Ignoring wrong pointing object 299 0 (offset 0)
+Ignoring wrong pointing object 300 0 (offset 0)
+Ignoring wrong pointing object 301 0 (offset 0)
+Ignoring wrong pointing object 302 0 (offset 0)
+Ignoring wrong pointing object 303 0 (offset 0)
+Ignoring wrong pointing object 304 0 (offset 0)
+Ignoring wrong pointing object 305 0 (offset 0)
+Ignoring wrong pointing object 306 0 (offset 0)
+Ignoring wrong pointing object 307 0 (offset 0)
+Ignoring wrong pointing object 308 0 (offset 0)
+Ignoring wrong pointing object 309 0 (offset 0)
+Ignoring wrong pointing object 310 0 (offset 0)
+Ignoring wrong pointing object 311 0 (offset 0)
+Ignoring wrong pointing object 312 0 (offset 0)
+Ignoring wrong pointing object 313 0 (offset 0)
+Ignoring wrong pointing object 314 0 (offset 0)
+Ignoring wrong pointing object 315 0 (offset 0)
+Ignoring wrong pointing object 316 0 (offset 0)
+Ignoring wrong pointing object 317 0 (offset 0)
+Ignoring wrong pointing object 318 0 (offset 0)
+Ignoring wrong pointing object 319 0 (offset 0)
+Ignoring wrong pointing object 321 0 (offset 0)
+Ignoring wrong pointing object 322 0 (offset 0)
+Ignoring wrong pointing object 323 0 (offset 0)
+Ignoring wrong pointing object 324 0 (offset 0)
+Ignoring wrong pointing object 325 0 (offset 0)
+Ignoring wrong pointing object 326 0 (offset 0)
+Ignoring wrong pointing object 328 0 (offset 0)
+Ignoring wrong pointing object 329 0 (offset 0)
+Ignoring wrong pointing object 330 0 (offset 0)
+Ignoring wrong pointing object 331 0 (offset 0)
+Ignoring wrong pointing object 332 0 (offset 0)
+Ignoring wrong pointing object 333 0 (offset 0)
+Ignoring wrong pointing object 334 0 (offset 0)
+Ignoring wrong pointing object 335 0 (offset 0)
+Ignoring wrong pointing object 336 0 (offset 0)
+Ignoring wrong pointing object 337 0 (offset 0)
+Ignoring wrong pointing object 338 0 (offset 0)
+Ignoring wrong pointing object 339 0 (offset 0)
+Ignoring wrong pointing object 340 0 (offset 0)
+Ignoring wrong pointing object 341 0 (offset 0)
+Ignoring wrong pointing object 342 0 (offset 0)
+Ignoring wrong pointing object 343 0 (offset 0)
+Ignoring wrong pointing object 344 0 (offset 0)
+Ignoring wrong pointing object 345 0 (offset 0)
+Ignoring wrong pointing object 346 0 (offset 0)
+Ignoring wrong pointing object 347 0 (offset 0)
+Ignoring wrong pointing object 348 0 (offset 0)
+Ignoring wrong pointing object 349 0 (offset 0)
+Ignoring wrong pointing object 350 0 (offset 0)
+Ignoring wrong pointing object 351 0 (offset 0)
+Ignoring wrong pointing object 353 0 (offset 0)
+Ignoring wrong pointing object 354 0 (offset 0)
+Ignoring wrong pointing object 355 0 (offset 0)
+Ignoring wrong pointing object 356 0 (offset 0)
+Ignoring wrong pointing object 357 0 (offset 0)
+Ignoring wrong pointing object 358 0 (offset 0)
+Ignoring wrong pointing object 359 0 (offset 0)
+Ignoring wrong pointing object 360 0 (offset 0)
+Ignoring wrong pointing object 361 0 (offset 0)
+Ignoring wrong pointing object 362 0 (offset 0)
+Ignoring wrong pointing object 363 0 (offset 0)
+Ignoring wrong pointing object 364 0 (offset 0)
+Ignoring wrong pointing object 365 0 (offset 0)
+Ignoring wrong pointing object 366 0 (offset 0)
+Ignoring wrong pointing object 367 0 (offset 0)
+Ignoring wrong pointing object 368 0 (offset 0)
+Ignoring wrong pointing object 371 0 (offset 0)
+Ignoring wrong pointing object 372 0 (offset 0)
+Ignoring wrong pointing object 374 0 (offset 0)
+Ignoring wrong pointing object 375 0 (offset 0)
+Ignoring wrong pointing object 376 0 (offset 0)
+Ignoring wrong pointing object 377 0 (offset 0)
+Ignoring wrong pointing object 378 0 (offset 0)
+Ignoring wrong pointing object 379 0 (offset 0)
+Ignoring wrong pointing object 381 0 (offset 0)
+Ignoring wrong pointing object 382 0 (offset 0)
+Ignoring wrong pointing object 383 0 (offset 0)
+Ignoring wrong pointing object 384 0 (offset 0)
+Ignoring wrong pointing object 385 0 (offset 0)
+Ignoring wrong pointing object 386 0 (offset 0)
+Ignoring wrong pointing object 387 0 (offset 0)
+Ignoring wrong pointing object 388 0 (offset 0)
+Ignoring wrong pointing object 389 0 (offset 0)
+Ignoring wrong pointing object 390 0 (offset 0)
+Ignoring wrong pointing object 391 0 (offset 0)
+Ignoring wrong pointing object 392 0 (offset 0)
+Ignoring wrong pointing object 393 0 (offset 0)
+Ignoring wrong pointing object 394 0 (offset 0)
+Ignoring wrong pointing object 395 0 (offset 0)
+Ignoring wrong pointing object 396 0 (offset 0)
+Ignoring wrong pointing object 397 0 (offset 0)
+Ignoring wrong pointing object 398 0 (offset 0)
+Ignoring wrong pointing object 399 0 (offset 0)
+Ignoring wrong pointing object 401 0 (offset 0)
+Ignoring wrong pointing object 402 0 (offset 0)
+Ignoring wrong pointing object 403 0 (offset 0)
+Ignoring wrong pointing object 404 0 (offset 0)
+Ignoring wrong pointing object 405 0 (offset 0)
+Ignoring wrong pointing object 406 0 (offset 0)
+Ignoring wrong pointing object 407 0 (offset 0)
+Ignoring wrong pointing object 408 0 (offset 0)
+Ignoring wrong pointing object 409 0 (offset 0)
+Ignoring wrong pointing object 410 0 (offset 0)
+Ignoring wrong pointing object 411 0 (offset 0)
+Ignoring wrong pointing object 412 0 (offset 0)
+Ignoring wrong pointing object 413 0 (offset 0)
+Ignoring wrong pointing object 414 0 (offset 0)
+Ignoring wrong pointing object 415 0 (offset 0)
+Ignoring wrong pointing object 416 0 (offset 0)
+Ignoring wrong pointing object 417 0 (offset 0)
+Ignoring wrong pointing object 418 0 (offset 0)
+Ignoring wrong pointing object 419 0 (offset 0)
+Ignoring wrong pointing object 420 0 (offset 0)
+Ignoring wrong pointing object 421 0 (offset 0)
+Ignoring wrong pointing object 422 0 (offset 0)
+Ignoring wrong pointing object 423 0 (offset 0)
+Ignoring wrong pointing object 424 0 (offset 0)
+Ignoring wrong pointing object 425 0 (offset 0)
+Ignoring wrong pointing object 426 0 (offset 0)
+Ignoring wrong pointing object 427 0 (offset 0)
+Ignoring wrong pointing object 428 0 (offset 0)
+Ignoring wrong pointing object 429 0 (offset 0)
+Ignoring wrong pointing object 430 0 (offset 0)
+Ignoring wrong pointing object 432 0 (offset 0)
+Ignoring wrong pointing object 433 0 (offset 0)
+Ignoring wrong pointing object 434 0 (offset 0)
+Ignoring wrong pointing object 435 0 (offset 0)
+Ignoring wrong pointing object 436 0 (offset 0)
+Ignoring wrong pointing object 437 0 (offset 0)
+Ignoring wrong pointing object 438 0 (offset 0)
+Ignoring wrong pointing object 439 0 (offset 0)
+Ignoring wrong pointing object 440 0 (offset 0)
+Ignoring wrong pointing object 442 0 (offset 0)
+Ignoring wrong pointing object 443 0 (offset 0)
+Ignoring wrong pointing object 444 0 (offset 0)
+Ignoring wrong pointing object 445 0 (offset 0)
+Ignoring wrong pointing object 446 0 (offset 0)
+Ignoring wrong pointing object 447 0 (offset 0)
+Ignoring wrong pointing object 449 0 (offset 0)
+Ignoring wrong pointing object 450 0 (offset 0)
+Ignoring wrong pointing object 451 0 (offset 0)
+Ignoring wrong pointing object 452 0 (offset 0)
+Ignoring wrong pointing object 453 0 (offset 0)
+Ignoring wrong pointing object 454 0 (offset 0)
+Ignoring wrong pointing object 456 0 (offset 0)
+Ignoring wrong pointing object 457 0 (offset 0)
+Ignoring wrong pointing object 458 0 (offset 0)
+Ignoring wrong pointing object 459 0 (offset 0)
+Ignoring wrong pointing object 460 0 (offset 0)
+Ignoring wrong pointing object 461 0 (offset 0)
+Ignoring wrong pointing object 463 0 (offset 0)
+Ignoring wrong pointing object 464 0 (offset 0)
+Ignoring wrong pointing object 465 0 (offset 0)
+Ignoring wrong pointing object 466 0 (offset 0)
+Ignoring wrong pointing object 467 0 (offset 0)
+Ignoring wrong pointing object 468 0 (offset 0)
+Ignoring wrong pointing object 469 0 (offset 0)
+Ignoring wrong pointing object 470 0 (offset 0)
+Ignoring wrong pointing object 471 0 (offset 0)
+Ignoring wrong pointing object 472 0 (offset 0)
+Ignoring wrong pointing object 473 0 (offset 0)
+Ignoring wrong pointing object 474 0 (offset 0)
+Ignoring wrong pointing object 475 0 (offset 0)
+Ignoring wrong pointing object 476 0 (offset 0)
+Ignoring wrong pointing object 477 0 (offset 0)
+Ignoring wrong pointing object 478 0 (offset 0)
+Ignoring wrong pointing object 479 0 (offset 0)
+Ignoring wrong pointing object 480 0 (offset 0)
+Ignoring wrong pointing object 481 0 (offset 0)
+Ignoring wrong pointing object 482 0 (offset 0)
+Ignoring wrong pointing object 483 0 (offset 0)
+Ignoring wrong pointing object 484 0 (offset 0)
+Ignoring wrong pointing object 487 0 (offset 0)
+Ignoring wrong pointing object 488 0 (offset 0)
+Ignoring wrong pointing object 489 0 (offset 0)
+Ignoring wrong pointing object 490 0 (offset 0)
+Ignoring wrong pointing object 493 0 (offset 0)
+Ignoring wrong pointing object 494 0 (offset 0)
+Ignoring wrong pointing object 495 0 (offset 0)
+Ignoring wrong pointing object 496 0 (offset 0)
+Ignoring wrong pointing object 497 0 (offset 0)
+Ignoring wrong pointing object 498 0 (offset 0)
+Ignoring wrong pointing object 499 0 (offset 0)
+Ignoring wrong pointing object 500 0 (offset 0)
+Ignoring wrong pointing object 501 0 (offset 0)
+Ignoring wrong pointing object 502 0 (offset 0)
+Ignoring wrong pointing object 503 0 (offset 0)
+Ignoring wrong pointing object 504 0 (offset 0)
+Ignoring wrong pointing object 505 0 (offset 0)
+Ignoring wrong pointing object 506 0 (offset 0)
+Ignoring wrong pointing object 507 0 (offset 0)
+Ignoring wrong pointing object 508 0 (offset 0)
+Ignoring wrong pointing object 509 0 (offset 0)
+Ignoring wrong pointing object 511 0 (offset 0)
+Ignoring wrong pointing object 512 0 (offset 0)
+Ignoring wrong pointing object 513 0 (offset 0)
+Ignoring wrong pointing object 514 0 (offset 0)
+Ignoring wrong pointing object 516 0 (offset 0)
+Ignoring wrong pointing object 517 0 (offset 0)
+Ignoring wrong pointing object 518 0 (offset 0)
+Ignoring wrong pointing object 519 0 (offset 0)
+Ignoring wrong pointing object 520 0 (offset 0)
+Ignoring wrong pointing object 521 0 (offset 0)
+Ignoring wrong pointing object 522 0 (offset 0)
+Ignoring wrong pointing object 524 0 (offset 0)
+Ignoring wrong pointing object 525 0 (offset 0)
+Ignoring wrong pointing object 526 0 (offset 0)
+Ignoring wrong pointing object 527 0 (offset 0)
+Ignoring wrong pointing object 528 0 (offset 0)
+Ignoring wrong pointing object 529 0 (offset 0)
+Ignoring wrong pointing object 530 0 (offset 0)
+Ignoring wrong pointing object 532 0 (offset 0)
+Ignoring wrong pointing object 533 0 (offset 0)
+Ignoring wrong pointing object 534 0 (offset 0)
+Ignoring wrong pointing object 535 0 (offset 0)
+Ignoring wrong pointing object 536 0 (offset 0)
+Ignoring wrong pointing object 537 0 (offset 0)
+Ignoring wrong pointing object 538 0 (offset 0)
+Ignoring wrong pointing object 540 0 (offset 0)
+Ignoring wrong pointing object 541 0 (offset 0)
+Ignoring wrong pointing object 542 0 (offset 0)
+Ignoring wrong pointing object 543 0 (offset 0)
+Ignoring wrong pointing object 544 0 (offset 0)
+Ignoring wrong pointing object 545 0 (offset 0)
+Ignoring wrong pointing object 546 0 (offset 0)
+Ignoring wrong pointing object 548 0 (offset 0)
+Ignoring wrong pointing object 549 0 (offset 0)
+Ignoring wrong pointing object 550 0 (offset 0)
+Ignoring wrong pointing object 551 0 (offset 0)
+Ignoring wrong pointing object 552 0 (offset 0)
+Ignoring wrong pointing object 553 0 (offset 0)
+Ignoring wrong pointing object 554 0 (offset 0)
+Ignoring wrong pointing object 556 0 (offset 0)
+Ignoring wrong pointing object 557 0 (offset 0)
+Ignoring wrong pointing object 558 0 (offset 0)
+Ignoring wrong pointing object 559 0 (offset 0)
+Ignoring wrong pointing object 560 0 (offset 0)
+Ignoring wrong pointing object 561 0 (offset 0)
+Ignoring wrong pointing object 562 0 (offset 0)
+Ignoring wrong pointing object 564 0 (offset 0)
+Ignoring wrong pointing object 565 0 (offset 0)
+Ignoring wrong pointing object 566 0 (offset 0)
+Ignoring wrong pointing object 567 0 (offset 0)
+Ignoring wrong pointing object 568 0 (offset 0)
+Ignoring wrong pointing object 569 0 (offset 0)
+Ignoring wrong pointing object 570 0 (offset 0)
+Ignoring wrong pointing object 571 0 (offset 0)
+Ignoring wrong pointing object 572 0 (offset 0)
+Ignoring wrong pointing object 573 0 (offset 0)
+Ignoring wrong pointing object 574 0 (offset 0)
+Ignoring wrong pointing object 575 0 (offset 0)
+Ignoring wrong pointing object 576 0 (offset 0)
+Ignoring wrong pointing object 577 0 (offset 0)
+Ignoring wrong pointing object 578 0 (offset 0)
+Ignoring wrong pointing object 579 0 (offset 0)
+Ignoring wrong pointing object 580 0 (offset 0)
+Ignoring wrong pointing object 581 0 (offset 0)
+Ignoring wrong pointing object 582 0 (offset 0)
+Ignoring wrong pointing object 583 0 (offset 0)
+Ignoring wrong pointing object 584 0 (offset 0)
+Ignoring wrong pointing object 585 0 (offset 0)
+Ignoring wrong pointing object 586 0 (offset 0)
+Ignoring wrong pointing object 587 0 (offset 0)
+Ignoring wrong pointing object 588 0 (offset 0)
+Ignoring wrong pointing object 591 0 (offset 0)
+Ignoring wrong pointing object 594 0 (offset 0)
+Ignoring wrong pointing object 597 0 (offset 0)
+Ignoring wrong pointing object 598 0 (offset 0)
+Ignoring wrong pointing object 599 0 (offset 0)
+Ignoring wrong pointing object 600 0 (offset 0)
+Ignoring wrong pointing object 601 0 (offset 0)
+Ignoring wrong pointing object 602 0 (offset 0)
+Ignoring wrong pointing object 603 0 (offset 0)
+Ignoring wrong pointing object 604 0 (offset 0)
+Ignoring wrong pointing object 605 0 (offset 0)
+Ignoring wrong pointing object 606 0 (offset 0)
+Ignoring wrong pointing object 608 0 (offset 0)
+Ignoring wrong pointing object 609 0 (offset 0)
+Ignoring wrong pointing object 610 0 (offset 0)
+Ignoring wrong pointing object 612 0 (offset 0)
+Ignoring wrong pointing object 613 0 (offset 0)
+Ignoring wrong pointing object 614 0 (offset 0)
+Ignoring wrong pointing object 616 0 (offset 0)
+Ignoring wrong pointing object 617 0 (offset 0)
+Ignoring wrong pointing object 618 0 (offset 0)
+Ignoring wrong pointing object 619 0 (offset 0)
+Ignoring wrong pointing object 620 0 (offset 0)
+Ignoring wrong pointing object 621 0 (offset 0)
+Ignoring wrong pointing object 622 0 (offset 0)
+Ignoring wrong pointing object 623 0 (offset 0)
+Ignoring wrong pointing object 624 0 (offset 0)
+Ignoring wrong pointing object 625 0 (offset 0)
+Ignoring wrong pointing object 626 0 (offset 0)
+Ignoring wrong pointing object 627 0 (offset 0)
+Ignoring wrong pointing object 628 0 (offset 0)
+Ignoring wrong pointing object 629 0 (offset 0)
+Ignoring wrong pointing object 630 0 (offset 0)
+Ignoring wrong pointing object 631 0 (offset 0)
+Ignoring wrong pointing object 632 0 (offset 0)
+Ignoring wrong pointing object 633 0 (offset 0)
+Ignoring wrong pointing object 634 0 (offset 0)
+Ignoring wrong pointing object 635 0 (offset 0)
+Ignoring wrong pointing object 636 0 (offset 0)
+Ignoring wrong pointing object 637 0 (offset 0)
+Ignoring wrong pointing object 638 0 (offset 0)
+Ignoring wrong pointing object 639 0 (offset 0)
+Ignoring wrong pointing object 640 0 (offset 0)
+Ignoring wrong pointing object 641 0 (offset 0)
+Ignoring wrong pointing object 642 0 (offset 0)
+Ignoring wrong pointing object 643 0 (offset 0)
+Ignoring wrong pointing object 644 0 (offset 0)
+Ignoring wrong pointing object 645 0 (offset 0)
+Ignoring wrong pointing object 646 0 (offset 0)
+Ignoring wrong pointing object 647 0 (offset 0)
+Ignoring wrong pointing object 648 0 (offset 0)
+Ignoring wrong pointing object 649 0 (offset 0)
+Ignoring wrong pointing object 650 0 (offset 0)
+Ignoring wrong pointing object 651 0 (offset 0)
+Ignoring wrong pointing object 652 0 (offset 0)
+Ignoring wrong pointing object 653 0 (offset 0)
+Ignoring wrong pointing object 654 0 (offset 0)
+Ignoring wrong pointing object 655 0 (offset 0)
+Ignoring wrong pointing object 656 0 (offset 0)
+Ignoring wrong pointing object 657 0 (offset 0)
+Ignoring wrong pointing object 658 0 (offset 0)
+Ignoring wrong pointing object 659 0 (offset 0)
+Ignoring wrong pointing object 660 0 (offset 0)
+Ignoring wrong pointing object 661 0 (offset 0)
+Ignoring wrong pointing object 662 0 (offset 0)
+Ignoring wrong pointing object 663 0 (offset 0)
+Ignoring wrong pointing object 664 0 (offset 0)
+Ignoring wrong pointing object 665 0 (offset 0)
+Ignoring wrong pointing object 666 0 (offset 0)
+Ignoring wrong pointing object 667 0 (offset 0)
+Ignoring wrong pointing object 668 0 (offset 0)
+Ignoring wrong pointing object 669 0 (offset 0)
+Ignoring wrong pointing object 670 0 (offset 0)
+Ignoring wrong pointing object 672 0 (offset 0)
+Ignoring wrong pointing object 673 0 (offset 0)
+Ignoring wrong pointing object 674 0 (offset 0)
+Ignoring wrong pointing object 675 0 (offset 0)
+Ignoring wrong pointing object 676 0 (offset 0)
+Ignoring wrong pointing object 677 0 (offset 0)
+Ignoring wrong pointing object 678 0 (offset 0)
+Ignoring wrong pointing object 679 0 (offset 0)
+Ignoring wrong pointing object 680 0 (offset 0)
+Ignoring wrong pointing object 681 0 (offset 0)
+Ignoring wrong pointing object 682 0 (offset 0)
+Ignoring wrong pointing object 683 0 (offset 0)
+Ignoring wrong pointing object 684 0 (offset 0)
+Ignoring wrong pointing object 686 0 (offset 0)
+Ignoring wrong pointing object 687 0 (offset 0)
+Ignoring wrong pointing object 688 0 (offset 0)
+Ignoring wrong pointing object 689 0 (offset 0)
+Ignoring wrong pointing object 690 0 (offset 0)
+Ignoring wrong pointing object 691 0 (offset 0)
+Ignoring wrong pointing object 693 0 (offset 0)
+Ignoring wrong pointing object 694 0 (offset 0)
+Ignoring wrong pointing object 695 0 (offset 0)
+Ignoring wrong pointing object 696 0 (offset 0)
+Ignoring wrong pointing object 698 0 (offset 0)
+Ignoring wrong pointing object 699 0 (offset 0)
+Ignoring wrong pointing object 700 0 (offset 0)
+Ignoring wrong pointing object 701 0 (offset 0)
+Ignoring wrong pointing object 702 0 (offset 0)
+Ignoring wrong pointing object 703 0 (offset 0)
+Ignoring wrong pointing object 704 0 (offset 0)
+Ignoring wrong pointing object 705 0 (offset 0)
+Ignoring wrong pointing object 706 0 (offset 0)
+Ignoring wrong pointing object 707 0 (offset 0)
+Ignoring wrong pointing object 710 0 (offset 0)
+Ignoring wrong pointing object 711 0 (offset 0)
+Ignoring wrong pointing object 712 0 (offset 0)
+Ignoring wrong pointing object 713 0 (offset 0)
+Ignoring wrong pointing object 714 0 (offset 0)
+Ignoring wrong pointing object 715 0 (offset 0)
+Ignoring wrong pointing object 716 0 (offset 0)
+Ignoring wrong pointing object 717 0 (offset 0)
+Ignoring wrong pointing object 718 0 (offset 0)
+Ignoring wrong pointing object 719 0 (offset 0)
+Ignoring wrong pointing object 720 0 (offset 0)
+Ignoring wrong pointing object 721 0 (offset 0)
+Ignoring wrong pointing object 722 0 (offset 0)
+Ignoring wrong pointing object 723 0 (offset 0)
+Ignoring wrong pointing object 724 0 (offset 0)
+Ignoring wrong pointing object 726 0 (offset 0)
+Ignoring wrong pointing object 727 0 (offset 0)
+Ignoring wrong pointing object 728 0 (offset 0)
+Ignoring wrong pointing object 729 0 (offset 0)
+Ignoring wrong pointing object 731 0 (offset 0)
+Ignoring wrong pointing object 732 0 (offset 0)
+Ignoring wrong pointing object 733 0 (offset 0)
+Ignoring wrong pointing object 734 0 (offset 0)
+Ignoring wrong pointing object 735 0 (offset 0)
+Ignoring wrong pointing object 736 0 (offset 0)
+Ignoring wrong pointing object 737 0 (offset 0)
+Ignoring wrong pointing object 738 0 (offset 0)
+Ignoring wrong pointing object 739 0 (offset 0)
+Ignoring wrong pointing object 740 0 (offset 0)
+Ignoring wrong pointing object 741 0 (offset 0)
+Ignoring wrong pointing object 742 0 (offset 0)
+Ignoring wrong pointing object 743 0 (offset 0)
+Ignoring wrong pointing object 745 0 (offset 0)
+Ignoring wrong pointing object 746 0 (offset 0)
+Ignoring wrong pointing object 747 0 (offset 0)
+Ignoring wrong pointing object 748 0 (offset 0)
+Ignoring wrong pointing object 749 0 (offset 0)
+Ignoring wrong pointing object 750 0 (offset 0)
+Ignoring wrong pointing object 751 0 (offset 0)
+Ignoring wrong pointing object 752 0 (offset 0)
+Ignoring wrong pointing object 753 0 (offset 0)
+Ignoring wrong pointing object 754 0 (offset 0)
+Ignoring wrong pointing object 756 0 (offset 0)
+Ignoring wrong pointing object 757 0 (offset 0)
+Ignoring wrong pointing object 758 0 (offset 0)
+Ignoring wrong pointing object 759 0 (offset 0)
+Ignoring wrong pointing object 760 0 (offset 0)
+Ignoring wrong pointing object 761 0 (offset 0)
+Ignoring wrong pointing object 762 0 (offset 0)
+Ignoring wrong pointing object 763 0 (offset 0)
+Ignoring wrong pointing object 764 0 (offset 0)
+Ignoring wrong pointing object 765 0 (offset 0)
+Ignoring wrong pointing object 766 0 (offset 0)
+Ignoring wrong pointing object 767 0 (offset 0)
+Ignoring wrong pointing object 768 0 (offset 0)
+Ignoring wrong pointing object 769 0 (offset 0)
+Ignoring wrong pointing object 770 0 (offset 0)
+Ignoring wrong pointing object 772 0 (offset 0)
+Ignoring wrong pointing object 773 0 (offset 0)
+Ignoring wrong pointing object 774 0 (offset 0)
+Ignoring wrong pointing object 776 0 (offset 0)
+Ignoring wrong pointing object 777 0 (offset 0)
+Ignoring wrong pointing object 778 0 (offset 0)
+Ignoring wrong pointing object 780 0 (offset 0)
+Ignoring wrong pointing object 781 0 (offset 0)
+Ignoring wrong pointing object 782 0 (offset 0)
+Ignoring wrong pointing object 783 0 (offset 0)
+Ignoring wrong pointing object 784 0 (offset 0)
+Ignoring wrong pointing object 785 0 (offset 0)
+Ignoring wrong pointing object 786 0 (offset 0)
+Ignoring wrong pointing object 787 0 (offset 0)
+Ignoring wrong pointing object 788 0 (offset 0)
+Ignoring wrong pointing object 789 0 (offset 0)
+Ignoring wrong pointing object 791 0 (offset 0)
+Ignoring wrong pointing object 792 0 (offset 0)
+Ignoring wrong pointing object 793 0 (offset 0)
+Ignoring wrong pointing object 794 0 (offset 0)
+Ignoring wrong pointing object 795 0 (offset 0)
+Ignoring wrong pointing object 796 0 (offset 0)
+Ignoring wrong pointing object 797 0 (offset 0)
+Ignoring wrong pointing object 798 0 (offset 0)
+Ignoring wrong pointing object 799 0 (offset 0)
+Ignoring wrong pointing object 800 0 (offset 0)
+Ignoring wrong pointing object 801 0 (offset 0)
+Ignoring wrong pointing object 802 0 (offset 0)
+Ignoring wrong pointing object 803 0 (offset 0)
+Ignoring wrong pointing object 805 0 (offset 0)
+Ignoring wrong pointing object 806 0 (offset 0)
+Ignoring wrong pointing object 807 0 (offset 0)
+Ignoring wrong pointing object 808 0 (offset 0)
+Ignoring wrong pointing object 809 0 (offset 0)
+Ignoring wrong pointing object 810 0 (offset 0)
+Ignoring wrong pointing object 811 0 (offset 0)
+Ignoring wrong pointing object 812 0 (offset 0)
+Ignoring wrong pointing object 813 0 (offset 0)
+Ignoring wrong pointing object 814 0 (offset 0)
+Ignoring wrong pointing object 815 0 (offset 0)
+Ignoring wrong pointing object 816 0 (offset 0)
+Ignoring wrong pointing object 817 0 (offset 0)
+Ignoring wrong pointing object 818 0 (offset 0)
+Ignoring wrong pointing object 819 0 (offset 0)
+Ignoring wrong pointing object 820 0 (offset 0)
+Ignoring wrong pointing object 821 0 (offset 0)
+Ignoring wrong pointing object 822 0 (offset 0)
+Ignoring wrong pointing object 823 0 (offset 0)
+Ignoring wrong pointing object 824 0 (offset 0)
+Ignoring wrong pointing object 825 0 (offset 0)
+Ignoring wrong pointing object 826 0 (offset 0)
+Ignoring wrong pointing object 827 0 (offset 0)
+Ignoring wrong pointing object 828 0 (offset 0)
+Ignoring wrong pointing object 829 0 (offset 0)
+Ignoring wrong pointing object 830 0 (offset 0)
+Ignoring wrong pointing object 831 0 (offset 0)
+Ignoring wrong pointing object 832 0 (offset 0)
+Ignoring wrong pointing object 833 0 (offset 0)
+Ignoring wrong pointing object 834 0 (offset 0)
+Ignoring wrong pointing object 835 0 (offset 0)
+Ignoring wrong pointing object 836 0 (offset 0)
+Ignoring wrong pointing object 837 0 (offset 0)
+Ignoring wrong pointing object 838 0 (offset 0)
+Ignoring wrong pointing object 839 0 (offset 0)
+Ignoring wrong pointing object 840 0 (offset 0)
+Ignoring wrong pointing object 841 0 (offset 0)
+Ignoring wrong pointing object 842 0 (offset 0)
+Ignoring wrong pointing object 844 0 (offset 0)
+Ignoring wrong pointing object 845 0 (offset 0)
+Ignoring wrong pointing object 846 0 (offset 0)
+Ignoring wrong pointing object 847 0 (offset 0)
+Ignoring wrong pointing object 849 0 (offset 0)
+Ignoring wrong pointing object 850 0 (offset 0)
+Ignoring wrong pointing object 851 0 (offset 0)
+Ignoring wrong pointing object 852 0 (offset 0)
+Ignoring wrong pointing object 853 0 (offset 0)
+Ignoring wrong pointing object 854 0 (offset 0)
+Ignoring wrong pointing object 855 0 (offset 0)
+Ignoring wrong pointing object 857 0 (offset 0)
+Ignoring wrong pointing object 858 0 (offset 0)
+Ignoring wrong pointing object 859 0 (offset 0)
+Ignoring wrong pointing object 860 0 (offset 0)
+Ignoring wrong pointing object 861 0 (offset 0)
+Ignoring wrong pointing object 862 0 (offset 0)
+Ignoring wrong pointing object 863 0 (offset 0)
+Ignoring wrong pointing object 865 0 (offset 0)
+Ignoring wrong pointing object 866 0 (offset 0)
+Ignoring wrong pointing object 867 0 (offset 0)
+Ignoring wrong pointing object 868 0 (offset 0)
+Ignoring wrong pointing object 869 0 (offset 0)
+Ignoring wrong pointing object 871 0 (offset 0)
+Ignoring wrong pointing object 872 0 (offset 0)
+Ignoring wrong pointing object 873 0 (offset 0)
+Ignoring wrong pointing object 874 0 (offset 0)
+Ignoring wrong pointing object 875 0 (offset 0)
+Ignoring wrong pointing object 876 0 (offset 0)
+Ignoring wrong pointing object 877 0 (offset 0)
+Ignoring wrong pointing object 879 0 (offset 0)
+Ignoring wrong pointing object 880 0 (offset 0)
+Ignoring wrong pointing object 881 0 (offset 0)
+Ignoring wrong pointing object 882 0 (offset 0)
+Ignoring wrong pointing object 883 0 (offset 0)
+Ignoring wrong pointing object 884 0 (offset 0)
+Ignoring wrong pointing object 885 0 (offset 0)
+Ignoring wrong pointing object 886 0 (offset 0)
+Ignoring wrong pointing object 887 0 (offset 0)
+Ignoring wrong pointing object 888 0 (offset 0)
+Ignoring wrong pointing object 890 0 (offset 0)
+Ignoring wrong pointing object 891 0 (offset 0)
+Ignoring wrong pointing object 892 0 (offset 0)
+Ignoring wrong pointing object 893 0 (offset 0)
+Ignoring wrong pointing object 894 0 (offset 0)
+Ignoring wrong pointing object 895 0 (offset 0)
+Ignoring wrong pointing object 896 0 (offset 0)
+Ignoring wrong pointing object 897 0 (offset 0)
+Ignoring wrong pointing object 898 0 (offset 0)
+Ignoring wrong pointing object 899 0 (offset 0)
+Ignoring wrong pointing object 900 0 (offset 0)
+Ignoring wrong pointing object 901 0 (offset 0)
+Ignoring wrong pointing object 902 0 (offset 0)
+Ignoring wrong pointing object 904 0 (offset 0)
+Ignoring wrong pointing object 905 0 (offset 0)
+Ignoring wrong pointing object 906 0 (offset 0)
+Ignoring wrong pointing object 907 0 (offset 0)
+Ignoring wrong pointing object 908 0 (offset 0)
+Ignoring wrong pointing object 911 0 (offset 0)
+Ignoring wrong pointing object 914 0 (offset 0)
+Ignoring wrong pointing object 917 0 (offset 0)
+Ignoring wrong pointing object 918 0 (offset 0)
+Ignoring wrong pointing object 919 0 (offset 0)
+Ignoring wrong pointing object 921 0 (offset 0)
+Ignoring wrong pointing object 922 0 (offset 0)
+Ignoring wrong pointing object 923 0 (offset 0)
+Ignoring wrong pointing object 924 0 (offset 0)
+Ignoring wrong pointing object 925 0 (offset 0)
+Ignoring wrong pointing object 926 0 (offset 0)
+Ignoring wrong pointing object 927 0 (offset 0)
+Ignoring wrong pointing object 928 0 (offset 0)
+Ignoring wrong pointing object 929 0 (offset 0)
+Ignoring wrong pointing object 930 0 (offset 0)
+Ignoring wrong pointing object 931 0 (offset 0)
+Ignoring wrong pointing object 933 0 (offset 0)
+Ignoring wrong pointing object 934 0 (offset 0)
+Ignoring wrong pointing object 935 0 (offset 0)
+Ignoring wrong pointing object 936 0 (offset 0)
+Ignoring wrong pointing object 938 0 (offset 0)
+Ignoring wrong pointing object 939 0 (offset 0)
+Ignoring wrong pointing object 940 0 (offset 0)
+Ignoring wrong pointing object 941 0 (offset 0)
+Ignoring wrong pointing object 943 0 (offset 0)
+Ignoring wrong pointing object 944 0 (offset 0)
+Ignoring wrong pointing object 945 0 (offset 0)
+Ignoring wrong pointing object 946 0 (offset 0)
+Ignoring wrong pointing object 947 0 (offset 0)
+Ignoring wrong pointing object 948 0 (offset 0)
+Ignoring wrong pointing object 949 0 (offset 0)
+Ignoring wrong pointing object 950 0 (offset 0)
+Ignoring wrong pointing object 951 0 (offset 0)
+Ignoring wrong pointing object 952 0 (offset 0)
+Ignoring wrong pointing object 953 0 (offset 0)
+Ignoring wrong pointing object 954 0 (offset 0)
+Ignoring wrong pointing object 955 0 (offset 0)
+Ignoring wrong pointing object 956 0 (offset 0)
+Ignoring wrong pointing object 958 0 (offset 0)
+Ignoring wrong pointing object 959 0 (offset 0)
+Ignoring wrong pointing object 960 0 (offset 0)
+Ignoring wrong pointing object 961 0 (offset 0)
+Ignoring wrong pointing object 962 0 (offset 0)
+Ignoring wrong pointing object 963 0 (offset 0)
+Ignoring wrong pointing object 964 0 (offset 0)
+Ignoring wrong pointing object 966 0 (offset 0)
+Ignoring wrong pointing object 967 0 (offset 0)
+Ignoring wrong pointing object 968 0 (offset 0)
+Ignoring wrong pointing object 969 0 (offset 0)
+Ignoring wrong pointing object 971 0 (offset 0)
+Ignoring wrong pointing object 972 0 (offset 0)
+Ignoring wrong pointing object 973 0 (offset 0)
+Ignoring wrong pointing object 974 0 (offset 0)
+Ignoring wrong pointing object 975 0 (offset 0)
+Ignoring wrong pointing object 976 0 (offset 0)
+Ignoring wrong pointing object 977 0 (offset 0)
+Ignoring wrong pointing object 979 0 (offset 0)
+Ignoring wrong pointing object 980 0 (offset 0)
+Ignoring wrong pointing object 981 0 (offset 0)
+Ignoring wrong pointing object 982 0 (offset 0)
+Ignoring wrong pointing object 983 0 (offset 0)
+Ignoring wrong pointing object 984 0 (offset 0)
+Ignoring wrong pointing object 985 0 (offset 0)
+Ignoring wrong pointing object 986 0 (offset 0)
+Ignoring wrong pointing object 987 0 (offset 0)
+Ignoring wrong pointing object 988 0 (offset 0)
+Ignoring wrong pointing object 989 0 (offset 0)
+Ignoring wrong pointing object 990 0 (offset 0)
+Ignoring wrong pointing object 991 0 (offset 0)
+Ignoring wrong pointing object 992 0 (offset 0)
+Ignoring wrong pointing object 993 0 (offset 0)
+Ignoring wrong pointing object 994 0 (offset 0)
+Ignoring wrong pointing object 995 0 (offset 0)
+Ignoring wrong pointing object 996 0 (offset 0)
+Ignoring wrong pointing object 997 0 (offset 0)
+Ignoring wrong pointing object 998 0 (offset 0)
+Ignoring wrong pointing object 999 0 (offset 0)
+Ignoring wrong pointing object 1000 0 (offset 0)
+Ignoring wrong pointing object 1001 0 (offset 0)
+Ignoring wrong pointing object 1002 0 (offset 0)
+Ignoring wrong pointing object 1003 0 (offset 0)
+Ignoring wrong pointing object 1004 0 (offset 0)
+Ignoring wrong pointing object 1005 0 (offset 0)
+Ignoring wrong pointing object 1006 0 (offset 0)
+Ignoring wrong pointing object 1007 0 (offset 0)
+Ignoring wrong pointing object 1008 0 (offset 0)
+Ignoring wrong pointing object 1009 0 (offset 0)
+Ignoring wrong pointing object 1010 0 (offset 0)
+Ignoring wrong pointing object 1011 0 (offset 0)
+Ignoring wrong pointing object 1013 0 (offset 0)
+Ignoring wrong pointing object 1014 0 (offset 0)
+Ignoring wrong pointing object 1015 0 (offset 0)
+Ignoring wrong pointing object 1016 0 (offset 0)
+Ignoring wrong pointing object 1017 0 (offset 0)
+Ignoring wrong pointing object 1019 0 (offset 0)
+Ignoring wrong pointing object 1020 0 (offset 0)
+Ignoring wrong pointing object 1021 0 (offset 0)
+Ignoring wrong pointing object 1022 0 (offset 0)
+Ignoring wrong pointing object 1023 0 (offset 0)
+Ignoring wrong pointing object 1024 0 (offset 0)
+Ignoring wrong pointing object 1026 0 (offset 0)
+Ignoring wrong pointing object 1027 0 (offset 0)
+Ignoring wrong pointing object 1028 0 (offset 0)
+Ignoring wrong pointing object 1029 0 (offset 0)
+Ignoring wrong pointing object 1030 0 (offset 0)
+Ignoring wrong pointing object 1031 0 (offset 0)
+Ignoring wrong pointing object 1032 0 (offset 0)
+Ignoring wrong pointing object 1033 0 (offset 0)
+Ignoring wrong pointing object 1034 0 (offset 0)
+Ignoring wrong pointing object 1035 0 (offset 0)
+Ignoring wrong pointing object 1036 0 (offset 0)
+Ignoring wrong pointing object 1037 0 (offset 0)
+Ignoring wrong pointing object 1038 0 (offset 0)
+Ignoring wrong pointing object 1039 0 (offset 0)
+Ignoring wrong pointing object 1040 0 (offset 0)
+Ignoring wrong pointing object 1041 0 (offset 0)
+Ignoring wrong pointing object 1042 0 (offset 0)
+Ignoring wrong pointing object 1043 0 (offset 0)
+Ignoring wrong pointing object 1044 0 (offset 0)
+Ignoring wrong pointing object 1045 0 (offset 0)
+Ignoring wrong pointing object 1046 0 (offset 0)
+Ignoring wrong pointing object 1047 0 (offset 0)
+Ignoring wrong pointing object 1048 0 (offset 0)
+Ignoring wrong pointing object 1049 0 (offset 0)
+Ignoring wrong pointing object 1050 0 (offset 0)
+Ignoring wrong pointing object 1051 0 (offset 0)
+Ignoring wrong pointing object 1052 0 (offset 0)
+Ignoring wrong pointing object 1053 0 (offset 0)
+Ignoring wrong pointing object 1054 0 (offset 0)
+Ignoring wrong pointing object 1055 0 (offset 0)
+Ignoring wrong pointing object 1056 0 (offset 0)
+Ignoring wrong pointing object 1057 0 (offset 0)
+Ignoring wrong pointing object 1058 0 (offset 0)
+Ignoring wrong pointing object 1059 0 (offset 0)
+Ignoring wrong pointing object 1060 0 (offset 0)
+Ignoring wrong pointing object 1061 0 (offset 0)
+Ignoring wrong pointing object 1062 0 (offset 0)
+Ignoring wrong pointing object 1063 0 (offset 0)
+Ignoring wrong pointing object 1064 0 (offset 0)
+Ignoring wrong pointing object 1065 0 (offset 0)
+Ignoring wrong pointing object 1066 0 (offset 0)
+Ignoring wrong pointing object 1067 0 (offset 0)
+Ignoring wrong pointing object 1068 0 (offset 0)
+Ignoring wrong pointing object 1069 0 (offset 0)
+Ignoring wrong pointing object 1070 0 (offset 0)
+Ignoring wrong pointing object 1071 0 (offset 0)
+Ignoring wrong pointing object 1072 0 (offset 0)
+Ignoring wrong pointing object 1073 0 (offset 0)
+Ignoring wrong pointing object 1074 0 (offset 0)
+Ignoring wrong pointing object 1075 0 (offset 0)
+Ignoring wrong pointing object 1076 0 (offset 0)
+Ignoring wrong pointing object 1077 0 (offset 0)
+Ignoring wrong pointing object 1078 0 (offset 0)
+Ignoring wrong pointing object 1079 0 (offset 0)
+Ignoring wrong pointing object 1080 0 (offset 0)
+Ignoring wrong pointing object 1081 0 (offset 0)
+Ignoring wrong pointing object 1082 0 (offset 0)
+Ignoring wrong pointing object 1083 0 (offset 0)
+Ignoring wrong pointing object 1084 0 (offset 0)
+Ignoring wrong pointing object 1085 0 (offset 0)
+Ignoring wrong pointing object 1086 0 (offset 0)
+Ignoring wrong pointing object 1087 0 (offset 0)
+Ignoring wrong pointing object 1088 0 (offset 0)
+Ignoring wrong pointing object 1089 0 (offset 0)
+Ignoring wrong pointing object 1090 0 (offset 0)
+Ignoring wrong pointing object 1091 0 (offset 0)
+Ignoring wrong pointing object 1092 0 (offset 0)
+Ignoring wrong pointing object 1093 0 (offset 0)
+Ignoring wrong pointing object 1094 0 (offset 0)
+Ignoring wrong pointing object 1095 0 (offset 0)
+Ignoring wrong pointing object 1096 0 (offset 0)
+Ignoring wrong pointing object 1097 0 (offset 0)
+Ignoring wrong pointing object 1098 0 (offset 0)
+Ignoring wrong pointing object 1099 0 (offset 0)
+Ignoring wrong pointing object 1100 0 (offset 0)
+Ignoring wrong pointing object 1101 0 (offset 0)
+Ignoring wrong pointing object 1102 0 (offset 0)
+Ignoring wrong pointing object 1103 0 (offset 0)
+Ignoring wrong pointing object 1104 0 (offset 0)
+Ignoring wrong pointing object 1105 0 (offset 0)
+Ignoring wrong pointing object 1106 0 (offset 0)
+Ignoring wrong pointing object 1107 0 (offset 0)
+Ignoring wrong pointing object 1108 0 (offset 0)
+Ignoring wrong pointing object 1109 0 (offset 0)
+Ignoring wrong pointing object 1110 0 (offset 0)
+Ignoring wrong pointing object 1111 0 (offset 0)
+Ignoring wrong pointing object 1112 0 (offset 0)
+Ignoring wrong pointing object 1113 0 (offset 0)
+Ignoring wrong pointing object 1114 0 (offset 0)
+Ignoring wrong pointing object 1115 0 (offset 0)
+Ignoring wrong pointing object 1116 0 (offset 0)
+Ignoring wrong pointing object 1118 0 (offset 0)
+Ignoring wrong pointing object 1119 0 (offset 0)
+Ignoring wrong pointing object 1120 0 (offset 0)
+Ignoring wrong pointing object 1121 0 (offset 0)
+Ignoring wrong pointing object 1123 0 (offset 0)
+Ignoring wrong pointing object 1124 0 (offset 0)
+Ignoring wrong pointing object 1125 0 (offset 0)
+Ignoring wrong pointing object 1126 0 (offset 0)
+Ignoring wrong pointing object 1127 0 (offset 0)
+Ignoring wrong pointing object 1128 0 (offset 0)
+Ignoring wrong pointing object 1129 0 (offset 0)
+Ignoring wrong pointing object 1131 0 (offset 0)
+Ignoring wrong pointing object 1132 0 (offset 0)
+Ignoring wrong pointing object 1133 0 (offset 0)
+Ignoring wrong pointing object 1134 0 (offset 0)
+Ignoring wrong pointing object 1135 0 (offset 0)
+Ignoring wrong pointing object 1136 0 (offset 0)
+Ignoring wrong pointing object 1137 0 (offset 0)
+Ignoring wrong pointing object 1138 0 (offset 0)
+Ignoring wrong pointing object 1139 0 (offset 0)
+Ignoring wrong pointing object 1140 0 (offset 0)
+Ignoring wrong pointing object 1141 0 (offset 0)
+Ignoring wrong pointing object 1142 0 (offset 0)
+Ignoring wrong pointing object 1143 0 (offset 0)
+Ignoring wrong pointing object 1144 0 (offset 0)
+Ignoring wrong pointing object 1145 0 (offset 0)
+Ignoring wrong pointing object 1146 0 (offset 0)
+Ignoring wrong pointing object 1148 0 (offset 0)
+Ignoring wrong pointing object 1149 0 (offset 0)
+Ignoring wrong pointing object 1150 0 (offset 0)
+Ignoring wrong pointing object 1151 0 (offset 0)
+Ignoring wrong pointing object 1152 0 (offset 0)
+Ignoring wrong pointing object 1153 0 (offset 0)
+Ignoring wrong pointing object 1154 0 (offset 0)
+Ignoring wrong pointing object 1155 0 (offset 0)
+Ignoring wrong pointing object 1156 0 (offset 0)
+Ignoring wrong pointing object 1157 0 (offset 0)
+Ignoring wrong pointing object 1158 0 (offset 0)
+Ignoring wrong pointing object 1160 0 (offset 0)
+Ignoring wrong pointing object 1161 0 (offset 0)
+Ignoring wrong pointing object 1162 0 (offset 0)
+Ignoring wrong pointing object 1163 0 (offset 0)
+Ignoring wrong pointing object 1164 0 (offset 0)
+Ignoring wrong pointing object 1165 0 (offset 0)
+Ignoring wrong pointing object 1166 0 (offset 0)
+Ignoring wrong pointing object 1167 0 (offset 0)
+Ignoring wrong pointing object 1168 0 (offset 0)
+Ignoring wrong pointing object 1169 0 (offset 0)
+Ignoring wrong pointing object 1170 0 (offset 0)
+Ignoring wrong pointing object 1171 0 (offset 0)
+Ignoring wrong pointing object 1172 0 (offset 0)
+Ignoring wrong pointing object 1173 0 (offset 0)
+Ignoring wrong pointing object 1174 0 (offset 0)
+Ignoring wrong pointing object 1175 0 (offset 0)
+Ignoring wrong pointing object 1176 0 (offset 0)
+Ignoring wrong pointing object 1178 0 (offset 0)
+Ignoring wrong pointing object 1179 0 (offset 0)
+Ignoring wrong pointing object 1180 0 (offset 0)
+Ignoring wrong pointing object 1181 0 (offset 0)
+Ignoring wrong pointing object 1182 0 (offset 0)
+Ignoring wrong pointing object 1184 0 (offset 0)
+Ignoring wrong pointing object 1185 0 (offset 0)
+Ignoring wrong pointing object 1186 0 (offset 0)
+Ignoring wrong pointing object 1187 0 (offset 0)
+Ignoring wrong pointing object 1188 0 (offset 0)
+Ignoring wrong pointing object 1189 0 (offset 0)
+Ignoring wrong pointing object 1190 0 (offset 0)
+Ignoring wrong pointing object 1191 0 (offset 0)
+Ignoring wrong pointing object 1192 0 (offset 0)
+Ignoring wrong pointing object 1193 0 (offset 0)
+Ignoring wrong pointing object 1194 0 (offset 0)
+Ignoring wrong pointing object 1195 0 (offset 0)
+Ignoring wrong pointing object 1196 0 (offset 0)
+Ignoring wrong pointing object 1198 0 (offset 0)
+Ignoring wrong pointing object 1199 0 (offset 0)
+Ignoring wrong pointing object 1200 0 (offset 0)
+Ignoring wrong pointing object 1201 0 (offset 0)
+Ignoring wrong pointing object 1202 0 (offset 0)
+Ignoring wrong pointing object 1203 0 (offset 0)
+Ignoring wrong pointing object 1204 0 (offset 0)
+Ignoring wrong pointing object 1206 0 (offset 0)
+Ignoring wrong pointing object 1207 0 (offset 0)
+Ignoring wrong pointing object 1208 0 (offset 0)
+Ignoring wrong pointing object 1209 0 (offset 0)
+Ignoring wrong pointing object 1210 0 (offset 0)
+Ignoring wrong pointing object 1211 0 (offset 0)
+Ignoring wrong pointing object 1212 0 (offset 0)
+Ignoring wrong pointing object 1213 0 (offset 0)
+Ignoring wrong pointing object 1214 0 (offset 0)
+Ignoring wrong pointing object 1217 0 (offset 0)
+Ignoring wrong pointing object 1220 0 (offset 0)
+Ignoring wrong pointing object 1221 0 (offset 0)
+Ignoring wrong pointing object 1222 0 (offset 0)
+Ignoring wrong pointing object 1225 0 (offset 0)
+Ignoring wrong pointing object 1228 0 (offset 0)
+Ignoring wrong pointing object 1229 0 (offset 0)
+Ignoring wrong pointing object 1230 0 (offset 0)
+Ignoring wrong pointing object 1231 0 (offset 0)
+Ignoring wrong pointing object 1232 0 (offset 0)
+Ignoring wrong pointing object 1233 0 (offset 0)
+Ignoring wrong pointing object 1234 0 (offset 0)
+Ignoring wrong pointing object 1235 0 (offset 0)
+Ignoring wrong pointing object 1236 0 (offset 0)
+Ignoring wrong pointing object 1237 0 (offset 0)
+Ignoring wrong pointing object 1238 0 (offset 0)
+Ignoring wrong pointing object 1239 0 (offset 0)
+Ignoring wrong pointing object 1240 0 (offset 0)
+Ignoring wrong pointing object 1241 0 (offset 0)
+Ignoring wrong pointing object 1242 0 (offset 0)
+Ignoring wrong pointing object 1243 0 (offset 0)
+Ignoring wrong pointing object 1244 0 (offset 0)
+Ignoring wrong pointing object 1245 0 (offset 0)
+Ignoring wrong pointing object 1246 0 (offset 0)
+Ignoring wrong pointing object 1248 0 (offset 0)
+Ignoring wrong pointing object 1249 0 (offset 0)
+Ignoring wrong pointing object 1250 0 (offset 0)
+Ignoring wrong pointing object 1251 0 (offset 0)
+Ignoring wrong pointing object 1252 0 (offset 0)
+Ignoring wrong pointing object 1253 0 (offset 0)
+Ignoring wrong pointing object 1254 0 (offset 0)
+Ignoring wrong pointing object 1255 0 (offset 0)
+Ignoring wrong pointing object 1256 0 (offset 0)
+Ignoring wrong pointing object 1257 0 (offset 0)
+Ignoring wrong pointing object 1258 0 (offset 0)
+Ignoring wrong pointing object 1259 0 (offset 0)
+Ignoring wrong pointing object 1260 0 (offset 0)
+Ignoring wrong pointing object 1261 0 (offset 0)
+Ignoring wrong pointing object 1262 0 (offset 0)
+Ignoring wrong pointing object 1263 0 (offset 0)
+Ignoring wrong pointing object 1264 0 (offset 0)
+Ignoring wrong pointing object 1265 0 (offset 0)
+Ignoring wrong pointing object 1266 0 (offset 0)
+Ignoring wrong pointing object 1267 0 (offset 0)
+Ignoring wrong pointing object 1268 0 (offset 0)
+Ignoring wrong pointing object 1269 0 (offset 0)
+Ignoring wrong pointing object 1270 0 (offset 0)
+Ignoring wrong pointing object 1271 0 (offset 0)
+Ignoring wrong pointing object 1273 0 (offset 0)
+Ignoring wrong pointing object 1274 0 (offset 0)
+Ignoring wrong pointing object 1275 0 (offset 0)
+Ignoring wrong pointing object 1276 0 (offset 0)
+Ignoring wrong pointing object 1277 0 (offset 0)
+Ignoring wrong pointing object 1278 0 (offset 0)
+Ignoring wrong pointing object 1279 0 (offset 0)
+Ignoring wrong pointing object 1280 0 (offset 0)
+Ignoring wrong pointing object 1281 0 (offset 0)
+Ignoring wrong pointing object 1282 0 (offset 0)
+Ignoring wrong pointing object 1283 0 (offset 0)
+Ignoring wrong pointing object 1284 0 (offset 0)
+Ignoring wrong pointing object 1285 0 (offset 0)
+Ignoring wrong pointing object 1286 0 (offset 0)
+Ignoring wrong pointing object 1287 0 (offset 0)
+Ignoring wrong pointing object 1288 0 (offset 0)
+Ignoring wrong pointing object 1289 0 (offset 0)
+Ignoring wrong pointing object 1290 0 (offset 0)
+Ignoring wrong pointing object 1291 0 (offset 0)
+Ignoring wrong pointing object 1292 0 (offset 0)
+Ignoring wrong pointing object 1293 0 (offset 0)
+Ignoring wrong pointing object 1294 0 (offset 0)
+Ignoring wrong pointing object 1295 0 (offset 0)
+Ignoring wrong pointing object 1296 0 (offset 0)
+Ignoring wrong pointing object 1298 0 (offset 0)
+Ignoring wrong pointing object 1299 0 (offset 0)
+Ignoring wrong pointing object 1300 0 (offset 0)
+Ignoring wrong pointing object 1301 0 (offset 0)
+Ignoring wrong pointing object 1302 0 (offset 0)
+Ignoring wrong pointing object 1303 0 (offset 0)
+Ignoring wrong pointing object 1305 0 (offset 0)
+Ignoring wrong pointing object 1306 0 (offset 0)
+Ignoring wrong pointing object 1307 0 (offset 0)
+Ignoring wrong pointing object 1308 0 (offset 0)
+Ignoring wrong pointing object 1309 0 (offset 0)
+Ignoring wrong pointing object 1310 0 (offset 0)
+Ignoring wrong pointing object 1311 0 (offset 0)
+Ignoring wrong pointing object 1312 0 (offset 0)
+Ignoring wrong pointing object 1313 0 (offset 0)
+Ignoring wrong pointing object 1314 0 (offset 0)
+Ignoring wrong pointing object 1315 0 (offset 0)
+Ignoring wrong pointing object 1316 0 (offset 0)
+Ignoring wrong pointing object 1318 0 (offset 0)
+Ignoring wrong pointing object 1319 0 (offset 0)
+Ignoring wrong pointing object 1320 0 (offset 0)
+Ignoring wrong pointing object 1321 0 (offset 0)
+Ignoring wrong pointing object 1322 0 (offset 0)
+Ignoring wrong pointing object 1324 0 (offset 0)
+Ignoring wrong pointing object 1325 0 (offset 0)
+Ignoring wrong pointing object 1326 0 (offset 0)
+Ignoring wrong pointing object 1327 0 (offset 0)
+Ignoring wrong pointing object 1328 0 (offset 0)
+Ignoring wrong pointing object 1329 0 (offset 0)
+Ignoring wrong pointing object 1330 0 (offset 0)
+Ignoring wrong pointing object 1331 0 (offset 0)
+Ignoring wrong pointing object 1332 0 (offset 0)
+Ignoring wrong pointing object 1333 0 (offset 0)
+Ignoring wrong pointing object 1334 0 (offset 0)
+Ignoring wrong pointing object 1335 0 (offset 0)
+Ignoring wrong pointing object 1337 0 (offset 0)
+Ignoring wrong pointing object 1338 0 (offset 0)
+Ignoring wrong pointing object 1339 0 (offset 0)
+Ignoring wrong pointing object 1340 0 (offset 0)
+Ignoring wrong pointing object 1341 0 (offset 0)
+Ignoring wrong pointing object 1342 0 (offset 0)
+Ignoring wrong pointing object 1343 0 (offset 0)
+Ignoring wrong pointing object 1344 0 (offset 0)
+Ignoring wrong pointing object 1345 0 (offset 0)
+Ignoring wrong pointing object 1346 0 (offset 0)
+Ignoring wrong pointing object 1347 0 (offset 0)
+Ignoring wrong pointing object 1348 0 (offset 0)
+Ignoring wrong pointing object 1349 0 (offset 0)
+Ignoring wrong pointing object 1350 0 (offset 0)
+Ignoring wrong pointing object 1351 0 (offset 0)
+Ignoring wrong pointing object 1352 0 (offset 0)
+Ignoring wrong pointing object 1353 0 (offset 0)
+Ignoring wrong pointing object 1354 0 (offset 0)
+Ignoring wrong pointing object 1356 0 (offset 0)
+Ignoring wrong pointing object 1357 0 (offset 0)
+Ignoring wrong pointing object 1359 0 (offset 0)
+Ignoring wrong pointing object 1360 0 (offset 0)
+Ignoring wrong pointing object 1362 0 (offset 0)
+Ignoring wrong pointing object 1363 0 (offset 0)
+Ignoring wrong pointing object 1364 0 (offset 0)
+Ignoring wrong pointing object 1365 0 (offset 0)
+Ignoring wrong pointing object 1366 0 (offset 0)
+Ignoring wrong pointing object 1367 0 (offset 0)
+Ignoring wrong pointing object 1368 0 (offset 0)
+Ignoring wrong pointing object 1369 0 (offset 0)
+Ignoring wrong pointing object 1370 0 (offset 0)
+Ignoring wrong pointing object 1371 0 (offset 0)
+Ignoring wrong pointing object 1373 0 (offset 0)
+Ignoring wrong pointing object 1374 0 (offset 0)
+Ignoring wrong pointing object 1375 0 (offset 0)
+Ignoring wrong pointing object 1376 0 (offset 0)
+Ignoring wrong pointing object 1377 0 (offset 0)
+Ignoring wrong pointing object 1378 0 (offset 0)
+Ignoring wrong pointing object 1379 0 (offset 0)
+Ignoring wrong pointing object 1380 0 (offset 0)
+Ignoring wrong pointing object 1381 0 (offset 0)
+Ignoring wrong pointing object 1382 0 (offset 0)
+Ignoring wrong pointing object 1383 0 (offset 0)
+Ignoring wrong pointing object 1384 0 (offset 0)
+Ignoring wrong pointing object 1385 0 (offset 0)
+Ignoring wrong pointing object 1386 0 (offset 0)
+Ignoring wrong pointing object 1387 0 (offset 0)
+Ignoring wrong pointing object 1388 0 (offset 0)
+Ignoring wrong pointing object 1389 0 (offset 0)
+Ignoring wrong pointing object 1390 0 (offset 0)
+Ignoring wrong pointing object 1391 0 (offset 0)
+Ignoring wrong pointing object 1392 0 (offset 0)
+Ignoring wrong pointing object 1394 0 (offset 0)
+Ignoring wrong pointing object 1395 0 (offset 0)
+Ignoring wrong pointing object 1396 0 (offset 0)
+Ignoring wrong pointing object 1397 0 (offset 0)
+Ignoring wrong pointing object 1398 0 (offset 0)
+Ignoring wrong pointing object 1399 0 (offset 0)
+Ignoring wrong pointing object 1400 0 (offset 0)
+Ignoring wrong pointing object 1401 0 (offset 0)
+Ignoring wrong pointing object 1402 0 (offset 0)
+Ignoring wrong pointing object 1403 0 (offset 0)
+Ignoring wrong pointing object 1404 0 (offset 0)
+Ignoring wrong pointing object 1405 0 (offset 0)
+Ignoring wrong pointing object 1406 0 (offset 0)
+Ignoring wrong pointing object 1407 0 (offset 0)
+Ignoring wrong pointing object 1408 0 (offset 0)
+Ignoring wrong pointing object 1409 0 (offset 0)
+Ignoring wrong pointing object 1411 0 (offset 0)
+Ignoring wrong pointing object 1412 0 (offset 0)
+Ignoring wrong pointing object 1413 0 (offset 0)
+Ignoring wrong pointing object 1414 0 (offset 0)
+Ignoring wrong pointing object 1415 0 (offset 0)
+Ignoring wrong pointing object 1416 0 (offset 0)
+Ignoring wrong pointing object 1417 0 (offset 0)
+Ignoring wrong pointing object 1419 0 (offset 0)
+Ignoring wrong pointing object 1420 0 (offset 0)
+Ignoring wrong pointing object 1421 0 (offset 0)
+Ignoring wrong pointing object 1422 0 (offset 0)
+Ignoring wrong pointing object 1423 0 (offset 0)
+Ignoring wrong pointing object 1424 0 (offset 0)
+Ignoring wrong pointing object 1425 0 (offset 0)
+Ignoring wrong pointing object 1427 0 (offset 0)
+Ignoring wrong pointing object 1428 0 (offset 0)
+Ignoring wrong pointing object 1429 0 (offset 0)
+Ignoring wrong pointing object 1430 0 (offset 0)
+Ignoring wrong pointing object 1431 0 (offset 0)
+Ignoring wrong pointing object 1432 0 (offset 0)
+Ignoring wrong pointing object 1433 0 (offset 0)
+Ignoring wrong pointing object 1434 0 (offset 0)
+Ignoring wrong pointing object 1435 0 (offset 0)
+Ignoring wrong pointing object 1436 0 (offset 0)
+Ignoring wrong pointing object 1438 0 (offset 0)
+Ignoring wrong pointing object 1439 0 (offset 0)
+Ignoring wrong pointing object 1440 0 (offset 0)
+Ignoring wrong pointing object 1441 0 (offset 0)
+Ignoring wrong pointing object 1442 0 (offset 0)
+Ignoring wrong pointing object 1443 0 (offset 0)
+Ignoring wrong pointing object 1444 0 (offset 0)
+Ignoring wrong pointing object 1445 0 (offset 0)
+Ignoring wrong pointing object 1446 0 (offset 0)
+Ignoring wrong pointing object 1447 0 (offset 0)
+Ignoring wrong pointing object 1448 0 (offset 0)
+Ignoring wrong pointing object 1449 0 (offset 0)
+Ignoring wrong pointing object 1450 0 (offset 0)
+Ignoring wrong pointing object 1451 0 (offset 0)
+Ignoring wrong pointing object 1452 0 (offset 0)
+Ignoring wrong pointing object 1453 0 (offset 0)
+Ignoring wrong pointing object 1454 0 (offset 0)
+Ignoring wrong pointing object 1455 0 (offset 0)
+Ignoring wrong pointing object 1456 0 (offset 0)
+Ignoring wrong pointing object 1457 0 (offset 0)
+Ignoring wrong pointing object 1458 0 (offset 0)
+Ignoring wrong pointing object 1459 0 (offset 0)
+Ignoring wrong pointing object 1461 0 (offset 0)
+Ignoring wrong pointing object 1463 0 (offset 0)
+Ignoring wrong pointing object 1464 0 (offset 0)
+Ignoring wrong pointing object 1465 0 (offset 0)
+Ignoring wrong pointing object 1466 0 (offset 0)
+Ignoring wrong pointing object 1467 0 (offset 0)
+Ignoring wrong pointing object 1468 0 (offset 0)
+Ignoring wrong pointing object 1469 0 (offset 0)
+Ignoring wrong pointing object 1470 0 (offset 0)
+Ignoring wrong pointing object 1471 0 (offset 0)
+Ignoring wrong pointing object 1472 0 (offset 0)
+Ignoring wrong pointing object 1473 0 (offset 0)
+Ignoring wrong pointing object 1474 0 (offset 0)
+Ignoring wrong pointing object 1475 0 (offset 0)
+Ignoring wrong pointing object 1476 0 (offset 0)
+Ignoring wrong pointing object 1477 0 (offset 0)
+Ignoring wrong pointing object 1478 0 (offset 0)
+Ignoring wrong pointing object 1480 0 (offset 0)
+Ignoring wrong pointing object 1481 0 (offset 0)
+Ignoring wrong pointing object 1482 0 (offset 0)
+Ignoring wrong pointing object 1483 0 (offset 0)
+Ignoring wrong pointing object 1484 0 (offset 0)
+Ignoring wrong pointing object 1485 0 (offset 0)
+Ignoring wrong pointing object 1486 0 (offset 0)
+Ignoring wrong pointing object 1487 0 (offset 0)
+Ignoring wrong pointing object 1488 0 (offset 0)
+Ignoring wrong pointing object 1489 0 (offset 0)
+Ignoring wrong pointing object 1490 0 (offset 0)
+Ignoring wrong pointing object 1491 0 (offset 0)
+Ignoring wrong pointing object 1492 0 (offset 0)
+Ignoring wrong pointing object 1493 0 (offset 0)
+Ignoring wrong pointing object 1494 0 (offset 0)
+Ignoring wrong pointing object 1496 0 (offset 0)
+Ignoring wrong pointing object 1497 0 (offset 0)
+Ignoring wrong pointing object 1498 0 (offset 0)
+Ignoring wrong pointing object 1499 0 (offset 0)
+Ignoring wrong pointing object 1500 0 (offset 0)
+Ignoring wrong pointing object 1502 0 (offset 0)
+Ignoring wrong pointing object 1503 0 (offset 0)
+Ignoring wrong pointing object 1504 0 (offset 0)
+Ignoring wrong pointing object 1505 0 (offset 0)
+Ignoring wrong pointing object 1506 0 (offset 0)
+Ignoring wrong pointing object 1507 0 (offset 0)
+Ignoring wrong pointing object 1508 0 (offset 0)
+Ignoring wrong pointing object 1509 0 (offset 0)
+Ignoring wrong pointing object 1511 0 (offset 0)
+Ignoring wrong pointing object 1512 0 (offset 0)
+Ignoring wrong pointing object 1513 0 (offset 0)
+Ignoring wrong pointing object 1514 0 (offset 0)
+Ignoring wrong pointing object 1516 0 (offset 0)
+Ignoring wrong pointing object 1517 0 (offset 0)
+Ignoring wrong pointing object 1518 0 (offset 0)
+Ignoring wrong pointing object 1519 0 (offset 0)
+Ignoring wrong pointing object 1521 0 (offset 0)
+Ignoring wrong pointing object 1522 0 (offset 0)
+Ignoring wrong pointing object 1523 0 (offset 0)
+Ignoring wrong pointing object 1524 0 (offset 0)
+Ignoring wrong pointing object 1525 0 (offset 0)
+Ignoring wrong pointing object 1526 0 (offset 0)
+Ignoring wrong pointing object 1527 0 (offset 0)
+Ignoring wrong pointing object 1528 0 (offset 0)
+Ignoring wrong pointing object 1529 0 (offset 0)
+Ignoring wrong pointing object 1530 0 (offset 0)
+Ignoring wrong pointing object 1531 0 (offset 0)
+Ignoring wrong pointing object 1532 0 (offset 0)
+Ignoring wrong pointing object 1534 0 (offset 0)
+Ignoring wrong pointing object 1535 0 (offset 0)
+Ignoring wrong pointing object 1536 0 (offset 0)
+Ignoring wrong pointing object 1537 0 (offset 0)
+Ignoring wrong pointing object 1539 0 (offset 0)
+Ignoring wrong pointing object 1540 0 (offset 0)
+Ignoring wrong pointing object 1541 0 (offset 0)
+Ignoring wrong pointing object 1542 0 (offset 0)
+Ignoring wrong pointing object 1544 0 (offset 0)
+Ignoring wrong pointing object 1545 0 (offset 0)
+Ignoring wrong pointing object 1546 0 (offset 0)
+Ignoring wrong pointing object 1547 0 (offset 0)
+Ignoring wrong pointing object 1548 0 (offset 0)
+Ignoring wrong pointing object 1549 0 (offset 0)
+Ignoring wrong pointing object 1550 0 (offset 0)
+Ignoring wrong pointing object 1551 0 (offset 0)
+Ignoring wrong pointing object 1552 0 (offset 0)
+Ignoring wrong pointing object 1553 0 (offset 0)
+Ignoring wrong pointing object 1554 0 (offset 0)
+Ignoring wrong pointing object 1555 0 (offset 0)
+Ignoring wrong pointing object 1556 0 (offset 0)
+Ignoring wrong pointing object 1557 0 (offset 0)
+Ignoring wrong pointing object 1558 0 (offset 0)
+Ignoring wrong pointing object 1559 0 (offset 0)
+Ignoring wrong pointing object 1561 0 (offset 0)
+Ignoring wrong pointing object 1562 0 (offset 0)
+Ignoring wrong pointing object 1563 0 (offset 0)
+Ignoring wrong pointing object 1564 0 (offset 0)
+Ignoring wrong pointing object 1565 0 (offset 0)
+Ignoring wrong pointing object 1566 0 (offset 0)
+Ignoring wrong pointing object 1567 0 (offset 0)
+Ignoring wrong pointing object 1568 0 (offset 0)
+Ignoring wrong pointing object 1570 0 (offset 0)
+Ignoring wrong pointing object 1571 0 (offset 0)
+Ignoring wrong pointing object 1572 0 (offset 0)
+Ignoring wrong pointing object 1573 0 (offset 0)
+Ignoring wrong pointing object 1574 0 (offset 0)
+Ignoring wrong pointing object 1575 0 (offset 0)
+Ignoring wrong pointing object 1576 0 (offset 0)
+Ignoring wrong pointing object 1577 0 (offset 0)
+Ignoring wrong pointing object 1578 0 (offset 0)
+Ignoring wrong pointing object 1579 0 (offset 0)
+Ignoring wrong pointing object 1580 0 (offset 0)
+Ignoring wrong pointing object 1581 0 (offset 0)
+Ignoring wrong pointing object 1583 0 (offset 0)
+Ignoring wrong pointing object 1584 0 (offset 0)
+Ignoring wrong pointing object 1585 0 (offset 0)
+Ignoring wrong pointing object 1586 0 (offset 0)
+Ignoring wrong pointing object 1588 0 (offset 0)
+Ignoring wrong pointing object 1589 0 (offset 0)
+Ignoring wrong pointing object 1590 0 (offset 0)
+Ignoring wrong pointing object 1591 0 (offset 0)
+Ignoring wrong pointing object 1592 0 (offset 0)
+Ignoring wrong pointing object 1593 0 (offset 0)
+Ignoring wrong pointing object 1594 0 (offset 0)
+Ignoring wrong pointing object 1595 0 (offset 0)
+Ignoring wrong pointing object 1596 0 (offset 0)
+Ignoring wrong pointing object 1597 0 (offset 0)
+Ignoring wrong pointing object 1599 0 (offset 0)
+Ignoring wrong pointing object 1600 0 (offset 0)
+Ignoring wrong pointing object 1601 0 (offset 0)
+Ignoring wrong pointing object 1602 0 (offset 0)
+Ignoring wrong pointing object 1603 0 (offset 0)
+Ignoring wrong pointing object 1604 0 (offset 0)
+Ignoring wrong pointing object 1605 0 (offset 0)
+Ignoring wrong pointing object 1606 0 (offset 0)
+Ignoring wrong pointing object 1607 0 (offset 0)
+Ignoring wrong pointing object 1608 0 (offset 0)
+Ignoring wrong pointing object 1610 0 (offset 0)
+Ignoring wrong pointing object 1611 0 (offset 0)
+Ignoring wrong pointing object 1612 0 (offset 0)
+Ignoring wrong pointing object 1613 0 (offset 0)
+Ignoring wrong pointing object 1615 0 (offset 0)
+Ignoring wrong pointing object 1616 0 (offset 0)
+Ignoring wrong pointing object 1617 0 (offset 0)
+Ignoring wrong pointing object 1618 0 (offset 0)
+Ignoring wrong pointing object 1619 0 (offset 0)
+Ignoring wrong pointing object 1620 0 (offset 0)
+Ignoring wrong pointing object 1621 0 (offset 0)
+Ignoring wrong pointing object 1622 0 (offset 0)
+Ignoring wrong pointing object 1623 0 (offset 0)
+Ignoring wrong pointing object 1624 0 (offset 0)
+Ignoring wrong pointing object 1625 0 (offset 0)
+Ignoring wrong pointing object 1626 0 (offset 0)
+Ignoring wrong pointing object 1627 0 (offset 0)
+Ignoring wrong pointing object 1629 0 (offset 0)
+Ignoring wrong pointing object 1630 0 (offset 0)
+Ignoring wrong pointing object 1631 0 (offset 0)
+Ignoring wrong pointing object 1632 0 (offset 0)
+Ignoring wrong pointing object 1635 0 (offset 0)
+Ignoring wrong pointing object 1636 0 (offset 0)
+Ignoring wrong pointing object 1638 0 (offset 0)
+Ignoring wrong pointing object 1639 0 (offset 0)
+Pages: 46
+Ignoring wrong pointing object 1640 0 (offset 0)
+Ignoring wrong pointing object 1641 0 (offset 0)
+Ignoring wrong pointing object 1642 0 (offset 0)
+Ignoring wrong pointing object 1644 0 (offset 0)
+Ignoring wrong pointing object 1645 0 (offset 0)
+Ignoring wrong pointing object 1646 0 (offset 0)
+Ignoring wrong pointing object 1647 0 (offset 0)
+Ignoring wrong pointing object 1649 0 (offset 0)
+Ignoring wrong pointing object 1650 0 (offset 0)
+Ignoring wrong pointing object 1651 0 (offset 0)
+Ignoring wrong pointing object 1652 0 (offset 0)
+Ignoring wrong pointing object 1654 0 (offset 0)
+Ignoring wrong pointing object 1655 0 (offset 0)
+Ignoring wrong pointing object 1656 0 (offset 0)
+Ignoring wrong pointing object 1657 0 (offset 0)
+Ignoring wrong pointing object 1658 0 (offset 0)
+Ignoring wrong pointing object 1659 0 (offset 0)
+Ignoring wrong pointing object 1660 0 (offset 0)
+Ignoring wrong pointing object 1661 0 (offset 0)
+Ignoring wrong pointing object 1662 0 (offset 0)
+Ignoring wrong pointing object 1663 0 (offset 0)
+Ignoring wrong pointing object 1665 0 (offset 0)
+Ignoring wrong pointing object 1666 0 (offset 0)
+Ignoring wrong pointing object 1667 0 (offset 0)
+Ignoring wrong pointing object 1668 0 (offset 0)
+Ignoring wrong pointing object 1669 0 (offset 0)
+Ignoring wrong pointing object 1670 0 (offset 0)
+Ignoring wrong pointing object 1671 0 (offset 0)
+Ignoring wrong pointing object 1672 0 (offset 0)
+Ignoring wrong pointing object 1673 0 (offset 0)
+Ignoring wrong pointing object 1674 0 (offset 0)
+Ignoring wrong pointing object 1676 0 (offset 0)
+Ignoring wrong pointing object 1677 0 (offset 0)
+Ignoring wrong pointing object 1678 0 (offset 0)
+Ignoring wrong pointing object 1679 0 (offset 0)
+Ignoring wrong pointing object 1681 0 (offset 0)
+Ignoring wrong pointing object 1682 0 (offset 0)
+Ignoring wrong pointing object 1683 0 (offset 0)
+Ignoring wrong pointing object 1684 0 (offset 0)
+Ignoring wrong pointing object 1685 0 (offset 0)
+Ignoring wrong pointing object 1686 0 (offset 0)
+Ignoring wrong pointing object 1687 0 (offset 0)
+Ignoring wrong pointing object 1688 0 (offset 0)
+Ignoring wrong pointing object 1689 0 (offset 0)
+Ignoring wrong pointing object 1690 0 (offset 0)
+Ignoring wrong pointing object 1692 0 (offset 0)
+Ignoring wrong pointing object 1693 0 (offset 0)
+Ignoring wrong pointing object 1694 0 (offset 0)
+Ignoring wrong pointing object 1695 0 (offset 0)
+--- Page 1 ---
+Qualcomm Technologies, Inc.
+80-58216-2 Rev. AA 
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets
+NO PUBLIC DISCLOSURE PERMITTED: Please report postings of this document on public servers or websites to: DocCtrlAgent@qualcomm.com.
+Confidential Distribution: Use or distribution of this item, in whole or in part, is prohibited except as expressly permitted by written agreement(s) and/or terms with Qualcomm 
+Incorporated and/or its subsidiaries. 
+CDSP debug on automotive
+
+--- Page 2 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  | MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  | 80-58216-2 Rev. AA 2
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets
+NO PUBLIC DISCLOSURE PERMITTED: Please report postings of this document on public servers or websites to: DocCtrlAgent@qualcomm.com.
+Confidential Distribution: Use or distribution of this item, in whole or in part, is prohibited except as expressly permitted by written agreement(s) and/or terms with Qualcomm Incorporated and/or its subsidiaries. 
+Not to be used, copied, reproduced, or modified in whole or in part, nor its contents revealed in any manner to others without the express written permission of Qualcomm Technologies, Inc. 
+All Qualcomm products mentioned herein are products of Qualcomm Technologies, Inc. and/or its subsidiaries.
+Hexagon and Qualcomm are trademarks or registered trademarks of Qualcomm Incorporated. Other product and brand names may be trademarks or registered trademarks of their respective owners. 
+This technical data may be subject to U.S. and international export, re-export, or transfer (鈥渆xport鈥? laws. Diversion contrary to U.S. and international law is strictly prohibited.
+Qualcomm Technologies, Inc.
+5775 Morehouse Drive
+San Diego, CA 92121
+U.S.A.
+漏 2023 Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+
+--- Page 3 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  | MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  | 80-58216-2 Rev. AA 3
+Revision Date Description
+1.0 Octobor 2022 Initial release
+1.1 May 2023 Add product signt & flash CDSP FW
+1.2 May 2026 Add Lemans/nord target & HGY 
+Revision History
+
+--- Page 4 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  | MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  | 80-58216-2 Rev. AA 4
+Contents
+1  CDSP logs capture method 5
+2  CDSP env path 9
+3  CDSP basic test 11
+4  CDSP error code introduce 13
+5  CDSP firmware flash 15
+6  CDSP dump preparation 19
+7  CDSP Clock Vote 26
+8  SysMonApp usage 32
+9  CDSP common error log analysis 34
+
+--- Page 5 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  | MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  | 80-58216-2 Rev. AA 5
+CDSP logs capture method
+Section 1
+
+--- Page 6 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  | MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  | 80-58216-2 Rev. AA 6
+CDSP Logs capture
+鈥?QXDM: (Used to capture CDSP internal diag logs, tool only have windows version)
+KBA-211109231449
+鈥?FARF:  (Put CDSP logs into logcat or qnx slog2, can check together with fastrpc userspace logs.)
+file:///C:/Qualcomm/Hexagon_SDK/4.4.0.1/docs/tools/messaging.html#run-time-farf
+1> define <rpc_hlos_process_name>.farf
+2> echo 0x1f > /vendor/lib/rfsa/adsp/xxx.farf (android GVM) or /var/log/xxx.farf (qnx)
+3> get CDSP logs in android GVM logcat or qnx slog2
+鈥?Offline save CDSP logs to device: (Can be used when not convenient to connect to QXDM, log same as 
+QXDM, only capture CDSP internal diag logs)
+1> Push CDSP.cfg to /var/log dir
+2> DiagPortChangeTest --mode=ondevice --logfilesize=15mb --logdir=/var/log/analyzer --
+config=/var/log/CDSP.cfg   --maxdiskspace=1gb   //start capture
+3> Run a CDSP demo
+4> DiagPortChangeTest --mode=null  //stop capture
+5> adb pull /var/log/analyzer/ondevice_logging/diag_dir_xx_xxx .
+6> Open log with qxdm
+NOTE: On HGY , change DiagPortChangeTest to diag-port-change-test
+
+--- Page 7 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   7
+CDSP Logs capture cont.
+鈥?Offline DiagPortChangeTest tool log mask use .cfg
+Below steps about how to generate .cfg:
+鈥?Open Windows QXDM
+鈥?Select Tools -> CFG File Generator (F5)
+鈥?Select Message Packets -> QDSP6 log masks
+鈥?Save Diag masks
+
+--- Page 8 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   8
+CDSP Logs capture cont.
+Besides CDSP logs, fastrpc userspace driver logs present in slog2 on QNX, journal log on Linux and logcat 
+on Android GVM.
+鈥?Capture fastrpc logs on Android GVM:  logcat > log.txt
+鈥?Capture fastrpc logs on QNX: slog2info -wt > /var/log/slog2.txt
+鈥?Capture fastrpc logs on Linux: journalctl -f > jourclt.log
+Normal fastrpc logs in slog2:
+16135  qvm[fastrpc_lib.c:3100]: Setting unsigned PD, domain:3, client:0 , me:18cad368d8
+16135  qvm[fastrpc_lib.c:1891]: Init domain=3, client=0 pd=1, init_cnt=68, deinit_cnt=68, frpc_init_done=9 
+group_ssr=0 me=0x18cad368d8
+16134  fastrpc[fastrpc_drv.c:511]: Assigning CB:/dev/smmu/STCU/HLOS_CDSP1 SID: 1 to client:405566_qvm 
+conid=1073741832 for domain 3
+16135  qvm[apps_std_imp.c:232]: apps_std fopen_INFO : /mnt/etc/images/fastrpc_shell_unsigned_3
+16135  qvm[fastrpc_lib.c:1153]: Allocated rpcmem DSP MEM: va=2fbfd33000, sz=4194304(0x400000)
+Qvm indicate this fastrpc call from Android GVM
+
+--- Page 9 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   9
+CDSP env path
+Section 2
+
+--- Page 10 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   10
+CDSP SET ENV PATH
+When algo run on CDSP, need to load related CPU libs and CDSP libs.
+鈥?For CPU side, need to set CPU lib path env to load CPU related libs from specify path.
+鈥?For CDSP side, CDSP lib load via fastrpc driver. Fastrpc driver will find DSP related libs from default CDSP lib path or via 
+CDSP lib path env, otherwise will return lib not found error.
+鈥?AP CPU lib path:
+export LD_LIBRARY_PATH=/data/local/tmp/xxx/:/vendor/lib64/
+鈥?GVM(Android) DSP lib path: 
+export ADSP_LIBRARY_PATH="/data/local/tmp/xxx;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp"
+鈥?QNX/Linux DSP lib path:
+export 
+CDSP_LIBRARY_PATH="/data/local/tmp/xxx;/etc/images/dsp;/mnt/etc/images/dsp;/mnt/etc/images/cdsp0;/mnt/etc/images"
+鈥?SA8797 Multi-core example: set CDSP0 and CDSP1 on PVM
+export CDSP_LIBRARY_PATH="/data/local/tmp/xxx;/vendor/dsp/cdsp0/;/usr/lib/" &&
+export CDSP1_LIBRARY_PATH="/data/local/tmp/xxx;/vendor/dsp/cdsp1/;/usr/lib/" 
+
+--- Page 11 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   11
+CDSP basic test
+Section 3
+
+--- Page 12 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   12
+Fastrpc calculator test
+To verify CDSP available, use below command on QNX/Linux
+CDSP0:
+fastrpc_calc64_test 0 100 3 1
+CDSP1:
+fastrpc_calc64_test 0 100 4 1
+If failed, means cdsp not available or bring-up failed.
+
+--- Page 13 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   13
+CDSP error code introduce
+Section 4
+
+--- Page 14 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   14
+CDSP Errorcode
+Sometimes algo run on CDSP failed, in order to help user quickly debug the issue, fastrpc define many errorcodes 
+to indicate common failure reason. 
+From CPU or DSP logs, we can directly search those errorcodes to get detail failure reason.
+C:\Qualcomm\Hexagon_SDK\4.4.0.1\incs\stddef\AEEStdErr.h
+鈥?#define AEE_EFAILED                   (AEE_EOFFSET + 0x001)  ///< General failure
+鈥?Mostly manual return from algo lib, not CDSP system error
+鈥?#define AEE_EUNABLETOLOAD             (AEE_EOFFSET + 0x006)  ///< Unable to load object/applet
+鈥?DSP lib not found/env path wrong/DSP lib not sign
+鈥?#define AEE_EBADSTATE                 (AEE_EOFFSET + 0x00D)  ///< Process or thread is not in expected state
+鈥?Check whether happened after algo finish && unload DSP lib && handle == 0x03, then can be ignored
+鈥?#define AEE_ENOMEMORY                 (AEE_EOFFSET + 0x002)  ///< Memory allocation failed because of insufficient RAM
+鈥?Check whether system mem at low memory state  or any mem leak in CDSP
+鈥?#define AEE_EBADPARM                  (AEE_EOFFSET + 0x00E)  ///< Invalid parameter
+鈥?Check whether your AP(CPU) xx_stub.so  not match DSP xx_skel.so
+鈥?#define AEE_EBADASID                  (AEE_EOFFSET + 0x053)     ///<  Bad asid
+鈥?Check CDSP firmware whether flash correctly
+鈥?#define AEE_EQURTTHREADCREATE         (AEE_EOFFSET + 0x14B)     ///<  QURT thread create failed
+鈥?Check whether any algo thread leak
+0x80000XXX error code means  error happened from CDSP side. 
+
+--- Page 15 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   15
+CDSP firmware flash
+Section 5
+
+--- Page 16 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   16
+CDSP SBA Download
+SBA/ST patch released from qpm: https://qpm.qualcomm.com/#/main/software/servicetask
+Step1: choose nsp/dsp diff: 鈥淒iff Download Image鈥?
+Step2: Depends on whether you re-compile cdsp image:
+    
+Option2. Need to compile by yourself (.lib/.o/.a), download from 鈥淪tandard|OEM鈥?
+Option1. No need to compile, use firmware file(mbn/fastrpc_shell), download from QNX(鈥淒EV|QNX鈥? or HGY(鈥淎P|Binaries鈥?
+
+--- Page 17 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   17
+CDSP FW flash
+Target Path from SBA/build Path on device
+Makena
+SA8295
+cdsp_proc/build/ms/bin/makena.cdsp0.prod/splitbins/signed/cdsp0.mdt
+cdsp_proc/build/ms/bin/makena.cdsp0.prod/signed/cdsp0.mbn
+cdsp_proc/build/ms/dynamic_modules/makena.cdsp0.prod/fastrpc_shell_3
+cdsp_proc/build/ms/dynamic_modules/makena.cdsp0.prod/fastrpc_shell_unsigned_3
+/mnt/etc/images/
+Lemans
+(SA8255/SA8775/
+SA8650)
+For mbn and mdt:
+dsp_proc/build/ms/bin/lemans.fusa_cdsp0.prod/signed/cdsp0.mbn
+dsp_proc/build/ms/bin/lemans.fusa_cdsp0.prod/signed/cdsp0.mdt
+For libs patch, refer txt on device:
+/dsplib/image/dsp/cdsp0/map_SHARED_LIBS_lemans.fusa_cdsp0.prodQ.txt
+/dsplib/image/dsp/cdsp0/
+/dsplib/image/dsp/cdsp1/
+/dspfw/image/
+Nordy
+(SA8397/SA8797)
+cdsp_proc/build/ms/bin/nord.cdsp.prod/signed/ /lib/firmware/qcom/image/
+/vendor/dsp/cdsp0/
+/vendor/dsp/cdsp1/
+/vendor/dsp/cdsp2/
+/vendor/dsp/cdsp3/
+
+--- Page 18 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   18
+CDSP DSP lib CRC sign for fusa CDSP .
+鈥?8255/8775 enable Fusa version for DSP Fw since ES8 version. 
+鈥?Fusa DSP firmware will default do crc check for all dsp libs.
+鈥?If dsp lib not include crc sign, then fastrpc will fail with below error:
+鈥?How to check whether DSP lib already include CRC sign ?
+鈥?If  lib include 鈥淪WIV*鈥?string, it default include CRC sign.
+strings libQnnHtpV73Skel.so | grep "SWIV"
+SWIV4
+鈥?How to sign DSP lib with CRC ?
+鈥?Get script from QNX source code (qnx_ap/target/swiv/swiv_build_utility.py)
+鈥?python swiv_build_utility.py -i libQnnHtpV73Skel.so  -o libQnnHtpV73Skel_crc.so
+鈥?Replace origin libQnnHtpV73Skel.so with new CRC lib on device.
+
+--- Page 19 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   19
+CDSP dump preparation
+Section 6
+
+--- Page 20 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   20
+Dump summary
+Dump is used to analyze system stability or CDSP crash issue. After provided dump related files to Qcom, we 
+can further analysis from dump to find crash root cause.
+All Dump related files needed as below:
+鈥?Dump files
+鈥?When device crash and goto dump mode, you can use QPST to collect dump.
+鈥?The dump files size is same as DDR size. (e.g. DDR is 24G, then full dump files will be 24G)
+鈥?After collect finish, need to zip the dump dir include all files and provide to Qcom.
+鈥?System/CDSP symbols
+鈥?Analysis dump need related system/CDSP symbols.
+鈥?Make sure all symbols are same version with dump and build timestamp can match.
+鈥?Version info
+鈥?About.html include the dump device current version info.
+Dump/Symbols details will be showed in subsequent pages.
+
+--- Page 21 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   21
+How to trigger a CDSP SSR dump?
+CDSP dump need CDSP cache flushed, otherwise can't get valid info for crash point.
+Target Command Default dump save path
+PVM-QNX PVM-Linux
+Makena
+SA8295
+ssr_test cdsp0
+ssr_test cdsp1
+Not applicable /var/log/analyzer/ramdumps
+Lemans
+(SA8255/SA8775/SA8650)
+ssr_test cdsp0
+ssr_test cdsp1
+pil_crash_test 18 - CDSP0
+pil_crash_test 30 - CDSP1
+Nordy
+(SA8397/SA8797)
+ssr_test cdsp0
+ssr_test cdsp1
+pil_crash_test 18 - CDSP0
+pil_crash_test 30 - CDSP1
+pil_crash_test 57 - CDSP2
+pil_crash_test 58 - CDSP3
+CDSP SSR(Subsystem restart) dump is used to analyze cdsp crash issue, below list command and dump path 
+on different target/system. 
+
+--- Page 22 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   22
+How to trigger a full dump?
+鈥?slay ssr_service
+鈥?Disable SSR   (SSR will let subsystem restart when crashed, need to disable SSR to let device directly 
+trigger ramdump.)
+鈥?Device automatic entry into DUMP (needed to disable SSR)
+鈥?System stability crash issues.
+鈥?CDSP crash issues.
+鈥?export FASTRPC_PROCESS_ATTRS=1
+鈥?Enable Process Debug Mode& Makes Process critical, then if userPD crash will trigger 
+subsystem crash.
+鈥?Manual force dump on QNX
+鈥?ramdump -x 1 -->  to crash HLOS
+鈥?ramdump -z 1 --> to crash with cache flush if DSP is in responsive state
+鈥?Manual force dump on Linux
+鈥?echo c > /proc/sysrq-trigger
+CDSP dump need CDSP cache flushed, otherwise can't get valid info for crash point.
+
+--- Page 23 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   23
+Collect Dump
+When crash happen, test device will automatically enter dump download mode, connect the device with PC (PC 
+need startup QPST firstly), and the dump will auto copy to below folder. 
+鈥?C:\ProgramData\Qualcomm\QPST\Sahara 
+鈥?QPST download dump
+
+--- Page 24 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   24
+Collect Symbols
+Dump needed system/CDSP symbols are in your code build path as below:
+鈥?QNX symbols
+鈥?<QXA.QA.XX Path>/qnx_ap/target/hypervisor/host/<out_target>/procnto-smp-instr.qvmhost_hyp_la.sym
+鈥?E.g. 8295: out_8540/procnto-smp-instr.qvmhost_hyp_la.sym
+鈥?E.g. 8155: out_8155/procnto-smp-instr.qvmhost_hyp_la.sym
+鈥?<QXA.QA.XX Path>/qnx_ap/install/aarch64le/bin/smmu_service-qvmhost.sym
+鈥?LA GVM symbols
+鈥?<LA.AU.XX Path>/LINUX/android/out/target/product/msmnile_gvmq/obj/KERNEL_OBJ/vmlinux
+鈥?CDSP symbols
+鈥?<CDSP Path>/cdsp_proc/build/ms
+鈥?E.g. 8155
+ROOT_855.cdsp.prodQ.elf, FACE_CDSP_USER_855.cdsp.prodQ_FACE.elf, 
+SRM_IMG_855.cdsp.prodQ.elf
+鈥?E.g. 8295
+ROOT_makena.cdsp0.prodQ.elf, ROOT_makena.cdsp0.coreQ.elf, 
+SRM_IMG_makena.cdsp0.prodQ.elf, UKERNEL_makena.cdsp0.coreQ.elf, 
+UKERNEL_makena.cdsp0.prodQ.elf, FACE_CDSP_USER_makena.cdsp0.prodQ_FACE.elf
+
+--- Page 25 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   25
+Method to check if dump and CDSP elf match as below:
+1. Open a linux prompt, and find Q6_BUILD in the dump:
+  $ strings DDRCS0_0.BIN | grep "Q6_BUILD_TS"
+  ENGG time:Q6_BUILD_TS_Tue_Oct_11_23:14:26_PST_2022_kailua.cdsp.prodQ
+  QCOM time:Q6_BUILD_TS_Mon_Oct_10_00:26:57_PST_2022_16016
+2. Find same Q6_BUILD string in CDSP elf file:
+  $ strings ROOT_kailua.cdsp.prodQ.elf | grep "Q6_BUILD"
+  ENGG time:Q6_BUILD_TS_Tue_Oct_11_23:14:26_PST_2022_kailua.cdsp.prodQ
+  QCOM time:Q6_BUILD_TS_Mon_Oct_10_00:26:57_PST_2022_16016
+ 
+3. QCOM time is Qualcomm release carried build time stamp, ENGG time is customer build time stamp. If both time stamp 
+strings are equal between dump and elf, means CDSP symbol match.
+ 
+Check Dump and CDSP Elf whether match
+
+--- Page 26 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   26
+CDSP Clock Vote
+Section 7
+
+--- Page 27 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   27
+鈻?Using HAP_power_set for CDSP clock vote and removal.
+鈻?Related Doc: <Hexagon SDK>/doxygen/HAP_power/index.html
+1. Clock vote:
+鈻?Example Code: <Hexagon SDK>/addons/compute/examples/benchmark/src_dsp/benchmark_imp.c
+ AEEResult benchmark_setClocks(remote_handle64 h, int32 power_level, int32 latency, int32 dcvs_enable)   {
+  void *benchmark_ctx = (void*) (h);        
+  //Step1. Remove all votes for NULL context,include fastRPC default vote.
+                     HAP_power_request_t request;
+       memset(&request, 0, sizeof(HAP_power_request_t)); 
+  request.type = HAP_power_set_DCVS_v2;
+  request.dcvs_v2.dcvs_enable = TRUE;
+  request.dcvs_v2.dcvs_option = HAP_DCVS_V2_POWER_SAVER_MODE;
+  request.dcvs_v2.latency = latency;
+  (void) HAP_power_set(NULL, &request); //Remove all votes for NULL context 
+  鈥?
+CDSP Clock Vote
+
+--- Page 28 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   28
+1. Clock vote:
+ 
+CDSP Clock Vote Cont.
+// Step2. Configure clocks & DCVS mode
+    memset(&request, 0, sizeof(HAP_power_request_t)); 
+    request.type = HAP_power_set_DCVS_v2;
+    request.dcvs_v2.dcvs_enable = dcvsEnable; // enable dcvs if desired, else it locks to target corner
+    request.dcvs_v2.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
+    request.dcvs_v2.set_dcvs_params = TRUE;
+    request.dcvs_v2.dcvs_params.min_corner = HAP_DCVS_VCORNER_DISABLE; // no minimum
+    request.dcvs_v2.dcvs_params.max_corner = HAP_DCVS_VCORNER_DISABLE; // no maximum
+    request.dcvs_v2.dcvs_params.target_corner = power_level;
+    request.dcvs_v2.set_latency = TRUE;
+    request.dcvs_v2.latency = latency;
+    retval = HAP_power_set(benchmark_ctx , &request);
+    if (retval) return AEE_EFAILED;
+    //Step3. vote for HVX power
+    memset(&request, 0, sizeof(HAP_power_request_t)); 
+    request.type = HAP_power_set_HVX;
+    request.hvx.power_up = TRUE;
+    retval = HAP_power_set(benchmark_ctx, &request);
+    if (retval) return AEE_EFAILED;
+    return AEE_SUCCESS;
+
+--- Page 29 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   29
+2. Clock Removal:
+ 
+     AEEResult benchmark_disableClocks(remote_handle64 h)
+    { 
+ void *benchmark_ctx = (void*) (h); 
+ HAP_power_request_t request;
+ memset(&request, 0, sizeof(HAP_power_request_t)); //Remove all votes.
+ request.type = HAP_power_set_DCVS_v2;
+ request.dcvs_v2.dcvs_enable = TRUE;
+ request.dcvs_v2.dcvs_option = HAP_DCVS_V2_POWER_SAVER_MODE;
+ int retval= HAP_power_set(benchmark_ctx, &request);
+ if (retval) return AEE_EFAILED;
+              retval = HAP_power_destroy(benchmark_ctx);
+              if (retval) return AEE_EFAILED;
+  return AEE_SUCCESS;                                   
+    }
+CDSP Clock Vote Cont.
+
+--- Page 30 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   30
+3. CPU side call flow example:
+ //Step1 init & vote CDSP clock
+ // your demo init & vote clock, here set CDSP to turbo mode, with latency set to 100 and dcvs enabled
+ demo_init()
+       |------voteClocks(handle, 0, 100, 1);
+ //Step2 execute your demo
+ Loop()
+ {
+  demo_execute()
+ }
+ //Step3 deinit & remove CDSP clock
+ demo_deinit()
+            |---------disableClocks(handle);
+     
+CDSP Clock Vote Cont.
+
+--- Page 31 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   31
+4. Clock vote Q&A:
+鈻?Which power level need to set ?
+鈥?Power level have 7 levels, if you want best performance, choose the maximum 7 (HAP_DCVS_VCORNER_TURBO), otherwise choose 
+other levels to save power consumption, depends on your usecase.
+鈻?What value should be set for latency value?
+鈥?Latency value:  Sleep latency vote in micro-seconds, it鈥檚 time to bring DSP out of sleep mode after it receives an interrupt from CPU.
+鈥?Details refer to <hexagon sdk>/doxygen/HAP_power/index.html and <hexagon_sdk>/ 
+software/system_performance/system_optimizations.html#dsp-sleep-latency
+鈥?Normally we can set value to 10 or 100 both is ok.
+鈥?Latency value set to 0 or 65535 will let DSP enter sleep mode immediately, so you can set these values when you want to disable 
+CDSP clock
+鈻?What鈥檚 difference between DCVS enable or not ?
+鈥?DCVS details refer to <hexagon_sdk>/doxygen/HAP_power/index.html
+鈥?Disable DCVS will let clock remains constant target_corner value during execution, otherwise DCVS enabled will automatically run 
+within range between min_corner and max_corner values to save power consumption.
+鈥?When DCVS is HAP_DCVS_V2_POWER_SAVER_MODE and not set latency value to 0 or 65535, DSP will automatically sleep after 
+5s when DSP in idle mode.
+鈻?Pls remember to call disable DSP clock API when the demo is finish, otherwise there maybe a DSP unsleep issue.
+鈻?If run demo and vote DSP with a new handle for each time, pls remember to call HAP_power_destroy in disable DSP clock API, otherwise 
+will lead to a clock context leak issue, and after several loops fastrpc will return 0x80000574 error.
+CDSP Clock Vote Cont.
+
+--- Page 32 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   32
+SysMonApp usage
+Section 8
+
+--- Page 33 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   33
+鈻?Get cdsp state
+鈻?Get cdsp basic info: sysMonAppQNX getinfo --q6 cdsp
+鈻?Get cdsp vote: sysMonAppQNX  getstate getvotes 1 --q6 cdsp
+鈻?Get stats of PD: sysMonAppQNX pinfo --q6 cdsp
+鈻?Profiling cdsp data, press enter to finish profiling.
+鈻?sysMonAppQNX  profiler --q6 cdsp
+鈻?Parse
+鈻?pull /data/sysmon_cdsp.bin
+鈻?./sysmon_parser_linux ./sysmon_cdsp.bin
+Use sysmonapp on HQX
+Details refer to KBA-240602194851 
+How_to_use_sysmonapp_on_HQX
+
+--- Page 34 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   34
+CDSP common error log analysis
+Section 9
+
+--- Page 35 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   35
+CDSP Error#1. Lib not found
+SLOG2_ERROR  qnn-net-run[fastrpc_farf.c:182]: qnn-net-run.farf: Setting log mask:0x1f, dsp_filenames: num_files:0[49;39m
+SLOG2_ERROR  qnn-net-run[fastrpc_farf.c:314]: FARF log config file qnn-net-run.farf found at /var/log
+SLOG2_ERROR  qnn-net-run[fastrpc_lib.c:2622]: :error: -2147482618: 0 == (nErr = dlerr)
+SLOG2_ERROR  qnn-net-run[fastrpc_lib.c:2629]: dsp dlopen error: 
+file:///libQnnHtpV68Skel.so?qnn_skel_handle_invoke&_modver=1.0&_dom=cdsp::_rtld_map_object_ex: cannot open 
+libQnnHtpV68Skel.so, errno 2 (no such file or directory)[49;39m
+SLOG2_ERROR  qnn-net-run[fastrpc_lib.c:1528]: Deinit tlsKey=0x4 domain=3 client=0 vmid=0  me=0x4651cac8c0 
+gac=0x4651cac8c0 frpc_init_done=8 tid=1 pid=4198400 init_cnt=1, deinit_cnt=0 group_ssr=0[49;39m
+Solution:
+1. Push libQnnHtpV68Skel.so  to /data/local/tmp/xxxx
+2. Set env path 
+-2147482618  -> 0x8000 0406  
+C:\Qualcomm\Hexagon_SDK\4.4.0.1\incs\stddef\AEEStdErr.h
+#define AEE_EUNABLETOLOAD             (AEE_EOFFSET + 0x006)  ///< Unable to load object/applet
+
+--- Page 36 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   36
+CDSP Error#2. PATH set wrong
+SLOG2_ERROR  qnn-net-run[apps_std_imp.c:232]: apps_std fopen_INFO : 
+/data/local/tmp/centernet_resnet18_256_256/dsp/fastrpc_shell_unsigned_3
+SLOG2_ERROR  qnn-net-run[apps_std_imp.c:232]: apps_std fopen_INFO : /etc/images/dsp/fastrpc_shell_unsigned_3
+SLOG2_ERROR  qnn-net-run[apps_std_imp.c:232]: apps_std fopen_INFO : /mnt/etc/images/dsp/fastrpc_shell_unsigned_3
+SLOG2_ERROR  qnn-net-run[apps_std_imp.c:232]: apps_std fopen_INFO : /mnt/etc/images/cdsp0/fastrpc_shell_unsigned_3
+SLOG2_ERROR  qnn-net-run[fastrpc_lib.c:996]: apps_std_fopen_with_env() FAIL(2)[49;39m
+SLOG2_ERROR  qnn-net-run[fastrpc_lib.c:1090]: :error: 2: AEE_SUCCESS == (nErr = open_shell(me, &len, &fh))
+Solution:
+1. Set env path 
+
+--- Page 37 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   37
+CDSP Error#3. sig verify fail
+CDSP:sigverify.c:724:0x7565:4485: :error: signature does not match image root
+CDSP:sigverify.c:591:0x7565:4485: OEM ID -----------------------> 0x72
+CDSP:sigverify.c:592:0x7565:4485: Debug Fuse Enabled -----------> No
+CDSP:sigverify.c:593:0x7565:4485: Testsig Enabled --------------> No
+CDSP:sigverify.c:594:0x7565:4485: Testsig file found -----------> Yes
+CDSP:sigverify.c:596:0x7565:4485: Testsig file valid -----------> No
+CDSP:sigverify.c:599:0x7565:4485: module: Module is signed -----> Yes
+CDSP:sigverify.c:601:0x7565:4485: module: Signature is valid ---> No
+CDSP:sigverify.c:604:0x7565:4485: module: Static hash found ----> No
+CDSP:map_object.c:738:0x7566:4485: signature verify start failed for libcalculator_skel.so
+CDSP:rtld.c:862:0x4163:4485: Error: dlopen_ex failed for libcalculator_skel.so (flags 258)
+CDSP:mod_table.c:610:0x4163:4485: Error 0x80000406: open_mod_table_open_dynamic failed for 
+file:///libcalculator_skel.so?calculator_skel_handle_invoke&_modver=1.0&_dom=cdsp
+Solution:
+鈥?Use testsig on non-secure device
+C:/Qualcomm/Hexagon_SDK/4.4.0.1/docs/tools/sign.html
+鈥?Use product sign on secure device
+鈥?Use unsigned PD to skip sign verify
+
+--- Page 38 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   38
+CDSP Error#4. UserPD Crash
+鈥?Logcat/slog2 (CPU log)
+E xxxxx: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1319: Error 0x4e: remote_handle64_invoke failed for 
+handle 0xdfc29350, method 5 on domain 3 (sc 0x5000100) (errno Success)
+鈥?QXDM (CDSP log)
+00: CDSP:############################### Process on cDSP CRASHED!!!!!!! ##################
+00: CDSP:--------------------- Crash Details are furnished below -------------------------
+00: CDSP:process
+00: CDSP:Crashed Shared Object ./libdspCV_skel.so load address : 0xE30B8000
+00: CDSP:fastrpc_shell_3 load address : 80B00000 and size : D5B00
+00: CDSP:Fault PC : 0xE30B93C4
+00: CDSP:LR : 0xE30BCA74
+00: CDSP:SP : 0x20A2FC60
+00: CDSP:Bad va : 0x0
+00: CDSP:FP : 0x20A2FCA0
+00: CDSP:SSR : 0x0
+00: CDSP:Call trace:
+00: CDSP:[<E30BCA74>] dspCV_getQ6_concurrency_attributes+0xA6C: (./libdspCV_skel.so)
+00: CDSP:----------------------------- End of Crash Report -------------------------------
+
+--- Page 39 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   39
+CDSP Error#4. UserPD Crash cont.
+Solution:
+鈥?Crashed in libdspCV_skel.so
+鈥?Load address 0xE30B8000
+鈥?Callstack crash address: 0xE30BCA74
+鈥?Crash offset address =  0xE30BCA74 -  0xE30B8000 = 0x4a74
+鈥?  Addr2line to check crash position   
+   HEXAGON_Tools\8.3.07\Tools\bin\hexagon-addr2line.exe -e libdspCV_skel.so 0x4a74
+ C:\Qualcomm\Hexagon_SDK\3.5.1\libs\fastcv\dspCV\src\dspCV_worker.cpp:159:9
+鈥?CV algo based on Hexagon SDK  crash
+鈥?Customer can directly check their CDSP algo code by using addr2line.
+鈥?Need compile cdsp lib with Debug or releaseG,  this will generate unstripped lib include symbol info.
+鈥?QNN crash / CDSP Qurt Os crash
+鈥?Need provide crash callstack && CDSP logs && CPU logs to Qcom to analysis firstly.
+鈥?May need to get dump further.
+
+--- Page 40 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   40
+CDSP Error#5. Mem leak
+#./qnn-throughput-net-run 鈥揷onfig single_thread_loog.json &
+#showmem -p 26480723
+Total process memory in use : 7496(KB)
+//waiting 5 ~ 10 mins 
+# showmem -p 26480723
+Total process memory in use : 7624(KB)
+Solution:
+鈥?Use valgrind or other mem tools to analysis leak code position. (Need unstripped lib include symbol info.)
+Push qnx_ap/prebuilt_***/target/qnx7/aarch64le/usr/bin/valgrind* to /mnt/bin
+Push qnx_ap/prebuilt_***/target/qnx7/aarch64le/usr/lib/valgrind to /mnt/lib64
+valgrind --leak-check=full --show-leak-kinds=all fastrpc_calc64_test 0 100 3 0
+==1900628== LEAK SUMMARY:
+==1900628==    definitely lost: 0 bytes in 0 blocks     //  if definitely lost have bytes > 0, means there is a leak.
+==1900628==    indirectly lost: 0 bytes in 0 blocks
+==1900628==      possibly lost: 0 bytes in 0 blocks
+
+--- Page 41 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   41
+CDSP Error#6. GVM SMMU Permission issue
+鈥?Issue
+Sometimes customer customize GVM memory Layout and lead to SNPE/QNN  or other hexagon demos 
+failed running on GVM.
+鈥?Customize#1: Split default sysram to more small pieces.
+鈥?Customize#2: Enlarge DDR memory, add external sysram.
+鈥?E.g. Default have sysram0 and sysram1,  split to sysram0~sysram6.
+鈥?Customize changes missing to add permissions for new sysram layout in secpol or QCPE config file.
+鈥?Demo on GVM calling to DSP access mem addresses on new sysram lead to fastrpc error.
+鈥?smmu fault crash issue.
+鈥?smmu access failed issue.
+鈥?Demo return results all zero.
+鈥?Etc..
+鈥?Issues often can only reproduce on customer device and can鈥檛 reproduce on qcom device with 
+same meta.
+
+--- Page 42 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   42
+CDSP Error#6. GVM SMMU Permission issue cont.
+Follow pages introduce 2 typical examples and analysis experiences from AI/DSP 
+perspective,  better suggestions to raise case to bsp->memory/security team to review 
+mem layout changes to get correct solutions.
+鈥?8155 SNPE output 100% all zero on GVM.
+鈥?Customize change split default sysram from 1~2 to 1~6
+鈥?Fastrpc failed with smmu error
+鈥?Add permissions for sysram3~6 in security secpol config fix the issue.
+鈥?8295 QNN call on GVM lead to device crash.
+鈥?Customize change enlarge sysram and add new sysram4
+鈥?Dump indicate fault address related with sysram4
+鈥?Add permissions for sysram4 in mem QCPE config fix the issue.
+
+--- Page 43 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   43
+CDSP Error#6.2 8295 GVM SMMU Access issue
+鈥?Issue
+8295 allocate a large buffer on GVM in QNN or Hexagon demo cause device crash.
+鈥?Key logs
+Got full dump and parse slog2 found issue related with smmu.
+qcpe_qhee-8540 14315  SLOG2_ERROR  [qcpe_platform_log.c:42]: [tid=25] SMMU S2 Dev CB# 0 0x15000000 Fault CB: 109 Fault: 
+FSR=0x00000402, FAR1=0x00000000, FAR0=0x04000000,
+鈥?
+vdev-emac  16135  SLOG2_ERROR qvm[fastrpc_lib.c:990]: :error: -1: 0 == (nErr = ctx->nRetVal)
+鈥?Root cause
+鈥?Dump indicate smmu fault crash in fastrpc driver and crash address belong to sysram4.
+鈥?How to check crash address and related with which sysram, can get help from bsp -> mem team.
+鈥?Customer enlarge DDR memory and add external sysram4, but missed add to QCPE config.
+
+--- Page 44 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   44
+CDSP Error#6.2 8295 GVM SMMU Access issue cont.
+鈥?Solution
+鈥?Default QCPE config qnx_ap/target/hypervisor/host/qcpe_config/8540/QCPE_config.xml.tmpl
+鈥?NSP0 permission only for VM_DMA2
+鈥?VM_DMA2 only include sysram1~3, not include sysram4.
+<dma_domain id="VM_DMA2" allow_multiple_owners="True" applicable_smmu="All" nickname="VM_DMA2" safe="False">
+鈥?
+<hv_range_ref id="gvm_sysram1" perm="RWX" />
+<hv_range_ref id="gvm_sysram2" perm="RWX" />
+<hv_range_ref id="gvm_sysram3" perm="RWX" />
+鈥?
+<context_bank id="40" valid="TRUE" nestedToCB="109" dma_domain="VM_DMA2" secure="FALSE" type="NESTED">
+<sid id="SID_MASK_NSP_0_APP1" owner="HOST" device="NSP0" />
+鈥?Add sysram4 to VM_DMA2 fix the issue
+<dma_domain id="VM_DMA2" allow_multiple_owners="True" applicable_smmu="All" nickname="VM_DMA2" safe="False">
+鈥?
++++ <hv_range_ref id="gvm_sysram4" perm="RWX" />
+鈥?Details refer to Memory KBA-220915231544 Autogen4 HQX memory layout tuning guide
+鈥?Suggest to sync with memory team to review QCPE config for new sysram customize change.
+
+--- Page 45 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   45
+CDSP Error#7. CDSP unsleep issue when enter STR
+鈥?Issue
+鈥?Device failed enter STR caused by CDSP unsleep. 
+鈥?STR failed QNX slogs :   waitfor_drv_idle(CDSP) failed
+鈥?Analysis
+鈥?Use sysMonApp to check current DSP clock state.
+鈥?Get slog & logcat & DSP logs for further check which client is voting dsp clock.
+鈥?Solution
+鈥?User applications must ensure DSP Clock vote is released before enter STR.
+鈥?Hexagon API: HAP_power_destroy
+鈥?QNN API: destroypowerconfigid
+More Details code refer to KBA-250119215141 (How to solve cdsp STR issue on SA8295)
+
+--- Page 46 ---
+Confidential 鈥?Qualcomm Technologies, Inc. and/or its affiliated companies 鈥?May Contain Trade Secrets  |  MAY CONTAIN U.S. AND INTERNATIONAL EXPORT CONTROLLED INFORMATION  |  80-58216-2 Rev. AA   46
+CDSP Error#7. CDSP unsleep issue when enter STR cont.
+鈥?sysMonApp check CDSP clock state
+鈥?sysMonApp cmd
+ sysMonAppQNX getstate --getvotes 1 --q6 cdsp
+鈥?Activate Clock state (e.g. 8295)
+鈥?Client ID: 2  (8295 fastrpc default clock vote)
+鈥?Sleep latency: 1000
+鈥?Clock level: NOM
+鈥?Client ID: 3  (user clock vote)
+鈥?Sleep latency: 40
+鈥?Clock level Turbo_plus
+鈥?Remove client ID 2&3 vote will let CDSP sleep. 
+鈥?Client ID2 (fastrpc default clock vote)
+鈥?8295: Manual call hexagon or QNN API to remove fastrpc default 
+clock vote.
+鈥?8255/8775+: no need to handle, CDSP automatically remove 
+fastrpc default clock when user vote a new clock.
+鈥?Client ID3 (user clock vote)
+鈥?Manual call hexagon or QNN API to remove the clock vote.
+

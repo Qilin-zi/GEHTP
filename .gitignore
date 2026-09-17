@@ -1,0 +1,32 @@
+# 构建产物
+compiler/build*/
+kernels/build/
+kernels/lib/
+kernels/results/
+*.exe
+*.o
+*.so.signed
+*.signed.so
+
+# 生成/中间产物
+compiler/our_simple_linear_context.bin
+*.raw
+*.wtop
+
+# 阶段1 converter 产物(gen_all.sh 可重生成)
+test_models/**/conv_add_qnn/
+
+# python
+__pycache__/
+*.pyc
+# Qwen3.5 模型产出(大二进制/权重/golden)
+test_models/qwen35_08b/
+scripts/venv_qpm/
+scripts/venv_qpm210/
+.scratch_d59/
+tmp/
+
+# 大资产目录 (C1 拷贝自 4090; 不进 git, 源树在 4090 只读)
+test_models/qwen35_08b/
+test_models/qnn_probe/
+test_assets/

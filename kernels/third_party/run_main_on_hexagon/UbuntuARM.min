@@ -1,0 +1,3 @@
+include cpu.min
+
+$(EXE_NAME)_LD_FLAGS += -ldl

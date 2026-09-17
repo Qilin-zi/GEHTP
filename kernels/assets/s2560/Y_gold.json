@@ -1,0 +1,12 @@
+{
+  "source": "oracle_m256_k2560/source",
+  "shape_mkn": [
+    256,
+    2560,
+    2560
+  ],
+  "formula": "Y[n,m]=clip(round_div7(sum_k(A[m,k]-32768)*W[k,n])+32768)",
+  "storage": "uint16_le (N,M) row-major",
+  "hmx_tolerance_lsb": 40,
+  "bytes": 1310720
+}

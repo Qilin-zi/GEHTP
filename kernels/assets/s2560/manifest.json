@@ -1,0 +1,41 @@
+{
+  "_comment": "T10 packed surfaces (same pack functions as htpw4a16_v81 M2)",
+  "oracle_dir": "/disk1/DFlashSpecCppRunner/htpw4a16_v81/oracle_m256_k2560/source",
+  "shape_mkn": [
+    256,
+    2560,
+    2560
+  ],
+  "tile_counts": {
+    "M_t": 8,
+    "K_t": 80,
+    "N_t": 80,
+    "table_m_groups": 8,
+    "table_row_span": 4,
+    "act_entries": 640,
+    "out_entries": 640,
+    "compact_stride_bytes": 2048
+  },
+  "files": {
+    "act_surface.raw": {
+      "bytes": 1310720,
+      "sha256": "c4ea812081e91fecae81a06dab119fd001909fbd97d18046cc0b09ab42e7b6d1"
+    },
+    "packed_weight.raw": {
+      "bytes": 3276800,
+      "sha256": "7eb67a201050ad1dc73bf7dc9b4fe0e57b9a7df2afb6a0ff34a9e7ca497c975c"
+    },
+    "folded_bias.raw": {
+      "bytes": 40960,
+      "sha256": "69e840b36a7a9f61ba339566c4f2acf37e0e6f07b96f80ce6a536b79b0274e26"
+    },
+    "act_table.raw": {
+      "bytes": 2560,
+      "sha256": "1b9aa477b997ad8481d953fafe4dd491a47164e8615572ef7275f2bbce7b4166"
+    },
+    "out_table.raw": {
+      "bytes": 2560,
+      "sha256": "1b9aa477b997ad8481d953fafe4dd491a47164e8615572ef7275f2bbce7b4166"
+    }
+  }
+}

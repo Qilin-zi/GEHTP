@@ -1,0 +1,13 @@
+=== 37_conv2d_add ===
+=== 37_conv2d_add (GEHTP M2) ===
+[PASS] main: fused == split byte-exact
+[PASS] main: golden <= 1 ULP (32768 elems)
+[PASS] main: run_io(ext in) == fused byte-exact
+[PASS] io_round: io golden <= 1 ULP
+[PASS] io_round: io golden <= 1 ULP
+[PASS] io_round: io golden <= 1 ULP
+[PASS] spill: fused == split byte-exact
+[PASS] spill: golden <= 1 ULP (32768 elems)
+[PASS] spill: run_io(ext in) == fused byte-exact
+[PASS] 37_conv2d_add overall
+--- summary: 0 pass, 0 fail ---

@@ -1,0 +1,4 @@
+include cpu.min
+
+$(EXE_NAME)_DEFINES += __LA_FLAG
+$(EXE_NAME)_LD_FLAGS += -llog -ldl
