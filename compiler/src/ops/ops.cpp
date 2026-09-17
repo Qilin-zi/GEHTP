@@ -546,6 +546,17 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         } else if (!in0 || !pads) {
             for (size_t i = 0; i < n; ++i) out[i] = pad_val;
         } else {
+            /* A3 设备恒等仿真: op_copy_sem 把 Pad 发成 UNARY 恒等拷贝 —
+             * out[i]=in[i] (pad 位不补, 尾部读旧值, 以 0 兜底模拟) */
+            if (getenv("GEHTP_HOST_COPY_SEM_IDENTITY") || getenv("GEHTP_HOST_PAD_IDENTITY")) {
+                size_t in_n = 1;
+                if (!in_defs.empty())
+                    for (uint32_t d = 0; d < in_defs[0].rank && d < 5; ++d)
+                        in_n *= in_defs[0].dims[d];
+                for (size_t i = 0; i < n; ++i)
+                    out[i] = (in0 && i < in_n) ? in0[i] : 0.0f;
+                return;
+            }
             if (getenv("GEHTP_EXDIAG")) {
                 std::fprintf(stderr, "[paddiag] n=%zu in_defs=%zu",
                              n, in_defs.size());
@@ -778,7 +789,14 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             if (const ScalarParam* p = scalar_get(sp2, "axis"))
                 axis = (int)(p->is_numeric ? p->value_num
                                            : std::strtol(p->value_str.c_str(), nullptr, 10));
-            if (axis < 0) axis += (int)irank;
+            /* axis 按 converter 写的原始 rank 计; compact 剥前导 size-1 后
+             * 必须同步左移, 否则轴错位 (0.8B GDN 实锤: tbl [1,16,1,64,64]
+             * axis=3 → 压缩 [16,1,64,64] 后真轴=2, 用 3 取到末维 64 —
+             * L0 host cos 1.0→0.53 回归根因)。 */
+            if (axis < 0 && !in_defs.empty()) axis += (int)in_defs[0].rank;
+            const int stripped = (!in_defs.empty() && (int)in_defs[0].rank > (int)irank)
+                               ? (int)in_defs[0].rank - (int)irank : 0;
+            axis -= stripped;
             if (axis < 0 || axis >= (int)irank) axis = 0;
             size_t ts[5] = {1, 1, 1, 1, 1}, os[5] = {1, 1, 1, 1, 1}, xs[5] = {1, 1, 1, 1, 1};
             for (int d = 3; d >= 0; d--) {
@@ -899,6 +917,10 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         const int32_t* idxs = inputs.size() > 1 ? reinterpret_cast<const int32_t*>(inputs[1]) : nullptr;
         const float* upd = inputs.size() > 2 ? reinterpret_cast<const float*>(inputs[2]) : nullptr;
         for (size_t i = 0; i < n; ++i) out[i] = data ? data[i] : 0.0f;
+        /* A3 设备恒等仿真: GEHTP_HOST_COPY_SEM_IDENTITY=1 (或单独
+         * GEHTP_HOST_SCATTER_IDENTITY=1) 时丢弃 scatter 更新,
+         * 与 op_copy_sem 的设备 emit (UNARY 恒等拷贝) 行为一致, 用于数值判决 */
+        if (getenv("GEHTP_HOST_COPY_SEM_IDENTITY") || getenv("GEHTP_HOST_SCATTER_IDENTITY")) return;
         if (!idxs || !upd) return;
         /* K = indices 末维; n_idx = 前导维积; block = updates/n_idx */
         uint32_t K = 1;
@@ -1152,6 +1174,11 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
          * int32 位模式, 只在 Cast 处转数值(RoPE position 链; 目标 f16
          * 由下游窄化承担)。float→float Cast 不存在于此语料。 */
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        /* A3 设备恒等仿真: 设备 UNARY 恒等 = 位模式直通 (int32 位模式当 f16 读) */
+        if (getenv("GEHTP_HOST_COPY_SEM_IDENTITY") || getenv("GEHTP_HOST_CAST_IDENTITY")) {
+            for (size_t i = 0; i < n; ++i) out[i] = in0 ? in0[i] : 0.0f;
+            return;
+        }
         const int32_t* i32 = reinterpret_cast<const int32_t*>(in0);
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? (float)i32[i] : 0.0f;
     } else {
