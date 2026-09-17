@@ -186,15 +186,17 @@
 |---|---|---|---|---|---|
 | A1 | （建议 VL 线本人） | | op_transpose.cpp | 否 | |
 | A2 | | | op_tile.cpp(新)/oplist_parse.h/ops.cpp | 设备段 | |
-| A3 | | | op_copy_sem.cpp/ops.cpp/oplist_parse.h | 设备段 | |
+| A3 | 105 会话 (branch gehtp-08b) | **进行中** (①审计) | op_copy_sem.cpp/ops.cpp/oplist_parse.h | ②③时才需要 | |
 | A4 | | | qnn_ir_loader.cpp/wtop_ops.hpp | 否 | |
 | A5 | | | scripts/gehtp/op_inventory.py | 否 | |
-| A6 | | | ops.cpp | 否 | |
-| B1 | | | oplist_exec.c | 设备段 | |
+| A6 | 105 会话 (branch gehtp-08b) | **闭合** 98e5e1d | ops.cpp/graph_prepare.cpp | 否 | L0/L3 零直通 + bogus 三模式 + ctest 44/44; 新增 factory-null 暗洞同治 |
+| B1 | 105 会话 (branch gehtp-08b) | 排队 (G3 后集成; default-off 纪律) | oplist_exec.c (独立 xop 文件+表登记) | 短槽 op 级 | |
 | B2 | | | oplist_exec.c | 设备段 | |
 | B3 | | （先查 VL 在途） | oplist_exec.c/42_runner/gehtp | 设备段 | |
-| B4 | | | oplist_exec.c/wtop_emit.cpp | 否 | |
-| C1 | | （例41线/disk2-ca 在跑） | test_models/qwen35_08b/ | 设备段长 | |
+| B4 | 105 会话 (branch gehtp-08b) | G3 后 | oplist_exec.c/wtop_emit.cpp | 否 | |
+| C1 | 105 会话 (branch gehtp-08b) | **进行中** (P0-P3; 与例41线/disk2-ca 交接) | test_models/qwen35_08b/, test_assets/l0/(新) | 设备段长 | T0+G0 闭合 (04ea082; conv_add 与 4090 VL 构建逐字节全同) |
+| C1b (新行) | 105 会话 | 进行中 | gdn_kern.c/gdn_sm.h wrapper + ex19 harness | 短槽 | gdn_kern 0.8B 参数化 (d_inner=2048/h=16/d=128), 目标 ex19 8/8 |
+| opcode 预登记 | 105 会话 | 通报 | oplist_parse.h | — | OP_SCATTER_ND(A3②备)/OP_GDN_STEP/OP_QGEMV/OP_GQA_FAD 只追加, 与 A2 OP_TILE_F16 错峰 |
 | C2 | | | test_models/qwen35_4b/ | 设备段长 | |
 | C3 | | | test_models/qwen3vl_4b/ | 设备段 | |
 | C4 | 104 本会话 (branch gehtp-08b, 2026-09-17) | **进行中** | test_models/minicpm5_2b*/ scripts/judge_minicpm.py | 设备段(编译完后) | 预检通过(12 型全覆盖); 撞 id 根因见 §8 |
