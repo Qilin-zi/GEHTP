@@ -194,10 +194,10 @@
 | B2 | | | oplist_exec.c | 设备段 | |
 | B3 | | （先查 VL 在途） | oplist_exec.c/42_runner/gehtp | 设备段 | |
 | B4 | | | oplist_exec.c/wtop_emit.cpp | 否 | |
-| C1 | | （与例41线交接） | test_models/qwen35_08b/ | 设备段长 | |
+| C1 | | （例41线/disk2-ca 在跑） | test_models/qwen35_08b/ | 设备段长 | |
 | C2 | | | test_models/qwen35_4b/ | 设备段长 | |
 | C3 | | | test_models/qwen3vl_4b/ | 设备段 | |
-| C4 | | | test_models/minicpm5_2b*/ | 设备段 | |
+| C4 | 104 本会话 (branch gehtp-08b, 2026-09-17) | **进行中** | test_models/minicpm5_2b*/ scripts/judge_minicpm.py | 设备段(编译完后) | 预检通过(12 型全覆盖); 撞 id 根因见 §8 |
 | D1 | | | graph_prepare.cpp/wtop_emit.cpp | 否 | |
 | D2 | | | scripts/ 新增 | 设备段(只读 optrace) | |
 | D3 | | | kernels/host/ | 否 | |
@@ -215,3 +215,16 @@
 - B1/B2 与 A2/A3 的设备执行体改动同文件（oplist_exec.c）→ 按 §2.1 错峰，建议 B 线先行，A 线新 op 执行体随后追加（不同函数，冲突小）。
 
 **总验收门（战役结束判据）**：四模型 `gehtp compile` 全通 + 设备 `gehtp run` 输出达各自判据 + conv_add/L3/L0 回归全绿 + D2 三方一致性四图全过 + `gehtp doctor` 干净环境全绿。
+
+---
+
+## 8. 战役日志（追加区，新进展置顶）
+
+### 2026-09-17 C4 线 (104 会话) 中段发现
+
+1. **loader 撞 id 根因（四模型共享）已双向定案**：tensor_params(perm/axes) 与权重 const 共用 JSON id 编号空间，`append_const_node` 撞 id **静默返 0**（不覆盖不后移），旧码不查返回值且把占用者 name_tag 改写为 perm 名 → Transpose.inputs[1] 接到权重 const。minicpm 11 处、4B/VL 同款（"perm 轴数 0xA00000/0xC00000>5" 实为权重字节数/4）、0.8B 也藏 1 处（layers.0/linear_attn/Transpose_5_perm id=155 撞 onnx::MatMul_188646 [1024,2048]——C1 线全模型编译必经此雷）。VL 在途（已入 T0=04ea082）含同款根治（"0.8B 全图 88 处撞号"实锤 + op156 SIGSEGV 实锤），本线独立复证。emit 侧 perm 形状贪心推断（VL, op_transpose.cpp）为缺属性兜底，两层互补。
+2. **minicpm split 动因定案**：split stageA/B（1249/1252 节点，均 54-63MB 小 blob 走外部权重）正是全模型 compile 撞 perm-collision 的绕行；根因修复后全模型单 blob 路线成立，C4 按单 blob 推进。
+3. **test_e2e 基线回归**（8936c01 即挂，非本次引入）：`in_bc` 广播阅读器对无形状调用方恒读元素 0 → Add 断言失败。已修（8e1d78a，空 in_defs 回退线性直读），ctest 44/44 复绿。
+4. **EXT_IN int32 槽位尺寸瑕疵**（未修，E 线登记）：emit 输入槽按 elems×2(f16) 建，int32 ids（elems×4）尺寸不符；运行时 g_ext_in 指针覆盖使其不影响正确性，但槽 len 语义错误，B3 多输入改造时一并收口。
+5. **host_run 输入加载实为 raw 字节直读**（无 f32 转换），int32 ids 位模式可直接过 Gather——E2 可把旗标名 `--input-f32` 改 `--input-raw` 消除误导。
+6. minicpm 预检结论：12 op 型全在注册表；rank>4 张量 252 个全可折前导 1（且仅触及 Reshape/Eltwise_Binary，broadcast 的 fold4 右对齐已覆盖该形态）；Transpose 无 rank>4；Neuron 6=SIGMOID、Binary 13=MUL/0=ADD 映射齐。
