@@ -230,6 +230,7 @@
 4. **设备楔死独立旁证**（与 C4 §8.13 同判）：0x39 全域失败=CDSP (gunyah VM) 本次未启动——remoteproc 未注册、boot_adsp/boot_cdsp 60s 超时 exit 1、SELinux 已 Permissive、两版 skel（380f3cb 正典/d0bfbc third_party）同败、adb root 同败。**非 skel/装载器问题，恢复=板主物理上电**。另：build_examples.sh 会推 third_party skel 覆盖设备正典件（md5 不同），已记坑。
 5. **P1 host 全模型**：修复后链跑通但 logits **全 NaN**（m5 时代则是 cos≈0 无 NaN——全模型 host 链从未正确过）；dump+看门狗二分 NaN 首现 op 进行中。L3 注意力层 host vs HF 锚点 cos=0.966（mask/cos/sin 布线已核），残差集中 channel 0 区（RMSNorm 约定候选），精确定位续查。
 6. **NaN 根因已定罪（输入序乌龙，非编译器 bug）**：dump+看门狗抓到首个 NaN op=4634（注意力 Softmax），逐头 row 0 全 -inf。链路：pad 掩码列 0 -inf（Equal(arange[0]=0, 0)=true）+ 因果基 row 0 只剩 col 0 → row 0 全 -inf → NaN。**真因 = host_run 三输入顺序：图 Input 按张量 id 升序 = input_ids(1), attention_mask(2), position_ids(3)——正确喂法 `ids,mask,pos`**，我按直觉 ids,pos,mask 喂反（m5 时代 cos≈0 同族：他们直接喂了三份 prompt-ids）。修正后全模型 host run 在跑。**坑表登记：host_run 多输入顺序 = 图张量 id 序，不是命名直觉序；喂错不报错只出 NaN/垃圾**。
+8. **L3 0.966 亦破案（输入布局，host 链无辜）**：cos/sin 文件是 [1,32,64] nfc，图声明 [1,64,32] ncf——转置喂入后 **L3 host vs HF 锚点 cos=1.0**（vs 设备 gold 0.999999）。隐藏态同法（ncf 声明）。**host 链对两类层均 HF 忠实（L0/L3 均 0.999999），"host 有 RMSNorm 约定 bug" 排除**；逐 op 锚点对照显示 RoPE/Softmax/门控全链无失真。坑表：host_run 喂数据必须按**图声明布局**（ncf 族），文件布局不一致时静默错。
 7. **P3 资产预备**：09-16 的 1.67GB 全模型 blob 含恒等 scatter（1154 站）已废——A3② 重编（真 scatter ×1154 + Gather 修复编译器）进行中。设备 run 待 DSP 恢复。
 
 ### 2026-09-17 C4 线 (104 会话) 中段发现
