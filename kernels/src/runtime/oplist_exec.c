@@ -875,6 +875,44 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
+/* A3② ScatterNd 真语义 (opcode 28): out = data 拷贝后, 按 n_idx 组 K 维
+ * 坐标把 updates 块写入。恒等拷贝=数值死刑 (docs/A3_COPY_SEM_AUDIT.md 判决:
+ * L0 cos 0.102)。与 host execute ScatterNd (ops.cpp) 同口径:
+ * K=indices 末维, n_idx=前导维积, block=updates/n_idx; 坐标越界跳过。 */
+static int exec_scatter_nd(const struct wt_blob* b, const struct wt_op* op,
+                           char* err, size_t errn) {
+    const uint16_t* data = (const uint16_t*)ref_ptr(b, op->args[0]);
+    const int32_t* idxs  = (const int32_t*)ref_ptr(b, op->args[1]);
+    const uint16_t* upd  = (const uint16_t*)ref_ptr(b, op->args[2]);
+    const uint32_t out_t = op->args[3];
+    const uint32_t n     = op->args[4];
+    const uint32_t rank  = op->args[5];
+    const uint32_t K     = op->args[11];
+    const uint32_t n_idx = op->args[12];
+    const uint32_t block = op->args[13];
+    uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)n * 2u);
+    if (!data || !idxs || !upd || !y) { snprintf(err, errn, "scatter_nd ref fail"); return -1; }
+    if (rank < 1 || rank > 5 || K < 1 || K > rank) { snprintf(err, errn, "scatter_nd rank/K"); return -1; }
+    uint32_t od[5];
+    for (uint32_t i = 0; i < 5; i++) od[i] = (i < rank) ? op->args[6 + i] : 1u;
+    size_t ostr[5];
+    ostr[4] = 1;
+    for (int d = 3; d >= 0; d--) ostr[d] = ostr[d + 1] * od[d + 1];
+    memcpy(y, data, (size_t)n * 2u);
+    for (uint32_t e = 0; e < n_idx; e++) {
+        size_t base = 0;
+        int bad = 0;
+        for (uint32_t k = 0; k < K; k++) {
+            int32_t c = idxs[(size_t)e * K + k];
+            if (c < 0 || c >= (int32_t)od[k]) { bad = 1; break; }
+            base += (size_t)c * ostr[k];
+        }
+        if (bad || base + block > n) continue;
+        memcpy(y + base, upd + (size_t)e * block, (size_t)block * 2u);
+    }
+    return 0;
+}
+
 /* f16×f16 GEMM (float 图; f32 累加 f16 存储)。M3c 正确性版 —— 性能版
  * 走 HMX (M7)。flags bit0 = a 转置(存 [K,M]), bit1 = w 转置(存 [N,K]),
  * bit2 = batched BMM(attention q·kᵀ/probs·v; 批数在高 16 位) */
@@ -1269,6 +1307,10 @@ static int xop_gather(const struct wt_op_ctx* cx) {
     return exec_gather(cx->b, cx->op, cx->err, cx->errn);
 }
 
+static int xop_scatter_nd(const struct wt_op_ctx* cx) {
+    return exec_scatter_nd(cx->b, cx->op, cx->err, cx->errn);
+}
+
 static int xop_argmax(const struct wt_op_ctx* cx) {
     return exec_argmax(cx->b, cx->op, cx->err, cx->errn);
 }
@@ -1317,6 +1359,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_CUMSUM_F32] = xop_cumsum,
     [OP_CONV1D_SSM_F16] = xop_conv1d_ssm,
     [OP_GATHER_F16] = xop_gather,
+    [OP_SCATTER_ND_F16] = xop_scatter_nd,
     [OP_ARGMAX_F16] = xop_argmax,
     [OP_KV_APPEND_F16] = xop_kv_unimpl,
     [OP_KV_GATHER_F16] = xop_kv_unimpl,
