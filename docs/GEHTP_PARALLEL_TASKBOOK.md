@@ -232,6 +232,8 @@
 6. **NaN 根因已定罪（输入序乌龙，非编译器 bug）**：dump+看门狗抓到首个 NaN op=4634（注意力 Softmax），逐头 row 0 全 -inf。链路：pad 掩码列 0 -inf（Equal(arange[0]=0, 0)=true）+ 因果基 row 0 只剩 col 0 → row 0 全 -inf → NaN。**真因 = host_run 三输入顺序：图 Input 按张量 id 升序 = input_ids(1), attention_mask(2), position_ids(3)——正确喂法 `ids,mask,pos`**，我按直觉 ids,pos,mask 喂反（m5 时代 cos≈0 同族：他们直接喂了三份 prompt-ids）。修正后全模型 host run 在跑。**坑表登记：host_run 多输入顺序 = 图张量 id 序，不是命名直觉序；喂错不报错只出 NaN/垃圾**。
 8. **L3 0.966 亦破案（输入布局，host 链无辜）**：cos/sin 文件是 [1,32,64] nfc，图声明 [1,64,32] ncf——转置喂入后 **L3 host vs HF 锚点 cos=1.0**（vs 设备 gold 0.999999）。隐藏态同法（ncf 声明）。**host 链对两类层均 HF 忠实（L0/L3 均 0.999999），"host 有 RMSNorm 约定 bug" 排除**；逐 op 锚点对照显示 RoPE/Softmax/门控全链无失真。坑表：host_run 喂数据必须按**图声明布局**（ncf 族），文件布局不一致时静默错。
 7. **P3 资产预备**：09-16 的 1.67GB 全模型 blob 含恒等 scatter（1154 站）已废——A3② 重编（真 scatter ×1154 + Gather 修复编译器）进行中。设备 run 待 DSP 恢复。
+9. **opcode 28 ABI 分裂警报（双 C1 树各自实现）**：/disk1/GEHTP（平行 C1 会话）与 task/prof-wp（105 会话）都加了 OP_SCATTER_ND_F16=28 但 **arg 布局不同**（他们 [data,idx,upd,out,n_idx,K,dims] arity 11 vs 本方 [data,idx,upd,out,n_out,rank,dims,K,n_idx,block] arity 14）——**blob 与 lib 必须同树配套，跨树混跑静默出垃圾**。设备共享 libhvxhmx_v23.so 标准名被多会话反复覆盖（md5 对拍实锤），身份制（独立 runner 名+job 通道）在合一前是铁律。合一方向：以 task/prof-wp（含 A6/审计/C1b/PORTAL 全套超集）为 C1 家，对方树转只读参考（其 E2/RUNBOOK/judge 修复已移植完）。
+10. **skel 解毒完成（task/prof-wp）**：third_party ship/ skel 已换正典 380f3cbf（d0bfbc 陈旧版=0x80000406 毒源，失败 open 级联楔死 fastrpc 通道——本次 0x39 全域失败的完整链条：他方推陈旧 skel → 通道楔死 → CDSP VM 重启未起）。**4090 基线树 ship/ 仍陈旧，patch 回合必须带上 skel 修正，否则 104 侧 setup 再推旧件再毒化**。GVM SELinux 有看门狗自动翻回 Enforcing，设备段跑前必查 getenforce。
 
 ### 2026-09-17 C4 线 (104 会话) 中段发现
 
