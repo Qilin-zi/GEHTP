@@ -76,24 +76,34 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
     if (buf[0] != 'W' || buf[1] != 'T' || buf[2] != 'O' || buf[3] != 'P')
         return WT_ERR_MAGIC;
     out->ver = wt_rd_u16(buf + 4);
-    if (out->ver != WT_BLOB_VER) return WT_ERR_VER;
+    if (out->ver != WT_BLOB_VER && out->ver != WT_BLOB_VER_2) return WT_ERR_VER;
     if (wt_rd_u16(buf + 6) != WT_ENDIAN_CHK) return WT_ERR_ENDIAN;
     out->n_slots = wt_rd_u32(buf + 8);
     out->n_ops = wt_rd_u32(buf + 12);
     if (out->n_slots == 0 || out->n_slots > WT_MAX_SLOTS) return WT_ERR_NSLOTS;
     if (out->n_ops == 0 || out->n_ops > WT_MAX_OPS) return WT_ERR_NOPS;
 
-    size_t need = 16u + (size_t)out->n_slots * WT_SLOT_SIZE;
+    /* v1: 16B 槽记录 {len,count,offset32,addr}; v2: 24B {len,count,off64,addr,rsv} */
+    const uint32_t slot_rec = (out->ver >= WT_BLOB_VER_2) ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE;
+    size_t need = 16u + (size_t)out->n_slots * slot_rec;
     if (size < need) return WT_ERR_SLOTS_OVERRUN;
     for (uint32_t i = 0; i < out->n_slots; i++) {
-        const uint8_t* s = buf + 16u + (size_t)i * WT_SLOT_SIZE;
+        const uint8_t* s = buf + 16u + (size_t)i * slot_rec;
         out->slots[i].len = wt_rd_u32(s);
         out->slots[i].count = wt_rd_u32(s + 4);
-        out->slots[i].offset = wt_rd_u32(s + 8);
-        out->slots[i].addr = wt_rd_u32(s + 12);
+        if (out->ver >= WT_BLOB_VER_2) {
+            out->slots[i].offset = (uint64_t)wt_rd_u32(s + 8) |
+                                   ((uint64_t)wt_rd_u32(s + 12) << 32);
+            out->slots[i].addr = wt_rd_u32(s + 16);
+        } else {
+            out->slots[i].offset = wt_rd_u32(s + 8);
+            out->slots[i].addr = wt_rd_u32(s + 12);
+        }
         if (out->slots[i].len == 0) return WT_ERR_WEIGHT_OVERRUN;
         if (out->slots[i].offset % WT_WEIGHT_ALIGN != 0) return WT_ERR_ALIGN;
-        if ((uint64_t)out->slots[i].offset + out->slots[i].len > 0xFFFFFFFFull)
+        /* v1 的 4GB 上限检查仅对 v1; v2 真实界由下方 end > weight_bytes 覆盖 */
+        if (out->ver < WT_BLOB_VER_2 &&
+            out->slots[i].offset + out->slots[i].len > 0xFFFFFFFFull)
             return WT_ERR_WEIGHT_OVERRUN;
     }
 

@@ -74,7 +74,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& out_path, const std::string& manifest_path,
          const std::string& gguf_path, const std::string& match_path,
          uint64_t ddr_budget = 0, uint64_t vtcm_budget = 0,
-         bool ext_weights = false, const std::string& ext_weights_path = "") {
+         bool ext_weights = false, const std::string& ext_weights_path = "",
+         bool force_v2 = false) {
     // 1. deserialize .bin
     std::vector<uint8_t> bin;
     if (!load_file(bin_path, bin)) { std::fprintf(stderr, "error: cannot open %s\n", bin_path.c_str()); return 2; }
@@ -535,21 +536,47 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     {
         uint32_t n_slots = (uint32_t)em.slots.size();
         uint32_t n_ops = (uint32_t)em.ops.size();
-        em.blob.resize(16 + n_slots * 16 + 1, 0);
+        /* WTOP v2(C4): 权重区(内联 weight_area 或外置 ext_weight_area)逼近/超
+         * v1 的 u32 字节偏移上限(4GB)时, slot 线记录 16B→24B 且 offset 升 u64。
+         * 内存侧 em.slots 恒为字节偏移, 仅此处线编码变化。小模型保持 v1 →
+         * 存量 byte-exact 回归零影响。--force-v2 供小模型走 v2 通路做设备回归
+         * (无需 4GB 资产)。 */
+        const uint64_t v1_off_max = 0xFFFFFF00ull;  // 留 256B 护栏
+        bool need_v2 = force_v2 ||
+                       em.weight_area.size() > v1_off_max ||
+                       em.ext_weight_area.size() > v1_off_max;
+        uint16_t ver = need_v2 ? WT_BLOB_VER_2 : WT_BLOB_VER;
+        const uint32_t slot_rec = need_v2 ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE;
+        if (need_v2)
+            std::fprintf(stderr, "[wtop] v2 格式: %s (weight_area=%zu ext=%zu), offset 升 u64\n",
+                         force_v2 ? "force-v2 强制" : "权重区超 v1 偏移上限",
+                         em.weight_area.size(), em.ext_weight_area.size());
+        em.blob.resize(16 + (size_t)n_slots * slot_rec + 1, 0);
         std::memcpy(em.blob.data(), "WTOP", 4);
-        uint16_t ver = WT_BLOB_VER, eck = WT_ENDIAN_CHK;
+        uint16_t eck = WT_ENDIAN_CHK;
         std::memcpy(em.blob.data() + 4, &ver, 2);
         std::memcpy(em.blob.data() + 6, &eck, 2);
         std::memcpy(em.blob.data() + 8, &n_slots, 4);
         std::memcpy(em.blob.data() + 12, &n_ops, 4);
         for (uint32_t i = 0; i < n_slots; i++) {
-            uint8_t* s = em.blob.data() + 16 + i * 16;
+            uint8_t* s = em.blob.data() + 16 + (size_t)i * slot_rec;
             std::memcpy(s, &em.slots[i].len, 4);
             std::memcpy(s + 4, &em.slots[i].count, 4);
-            std::memcpy(s + 8, &em.slots[i].offset, 4);
-            std::memcpy(s + 12, &em.slots[i].addr, 4);
+            uint64_t off = em.slots[i].offset;
+            if (need_v2) {
+                uint32_t lo = (uint32_t)(off & 0xFFFFFFFFu), hi = (uint32_t)(off >> 32);
+                std::memcpy(s + 8, &lo, 4);
+                std::memcpy(s + 12, &hi, 4);
+                std::memcpy(s + 16, &em.slots[i].addr, 4);
+                uint32_t zero = 0;
+                std::memcpy(s + 20, &zero, 4);
+            } else {
+                uint32_t off32 = (uint32_t)off;
+                std::memcpy(s + 8, &off32, 4);
+                std::memcpy(s + 12, &em.slots[i].addr, 4);
+            }
         }
-        size_t p = 16 + n_slots * 16;
+        size_t p = 16 + (size_t)n_slots * slot_rec;
         em.blob.resize(p);
         for (const auto& o : em.ops) {
             size_t sz = 4 + o.n_args * 4;
@@ -624,7 +651,11 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             const OpDef* out = gp.get_op_at(gp.get_output_node_id());
             if (out && !out->inputs.empty())
                 out_temp = em.src_ref(out->inputs[0], gp.get_input_node_id(), gp, wslots);
+            /* PROF W-P1: manifest v2 = v1 全字段 + op_names (runlist idx →
+             * net.json 节点名, 经 emitted_ids → OpDef.name_tag)。名字只在
+             * emit 时手里有, blob 不带; gehtp_prof.py join 用。 */
             std::fprintf(f, "{\n");
+            std::fprintf(f, "  \"manifest_ver\": 2,\n");
             std::fprintf(f, "  \"input_slot\": 0,\n");
             std::fprintf(f, "  \"input_elems\": %zu,\n", input_elems);
             std::fprintf(f, "  \"output_temp\": %u,\n", out_temp & 0x7FFFu);
@@ -636,6 +667,20 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::fprintf(f, "],\n  \"opcodes\": [");
             for (size_t i = 0; i < em.ops.size(); i++)
                 std::fprintf(f, "%s%u", i ? "," : "", (unsigned)em.ops[i].opcode);
+            std::fprintf(f, "],\n  \"op_names\": [");
+            for (size_t i = 0; i < em.emitted_ids.size(); i++) {
+                const OpDef* nod = gp.get_op_at(em.emitted_ids[i]);
+                const char* nm = (nod && nod->name_tag && nod->name_tag->name())
+                                 ? nod->name_tag->name() : "?";
+                std::fprintf(f, "%s\"", i ? "," : "");   /* 分隔符仅逗号; 此处的 " 是开引号 */
+                for (const char* p = nm; *p; p++) {   /* JSON 转义最小集 */
+                    unsigned char ch = (unsigned char)*p;
+                    if (ch == '"' || ch == '\\') std::fprintf(f, "\\%c", ch);
+                    else if (ch < 0x20) std::fprintf(f, "\\u%04x", ch);
+                    else std::fputc(ch, f);
+                }
+                std::fprintf(f, "\"");
+            }
             std::fprintf(f, "]\n}\n");
             std::fclose(f);
         }
@@ -648,6 +693,7 @@ int main(int argc, char** argv) {
     uint64_t ddr_budget = 0;   // --ddr-budget: 第7步阶段一静态 DDR 池(0=禁用)
     uint64_t vtcm_budget = 0;  // --vtcm-budget: 第7步阶段二 VTCM 驻留池(0=禁用)
     bool ext_weights = false;  // --ext-weights: 路线B 权重外置(blob 描述符 + model.weights.bin)
+    bool force_v2 = false;     // --force-v2: 小模型强制 v2 槽记录(设备回归 v2 通路用)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -668,6 +714,7 @@ int main(int argc, char** argv) {
         else if (a == "--vtcm-budget") vtcm_budget = strtoull(next().c_str(), nullptr, 0);
         else if (a == "--ext-weights") ext_weights = true;
         else if (a == "--weights-bin") ext_weights_path = next();
+        else if (a == "--force-v2") force_v2 = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (bin_path.empty() || out_path.empty()) {
@@ -675,5 +722,5 @@ int main(int argc, char** argv) {
         return 2;
     }
     return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path,
-                ddr_budget, vtcm_budget, ext_weights, ext_weights_path);
+                ddr_budget, vtcm_budget, ext_weights, ext_weights_path, force_v2);
 }

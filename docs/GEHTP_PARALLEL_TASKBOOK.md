@@ -230,3 +230,9 @@
 4. **EXT_IN int32 槽位尺寸瑕疵**（未修，E 线登记）：emit 输入槽按 elems×2(f16) 建，int32 ids（elems×4）尺寸不符；运行时 g_ext_in 指针覆盖使其不影响正确性，但槽 len 语义错误，B3 多输入改造时一并收口。
 5. **host_run 输入加载实为 raw 字节直读**（无 f32 转换），int32 ids 位模式可直接过 Gather——E2 可把旗标名 `--input-f32` 改 `--input-raw` 消除误导。
 6. minicpm 预检结论：12 op 型全在注册表；rank>4 张量 252 个全可折前导 1（且仅触及 Reshape/Eltwise_Binary，broadcast 的 fold4 右对齐已覆盖该形态）；Transpose 无 rank>4；Neuron 6=SIGMOID、Binary 13=MUL/0=ADD 映射齐。
+
+### 2026-09-17 C4 线 (续) — WTOP v2 登记 + 设备事故通报
+
+7. **WTOP v2 格式登记（接口冻结点 §2.1）**：slot 线记录 16B→24B {len,count,offset_lo,offset_hi,addr,reserved}，offset 升 u64。动因：minicpm f16 全模型 blob 5.15GB 撞 v1 u32 偏移 4GB 天花板（emit 自校验 max_slot_end=4309975296 实锤；旧树 split 即此限制的历史绕行）。emit 仅在权重区（内联/外置）>0xFFFFFF00 时写 v2，小模型继续 v1（conv_add blob 逐字节回归已验）；`--force-v2` 供小模型走 v2 通路做回归。改动：oplist_parse.h/.c（parse 双版本）、wtop_emit.cpp（编码）、wt_slot.offset 内存侧 u64。引擎/上游工具全指针算术自动兼容。附带修复：manifest op_names 多引号 bug（T0 引入，quickstart 判据脚本 JSON 解析实锤）。
+8. **设备事故（2026-09-17 ~17:55）**：52f67807 被重启（uptime 4min 实锤，非本线操作），重启后 **SELinux 回弹 Enforcing** → FastRPC Capability API 失败 + unsigned PD dom3 拒绝（0x72）。重启前同二进制同流程全绿（16:30/17:50）。设备文件（装载器/skel/库/runner）均幸存。**恢复需要 root 权限操作（setenforce 0 或等价 sepolicy 处置），本线无 adb root 权限（策略拦截），设备段挂起等待。** 教训入坑表：设备门禁应加 `getenforce` 预检。
+9. minicpm 全模型 compile 实证：hnnx_compile 32min/32.7GB RSS 通过（2492 op）；tagged.bin 10.07GB（修复后比修复前多 2.2GB = 撞 id 被静默丢弃的权重全数回收——**修复前任何全模型 tagged.bin 都在静默丢权重**）。

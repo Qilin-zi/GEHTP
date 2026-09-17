@@ -40,6 +40,15 @@ extern "C" {
 #endif
 
 #define WT_BLOB_VER 1u
+/* v2 (C4, 2026-09-17): slot 线记录 16B → 24B, offset u32 → u64
+ * {len u32, count u32, offset_lo u32, offset_hi u32, addr u32, reserved u32}。
+ * 动因: minicpm f16 全模型 blob 5.15GB 撞 v1 的 u32 字节偏移 4GB 天花板
+ * (emit 自校验 max_slot_end=4309975296 > 0xFFFFFFFF 实锤; 旧树 split stageA/B
+ * 即此限制的历史绕行)。v2 寻址上限 u64, reserved 留 dtype/flags 等扩展。
+ * emit 仅在权重区(内联或外置)逼近 4GB 时写 v2, 小模型继续写 v1
+ * (存量 byte-exact 回归门零影响)。内存侧 wt_slot.offset 恒 u64 字节。 */
+#define WT_BLOB_VER_2 2u
+#define WT_SLOT_SIZE_V2 24u
 #define WT_ENDIAN_CHK 0x1234u
 #define WT_SLOT_SIZE 16u
 #define WT_WEIGHT_ALIGN 128u
@@ -148,7 +157,7 @@ enum {
 struct wt_slot {
     uint32_t len;
     uint32_t count;
-    uint32_t offset;
+    uint64_t offset;   /* 内存侧恒为字节偏移; 线格式 v1=u32 字节, v2=u32 128B 块号(>4GB 模型) */
     uint32_t addr;
 };
 
