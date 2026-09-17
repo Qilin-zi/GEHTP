@@ -38,7 +38,13 @@ cmd_compile() {
     esac; done
     [ -n "$out" ] || die "usage: gehtp compile model.onnx -o model.wtop [旗标]  (大模型免重复转换: --net-json X --weights-bin Y 跳 converter)"
     case "$out" in /*) ;; *) out="$(pwd)/$out";; esac
-    [ -n "$in_f16" ] && in_f16="$(realpath "$in_f16")"
+    # 逗号多输入: 逐个 realpath 再逗号重组 (单文件 realpath 整串即死, E2 坑)
+    if [ -n "$in_f16" ]; then
+        local _rp=() _IFS="$IFS"; IFS=','
+        read -ra _parts <<< "$in_f16"; IFS="$_IFS"
+        for _p in "${_parts[@]}"; do _rp+=("$(realpath "$_p")"); done
+        in_f16="$(IFS=,; echo "${_rp[*]}")"
+    fi
     [ -x "$CB/hnnx_compile" ] || die "compiler not built: cmake --build $CB"
     local name; name="$(basename "$out" .wtop)"
     local work="$out.work"
@@ -102,11 +108,12 @@ cmd_compile() {
 }
 
 cmd_run() {
-    local blob="" input="" output="" device="${ANDROID_SERIAL:-52f67807}"
+    local blob="" input="" output="" device="${ANDROID_SERIAL:-52f67807}" trace=0
     while [ $# -gt 0 ]; do case "$1" in
         --input) input="$2"; shift 2;;
         --output) output="$2"; shift 2;;
         --device) device="$2"; shift 2;;
+        --trace) trace=1; shift;;   # PROF W-P2: per-op optrace 落盘行 (调试取证; 性能测量勿开)
         -*) die "unknown flag $1";;
         *) [ -z "$blob" ] && blob="$1" || die "unexpected arg $1"; shift;;
     esac; done
@@ -157,15 +164,41 @@ cmd_run() {
         printf 'blob %s/%s\ninput %s/input.f16.raw\noutput %s/output.f16.raw\nout_temp %s\n' \
             "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" > /tmp/gehtp_job.txt
     fi
+    # PROF W-P2: trace 旗标经 job.txt 下发 (runner 读到 =1 才开 per-op 落盘行)
+    [ "$trace" = 1 ] && printf 'trace 1\n' >> /tmp/gehtp_job.txt
     adb -s "$device" push /tmp/gehtp_job.txt "$GDIR/job.txt" >/dev/null
 
+    # PROF W-P2: prof 产物目录取 output 同侧 prof/, 键 = blob 名
+    local prof_dir; prof_dir="$(dirname "$output")/prof"
+    mkdir -p "$prof_dir"
+    local pname="${bname%.wtop}"
+    local run_log="$prof_dir/$pname.run.log"
+    # trace 模式: optrace.txt 是 append 累积文件, 先清保证拉到的是本次
+    [ "$trace" = 1 ] && adb -s "$device" shell "rm -f /data/local/tmp/hrt/gehtp/optrace.txt" >/dev/null
+
     echo "== run on $device =="
-    adb -s "$device" shell "cd $DEVROOT && ADSP_LIBRARY_PATH=$DEVROOT CDSP_LIBRARY_PATH=$DEVROOT ./run_main_on_hexagon 3 gehtp_runner.so" 2>&1 | tail -5
+    adb -s "$device" shell "cd $DEVROOT && ADSP_LIBRARY_PATH=$DEVROOT CDSP_LIBRARY_PATH=$DEVROOT ./run_main_on_hexagon 3 gehtp_runner.so" 2>&1 | tee "$run_log" | tail -20
 
     echo "== pull =="
     adb -s "$device" pull "$GDIR/output.f16.raw" "$output" >/dev/null \
-        || die "no output on device (runner log above)"
+        || die "no output on device (runner log: $run_log)"
     echo "output: $output ($(wc -c < "$output") bytes)"
+    # PROF W-P2: 性能证据三件套 (设备结果 txt / 逐 op 时间戳对 / optrace)
+    adb -s "$device" pull "/data/local/tmp/hrt/gehtp/42_gehtp_runner.txt" \
+        "$prof_dir/$pname.device.txt" >/dev/null 2>&1 \
+        && echo "prof: $prof_dir/$pname.device.txt (含 [timing]/[run] 行)" \
+        || echo "prof: 设备结果 txt 拉取失败 (非致命)"
+    adb -s "$device" pull "/data/local/tmp/hrt/gehtp/op_ts.bin" \
+        "$prof_dir/$pname.op_ts.bin" >/dev/null 2>&1 \
+        && echo "prof: $prof_dir/$pname.op_ts.bin" \
+        || echo "prof: op_ts.bin 拉取失败 (非致命)"
+    if [ "$trace" = 1 ]; then
+        adb -s "$device" pull "/data/local/tmp/hrt/gehtp/optrace.txt" \
+            "$prof_dir/$pname.optrace.txt" >/dev/null 2>&1 \
+            && echo "prof: $prof_dir/$pname.optrace.txt" \
+            || echo "prof: optrace.txt 拉取失败 (trace=1 但未产出?)"
+    fi
+    echo "prof 报表: scripts/gehtp_prof.py --wtop $blob --op-ts $prof_dir/$pname.op_ts.bin"
 }
 
 cmd_setup() {
