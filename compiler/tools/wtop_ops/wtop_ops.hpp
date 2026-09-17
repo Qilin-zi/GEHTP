@@ -179,6 +179,30 @@ struct Emitter {
         }
         return t;
     }
+    // 路线B(4B 外置权重): 权重字节不进 blob, 累积到 ext_weight_area(独立
+    // model.weights.bin), 权重 slot 记 EXT_WGT + 相对该区偏移。
+    bool ext_weights = false;
+    std::vector<uint8_t> ext_weight_area;   // 128B 对齐, emit 末尾落盘
+
+    // 外置权重槽: 同 add_slot 但数据进 ext_weight_area, addr=EXT_WGT。
+    // slot.offset = 相对外部权重区基址(设备 slot_ptr 据此定位)。
+    uint32_t add_ext_slot(uint32_t len, uint32_t count, const uint8_t* data) {
+        wt_slot s{};
+        s.len = len;
+        s.count = count;
+        s.offset = (uint32_t)ext_weight_area.size();
+        s.addr = WT_SLOT_EXT_WGT;
+        ext_weight_area.insert(ext_weight_area.end(), data, data + len);
+        while (ext_weight_area.size() % 128 != 0) ext_weight_area.push_back(0);
+        uint32_t id = (uint32_t)slots.size();
+        slots.push_back(s);
+        return id;
+    }
+
+    // 路线B 外置权重源: emit --weights-bin 直读(params.bin f32), 按
+    // const_data_offset 从此外部缓冲取权重字节(替代空 const_pool)。
+    const std::vector<uint8_t>* ext_weights_bin = nullptr;
+
 // GGUF 供给上下文(M2c; emit 启动时设置)
     const std::map<std::string, GgufEntry>* gguf_tab = nullptr;
     const std::vector<uint8_t>* gguf_bytes = nullptr;
@@ -237,6 +261,10 @@ struct Emitter {
                                 const std::string& consumer_grp = "") {
         auto it = wslots.find(w->op_id);
         if (it != wslots.end()) return it->second;
+        /* 路线B: 外置模式权重进 ext_weight_area(addr=EXT_WGT), 内置进 blob */
+        auto slot_for = [&](uint32_t len, uint32_t cnt, const uint8_t* d) {
+            return ext_weights ? add_ext_slot(len, cnt, d) : add_slot(len, cnt, d);
+        };
         if (use_gguf && gguf_tab && gguf_bytes) {
             auto mit = gguf_tab->find(w->grouping);
             if (mit == gguf_tab->end() && !consumer_grp.empty())
@@ -251,7 +279,7 @@ struct Emitter {
                     if (e.type == 2 && K % 32 == 0 && NN % 32 == 0) {
                         // Q4_0 → tile-major(32×32 tile 契约)
                         auto tile = repack_q4_0_tiles(src, e.nbytes, K, NN);
-                        id = add_slot((uint32_t)tile.size(), (uint32_t)(K * NN), tile.data());
+                        id = slot_for((uint32_t)tile.size(), (uint32_t)(K * NN), tile.data());
                     } else if (e.type == 2) {
                         // 小维度(<32)不走 tile: 反量化 f16 直存
                         std::vector<float> wf2(K * NN);
@@ -269,7 +297,7 @@ struct Emitter {
                         for (size_t i = 0; i < K * NN; i++) w16[i] = f32_to_f16_rne(wf2[i]);
                         std::vector<uint8_t> wb(K * NN * 2);
                         std::memcpy(wb.data(), w16.data(), wb.size());
-                        id = add_slot((uint32_t)wb.size(), (uint32_t)(K * NN), wb.data());
+                        id = slot_for((uint32_t)wb.size(), (uint32_t)(K * NN), wb.data());
                     } else {  // F32 → f16
                         size_t n4 = e.nbytes / 4;
                         std::vector<uint16_t> w16(n4);
@@ -277,7 +305,7 @@ struct Emitter {
                         for (size_t i = 0; i < n4; i++) w16[i] = f32_to_f16_rne(wf[i]);
                         std::vector<uint8_t> wb(n4 * 2);
                         std::memcpy(wb.data(), w16.data(), wb.size());
-                        id = add_slot((uint32_t)wb.size(), (uint32_t)n4, wb.data());
+                        id = slot_for((uint32_t)wb.size(), (uint32_t)n4, wb.data());
                     }
                     wslots[w->op_id] = id;
                     gguf_hits++;
@@ -292,16 +320,20 @@ struct Emitter {
             std::fprintf(stderr, "warn: empty weight const (op %llu), 零槽占位\n",
                          (unsigned long long)w->op_id);
             std::vector<uint8_t> zeros(128, 0);
-            uint32_t id = add_slot(128, 64, zeros.data());
+            uint32_t id = slot_for(128, 64, zeros.data());
             wslots[w->op_id] = id;
             return id;
         }
         std::vector<uint16_t> w16(n);
-        const float* wf = reinterpret_cast<const float*>(gp.const_pool().data() + w->const_data_offset);
+        /* 权重字节源始终从 const_pool 读 (const_data_offset 是 const_pool 内偏移)。
+         * 路线B 仅改变槽路由: slot_for 已按 ext_weights 选 add_ext_slot/add_slot。
+         * ext_weights_bin(params.bin) 的字节布局与 const_pool 不同, 不能作为源。 */
+        const float* wf = reinterpret_cast<const float*>(
+            gp.const_pool().data() + w->const_data_offset);
         for (size_t i = 0; i < n; i++) w16[i] = f32_to_f16_rne(wf[i]);
         std::vector<uint8_t> wbytes(n * 2);
         std::memcpy(wbytes.data(), w16.data(), wbytes.size());
-        uint32_t id = add_slot((uint32_t)wbytes.size(), (uint32_t)n, wbytes.data());
+        uint32_t id = slot_for((uint32_t)wbytes.size(), (uint32_t)n, wbytes.data());
         wslots[w->op_id] = id;
         return id;
     }

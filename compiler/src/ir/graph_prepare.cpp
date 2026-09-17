@@ -337,6 +337,10 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     // Example: [8, 192] (rank 2) -> [1, 1, 8, 192] (rank 4)
     //          [1, 8, 64] (rank 3) -> [1, 1, 8, 64] (rank 4)
     //          [1, 8, 1, 3, 64] (rank 5) -> unchanged
+    std::unordered_map<op_id_t, uint32_t> pre_pad_rank;
+    for (auto& [pid0, opdef0] : opdef_map_)
+        if (opdef0 && opdef0->output_def.rank > 0 && opdef0->output_def.rank < 4)
+            pre_pad_rank[pid0] = opdef0->output_def.rank;
     for (auto& [id, opdef] : opdef_map_) {
         if (!opdef) continue;
         OutputDef& od = opdef->output_def;
@@ -352,6 +356,60 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
                     od.dims[i] = 1;
             }
             od.rank = 4;
+        }
+    }
+
+    // 3b2. axis 重映射(与 3b 配套): 前插 (4-r) 个前导 1 后, 正 axis 的
+    // 语义轴平移 +(4-r); 负 axis(末轴起)不受前导填充影响。覆盖 op_data
+    // 的 "axis" scalar(Concat/Softmax/Gather/CumulativeSum/Split)与
+    // Reduce 的 axes tensor_param 数据(int32)。0.8B 全图实锤: rotary_emb
+    // Concat_4 rank3 axis=2 → 真拼接轴=3(padding 后按轴 2 读爆缓冲);
+    // embedding Gather axis=0 rank2 表 → 轴 2。host execute / const_fold
+    // / wtop_emit(ExtraAxis)同源读此值, 源头重映射三处一致。轴基准秩
+    // 取第一个输入的填充前秩(axis 语义挂在输入形状上)。
+    {
+        std::unordered_set<op_id_t> done_axes_const;
+        for (auto& [id2, opdef] : opdef_map_) {
+            if (!opdef || !opdef->name_tag) continue;
+            const char* nm2 = opdef->name_tag->name();
+            if (!nm2) continue;
+            const bool axis_scalar_op =
+                !std::strcmp(nm2, "Concat") || !std::strcmp(nm2, "Softmax") ||
+                !std::strcmp(nm2, "Gather") || !std::strcmp(nm2, "CumulativeSum") ||
+                !std::strcmp(nm2, "Split");
+            const bool reduce_op = !std::strcmp(nm2, "Reduce");
+            if (!axis_scalar_op && !reduce_op) continue;
+            if (opdef->inputs.empty()) continue;
+            auto rit = pre_pad_rank.find(opdef->inputs[0].src_id);
+            if (rit == pre_pad_rank.end()) continue;
+            const uint32_t delta = 4 - rit->second;
+            if (axis_scalar_op && !opdef->op_data.empty()) {
+                auto sp = unpack_scalar_params(opdef->op_data);
+                bool changed = false;
+                for (auto& p : sp) {
+                    if (p.name != "axis" || !p.is_numeric) continue;
+                    int64_t ax = (int64_t)p.value_num;
+                    if (ax < 0) continue;
+                    p.value_num = (double)(ax + (int64_t)delta);
+                    changed = true;
+                }
+                if (changed) opdef->op_data = pack_scalar_params(sp);
+            }
+            if (reduce_op) {
+                for (op_id_t pid : opdef->tensor_param_ids) {
+                    if (!done_axes_const.insert(pid).second) continue;
+                    OpDef* pc = get_op_at(pid);
+                    if (!pc || pc->const_data_size == 0 || pc->const_data_size % 4 != 0 ||
+                        pc->const_data_size / 4 > 8) continue;
+                    if (pc->const_data_offset + pc->const_data_size > const_pool_.size())
+                        continue;
+                    if (pc->output_def.dtype != static_cast<uint32_t>(DType::Int32)) continue;
+                    int32_t* vals = reinterpret_cast<int32_t*>(
+                        const_pool_.data() + pc->const_data_offset);
+                    for (uint64_t k = 0; k < pc->const_data_size / 4; k++)
+                        if (vals[k] >= 0 && vals[k] <= 8) vals[k] += (int32_t)delta;
+                }
+            }
         }
     }
 
@@ -650,9 +708,23 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
                 in_n *= static_cast<size_t>(idef->output_def.dims[i]);
         auto& buf = tensor_map[iid];
         buf.resize(in_n > 0 ? in_n : 1, 0.0f);
-        if (src)
-            for (size_t i = 0; i < in_n && i < src->size(); ++i)
-                buf[i] = (*src)[i];
+        if (src) {
+            /* i64 输入文件: nbytes/4 = 2×in_n 个字 = [lo,hi] 交织 —
+             * 线性取前 in_n 会把前半 tokens 的高字(恒 0)掺进来
+             * (0.8B 全图实锤: EQUAL(x,0) 掩码链输出严格交替 [0,1,0,1],
+             *  奇数行 causal mask 全 -inf → softmax NaN)。
+             * 收缩 = 取每个 int64 的低 32 位位模式(token id < 2^31)。 */
+            if (src->size() == 2 * in_n) {
+                const uint32_t* w = reinterpret_cast<const uint32_t*>(src->data());
+                for (size_t i = 0; i < in_n; i++) {
+                    uint32_t lo = w[i * 2];
+                    std::memcpy(&buf[i], &lo, 4);
+                }
+            } else {
+                for (size_t i = 0; i < in_n && i < src->size(); ++i)
+                    buf[i] = (*src)[i];
+            }
+        }
     }
 
     // Materialize const ops: copy their data from const_pool_ into tensor_map.
@@ -665,6 +737,21 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
         if (opdef->const_data_size == 0) continue;
         size_t es = opdef->output_def.element_size;
         if (es == 0 || es > 4) es = 4;
+        /* 物理宽度优先: adapter 把 f16 静态张量拓宽成 f32 存储, 但
+         * output_def.element_size 仍按 JSON dt 记 2 —— 按 es=2 读 f32
+         * 字节会把每个 f32 错读成 2 个 f16(0.8B causal mask 实锤:
+         * 读出 2.75/NaN 垃圾)。以 const_data_size/∏dims 反推真实宽度,
+         * 与声明不符时以数据为准。 */
+        {
+            size_t dn = 1;
+            for (uint32_t d = 0; d < opdef->output_def.rank && d < 5; ++d)
+                dn *= (size_t)opdef->output_def.dims[d];
+            if (dn > 0) {
+                if (opdef->const_data_size == dn * 4) es = 4;
+                else if (opdef->const_data_size == dn * 2) es = 2;
+                else if (opdef->const_data_size == dn) es = 1;
+            }
+        }
         size_t elem_n = opdef->const_data_size / es;
         auto& buf = tensor_map[id];
         buf.resize(elem_n, 0.0f);
@@ -685,7 +772,7 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
                     else {
                         int e = -1;
                         while (!(mant & 0x400)) { mant <<= 1; e--; }
-                        u = sign | ((uint32_t)(127 + 15 + e) << 23) | ((mant & 0x3FF) << 13);
+                        u = sign | ((uint32_t)(114 + e) << 23) | ((mant & 0x3FF) << 13);
                     }
                 } else if (exp == 31) u = sign | 0x7F800000u | (mant << 13);
                 else u = sign | ((exp - 15 + 127) << 23) | (mant << 13);
@@ -751,9 +838,24 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
     // Iterate ops_ (compute ops only: Relu, Conv, Add, etc.).
     // Input/Output are not in ops_ (not registered).
     size_t seq_idx = 0;
+    static const bool optrace = getenv("GEHTP_OPTRACE") != nullptr;
     for (const TypicalOp* top : topo) {
         op_id_t oid = top->op_id;
         if (oid == 0) continue;
+        if (optrace) {
+            std::fprintf(stderr, "[optrace] seq=%zu id=%llu %s ins=",
+                         seq_idx, (unsigned long long)oid, top->op_type_name.c_str());
+            for (const auto& c : top->exec_inputs)
+                std::fprintf(stderr, "%llu ", (unsigned long long)c.src_id);
+            std::fprintf(stderr, "\n");
+        }
+        /* 早停: GEHTP_STOP_SEQ=N 执行到 seq==N 后中断(NaN 溯源诊断用,
+         * 输出不可用但 dump 已落盘) */
+        static const char* stop_seq_s = getenv("GEHTP_STOP_SEQ");
+        if (stop_seq_s && seq_idx >= (size_t)std::strtoull(stop_seq_s, nullptr, 10)) {
+            std::fprintf(stderr, "[optrace] stop at seq=%zu\n", seq_idx);
+            return ret;
+        }
 
         // Gather input buffers and their OutputDefs from predecessors.
         std::vector<const uint8_t*> in_bufs;
@@ -844,21 +946,28 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
                          out_vec.size() > 2 ? out_vec[2] : 0.f,
                          out_vec.size() > 3 ? out_vec[3] : 0.f);
         }
-        /* 全 op 按 op_id dump(与设备 dump 经 manifest 映射对拍) */
+        /* 全 op 按 op_id dump(与设备 dump 经 manifest 映射对拍)。
+         * GEHTP_DUMPDIR 指定目录(多会话共享 /tmp 会串台, 诊断须独占) */
         {
-            char pn2[64];
-            std::snprintf(pn2, sizeof(pn2), "/tmp/host_seq_%zu.f32.raw", seq_idx);
-            char pn3[64];
-            std::snprintf(pn3, sizeof(pn3), "/tmp/host_id_%llu.f32.raw", (unsigned long long)oid);
+            static const char* dd = getenv("GEHTP_DUMPDIR");
+            static const std::string dpre = (dd && *dd) ? std::string(dd) + "/" : std::string("/tmp/");
+            char pn2[512];
+            std::snprintf(pn2, sizeof(pn2), "%shost_seq_%zu.f32.raw", dpre.c_str(), seq_idx);
+            char pn3[512];
+            std::snprintf(pn3, sizeof(pn3), "%shost_id_%llu.f32.raw", dpre.c_str(), (unsigned long long)oid);
             std::FILE* fo3 = std::fopen(pn3, "wb");
             if (fo3) {
                 std::fwrite(out_vec.data(), 4, out_vec.size(), fo3);
                 std::fclose(fo3);
             }
-            std::FILE* fo2 = std::fopen(pn2, "wb");
-            if (fo2) {
-                std::fwrite(out_vec.data(), 4, out_vec.size(), fo2);
-                std::fclose(fo2);
+            /* host_seq 只在显式开 GEHTP_SEQDUMP 时写(大图 14821 文件 I/O
+             * 是纯开销; M5 全图诊断曾因此翻倍时长) */
+            if (getenv("GEHTP_SEQDUMP")) {
+                std::FILE* fo2 = std::fopen(pn2, "wb");
+                if (fo2) {
+                    std::fwrite(out_vec.data(), 4, out_vec.size(), fo2);
+                    std::fclose(fo2);
+                }
             }
         }
         /* 中间对拍 dump(与 ORT 同名输出逐元素比) */
@@ -1862,6 +1971,12 @@ std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& o
         /* 压尾 1 得有效 rank(QNN 前置填充 [1,1,m,k]) */
         while (ar > 0 && a->output_def.dims[ar - 1] == 1) ar--;
         while (br > 0 && b->output_def.dims[br - 1] == 1) br--;
+        /* K 一致性校验: 压尾后两侧 K 不一致 ⇒ 尾 1 是真实外积 K 维
+         * (RoPE inv_freq [1,64,1] × pos [1,1,16] → [1,64,16]), 回退未压秩 */
+        if (ar >= 2 && br >= 2 &&
+            a->output_def.dims[ar - 1] != b->output_def.dims[br - 2]) {
+            ar = a->output_def.rank; br = b->output_def.rank;
+        }
         uint32_t bk = e.transpose_in1 ? b->output_def.dims[br - 1] : b->output_def.dims[br - 2];
         uint32_t bn = e.transpose_in1 ? b->output_def.dims[br - 2] : b->output_def.dims[br - 1];
         (void)bk;
@@ -1898,7 +2013,7 @@ std::vector<uint8_t> extract_strided_slice_extra(const GraphPrepare& gp, const O
     const OpDef* rg = find_param_const(gp, opdef, "ranges");
     if (rg) {
         e.rank = static_cast<uint32_t>(rg->const_data_size / 4 / 3);
-        e.ranges_offset = static_cast<uint32_t>(rg->const_data_offset);
+        e.ranges_offset = static_cast<uint64_t>(rg->const_data_offset);
     }
     return raw_extra(&e, sizeof(e));
 }

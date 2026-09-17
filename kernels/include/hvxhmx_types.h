@@ -37,9 +37,9 @@
   /* ============================================================
    *  host 路径: stub 类型, 仅供标量 fallback 路径
    * ============================================================ */
-  typedef long   hvhx_vec_t   __attribute__((__vector_size__(128)));
-  typedef long   hvhx_vecp_t  __attribute__((__vector_size__(256)));
-  typedef long   hvhx_pred_t  __attribute__((__vector_size__(4)));
+  typedef int32_t hvhx_vec_t  __attribute__((__vector_size__(128)));
+  typedef int32_t hvhx_vecp_t __attribute__((__vector_size__(256)));
+  typedef int32_t hvhx_pred_t __attribute__((__vector_size__(4)));
   /* 兼容名, 真实 HVX 编译时无 */
   typedef hvhx_vec_t   HVX_Vector;
   typedef hvhx_vecp_t  HVX_VectorPair;

@@ -11,11 +11,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CB="$ROOT/compiler/build_linux"
 KD="$ROOT/kernels"
-SDK=/disk2/QCtools/qairt_2.48.40.260702
-PY=/disk2/Qwen35dev/revlibHtpPrepare/venv310/bin/python3
+SDK=/4090disk2/QCtools/qairt_2.48.40.260702
+PY=/4090disk2/Qwen35dev/revlibHtpPrepare/venv310/bin/python3
 HEX=/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0
 HT="$HEX/tools/HEXAGON_Tools/19.0.07"
-SWIV=/disk2/QCtools/swiv_build_utility.py
+SWIV=/4090disk2/QCtools/swiv_build_utility.py
 DEVROOT=/data/local/tmp/hvxhmx23
 GDIR="$DEVROOT/gehtp"
 
@@ -72,7 +72,8 @@ cmd_compile() {
     local c_args=()
     [ -n "$ddr" ] && c_args+=(--ddr-budget "$ddr")
     [ -n "$vtcm" ] && c_args+=(--plan-vtcm-budget "$vtcm")
-    [ -n "$external" ] && c_args+=(--external-weights)
+    # hnnx_compile 不需要 --external-weights (tagged.bin 始终内嵌权重元数据;
+    # 外部化仅在 wtop_emit 阶段做槽路由 + 磁盘拆分)
     "$CB/hnnx_compile" --net-json "$work/${name}_net.json" \
         --weights-bin "$work/model.params.bin" --format tagged \
         "${c_args[@]}" \
@@ -87,6 +88,9 @@ cmd_compile() {
         gguf="$(realpath "$gguf")"; match="$(realpath "$match" 2>/dev/null || true)"
         [ -f "$gguf" ] && [ -f "$match" ] || die "--gguf 需配 --match <tsv>"
         in_args+=(--gguf "$gguf" --match "$match")
+    fi
+    if [ -n "$external" ]; then
+        in_args+=(--ext-weights)
     fi
     "$CB/wtop_emit" --bin "$work/$name.tagged.bin" "${in_args[@]}" \
         --out "$out" --manifest "$out.manifest.json" | tail -1
@@ -121,6 +125,7 @@ cmd_run() {
         || die "device side not ready — run: gehtp setup --device $device"
 
     local bname; bname="$(basename "$blob")"
+    local wgt_bname="${bname%.wtop}.weights.bin"
     echo "== push =="
     adb -s "$device" shell "mkdir -p $GDIR && rm -f $GDIR/output.f16.raw" >/dev/null
     # 大 blob 免重推: 设备侧同名尺寸一致即跳过 (1.67GB 重试省 ~3min)
@@ -132,9 +137,26 @@ cmd_run() {
     else
         adb -s "$device" push "$blob" "$GDIR/$bname" >/dev/null
     fi
+    # 路线B: 推送外部权重区
+    local wgt_local_size wgt_dev_size
+    # 本地权重文件名 = 剥 .wtop 后缀 + .weights.bin (与 wgt_bname 同构, 勿写成 $blob.weights.bin)
+    wgt_local_size="$(wc -c < "${blob%.wtop}.weights.bin" 2>/dev/null || echo 0)"
+    if [ "$wgt_local_size" -gt 0 ]; then
+        wgt_dev_size="$(adb -s "$device" shell "wc -c < $GDIR/$wgt_bname 2>/dev/null" 2>/dev/null | tr -d '\r' || true)"
+        if [ "$wgt_dev_size" = "$wgt_local_size" ]; then
+            echo "  $wgt_bname 已在设备且尺寸一致, 跳过推送"
+        else
+            adb -s "$device" push "${blob%.wtop}.weights.bin" "$GDIR/$wgt_bname" >/dev/null
+        fi
+    fi
     adb -s "$device" push "$input" "$GDIR/input.f16.raw" >/dev/null
-    printf 'blob %s/%s\ninput %s/input.f16.raw\noutput %s/output.f16.raw\nout_temp %s\n' \
-        "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" > /tmp/gehtp_job.txt
+    if [ "$wgt_local_size" -gt 0 ]; then
+        printf 'blob %s/%s\ninput %s/input.f16.raw\noutput %s/output.f16.raw\nout_temp %s\nweights_size %s\n' \
+            "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" "$wgt_local_size" > /tmp/gehtp_job.txt
+    else
+        printf 'blob %s/%s\ninput %s/input.f16.raw\noutput %s/output.f16.raw\nout_temp %s\n' \
+            "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" > /tmp/gehtp_job.txt
+    fi
     adb -s "$device" push /tmp/gehtp_job.txt "$GDIR/job.txt" >/dev/null
 
     echo "== run on $device =="

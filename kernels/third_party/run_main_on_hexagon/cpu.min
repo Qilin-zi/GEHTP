@@ -1,0 +1,18 @@
+# binary names
+EXE_NAME=run_main_on_hexagon
+
+UTILS_DIR=$(HEXAGON_SDK_ROOT)/utils/examples
+
+# stand-alone executable
+BUILD_EXES += $(EXE_NAME)
+$(EXE_NAME)_QAICIDLS += inc/run_main_on_hexagon
+$(EXE_NAME)_C_SRCS += src/run_main_on_hexagon_ap $V/run_main_on_hexagon_stub \
+                    $(UTILS_DIR)/dsp_capabilities_utils
+$(EXE_NAME)_DLLS += $(LIB_DSPRPC)
+
+# copy final build products to the ship directory
+BUILD_COPIES = \
+   $(DLLS) \
+   $(EXES) \
+   $(LIBS) \
+   $(SHIP_DIR)/ ;

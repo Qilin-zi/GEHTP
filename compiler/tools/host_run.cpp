@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -35,7 +36,10 @@ static float widen_f16(uint16_t h) {
             int e = -1;
             while (!(mant & 0x400)) { mant <<= 1; e--; }
             mant &= 0x3FF;
-            u = sign | ((uint32_t)(127 + 15 + e) << 23) | (mant << 13);
+            /* 次正规: 值 = mant×2^-24 = (1+m')×2^(-15-s), s=移位次数
+             * = -1-e → exp 字段 = 114+e(旧 127+15+e 把 0x82AC 类次正规
+             * 放大 2^28 倍, 0.8B embedding 单点 10944 尖峰实锤) */
+            u = sign | ((uint32_t)(114 + e) << 23) | (mant << 13);
         }
     } else if (exp == 31) {
         u = sign | 0x7F800000u | (mant << 13);
@@ -131,7 +135,7 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
             std::string dimstr = js.substr(lb + 1, rb - lb - 1);
             /* 字节/元素按 data_type: int32 变体(0x0132/0x0032/0x0432/
              * 306)=4, f32(0x0232)=4, bool(0x0508)=1, 其余 f16=2
-             * (2.48 params.bin 实测: 静态张量按声明序紧凑拼接,
+             * (2.48 params.bin 实测: 静态张量按声明序拼接, 每张量 4B 对齐,
              *  字节宽 = 张量自身 dtype, 非全 f16) */
             size_t eb = 2;
             if (cur_dtype == 0x0232 || cur_dtype == 0x0132 || cur_dtype == 0x0032 ||
@@ -195,6 +199,10 @@ static std::string adapt_weights_bin(const std::string& net_json_path,
     size_t off = 0;
     size_t n_hits = 0;
     for (const auto& c : cands) {
+        /* 字节级实证(0.8B 全图 params.bin 头部 8 张量逐一对上): 静态张量
+         * 按声明序拼接且每张量 4 字节对齐 —— causal mask 非对齐模型预测
+         * @36 实际 @40(=align4)。无对齐时全部 const 偏移漂移 → 全 NaN。 */
+        off = (off + 3) & ~size_t(3);
         if (off + c.bytes > raw.size() || c.bytes == 0) continue;
         const bool d4 = (c.dtype == 0x0232 || c.dtype == 0x0132 || c.dtype == 0x0032 ||
                          c.dtype == 0x0432 || c.dtype == 306 || c.dtype == 0x0532 ||
@@ -281,30 +289,87 @@ int main(int argc, char** argv) {
     HexagonNNEnv env;
     GraphStatus st = gp.prepare(env);
     if (st != GraphStatus::Success) { std::fprintf(stderr, "Error: prepare=%d\n", (int)st); return 1; }
+    /* GEHTP_NAMEMAP=path: prepare 后(含 CSE/DCE renumber)的 op_id →
+     * grouping(= net.json 节点名, ORT 张量名去 "_output_0" 后缀)映射。
+     * dump 文件按执行期 op_id 写, loader 期映射会因 renumber 漂移。 */
+    if (const char* nm = getenv("GEHTP_NAMEMAP")) {
+        std::ofstream nf(nm);
+        gp.for_each_op([&](OpDef* od) {
+            if (!od || od->is_dead()) return;
+            const char* gn = od->grouping.empty() ? nullptr : od->grouping.c_str();
+            if (gn) nf << gn << '\t' << (unsigned long long)od->op_id << '\n';
+        });
+    }
     std::fprintf(stderr, "prepare ok: input=%llu output=%llu plan=%zu\n",
                  (unsigned long long)gp.get_input_node_id(),
                  (unsigned long long)gp.get_output_node_id(),
                  gp.plan_order().size());
 
     // 输入: --input-f32 逗号分隔多文件(按图输入声明序); 缺省全零
-    // (全注意力层 4 输入: hidden/causal_mask/cos/sin)
+    // (全注意力层 4 输入: hidden/causal_mask/cos/sin; 0.8B 全图 3 输入
+    // input_ids/position_ids/attention_mask i64)
+    // 元素宽按图输入元素数自适应: 8B=i64(值截 int32 以位模式喂 ——
+    // "int32 经 float 缓冲传递"约定, Gather/Cast 按位读), 4B=f32, 2B=f16
     std::vector<std::vector<float>> ins;
+    std::vector<size_t> in_elems;
+    {
+        std::vector<op_id_t> in_ids;
+        gp.for_each_op([&](OpDef* od) {
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::string(od->name_tag->name()) == "Input" && !od->is_dead())
+                in_ids.push_back(od->op_id);
+        });
+        std::sort(in_ids.begin(), in_ids.end());
+        for (op_id_t iid : in_ids) {
+            const OpDef* iop = gp.get_op_at(iid);
+            size_t nn = 1;
+            if (iop)
+                for (uint32_t d = 0; d < iop->output_def.rank && d < 5; ++d)
+                    nn *= (size_t)iop->output_def.dims[d];
+            in_elems.push_back(nn);
+        }
+    }
     if (!in_path.empty()) {
-        size_t pos = 0;
+        size_t pos = 0, k = 0;
         while (pos <= in_path.size()) {
             size_t comma = in_path.find(',', pos);
             std::string p = in_path.substr(pos, comma == std::string::npos
                                                    ? std::string::npos : comma - pos);
-            std::ifstream f(p, std::ios::binary);
-            if (!f) { std::fprintf(stderr, "Error: cannot open %s\n", p.c_str()); return 1; }
-            f.seekg(0, std::ios::end);
-            size_t nbytes = (size_t)f.tellg();
-            f.seekg(0, std::ios::beg);
-            std::vector<float> v(nbytes / 4, 0.0f);
-            f.read(reinterpret_cast<char*>(v.data()), (std::streamsize)nbytes);
+            std::vector<uint8_t> raw;
+            {
+                std::ifstream f(p, std::ios::binary);
+                if (!f) { std::fprintf(stderr, "Error: cannot open %s\n", p.c_str()); return 1; }
+                f.seekg(0, std::ios::end);
+                size_t nbytes = (size_t)f.tellg();
+                f.seekg(0, std::ios::beg);
+                raw.resize(nbytes);
+                f.read(reinterpret_cast<char*>(raw.data()), (std::streamsize)nbytes);
+            }
+            size_t elems = k < in_elems.size() ? in_elems[k] : raw.size() / 4;
+            std::vector<float> v;
+            if (raw.size() == elems * 8) {
+                v.resize(elems);
+                for (size_t i = 0; i < elems; i++) {
+                    int64_t x;
+                    std::memcpy(&x, raw.data() + i * 8, 8);
+                    int32_t x32 = (int32_t)x;
+                    std::memcpy(&v[i], &x32, 4);
+                }
+            } else if (raw.size() == elems * 4) {
+                v.resize(elems);
+                std::memcpy(v.data(), raw.data(), elems * 4);
+            } else if (raw.size() == elems * 2) {
+                v.resize(elems);
+                const uint16_t* h = reinterpret_cast<const uint16_t*>(raw.data());
+                for (size_t i = 0; i < elems; i++) v[i] = widen_f16(h[i]);
+            } else {
+                v.resize(raw.size() / 4);
+                std::memcpy(v.data(), raw.data(), v.size() * 4);
+            }
             ins.push_back(std::move(v));
-            std::fprintf(stderr, "input[%zu]: %zu f32 from %s\n", ins.size() - 1,
-                         ins.back().size(), p.c_str());
+            std::fprintf(stderr, "input[%zu]: %zu f32 from %s (%zuB)\n", ins.size() - 1,
+                         ins.back().size(), p.c_str(), raw.size());
+            k++;
             if (comma == std::string::npos) break;
             pos = comma + 1;
         }

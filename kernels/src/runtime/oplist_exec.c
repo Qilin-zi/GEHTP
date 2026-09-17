@@ -22,6 +22,7 @@
 #include "oplist_parse.h"
 #include "oplist_exec.h"
 #include "wtcache.h"
+#include "hvxhmx_v2_binary.h"
 
 #define MAX_TEMPS 256
 
@@ -57,18 +58,61 @@ static uint32_t g_last_bytes[MAX_TEMPS];  /* 每 temp 最后写入的字节数
 static FILE* g_rtrace = NULL;  /* 统一 trace 句柄(同路径双 FILE* 在 DSP farf
                                    下句柄冲突崩溃, M4.2 实锤) */
 static void rtrace(const char* msg, int v) {
-    if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hvxhmx23/optrace.txt", "a");
+    if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
     if (g_rtrace) { fprintf(g_rtrace, "[run_io] %s %d\n", msg, v); fflush(g_rtrace); }
 }
 
+/* hostsim 调试钩子: GEHTP_HOOK="opidx:temp,..." — 执行到 op idx 后把
+ * temp 内容 dump 到 /tmp/hook_<idx>_<temp>.f16.raw (仅 host 构建,
+ * 设备 qurt 无此调试需求) */
+#ifndef __hexagon__
+static void exec_hook_dump(uint32_t ii) {
+    static const char* hook = NULL;
+    if (!hook) hook = getenv("GEHTP_HOOK");
+    if (!hook || !hook[0]) return;
+    const char* tok = hook;
+    while (*tok) {
+        const char* comma = strchr(tok, ',');
+        size_t len = comma ? (size_t)(comma - tok) : strlen(tok);
+        const char* col = NULL;
+        for (size_t i = 0; i < len; i++) if (tok[i] == ':') col = tok + i;
+        if (col) {
+            char b1[16], b2[16];
+            size_t l1 = (size_t)(col - tok);
+            if (l1 > 15) l1 = 15;
+            memcpy(b1, tok, l1); b1[l1] = 0;
+            snprintf(b2, sizeof b2, "%s", col + 1);
+            uint32_t hi = (uint32_t)strtoul(b1, NULL, 0);
+            uint32_t ht = (uint32_t)strtoul(b2, NULL, 0);
+            if (hi == ii && ht < MAX_TEMPS && g_exec.temps[ht]) {
+                char fn[96];
+                snprintf(fn, sizeof fn, "/tmp/hook_%u_%u.f16.raw", hi, ht);
+                FILE* f = fopen(fn, "wb");
+                if (f) { fwrite(g_exec.temps[ht], 1, g_last_bytes[ht], f); fclose(f); }
+            }
+        }
+        if (!comma) break;
+        tok = comma + 1;
+    }
+}
+#endif
+
 /* Level 1 输入注入: 外部输入缓冲 (run_io 设置) */
 static const uint8_t* g_ext_in = NULL;
+/* 路线B: 外部权重区基址 (run_io 的 wgt_ptr 设置; 权重 slot 的 offset 相对此) */
+static const uint8_t* g_ext_wgt = NULL;
 
-/* slot 数据指针: addr==EXT_IN 的 slot 走外部缓冲 */
+/* slot 数据指针: addr==EXT_IN 的 slot 走外部输入缓冲;
+ * addr==EXT_WGT 的 slot 走外部权重区(基址+offset) */
 static const uint8_t* slot_ptr(const struct wt_blob* b, uint32_t s) {
     if (s >= b->n_slots) return NULL;
     /* EXT_IN 槽: 有注入缓冲用注入, 否则回退 blob 内固化数据(整步/逐段校验) */
     if (b->slots[s].addr == WT_SLOT_EXT_IN && g_ext_in) return g_ext_in;
+    /* EXT_WGT 槽: 外部权重区基址 + offset(描述符式, blob 不固化权重) */
+    if (b->slots[s].addr == WT_SLOT_EXT_WGT) {
+        if (!g_ext_wgt) return NULL;
+        return g_ext_wgt + b->slots[s].offset;
+    }
     return b->weight_base + b->slots[s].offset;
 }
 
@@ -169,12 +213,16 @@ static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
         uint32_t aligned = (bytes + 127u) & ~127u;
         if (g_exec.pool_used + aligned > g_exec.pool_cap) {
             if (g_exec.static_offsets) return NULL;  /* 静态模式: 预留区耗尽 */
-            uint32_t ncap = g_exec.pool_cap ? g_exec.pool_cap : (8u << 20);
+            uint32_t ncap = g_exec.pool_cap ? g_exec.pool_cap : (64u << 20);
             while (ncap < g_exec.pool_used + aligned) ncap *= 2;
             uint8_t* np = memalign(128, ncap);
             if (!np) return NULL;
-            if (g_exec.pool) memcpy(np, g_exec.pool, g_exec.pool_used);
-            free(g_exec.pool);
+            /* 泄漏式扩容: 旧池不 free。调用者在 temp_get 前取走的旧池
+             * 指针(如 exec_slice 的 x=ref_ptr 在 y=temp_get 前)在旧池
+             * free 后悬空 —— host glibc 立即 unmap 直接 SIGSEGV, DSP
+             * free 后内存被后续分配复用则数值污染(上板 cos=0.986 偏差
+             * 根因候选)。旧池留用, 新分配全部从新池 bump; 旧代池泄漏
+             * 至进程退出(OS 回收), DSP 3GB 预算下可接受。 */
             g_exec.pool = np;
             g_exec.pool_cap = ncap;
         }
@@ -482,7 +530,11 @@ static int exec_conv2d(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
-/* GEHTP 阶段9: 纯 f16 加 (f32 累加, f16 存储; 无 ReLU)。args: [a_ref, b_ref, out_t, n] */
+/* GEHTP 阶段9: 纯 f16 加 (f32 累加, f16 存储; 无 ReLU)。args: [a_ref, b_ref, out_t, n]
+ * HVX 接线(M8): GEHTP_HVX_ADD=1 时走向量化 hvhx_v2_add_f16, 数学与标量
+ * f32 中间路径位级等价(f16↔f32 vmpy 保真 + f32 加 + RNE 舍入); 默认关(标量),
+ * n < 64 或任一指针异常时回落标量。对齐由 hvhx_v2_add_f16 内部前导/主体/尾处理。 */
+static int g_hvx_add = -1;  /* -1=未探测, 0=关, 1=开 */
 static int exec_add(const struct wt_blob* b, const struct wt_op* op,
                     char* err, size_t errn) {
     uint32_t n = op->args[3];
@@ -493,6 +545,14 @@ static int exec_add(const struct wt_blob* b, const struct wt_op* op,
     if (!y) { snprintf(err, errn, "add temp alloc"); return -1; }
     const uint16_t* A = (const uint16_t*)a;
     const uint16_t* B2 = (const uint16_t*)b2;
+    if (g_hvx_add < 0) {
+        const char* e = getenv("GEHTP_HVX_ADD");
+        g_hvx_add = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (g_hvx_add && n >= 64u) {
+        hvhx_v2_add_f16(y, A, B2, n);
+        return 0;
+    }
     for (uint32_t i = 0; i < n; i++)
         y[i] = f32_to_f16(f16_to_f32(A[i]) + f16_to_f32(B2[i]));
     return 0;
@@ -571,6 +631,7 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, n * 2u);
     if (!x || !y) { snprintf(err, errn, "unary ref fail"); return -1; }
+    if (g_rtrace) { fprintf(g_rtrace, "unary x=%p y=%p n=%u sub=%u\n", (void*)x, (void*)y, (unsigned)n, (unsigned)subtype); fflush(g_rtrace); }
     for (uint32_t i = 0; i < n; i++) {
         float v = f16_to_f32(x[i]);
         float r = v;
@@ -1282,15 +1343,27 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             snprintf(err, errn, "opcode %u unhandled", (unsigned)op->opcode);
             rc = -1;
         } else {
+            if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
+            if (g_rtrace) {
+                fprintf(g_rtrace, "pre%u code=%u a=%u,%u,%u,%u pool=%u\n",
+                        (unsigned)ii, (unsigned)op->opcode,
+                        (unsigned)op->args[0], (unsigned)op->args[1],
+                        (unsigned)op->args[2], (unsigned)op->args[3],
+                        (unsigned)g_exec.pool_used);
+                fflush(g_rtrace);
+            }
             const struct wt_op_ctx cx = {b, op, engine_m, err, errn};
             rc = g_op_exec_table[op->opcode](&cx);
+#ifndef __hexagon__
+            if (rc == 0) exec_hook_dump(ii);
+#endif
         }
         g_exec.st.ops++;
         if (op_us) op_us[ii] = HAP_perf_get_time_us() - t0;
         {
             /* 统一 trace 句柄铁律(M4.2 实锤: 同路径双 FILE* 在 DSP farf
              * 下句柄冲突挂死) —— 与 rtrace 共用 g_rtrace, 禁止自建 gf。 */
-            if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hvxhmx23/optrace.txt", "a");
+            if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
             if (g_rtrace) {
                 fprintf(g_rtrace, "op%u code=%u rc=%d us=%lld\n",
                         (unsigned)ii, (unsigned)op->opcode, rc,
@@ -1316,6 +1389,13 @@ int wt_exec_run(const struct wt_blob* b, uint32_t* engine_m,
 }
 
 /* GEHTP 阶段9 (Level 1): 外部输入注入 + 输出回传 */
+/* 路线B: 外部权重区注入(在 run/run_io 之前调一次; NULL=禁用 EXT_WGT 槽)。
+ * 与 run_io 解耦(权重区跨多次 run 常驻, 输入每次注入) —— 签名不动,
+ * 现有 5 个 runner 调用零影响。 */
+void wt_exec_set_ext_weights(const void* wgt_ptr) {
+    g_ext_wgt = (const uint8_t*)wgt_ptr;
+}
+
 int wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
                    uint32_t out_temp,
                    uint32_t* engine_m, int64_t* op_us, char* err, size_t errn) {

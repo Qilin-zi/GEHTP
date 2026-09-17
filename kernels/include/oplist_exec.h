@@ -67,6 +67,10 @@ int  wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
                     uint32_t out_temp,
                     uint32_t* engine_m, int64_t* op_us, char* err, size_t errn);
 
+/* 路线B: 外部权重区注入(run/run_io 前调一次; 权重 slot addr==WT_SLOT_EXT_WGT
+ * 时从此基址+slot.offset 读)。NULL=禁用。与 run_io 解耦(权重常驻)。 */
+void wt_exec_set_ext_weights(const void* wgt_ptr);
+
 /* W3 解析报告 (源: wt_w3.c)。emit 逐行收到 JSON 行; host wt_inspect 与
  * 设备输出共用此函数, 行逐字节一致。 */
 void wt_w3_report(const char* blob_name, const uint8_t* buf, size_t size,

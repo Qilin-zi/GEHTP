@@ -45,7 +45,10 @@ void QnnIRLoader::fill_output_def(OutputDef& od, const std::vector<uint32_t>& di
         od.dims[i] = dims[i + start];
     uint32_t es = 4;
     switch (dt) {
-        case DType::Float32: case DType::Int32: case DType::Float16: es = 4; break;
+        case DType::Float32: case DType::Int32: es = 4; break;
+        case DType::Float16: es = 2; break;   // 张量语义 f16=2B(常量池按 f32 存是
+                                              // 物化视角, 非张量字节宽 —— 阶段一
+                                              // 静态偏移按张量字节宽分配, 否则越界)
         case DType::Int16: es = 2; break;
         case DType::Int8: case DType::UInt8: case DType::Bool: es = 1; break;
         default: es = 4; break;
@@ -290,8 +293,12 @@ uint32_t QnnIRLoader::build_graph() {
                     cdata.assign(byte_size, 0);
                 }
             }
-            gp_.append_const_node(ti.id, od, cdata.data(), cdata.size());
-            tensor_opids_[item.tensor_name] = ti.id;
+            /* 同款碰撞防护: 后移的 param 可能占住本 id, 直接 append 会静默
+             * 丢权重(DCE 后 src_ref 查无生产者 → 哑槽)。 */
+            op_id_t cid = ti.id;
+            while (gp_.get_op_at(cid) != nullptr) cid++;
+            gp_.append_const_node(static_cast<uint32_t>(cid), od, cdata.data(), cdata.size());
+            tensor_opids_[item.tensor_name] = cid;
         } else if (item.kind == 2) {
             const QnnNodeInfo* node = item.node;
             OutputDef od;
@@ -332,6 +339,12 @@ uint32_t QnnIRLoader::build_graph() {
                     for (auto d : tp.dims) ec *= d;
                     pdata.assign(ec * pod.element_size, 0);
                 }
+                /* id 碰撞: tensor_params 与 tensors 共用编号空间(0.8B 全图
+                 * 88 处撞号)。append_const_node 碰撞时静默 return 0, 但
+                 * 下行 name_tag 会误改既有 op、tensor_opids_ 让消费者把权重
+                 * 当 perm/ranges 读(op156 Transpose→8MB 权重 SIGSEGV 实锤)
+                 * —— 与节点同款后移到空闲 id。 */
+                while (gp_.get_op_at(param_id) != nullptr) param_id++;
                 gp_.append_const_node(static_cast<uint32_t>(param_id), pod, pdata.data(), pdata.size());
                 // 参数 const 带名字(inject_htp_prepare_inputs 与 extra_info extractor
                 // 都按名匹配 stride/pad_amount/dilation/perm)

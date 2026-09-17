@@ -73,7 +73,8 @@ static std::vector<std::string> split_str(const std::string& st, char sep) {
 int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& out_path, const std::string& manifest_path,
          const std::string& gguf_path, const std::string& match_path,
-         uint64_t ddr_budget = 0, uint64_t vtcm_budget = 0) {
+         uint64_t ddr_budget = 0, uint64_t vtcm_budget = 0,
+         bool ext_weights = false, const std::string& ext_weights_path = "") {
     // 1. deserialize .bin
     std::vector<uint8_t> bin;
     if (!load_file(bin_path, bin)) { std::fprintf(stderr, "error: cannot open %s\n", bin_path.c_str()); return 2; }
@@ -110,6 +111,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     uint32_t C = input_op->output_def.rank >= 4 ? (uint32_t)input_op->output_def.dims[3] : 1;
 
     Emitter em;
+    em.ext_weights = ext_weights;  // 路线B: 权重外置(ensure_weight_slot → ext_weight_area)
     if (gp.has_mem_plan()) {
         // M2: 静态规划由编译器定稿(TAG_MEM_PLAN)——照抄, 不再自算。
         const auto& mp = gp.mem_plan();
@@ -209,7 +211,24 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             /* 设备槽面统一 f16: f32 文件(4B/元素)转 f16 后塞槽;
              * 已是 f16(2B/元素)直塞。 */
             std::vector<uint8_t> data;
-            if (k < in_paths.size()) {
+            /* 主输入 dtype 跟随图输入节点: int32(ids/gather 索引)保持 4B/元素,
+             * 不参与槽面 f16 化; 其余 f16 直塞 / f32 转 f16。 */
+            bool is_i32_in = (k == 0 && iop->output_def.dtype == (uint32_t)DType::Int32);
+            if (is_i32_in) {
+                if (k < in_paths.size()) {
+                    if (!load_file(in_paths[k], data)) {
+                        std::fprintf(stderr, "error: cannot open %s\n", in_paths[k].c_str());
+                        return 2;
+                    }
+                    if (data.size() != elems * 4) {
+                        std::fprintf(stderr, "error: input %zu size %zu != %zu*4 (int32, elems=%zu)\n",
+                                     k, data.size(), elems, elems);
+                        return 2;
+                    }
+                } else {
+                    data.assign(elems * 4, 0);
+                }
+            } else if (k < in_paths.size()) {
                 if (!load_file(in_paths[k], data)) {
                     std::fprintf(stderr, "error: cannot open %s\n", in_paths[k].c_str());
                     return 2;
@@ -221,12 +240,13 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                     for (size_t i = 0; i < elems; i++) d[i] = f32_to_f16_rne(f[i]);
                     data = std::move(h);
                 } else if (data.size() != elems * 2) {
-                    std::fprintf(stderr, "error: input %zu size %zu != %zu×2/4 (elems=%zu)\n",
+                    std::fprintf(stderr, "error: input %zu size %zu != %zu*2/4 (elems=%zu)\n",
                                  k, data.size(), elems, elems);
                     return 2;
                 }
             } else {
                 data.assign(elems * 2, 0);
+
             }
             uint32_t sid = em.add_slot((uint32_t)data.size(), (uint32_t)elems, data.data());
             if (k == 0) {
@@ -278,6 +298,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         em.use_gguf = true;
         em.gguf_tab = &gguf_map;
         em.gguf_bytes = &gguf_data;
+    }
+
+    // 2c. 路线B: 外置权重源(--weights-bin params.bin), ensure_weight_slot 按
+    //     extent offset 从此读权重字节(const_pool 空时的替代源)。
+    std::vector<uint8_t> ext_weights_bin;
+    if (em.ext_weights && !ext_weights_path.empty()) {
+        if (!load_file(ext_weights_path, ext_weights_bin)) {
+            std::fprintf(stderr, "error: cannot open weights-bin %s\n", ext_weights_path.c_str());
+            return 2;
+        }
+        em.ext_weights_bin = &ext_weights_bin;
+        std::printf("[ext-weights] source %s = %zu bytes\n", ext_weights_path.c_str(), ext_weights_bin.size());
     }
 
     // 3. 通用权重槽收集(M2): 按 plan_order 遍历, 对权重消费 op 的 const 输入
@@ -548,6 +580,15 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                          (unsigned long long)max_end, em.slots.size());
             return 3;
         }
+        // 外置槽界自校验(wt_parse 只校验内联区, 不覆盖 ext 区)
+        for (auto& sl : em.slots)
+            if (sl.addr == WT_SLOT_EXT_WGT &&
+                (uint64_t)sl.offset + sl.len > em.ext_weight_area.size()) {
+                std::fprintf(stderr, "error: ext weight slot overruns ext area "
+                             "(ext_area=%zu slot_end=%llu)\n", em.ext_weight_area.size(),
+                             (unsigned long long)((uint64_t)sl.offset + sl.len));
+                return 3;
+            }
         std::printf("WTOP OK: slots=%u ops=%u bytes=%zu (gguf hits=%u miss=%u)\n",
                     (unsigned)em.slots.size(), (unsigned)em.ops.size(), em.blob.size(),
                     em.gguf_hits, em.gguf_miss);
@@ -558,6 +599,19 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         if (!f) { std::fprintf(stderr, "error: cannot write %s\n", out_path.c_str()); return 2; }
         std::fwrite(em.blob.data(), 1, em.blob.size(), f);
         std::fclose(f);
+    }
+
+    // 7b. 路线B: 外置权重落盘(model.weights.bin; blob 仅描述符, EXT_WGT 槽)
+    if (em.ext_weights && !em.ext_weight_area.empty()) {
+        std::string wpath = out_path;
+        size_t dot = wpath.rfind(".wtop");
+        wpath = (dot == std::string::npos) ? wpath + ".weights.bin"
+                                           : wpath.substr(0, dot) + ".weights.bin";
+        FILE* f = std::fopen(wpath.c_str(), "wb");
+        if (!f) { std::fprintf(stderr, "error: cannot write %s\n", wpath.c_str()); return 2; }
+        std::fwrite(em.ext_weight_area.data(), 1, em.ext_weight_area.size(), f);
+        std::fclose(f);
+        std::printf("[ext-weights] %zu bytes -> %s\n", em.ext_weight_area.size(), wpath.c_str());
     }
 
     // 8. manifest
@@ -590,9 +644,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 }
 
 int main(int argc, char** argv) {
-    std::string bin_path, in_f16, out_path, manifest_path, gguf_path, match_path;
+    std::string bin_path, in_f16, out_path, manifest_path, gguf_path, match_path, ext_weights_path;
     uint64_t ddr_budget = 0;   // --ddr-budget: 第7步阶段一静态 DDR 池(0=禁用)
     uint64_t vtcm_budget = 0;  // --vtcm-budget: 第7步阶段二 VTCM 驻留池(0=禁用)
+    bool ext_weights = false;  // --ext-weights: 路线B 权重外置(blob 描述符 + model.weights.bin)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -611,12 +666,14 @@ int main(int argc, char** argv) {
         else if (a == "--match") match_path = next();
         else if (a == "--ddr-budget") ddr_budget = strtoull(next().c_str(), nullptr, 0);
         else if (a == "--vtcm-budget") vtcm_budget = strtoull(next().c_str(), nullptr, 0);
+        else if (a == "--ext-weights") ext_weights = true;
+        else if (a == "--weights-bin") ext_weights_path = next();
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (bin_path.empty() || out_path.empty()) {
-        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ddr-budget <bytes>] [--vtcm-budget <bytes>]\n");
+        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ddr-budget <bytes>] [--vtcm-budget <bytes>] [--ext-weights [--weights-bin <params.bin>]]\n");
         return 2;
     }
     return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path,
-                ddr_budget, vtcm_budget);
+                ddr_budget, vtcm_budget, ext_weights, ext_weights_path);
 }

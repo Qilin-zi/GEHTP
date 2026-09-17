@@ -17,7 +17,7 @@ SDK="${HEXAGON_SDK_ROOT:-/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0}"
 HT="$SDK/tools/HEXAGON_Tools/19.0.07"
 CC="$HT/Tools/bin/hexagon-clang"
 OBJDUMP="$HT/Tools/bin/hexagon-llvm-objdump"
-SWIV="${SWIV_TOOL:-/disk2/QCtools/swiv_build_utility.py}"
+SWIV="${SWIV_TOOL:-$LIB/third_party/swiv/swiv_build_utility.py}"
 
 INC_HEX="-I$SDK/incs -I$SDK/incs/stddef \
          -I$SDK/rtos/qurt/computev81/include \

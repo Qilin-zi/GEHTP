@@ -1,7 +1,7 @@
 /*
  * 41_qwen_layer0 — GEHTP M4.2b: Qwen3.5 GDN 层 L0 WTOP blob 设备验证
  * =====================================================================
- * 输入 (host 准备并 push 到 /data/local/tmp/hvxhmx23/g41/):
+ * 输入 (host 准备并 push 到 /data/local/tmp/hrt/gehtp/):
  *   layer_0.wtop   wtop_emit 产物 (slot0 EXT_IN 单输入 hidden)
  *   in_ncf.f16.raw     外部输入 hidden [1,1024,32] f16 (32768 元素, 64KB)
  *   gold_ncf.f16.raw   host 参考输出 (host_run execute_host → f16, 同布局)
@@ -22,7 +22,7 @@
 #include "oplist_parse.h"
 #include "oplist_exec.h"
 
-#define D "/data/local/tmp/hvxhmx23/g41"
+#define D "/data/local/tmp/hrt/gehtp"
 #define N_ELEM (1u * 1024u * 32u)   /* 输出 [1,1024,32] = 32768 */
 #define OUT_TEMP 1u                  /* manifest: output_temp */
 
@@ -92,7 +92,7 @@ int main(void) {
     }
 
     /* 二分定位第一个输出含 inf/nan 的 op (g41/diag_mode 存在时) */
-    FILE* dflag = fopen("/data/local/tmp/hvxhmx23/g41/diag_mode", "r");
+    FILE* dflag = fopen("/data/local/tmp/hrt/gehtp/diag_mode", "r");
     if (dflag) {
         char dm[64] = {0};
         (void)!fread(dm, 1, sizeof(dm) - 1, dflag);

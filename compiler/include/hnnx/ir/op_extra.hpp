@@ -56,7 +56,8 @@ struct ExtraStridedSlice {
     uint32_t end_mask;       // +8
     uint32_t new_axes_mask;  // +12
     uint32_t shrink_axes;    // +16
-    uint32_t ranges_offset;  // +20 (const 池偏移, 指向 rank×3×u32 数组)
+    uint64_t ranges_offset;  // +24 (const 池偏移, 指向 rank×3×u32 数组; 64 位——
+                             //  16GB 池末层 ranges coff>4GB, 32 位截断读垃圾)
 };
 
 // Reshape: 目标形状(dims 数组直接进 extra, rank ≤ 5)

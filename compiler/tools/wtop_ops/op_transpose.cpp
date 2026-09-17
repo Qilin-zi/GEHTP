@@ -24,7 +24,37 @@ static int op_transpose(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map
             gp.const_pool().data() + permc->const_data_offset);
         for (uint32_t i = 0; i < pc; i++) pv[i] = p[i];
     }
-    if (pc == 0) pc = rk;  // 无 const: 单位 perm
+    if (pc == 0) {
+        /* 无 perm const(qairt DLC→json 丢属性; rotary_emb Transpose 首撞):
+         * 由 src/output 形状贪心推断(RoPE [1,64,16]→[1,16,64] ⇒ [0,2,1];
+         * 恒等形状 ⇒ 单位 perm, 行为与旧码一致) */
+        uint32_t od_[5] = {1, 1, 1, 1, 1}, ork = od->output_def.rank;
+        for (uint32_t i = 0; i < ork && i < 5; i++) od_[i] = od->output_def.dims[i];
+        /* 两侧折前导 size-1 轴对齐秩 */
+        while (rk > ork && dims[0] == 1) {
+            for (uint32_t i = 0; i + 1 < rk; i++) dims[i] = dims[i + 1];
+            rk--;
+        }
+        while (ork > rk && od_[0] == 1) {
+            for (uint32_t i = 0; i + 1 < ork; i++) od_[i] = od_[i + 1];
+            ork--;
+        }
+        if (ork != rk) {
+            std::fprintf(stderr, "error: transpose 无 perm 且秩不可对齐 %u/%u\n", ork, rk);
+            return 4;
+        }
+        int used[5] = {0, 0, 0, 0, 0};
+        for (uint32_t o = 0; o < rk; o++) {
+            pv[o] = -1;
+            for (uint32_t j = 0; j < rk; j++)
+                if (!used[j] && dims[j] == od_[o]) { pv[o] = (int32_t)j; used[j] = 1; break; }
+            if (pv[o] < 0) {
+                std::fprintf(stderr, "error: transpose 形状轴 %u 无法对齐\n", o);
+                return 4;
+            }
+        }
+        pc = rk;
+    }
     /* 秩对齐: 图 rank-4 填充 vs rank-3 perm 契约(L3 实测 [1,1,X,Y]
      * pc=3) —— 折前导 size-1 维至 perm 参照系。旧码 >=16B 门槛漏读
      * 12B perm, 回落"单位"实为 reverse(0x00010203 字节序), 因前两轴

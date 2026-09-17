@@ -56,6 +56,11 @@ extern "C" {
  * 槽数据 = [cap u32][reserve u32][n u32][n × {temp_id u32, offset u32,
  * size u32}]。表内 temp 静态定址, 表外 temp 回落池尾预留区 bump。 */
 #define WT_SLOT_TEMPOFF  0xFFFFFFFDu
+/* 路线B(4B 外置权重): 权重 slot 的 len/offset 是描述符不内嵌 blob,
+ * slot.addr == EXT_WGT → 该 slot 数据在外部权重区(run_io 的 wgt_ptr 基址
+ * + slot.offset)。blob 只带元数据, 19GB 级权重独立文件传输/驻留。
+ * 与 EXT_IN 并列: EXT_IN=运行时输入, EXT_WGT=外部权重文件。 */
+#define WT_SLOT_EXT_WGT 0xFFFFFFFCu
 /* 第7步阶段二: VTCM 驻留编码(0x4000|temp_id, 与 0x8000|slot 同族不冲突)
  * 驻留张量 = VTCM 静态偏移表内的 temp; 用时由引擎放 VTCM 基址+偏移。
  * TEMPOFF 槽 reserve 字段拆两段(u32): [低 16 位=表外 bump 预留 KB] |

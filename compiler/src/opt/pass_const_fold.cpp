@@ -92,7 +92,7 @@ static std::vector<float> widen_const(const GraphPrepare* gp, const OpDef* pc) {
                 else {
                     int e = -1;
                     while (!(mant & 0x400)) { mant <<= 1; e--; }
-                    u = sign | ((uint32_t)(127 + 15 + e) << 23) | ((mant & 0x3FF) << 13);
+                    u = sign | ((uint32_t)(114 + e) << 23) | ((mant & 0x3FF) << 13);
                 }
             } else if (exp == 31) u = sign | 0x7F800000u | (mant << 13);
             else u = sign | ((exp - 15 + 127) << 23) | (mant << 13);

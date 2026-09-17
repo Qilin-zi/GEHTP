@@ -120,6 +120,8 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
     out->weight_bytes = size - out->weight_off;
 
     for (uint32_t i = 0; i < out->n_slots; i++) {
+        /* 外置权重槽的 offset 相对外部权重区(注入时由发射器校验), 不比对内联区 */
+        if (out->slots[i].addr == WT_SLOT_EXT_WGT) continue;
         uint64_t end = (uint64_t)out->slots[i].offset + out->slots[i].len;
         if (end > out->weight_bytes) return WT_ERR_WEIGHT_OVERRUN;
     }

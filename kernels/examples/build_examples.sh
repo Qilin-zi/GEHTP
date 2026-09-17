@@ -19,7 +19,7 @@ LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="${HEXAGON_SDK_ROOT:-/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0}"
 HT="$SDK/tools/HEXAGON_Tools/19.0.07/Tools"
 CC="$HT/bin/hexagon-clang"
-SWIV="${SWIV_TOOL:-/disk2/QCtools/swiv_build_utility.py}"
+SWIV="${SWIV_TOOL:-$LIB/third_party/swiv/swiv_build_utility.py}"
 
 INC_HEX="-I$SDK/incs -I$SDK/incs/stddef \
          -I$SDK/rtos/qurt/computev81/include \
@@ -29,7 +29,7 @@ CFLAGS="-mv81 -O2 -mhvx -mhvx-length=128B -mhmx -shared -fPIC -std=gnu11 -Wall"
 # (全部已闭合模块的测试 .so 同款链法)
 LDFLAGS="-lc -ldl -lgcc"
 
-DEVDIR="/data/local/tmp/hvxhmx23"
+DEVDIR="${GEHTP_DEV_TMP:-/data/local/tmp/hvxhmx23}"
 BUILD="$LIB/build"
 RES="$LIB/results"
 BLOBS="$BUILD/blobs"
@@ -118,17 +118,9 @@ adb push "$LIB/assets/s256/Y_gold_2563.raw" "$DEVDIR/assets/s256/" >/dev/null
 adb shell "cp /data/local/tmp/hvxhmx_libs/libhvxhmx_v2.so $DEVDIR/libhvxhmx_v2.so 2>/dev/null || true"
 # 例 20 dump 目录: DSP 上 system() 无 shell, 必须 host 预建
 adb shell "rm -rf $DEVDIR/dd_out; mkdir -p $DEVDIR/dd_out" >/dev/null 2>&1
-# skel 必须用 hvxhmx_libs 的 2026-08-10 版 (支持 dom3/4 unsigned PD;
-# /data/local/tmp 顶层 2022 旧版报 0x80000406)
-adb shell "cp /data/local/tmp/hvxhmx_libs/librun_main_on_hexagon_skel.so $DEVDIR/ 2>/dev/null || cp /data/local/tmp/librun_main_on_hexagon_skel.so $DEVDIR/ 2>/dev/null || true"
-if adb shell "test -x /data/local/tmp/hvxhmx_libs/run_main_on_hexagon"; then
-    adb shell "cp /data/local/tmp/hvxhmx_libs/run_main_on_hexagon $DEVDIR/"
-elif adb shell "test -x /data/local/tmp/run_main_on_hexagon"; then
-    adb shell "cp /data/local/tmp/run_main_on_hexagon $DEVDIR/"
-else
-    echo "ERROR: run_main_on_hexagon not found on device" >&2
-    exit 1
-fi
+# skel/host launcher: 用 third_party 收编件(避免外部路径依赖)
+adb push "$LIB/third_party/run_main_on_hexagon/ship/librun_main_on_hexagon_skel.so" "$DEVDIR/" >/dev/null
+adb push "$LIB/third_party/run_main_on_hexagon/ship/run_main_on_hexagon" "$DEVDIR/" >/dev/null
 adb shell "chmod 755 $DEVDIR/*" >/dev/null 2>&1
 
 run_shell() { adb shell "cd $DEVDIR && ADSP_LIBRARY_PATH=$DEVDIR CDSP_LIBRARY_PATH=$DEVDIR $1"; }

@@ -32,6 +32,15 @@ void hvhx_v2_add_scalar_f32(float * __restrict__ dst, const float * __restrict__
 void hvhx_v2_mul_scalar_f32(float * __restrict__ dst, const float * __restrict__ a,
                              float s, uint32_t n);
 
+/* ---- f16 面直收直发(oplist 执行器契约; 数学与标量 f32 中间路径位级等价) ----
+ * dst[i] = f32_to_f16(f16_to_f32(a[i]) + f16_to_f32(b[i])), i ∈ [0, n).
+ * 向量主体: f16→f32(HVX vmpy 位级保真) → f32 加 → f16(RNE)。
+ * 首/尾未对齐段与 <VLEN 余量走标量(与 oplist_exec 标量逐字节同)。
+ * 对齐: 任意地址安全; 128B 对齐时全向量化。 */
+void hvhx_v2_add_f16(uint16_t * __restrict__ dst,
+                     const uint16_t * __restrict__ a, const uint16_t * __restrict__ b,
+                     uint32_t n);
+
 #ifdef __cplusplus
 }
 #endif

@@ -11,7 +11,7 @@ static int g_npass = 0, g_nfail = 0;
 void ex_open_result(const char *name)
 {
     char path[256];
-    snprintf(path, sizeof(path), "/data/local/tmp/hvxhmx23/%s.txt", name);
+    snprintf(path, sizeof(path), "/data/local/tmp/hrt/gehtp/%s.txt", name);
     g_fp = fopen(path, "w");
     if (!g_fp) g_fp = stderr;
     /* 无缓冲: 崩溃取证时每一行立即落盘(定位 PD 死点) */
