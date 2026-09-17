@@ -19,6 +19,6 @@ static int op_copy_sem(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<
 static const wtop::OpRegistrar g_reg_op_copy_sem{
     {"Reshape", op_copy_sem},
     {"Pad", op_copy_sem},
-    {"ScatterNd", op_copy_sem},
+    /* A3②: ScatterNd 已迁出 (op_scatter_nd.cpp 真语义发射, L0 cos 0.102 死刑判决) */
     {"Cast", op_copy_sem},
 };
