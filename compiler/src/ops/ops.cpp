@@ -760,7 +760,8 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         const int32_t* idx = inputs.size() > 1 ? reinterpret_cast<const int32_t*>(inputs[1]) : nullptr;
         if (!tbl || !idx) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; }
         else {
-            auto compact = [](const OutputDef& d, uint32_t dd[5]) {
+            uint32_t lead_s = 0;  /* 输入张量前导 size-1 维数(compact 去掉的) */
+            auto compact = [&](const OutputDef& d, uint32_t dd[5]) {
                 uint32_t s = 0;
                 while (s + 1 < d.rank && d.dims[s] == 1) s++;
                 uint32_t w = 0;
@@ -768,6 +769,14 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                 for (uint32_t i = s; i < d.rank && w < 5; i++, w++) dd[w] = d.dims[i];
                 return w ? w : 1;
             };
+            /* compact 去前导 size-1 后 axis 计数平移: 声明 axis 按全 rank,
+             * compact 后 rank 缩 s → axis 同步减 s (axis 只前于被去维时).
+             * (0.8B GDN attn_iter/attn_qk: 声明 rank5 [1,16,1,64,*] axis=2/3
+             *  = chunk/row, compact rank4 未减 → 错位取 row/col 实锤) */
+            if (!in_defs.empty()) {
+                const OutputDef& d0 = in_defs[0];
+                while (lead_s + 1 < d0.rank && d0.dims[lead_s] == 1) lead_s++;
+            }
             uint32_t td[5], xd[5], od[5];
             uint32_t irank = in_defs.empty() ? out_def.rank : compact(in_defs[0], td);
             uint32_t xrank = in_defs.size() > 1 ? compact(in_defs[1], xd) : 1;
@@ -777,8 +786,14 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             if (const ScalarParam* p = scalar_get(sp2, "axis"))
                 axis = (int)(p->is_numeric ? p->value_num
                                            : std::strtol(p->value_str.c_str(), nullptr, 10));
+            if (axis >= (int)lead_s) axis -= (int)lead_s;
             if (axis < 0) axis += (int)irank;
             if (axis < 0 || axis >= (int)irank) axis = 0;
+            if (getenv("GEHTP_GATHER_DIAG")) {
+                std::fprintf(stderr, "[gdiag] irank=%u xrank=%u axis=%d n=%zu td=[%u,%u,%u,%u,%u] od=[%u,%u,%u,%u,%u] idx0=%d\n",
+                             irank, xrank, axis, n, td[0], td[1], td[2], td[3], td[4],
+                             od[0], od[1], od[2], od[3], od[4], idx ? (int)idx[0] : -999);
+            }
             size_t ts[5] = {1, 1, 1, 1, 1}, os[5] = {1, 1, 1, 1, 1}, xs[5] = {1, 1, 1, 1, 1};
             for (int d = 3; d >= 0; d--) {
                 ts[d] = ts[d + 1] * td[d + 1];
@@ -805,6 +820,11 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                     }
                 }
                 out[i] = bad ? 0.0f : tbl[src];
+                if (getenv("GEHTP_GATHER_DIAG") && i < 3) {
+                    std::fprintf(stderr, "[gsrc] i=%zu oc=[%zu,%zu,%zu,%zu,%zu] il=%zu r=%d src=%zu bad=%d ts=[%zu,%zu,%zu,%zu,%zu]\n",
+                                 i, oc[0], oc[1], oc[2], oc[3], oc[4], il, r, src, (int)bad,
+                                 ts[0], ts[1], ts[2], ts[3], ts[4]);
+                }
             }
         }
     } else if (op_type_name == "Reduce") {
