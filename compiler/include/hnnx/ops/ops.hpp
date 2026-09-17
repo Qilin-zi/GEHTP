@@ -26,6 +26,16 @@ enum class HwWrapper : uint8_t {
 };
 HwWrapper select_wrapper(const std::string& op_type, DType dtype, uint32_t soc_type);
 
+// A6 静默直通治理 (任务书 WS-A6): TypicalOp::execute 末尾 else 直通分支
+// 不再静默 —— 每次直通登记 (op 型 × 次数), execute_host 收尾汇总报告,
+// 对拍脚本认 "HOST_PASSTHRU total=N" (N≠0) 即假绿报警。
+// 环境变量 GEHTP_HOST_PASSTHRU: error=首个直通即 abort; off=旧静默行为;
+// 其他/未设 = warn 登记 + 收尾报告 (默认)。
+void        ops_passthru_note(const std::string& op_type);
+size_t      ops_passthru_count();
+void        ops_passthru_reset();
+void        ops_passthru_report(const char* tag);
+
 class TypicalOp : public Op {
 public:
     TypicalOp() { graph = nullptr; }

@@ -5,9 +5,12 @@
 #include "hnnx/cost/cost_model.hpp"
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <algorithm>
 #include <numeric>
+#include <unordered_map>
 
 namespace hnnx {
 
@@ -1152,7 +1155,9 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         const int32_t* i32 = reinterpret_cast<const int32_t*>(in0);
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? (float)i32[i] : 0.0f;
     } else {
-        // 默认: 直通第一个输入
+        /* A6 静默直通治理: 未知 op 型不再静默拷贝第一输入 (对拍假绿源)。
+         * 每次直通登记; GEHTP_HOST_PASSTHRU=error 立即 abort, =off 旧静默。 */
+        ops_passthru_note(op_type_name);
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? in0[i] : 0.0f;
     }
@@ -1510,6 +1515,59 @@ void register_all_ops() {
 
     // HLX/HMX ops
     register_hlx_hmx_ops();
+}
+
+// ---------------------------------------------------------------------------
+// A6 静默直通治理 (任务书 WS-A6)
+// ---------------------------------------------------------------------------
+namespace {
+
+std::unordered_map<std::string, size_t>& passthru_map() {
+    static std::unordered_map<std::string, size_t> m;
+    return m;
+}
+
+const char* passthru_mode() {
+    static const char* mode = []() -> const char* {
+        const char* e = std::getenv("GEHTP_HOST_PASSTHRU");
+        return (e && *e) ? e : "warn";
+    }();
+    return mode;
+}
+
+} // namespace
+
+void ops_passthru_note(const std::string& op_type) {
+    if (std::strcmp(passthru_mode(), "off") == 0) return;      // 旧静默行为
+    passthru_map()[op_type] += 1;
+    if (std::strcmp(passthru_mode(), "error") == 0) {
+        std::fprintf(stderr,
+            "HOST_PASSTHRU fatal: op 型 '%s' 无 host execute 真语义, "
+            "命中直通分支 (GEHTP_HOST_PASSTHRU=error)\n", op_type.c_str());
+        std::abort();
+    }
+}
+
+size_t ops_passthru_count() {
+    size_t n = 0;
+    for (const auto& [k, v] : passthru_map()) n += v;
+    return n;
+}
+
+void ops_passthru_reset() { passthru_map().clear(); }
+
+void ops_passthru_report(const char* tag) {
+    const size_t n = ops_passthru_count();
+    if (n == 0) return;
+    std::fprintf(stderr, "HOST_PASSTHRU total=%zu", n);
+    if (tag) std::fprintf(stderr, " [%s]", tag);
+    std::fprintf(stderr, " types=");
+    bool first = true;
+    for (const auto& [k, v] : passthru_map()) {
+        std::fprintf(stderr, "%s%s(x%zu)", first ? "" : ",", k.c_str(), v);
+        first = false;
+    }
+    std::fprintf(stderr, " — 这些 op 型 host execute 走了直通拷贝, 对拍结果不可信 (假绿)\n");
 }
 
 } // namespace hnnx

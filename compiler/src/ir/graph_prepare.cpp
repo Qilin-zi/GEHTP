@@ -632,6 +632,7 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
         const std::vector<float>& input,
         const std::vector<std::vector<float>>* multi_inputs) {
     ExecResult ret{};
+    ops_passthru_reset();   /* A6: 每次 host 执行前清零直通计数 */
 
     /* ops_ 在 do_prepare2 的 prepare_op 填充后, Phase7 fixpoint 的 DCE 仍会
      * 改 opdef_map_(删 op)——ops_ 保持陈旧(probe: Slice 被删但 TypicalOp
@@ -646,12 +647,23 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
         auto op = op_factory_generate(io, id);
         if (op) {
             ops_.push_back(std::move(op));
-        } else if (getenv("GEHTP_EXDIAG")) {
-            std::fprintf(stderr, "[skip] oid=%llu factory-null %s const=%d dead=%d out(r%u:%u,%u,%u)\n",
-                         (unsigned long long)id, opdef->name_tag->name(),
-                         (int)opdef->is_const(), (int)opdef->is_dead(),
-                         opdef->output_def.rank, opdef->output_def.dims[0],
-                         opdef->output_def.dims[1], opdef->output_def.dims[2]);
+        } else {
+            /* A6: factory-null 合法类仅 $Const/Input/Output/const 节点;
+             * 非 const 计算 op 未注册 → 静默跳过 = 比直通更坏的暗洞
+             * (下游读空 buf, BogusOpXYZ 阳性对照实锤) — 登记治理。 */
+            const char* nm = opdef->name_tag->name();
+            const bool legit = opdef->is_const()
+                || !std::strcmp(nm, "$Const") || !std::strcmp(nm, "Input")
+                || !std::strcmp(nm, "Output");
+            if (!legit)
+                ops_passthru_note(std::string("factory-null:") + nm);
+            if (getenv("GEHTP_EXDIAG")) {
+                std::fprintf(stderr, "[skip] oid=%llu factory-null %s const=%d dead=%d out(r%u:%u,%u,%u)\n",
+                             (unsigned long long)id, nm,
+                             (int)opdef->is_const(), (int)opdef->is_dead(),
+                             opdef->output_def.rank, opdef->output_def.dims[0],
+                             opdef->output_def.dims[1], opdef->output_def.dims[2]);
+            }
         }
     }
 
@@ -1003,6 +1015,7 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
         }
     }
 
+    ops_passthru_report("execute_host");   /* A6: 直通 N≠0 即假绿报警 */
     return ret;
 }
 
