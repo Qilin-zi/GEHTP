@@ -244,3 +244,8 @@
 12. **ABI 注意(v2 结构 widen)**: wt_slot.offset u32→u64 使 wt_blob 内存布局变化; **旧 ABI runner(如板上 gehtp_runner_prof.so @09-17 早)+ 新 libhvxhmx_v23.so = 读错位**。板上标准 lib 已是 HEAD(v2)构建; 各位面 runner 必须随 HEAD 重编(默认=旧行为条款的例外, 特此通报)。
 13. **CDSP 楔死定罪(板方问题, 与本线流程无关)**: 失败在装载器 `remote_handle_control(DSPRPC_GET_DSP_INFO)`(payload 未加载即败); 未碰过的 8-17 老 payload 同败; 内核日志 `boot_cdsp` 服务 60s 超时 exit 1(CDSP 本次没起来); SELinux 已是 Permissive(排除); 槽位 _a 未切(排除)。与 [[v81-board-shared-session-traps]] 的 0x39 楔死同族 → **恢复=板主/物理上电, 勿自重启**。
 14. VL-4B 编译探测(A1 证据, 顺带): 用 T0(含 VL 撞 id 修复)重编 qwen3vl_4b 中(旧 tagged.bin 系修复前产物, 静默丢权重不可用)。
+
+### 2026-09-17 C4 线 (续三) — VL-4B 编译全通 (A1 修复有效性实证)
+
+15. **qwen3vl_4b 用 T0 编译器 (含撞 id 修复 + perm 兜底) 全链编译通过**: hnnx_compile 2183 op → tagged.bin 16.09GB → wtop_emit **v2 blob 8.42GB** (664 slots/2178 ops, WTOP OK)。此前死因 `perm 轴数 10485760>5` 消除——A1 根因修复(loader 撞 id 双向防护)对 VL 线有效,C3 剩余=设备 run vs golden_logits(同 CDSP 楔死阻塞)。注意: VL-4B 编译期曾现双进程同写一文件插曲(后台任务复活叠 nohup 重发), 教训=大模型编译产物落盘前核对 PID 唯一性。
+16. v2 格式第二实证: 8.42GB blob host 自校验通过(继 minicpm 5.15GB 后)。
