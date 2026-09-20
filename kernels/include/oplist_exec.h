@@ -71,6 +71,19 @@ int  wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
  * 时从此基址+slot.offset 读)。NULL=禁用。与 run_io 解耦(权重常驻)。 */
 void wt_exec_set_ext_weights(const void* wgt_ptr);
 
+/* ---- PROF 战役 W-P2: 逐 op 时间戳对 + optrace 开关 ----
+ * wt_op_ts: 每 op 的 {start_us, dur_us}, 相对 run_range 入口 (u32 µs 约 71min
+ * 回绕, 单 run 不会超)。注册后 run/run_range 自动回填; 索引 = 全局 op 序号,
+ * 缓冲须 >= n_ops (run_range 分段调用时按绝对序号写)。不注册 = 零开销旧行为。 */
+struct wt_op_ts { uint32_t start_us; uint32_t dur_us; };
+void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap);
+
+/* optrace 逐 op 行开关。默认开(=旧行为, 存量 runner 零回归); 性能测量前
+ * 显式 set_trace(0) 关 = 无落盘污染。只控 run_range 内 per-op pre/post
+ * fprintf; run 级 rtrace 里程碑常开 (M4.2 崩溃取证命脉)。句柄铁律不动:
+ * 仍只有 g_rtrace 一个 FILE*, 开关只控 fopen 与否, 绝不新建路径。 */
+void wt_exec_set_trace(int on);
+
 /* W3 解析报告 (源: wt_w3.c)。emit 逐行收到 JSON 行; host wt_inspect 与
  * 设备输出共用此函数, 行逐字节一致。 */
 void wt_w3_report(const char* blob_name, const uint8_t* buf, size_t size,

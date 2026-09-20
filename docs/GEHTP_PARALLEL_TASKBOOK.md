@@ -199,7 +199,8 @@
 | opcode 预登记 | 105 会话 | 通报 | oplist_parse.h | — | OP_SCATTER_ND(A3②备)/OP_GDN_STEP/OP_QGEMV/OP_GQA_FAD 只追加, 与 A2 OP_TILE_F16 错峰 |
 | C2 | | | test_models/qwen35_4b/ | 设备段长 | |
 | C3 | | | test_models/qwen3vl_4b/ | 设备段 | |
-| C4 | 104 本会话 (branch gehtp-08b, 2026-09-17) | **进行中** | test_models/minicpm5_2b*/ scripts/judge_minicpm.py | 设备段(编译完后) | 预检通过(12 型全覆盖); 撞 id 根因见 §8 |
+| C4 | 104 本会话 (branch gehtp-08b, 2026-09-17) | **设备门** | test_models/minicpm5_2b*/ scripts/judge_minicpm.py | d0f1784 经 110, 2026-09-20 排队 (~30min: 推 5.15GB+2532op run); 只碰 *_c4* 文件 | host 门全绿(790a198 cos=0.9999887 top1 16/16); 撞 id 根因见 §8 |
+| PROF-G2 | 105 本会话 (branch task/prof-wp) | **排队** (C1/C4 后) | oplist_exec.c/42_gehtp_runner/scripts/gehtp_prof.py (W-P2/W-P1, 未提交) | d0f1784 经 110, 2026-09-20, 短槽 ~5min (conv_add 2s run + 拉回 op_ts/device.txt) | G-P1 host 全绿 (合成件+真 v2 blob); 上机后=conv_add 零退化 + op_ts 真数据报表 |
 | D1 | | | graph_prepare.cpp/wtop_emit.cpp | 否 | |
 | D2 | | | scripts/ 新增 | 设备段(只读 optrace) | |
 | D3 | | | kernels/host/ | 否 | |
@@ -262,3 +263,8 @@
 
 15. **qwen3vl_4b 用 T0 编译器 (含撞 id 修复 + perm 兜底) 全链编译通过**: hnnx_compile 2183 op → tagged.bin 16.09GB → wtop_emit **v2 blob 8.42GB** (664 slots/2178 ops, WTOP OK)。此前死因 `perm 轴数 10485760>5` 消除——A1 根因修复(loader 撞 id 双向防护)对 VL 线有效,C3 剩余=设备 run vs golden_logits(同 CDSP 楔死阻塞)。注意: VL-4B 编译期曾现双进程同写一文件插曲(后台任务复活叠 nohup 重发), 教训=大模型编译产物落盘前核对 PID 唯一性。
 16. v2 格式第二实证: 8.42GB blob host 自校验通过(继 minicpm 5.15GB 后)。
+
+### 2026-09-20 PROF 线 — G-P2 上机窗口排队登记 (105 本会话)
+
+17. **PROF 战役 G-P2 登记**: d0f1784 经 110, 短槽 ~5min (conv_add 2s run + 拉回 op_ts.bin/device.txt)。身份制合规: gehtp_runner_prof.so + job_prof.txt 独立通道 (不碰 job.txt)。lib 换装窗口: 备份设备标准 lib (f35e06d6) → 我方 d8fc9502 (同 HEAD v2 ABI 超集: PROF+arity14; 对在册 runner/blob 兼容) → 跑完恢复。**勘误 #12**: 本线 runner 已 09-18 随 v2 ABI 重编 (两态 trace 版), 非 #12 所指 09-17 早旧件。排队序: C1 (在跑 qwen35_08b_scatter) → C4 (minicpm 30min) → PROF (本行)。
+18. **skel 层①字节级定案 (顺带, 见 §8 前文 09-17 事故)**: 好坏 skel 符号表/strings 全同, 唯一差=SWIV 签名段 (56B); 未签件补签 = 已知好件 380f3cbf 逐字节一致 (确定性签名)。治理已入 task/prof-wp scripts/gehtp cmd_setup [0/5] (ship 缺签→现场补签→推后读回校验; 缺件→源码重建) + device_run.sh 拷链门卫。新板 skel 已 380f3cbf ✓ 勿动。

@@ -57,6 +57,16 @@ static uint32_t g_last_bytes[MAX_TEMPS];  /* 每 temp 最后写入的字节数
     用最后写入大小, 否则历史大值 memcpy 越界 = PD 死, M4.2 实锤) */
 static FILE* g_rtrace = NULL;  /* 统一 trace 句柄(同路径双 FILE* 在 DSP farf
                                    下句柄冲突崩溃, M4.2 实锤) */
+/* PROF W-P2: per-op trace 行开关。默认开(=旧行为, 存量 runner/诊断流零回归;
+ * 新 runner 按 job.txt trace 键显式 set_trace(0/1) 拿净测量/取证两态) */
+static int g_trace_on = 1;
+void wt_exec_set_trace(int on) { g_trace_on = on ? 1 : 0; }
+/* PROF W-P2: 逐 op 时间戳对缓冲 (注册式, 不注册零开销) */
+static struct wt_op_ts* g_ts_buf = NULL;
+static uint32_t g_ts_cap = 0;
+void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap) {
+    g_ts_buf = buf; g_ts_cap = buf ? cap : 0;
+}
 static void rtrace(const char* msg, int v) {
     if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
     if (g_rtrace) { fprintf(g_rtrace, "[run_io] %s %d\n", msg, v); fflush(g_rtrace); }
@@ -1376,6 +1386,7 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
     *engine_m = g_exec.engine_ready ? g_exec.e.m : 0;
     if (first + count > b->n_ops) { snprintf(err, errn, "range oob"); return -1; }
     if (wt_exec_load_tempoff(b, err, errn) != 0) return -1;
+    const int64_t t_run0 = HAP_perf_get_time_us();  /* PROF W-P2: ts 时间轴零点 */
     for (uint32_t ii = 0; ii < count; ii++) {
         uint32_t i = first + ii;
         const struct wt_op* op = &b->ops[i];
@@ -1386,14 +1397,17 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             snprintf(err, errn, "opcode %u unhandled", (unsigned)op->opcode);
             rc = -1;
         } else {
-            if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
-            if (g_rtrace) {
-                fprintf(g_rtrace, "pre%u code=%u a=%u,%u,%u,%u pool=%u\n",
-                        (unsigned)ii, (unsigned)op->opcode,
-                        (unsigned)op->args[0], (unsigned)op->args[1],
-                        (unsigned)op->args[2], (unsigned)op->args[3],
-                        (unsigned)g_exec.pool_used);
-                fflush(g_rtrace);
+            /* PROF W-P2: per-op trace 行受 g_trace_on 门控 (默认关=零落盘污染) */
+            if (g_trace_on) {
+                if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
+                if (g_rtrace) {
+                    fprintf(g_rtrace, "pre%u code=%u a=%u,%u,%u,%u pool=%u\n",
+                            (unsigned)ii, (unsigned)op->opcode,
+                            (unsigned)op->args[0], (unsigned)op->args[1],
+                            (unsigned)op->args[2], (unsigned)op->args[3],
+                            (unsigned)g_exec.pool_used);
+                    fflush(g_rtrace);
+                }
             }
             const struct wt_op_ctx cx = {b, op, engine_m, err, errn};
             rc = g_op_exec_table[op->opcode](&cx);
@@ -1402,8 +1416,16 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
 #endif
         }
         g_exec.st.ops++;
-        if (op_us) op_us[ii] = HAP_perf_get_time_us() - t0;
         {
+            const int64_t t1 = HAP_perf_get_time_us();
+            if (op_us) op_us[ii] = t1 - t0;
+            /* PROF W-P2: 打点对, 索引 = 全局 op 序号 (run_range 分段安全) */
+            if (g_ts_buf && i < g_ts_cap) {
+                g_ts_buf[i].start_us = (uint32_t)(t0 - t_run0);
+                g_ts_buf[i].dur_us   = (uint32_t)(t1 - t0);
+            }
+        }
+        if (g_trace_on) {
             /* 统一 trace 句柄铁律(M4.2 实锤: 同路径双 FILE* 在 DSP farf
              * 下句柄冲突挂死) —— 与 rtrace 共用 g_rtrace, 禁止自建 gf。 */
             if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
