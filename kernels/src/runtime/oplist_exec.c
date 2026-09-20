@@ -956,8 +956,10 @@ static int exec_conv1d_ssm(const struct wt_blob* b, const struct wt_op* op,
             for (uint32_t j = 0; j < k && (int32_t)(t - j) >= 0; j++)
                 acc += f16_to_f32(x[(size_t)(t - j) * C + c]) *
                        f16_to_f32(w[(size_t)j * C + c]);
-            float sv = acc / (1.0f + expf(-acc));
-            y[(size_t)t * C + c] = f32_to_f16(sv);
+            /* 双重 sigmoid 根因: 参考实现 Conv 为纯卷积, 图中另有独立
+             * Sigmoid 节点 (op199 subtype 8); 引擎融合 sigmoid 导致
+             * sigmoid(sigmoid(conv)) → 门值全错 (0.8B 全链偏) */
+            y[(size_t)t * C + c] = f32_to_f16(acc);
         }
     return 0;
 }
