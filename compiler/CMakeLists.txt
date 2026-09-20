@@ -31,6 +31,7 @@ add_library(htp_core STATIC
     src/vtcm/supertile.cpp
     src/tiling/tiler.cpp
     src/tiling/conv_tiling.cpp
+    src/tiling/tiling_rule.cpp
     src/serialize/serializer.cpp
     src/serialize/deserializer.cpp
     src/serialize/bin_format.cpp
@@ -298,3 +299,8 @@ add_test(NAME test_wtop_emit COMMAND test_wtop_emit)
 add_executable(test_qwen35_ir tests/test_qwen35_ir.cpp)
 target_link_libraries(test_qwen35_ir htp_core)
 add_test(NAME test_qwen35_ir COMMAND test_qwen35_ir)
+
+# 阶段9: tiling 规则注册表(matmul/conv shape_fn, 预算驱动)
+add_executable(test_tiling_rule tests/test_tiling_rule.cpp)
+target_link_libraries(test_tiling_rule htp_core)
+add_test(NAME test_tiling_rule COMMAND test_tiling_rule)
