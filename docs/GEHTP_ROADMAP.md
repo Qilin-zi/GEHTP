@@ -1,6 +1,7 @@
-# GEHTP 未来工作计划（ROADMAP v1）
+# GEHTP 未来工作计划（ROADMAP v1.1）
 
 > 生成日期 2026-09-20。基线：/disk1/gehtp/GEHTP @ a098509，task/prof-wp 为主家。
+> v1.1 修正：收编 M1/M2 已落地（44d5ab8/db7d2ee）——§2.1 改为 M3 退役 + M4 真 DMA runlist；新增 §2.4 合并 DMA/spill-fill/cache-flush 三份既有计划。
 > 本文是三条主线（用户点名）+ 正确性/工程化收口的整合计划，供跨服务器协作参照。
 > 铁律沿用：判据纪律（PORTAL §3）、设备纪律（PORTAL §4 + RUNBOOK §5/§7）、
 > 接口冻结点登记（TASKBOOK §2.1）。
@@ -15,8 +16,8 @@
   44 个 ctest；新板 d0f1784 CDSP(domain 3) 实测可用。
 - **三条结构性债务**（本次计划主攻）：
   1. **多物理树并存**（4090 / /disk2 / /disk1）+ 死路径 + 无环境自检 → 换服务器无法 bootstrap。
-  2. **规划双轨**：compiler 在 do_prepare2 算了全套（FancyAllocator/supertiles/tcm_migration），
-     但无序列化出口；设备实际只用 `wtop_emit` 重新算的那遍（MEMPLAN 迁移计划 §1.2 三条实证）。
+  2. **静态规划已收编**（M1 拓扑定稿 44d5ab8 + M2 静态规划收编 db7d2ee 已落地，`TAG_MEM_PLAN` 序列化）；
+     剩余 M3 旧链路退役 + M4 算法升级（真 DMA runlist / cp_solver 默认化 / 跨组复用）。
   3. **pass 双轨**：PassManager 注册框架已建但只注册 2 个 pass（const/shape fold）；
      8 条融合规则 + 8 相位阈值分发仍是遗留结构，未走注册。
 
@@ -51,12 +52,14 @@
 
 ## 2. P0 — 规划/调度整合进编译阶段 + tiling 决策（用户第 2 点）
 
-### 2.1 收编：编译器成为规划唯一真相源
-现状已核实：`compute_ddr_offsets` 是 GraphPrepare 成员但只在 emit 里被调；`plan_order_` 被 emit 用 Kahn 重排否定。
+### 2.1 收编已落地（M1/M2），余下 M3 退役 + M4 真 DMA runlist
+M1 拓扑定稿（44d5ab8）+ M2 静态规划收编（db7d2ee）已在 task/prof-wp 落地并门全绿：
+`do_prepare2_late` 定稿 Kahn 序 + 调 `compute_ddr_offsets` + spill 集合，经 `TAG_MEM_PLAN`
+序列化进 tagged.bin；`wtop_emit` 读 bin 照抄（shadow 期保留重算 + warn）。
 
-- 新增 `TAG_MEM_PLAN` 记录；`do_prepare2_late` 内**定稿** Kahn 序 + 调 `compute_ddr_offsets` + spill 集合，序列化进 tagged.bin。
-- `wtop_emit` 退化为打包器：读 bin → 权重打包 → op lowering → 按 plan 发射 + 插桩（不再重算规划）。
-- 完成门：conv_add/L3/0.8B 三图 blob 与收编前 byte-exact；`check_offsets` 三方核对。
+- **M3 旧链路退役**：删 `wtop_emit.cpp:389-401` `spill_fill_recs()` 量池段；编译器贪心 spill 重定语义为成本模型观察记录；文档状态更新。
+- **M4 真 DMA runlist**（DMA/spill/fill 的核心）：收编 matmul 内嵌的 `cpu_to_vtcm`/`dc_dma_once` 为显式 runlist 条目；cp_solver 默认化（现 env `HNNX_VTCM_ALLOCATOR=cp*` 门控）；跨组复用（RuntimeAllocator 语义）。
+- 完成门：M3 后 emit 无重算分支；M4 后 spill/fill 是 runlist 显式 op，非标量 memcpy。
 
 ### 2.2 tiling 决策：移植 QNN 的"注册式 DSL 结构"，不移植公式
 逆向结论（见 compiler/DISASM_PLAN.md M36/M36c）：QNN 的 tiling 是**声明式注册 DSL**
@@ -79,12 +82,28 @@ tcm_size_for_tiling = get_vtcm_tile_size() = VTCM × 3/4   ← "3/4 规则"指�
   镜像 QNN 的 `declare_tiling_rule` + `tcm_size_for_tiling` 预算查询。allocator 请求粒度从"张量"改为"tile 流"，今天 tile=整张量。
 - **以后（M7 性能）**：按 cp_solver 代价模型，只在峰值内存/VTCM 驻留收益 > 阈值的 op 上
   写**我们自己的 shape_fn**（大 matmul 切 VTCM 尺寸块、长上下文注意力切 seq 维），非全面重写。
+- **现在起步（host 原型）**：conv（compute_conv_tiles）+ MatMul（输出分块）两个 shape_fn 落进注册表骨架，
+  host 侧分 tile vs 不分 tile byte-exact 对拍，不碰设备；设备接线仍留 M4/M7。
 - **与第 3 点的关系**：QNN 用同一个 `GraphOptInfo` 注册 pass 和 tiling——我们的 pass 注册框架和
   tiling 规则注册表应**收敛到同一套"注册式图变换"机制**，而非两套。
 
 ### 2.3 三方一致性验证器
 - tagged.bin（plan_order+mem_plan）↔ blob（发射序+TEMPOFF）↔ 设备 optrace（执行序）自动对拍。
 - 完成门：故意改 1 字节偏移必被检出。
+
+### 2.4 DMA / spill-fill / cache-flush 收口（合并三份既有计划）
+cache 侧已实现：`fence.c`（U9 方向对偶决策表）+ `dc_parts.c`（dc_dma_fence/clean/invalidate）
++ oplist_exec 的 flush（"四铁律"源自 V2.2 api_v22_overview.md）。剩余工作分散在三处，本节合并：
+
+| 项 | 现状 | 归口 |
+|---|---|---|
+| SFCD spill/fill 写侧（RE） | 104 只有读侧 388 行 vs 779 行 | BACKPORT_PLAN §2（P0，M7 阶段二必需） |
+| OP_SPILL/OP_FILL 快路径 | 设备标量 memcpy | TASKBOOK B2：UserDMA + fence 决策表 |
+| 真 DMA runlist 算子 | matmul 内嵌 cpu_to_vtcm/dc_dma_once | MEMPLAN M4（见 §2.1） |
+| 编译器 spill 决策 | 已 TAG_MEM_PLAN 序列化 | MEMPLAN M2（已落地） |
+
+- 依赖：tiling（§2.2）产出 tile 流 → allocator 按 tile 请求 → spill/fill/preload 变显式 runlist op。
+- 完成门：spill 变体 byte-exact 不变 + 大 spill（≥1MB）耗时下降入报告（B2 门）。
 
 ---
 
@@ -150,7 +169,7 @@ tcm_size_for_tiling = get_vtcm_tile_size() = VTCM × 3/4   ← "3/4 规则"指�
 ## 5. 依赖与顺序总图
 
 ```
-1 Git/可移植 ──▶ 2 收编(+tiling规则注册表接缝)
+1 Git/可移植 ──▶ 2 M3退役+M4真DMA(+tiling规则注册表接缝)
      │                    │
      │            ┌───────┴───────┐
      ▼            ▼               ▼
@@ -174,7 +193,7 @@ tcm_size_for_tiling = get_vtcm_tile_size() = VTCM × 3/4   ← "3/4 规则"指�
 2. **1.2 环境变量化**（1 天）：env.sh + gehtp doctor + 死路径清零。
 3. **1.4 版本握手**（0.5 天）：GEHTP_LIB_VERSION 符号。
 4. **4.1.1 ScatterNd 真语义**（2-3 天，.scratch_a3 已积累）：正确性最大杠杆。
-5. **2.1 收编**（2-3 天）：搬规划，行为保持，byte-exact 回归做门。
+5. **M3 旧链路退役**（0.5 天）：删 emit 重算/量池段，行为保持，byte-exact 回归做门。
 
 ---
 
