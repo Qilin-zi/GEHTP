@@ -73,8 +73,7 @@ cmd_compile() {
     fi
 
     echo "== [3/5] hnnx_compile (tagged runlist) =="
-    # M2: 静态规划预算随编译进 TAG_MEM_PLAN(wtop_emit 照抄); 第 4 步旗标
-    # 在 shadow 期保留作比对, M3 删。
+    # M2/M3: 静态规划预算随编译进 TAG_MEM_PLAN; wtop_emit 只读 plan, 不再收预算旗标。
     local c_args=()
     [ -n "$ddr" ] && c_args+=(--ddr-budget "$ddr")
     [ -n "$vtcm" ] && c_args+=(--plan-vtcm-budget "$vtcm")
@@ -88,8 +87,6 @@ cmd_compile() {
     echo "== [4/5] wtop_emit (blob) =="
     local in_args=()
     [ -n "$in_f16" ] && in_args+=(--input-f16 "$in_f16")
-    [ -n "$vtcm" ] && in_args+=(--vtcm-budget "$vtcm")
-    [ -n "$ddr" ] && in_args+=(--ddr-budget "$ddr")
     if [ -n "$gguf" ]; then
         gguf="$(realpath "$gguf")"; match="$(realpath "$match" 2>/dev/null || true)"
         [ -f "$gguf" ] && [ -f "$match" ] || die "--gguf 需配 --match <tsv>"

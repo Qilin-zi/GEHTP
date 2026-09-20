@@ -1,9 +1,11 @@
 {
+  "manifest_ver": 2,
   "input_slot": 0,
   "input_elems": 32768,
   "output_temp": 0,
   "n_slots": 3,
   "n_ops": 5,
   "op_ids": [6,11,11,12,14],
-  "opcodes": [27,5,6,7,27]
+  "opcodes": [27,5,6,7,27],
+  "op_names": ["Transpose","Conv2d","Conv2d","Eltwise_Binary","Transpose"]
 }

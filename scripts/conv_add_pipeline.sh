@@ -2,7 +2,7 @@
 # conv_add_pipeline.sh — GEHTP conv2d+add 端到端一键 (阶段 10, M2)
 # =====================================================================
 # 流程: 模型/金标(gen_all + gen_io_rounds) → hnnx_compile tagged
-#       (主 + 1KB 溢出变体) → wtop_emit (主 + spill) → kernels 编译/签名
+#       (主 + 4KB DDR 溢出变体) → wtop_emit (主 + spill) → kernels 编译/签名
 #       → 推板 52f67807 → 运行例 37 → 拉结果 → 判据汇总
 # 用法: conv_add_pipeline.sh [device]      # 不带参数 = 仅 host 全链
 # 依赖(只读): venv310、qairt SDK、Hexagon SDK、SWIV
@@ -33,7 +33,7 @@ unzip -p conv_add_qnn/conv_add.cpp model.params.bin > conv_add_qnn/model.params.
     --output conv_add_qnn/conv_add.bin | tail -1
 "$CB/hnnx_compile" --net-json conv_add_qnn/conv_add_net.json \
     --weights-bin conv_add_qnn/model.params.bin --format tagged \
-    --vtcm-budget 1024 \
+    --ddr-budget 4096 \
     --output conv_add_qnn/conv_add_spill.bin | tail -1
 
 echo "=== [3/6] wtop_emit (主 + spill) ==="

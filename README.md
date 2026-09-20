@@ -11,7 +11,7 @@ ONNX → qairt-converter → net.json (QNN IR)
   → compiler/ (B线图编译器): qnn_ir_loader → OpDef IR → do_prepare1
       → ST-Cut 调度 → 单算子 tiling → FancyAllocator/cp_solver (spill/fill)
       → 序列化 (tagged-record runlist) → 我方 .bin
-  → [host] wtop_emit → WTOP blob
+  → [host] wtop_emit (读 TAG_MEM_PLAN 照抄, 无自算) → WTOP blob
   → V81 板 oplist_exec 引擎执行 (kernels/: hmx/hvx kernel 库)
 ```
 

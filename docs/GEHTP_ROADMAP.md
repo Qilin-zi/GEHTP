@@ -59,7 +59,7 @@ M1 拓扑定稿（44d5ab8）+ M2 静态规划收编（db7d2ee）已在 task/prof
 
 - **M3 旧链路退役**：删 `wtop_emit.cpp:389-401` `spill_fill_recs()` 量池段；编译器贪心 spill 重定语义为成本模型观察记录；文档状态更新。
 - **M4 真 DMA runlist**（DMA/spill/fill 的核心）：收编 matmul 内嵌的 `cpu_to_vtcm`/`dc_dma_once` 为显式 runlist 条目；cp_solver 默认化（现 env `HNNX_VTCM_ALLOCATOR=cp*` 门控）；跨组复用（RuntimeAllocator 语义）。
-- 完成门：M3 后 emit 无重算分支；M4 后 spill/fill 是 runlist 显式 op，非标量 memcpy。
+- 完成门：M4 后 spill/fill 是 runlist 显式 op，非标量 memcpy。（M3 已达成：emit 无重算分支，只读 TAG_MEM_PLAN）
 
 ### 2.2 tiling 决策：移植 QNN 的"注册式 DSL 结构"，不移植公式
 逆向结论（见 compiler/DISASM_PLAN.md M36/M36c）：QNN 的 tiling 是**声明式注册 DSL**

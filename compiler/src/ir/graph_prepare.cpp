@@ -1620,10 +1620,12 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
     }
 
     // Spill/fill(阶段7): 溢出张量 → 0x4453 配置记录 + 每张量 0x5346 DMA 记录。
-    // 收集来源: ①allocator spilled(vtcm_allocations_)②tcm_migration 标记
-    // (flags2 & SPILL_TO_DDR=0x40, 未在①中)。DDR 池偏移按 op_id 升序确定性
-    // 分配(128B 对齐, 起 0x1000)。反序列化回读 spill_fill_recs_, 优先复用
-    // (round-trip 确定性)。
+    // M3 起重定语义为「成本模型观察记录」: 真实溢出决策已收编进 TAG_MEM_PLAN
+    // (compute_ddr_offsets → mp.spills), 本节仍序列化 greedy allocator spill 集
+    // (vtcm_allocations_ 的 spilled 标记 + tcm_migration SPILL_TO_DDR=0x40 标记),
+    // 供成本模型活跃集观察与 round-trip 确定性, wtop_emit 不再消费为发射语义。
+    // DDR 池偏移按 op_id 升序确定性分配(128B 对齐, 起 0x1000)。
+    // 反序列化回读 spill_fill_recs_, 优先复用(round-trip 确定性)。
     {
         std::vector<SpillFillRec> recs;
         if (!spill_fill_recs_.empty()) {
