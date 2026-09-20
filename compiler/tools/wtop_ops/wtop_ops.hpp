@@ -276,8 +276,9 @@ struct Emitter {
                     uint32_t id;
                     size_t K = e.dims[0], NN = 1;
                     for (size_t i = 1; i < e.dims.size(); i++) NN *= e.dims[i];
-                    if (e.type == 2 && K % 32 == 0 && NN % 32 == 0) {
-                        // Q4_0 → tile-major(32×32 tile 契约)
+                    if (e.type == 2 && K % 32 == 0 && NN % 32 == 0 && getenv("GEHTP_TILE")) {
+                        // Q4_0 → tile-major(32×32 tile 契约; 门控: 主机侧
+                        // W4A16 标量参考未接前默认走反量化 f16, 数值先行)
                         auto tile = repack_q4_0_tiles(src, e.nbytes, K, NN);
                         id = slot_for((uint32_t)tile.size(), (uint32_t)(K * NN), tile.data());
                     } else if (e.type == 2) {

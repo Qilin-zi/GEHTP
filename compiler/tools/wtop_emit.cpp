@@ -213,8 +213,31 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::vector<uint8_t> data;
             /* 主输入 dtype 跟随图输入节点: int32(ids/gather 索引)保持 4B/元素,
              * 不参与槽面 f16 化; 其余 f16 直塞 / f32 转 f16。 */
-            bool is_i32_in = (k == 0 && iop->output_def.dtype == (uint32_t)DType::Int32);
-            if (is_i32_in) {
+            bool is_i32_in = (iop->output_def.dtype == (uint32_t)DType::Int32);
+            if (is_i32_in && k > 0) {
+                /* 非主输入的 int32 图输入 (position_ids/attention_mask):
+                 * 按值语义转 f16 (主输入 ids 保持 raw int32 供 GATHER 索引)。
+                 * 旧 f32 路径把 int32 字节当 f32 读 → 全 0 → 位置全 0
+                 * → RoPE 角 0 → logits 有限但 cos=-0.05 (实锤) */
+                if (k < in_paths.size()) {
+                    if (!load_file(in_paths[k], data)) {
+                        std::fprintf(stderr, "error: cannot open %s\n", in_paths[k].c_str());
+                        return 2;
+                    }
+                    if (data.size() != elems * 4) {
+                        std::fprintf(stderr, "error: input %zu size %zu != %zu*4 (int32, elems=%zu)\n",
+                                     k, data.size(), elems, elems);
+                        return 2;
+                    }
+                    const int32_t* iv = reinterpret_cast<const int32_t*>(data.data());
+                    std::vector<uint8_t> h(elems * 2);
+                    uint16_t* d = reinterpret_cast<uint16_t*>(h.data());
+                    for (size_t i = 0; i < elems; i++) d[i] = f32_to_f16_rne((float)iv[i]);
+                    data = std::move(h);
+                } else {
+                    data.assign(elems * 2, 0);
+                }
+            } else if (is_i32_in) {
                 if (k < in_paths.size()) {
                     if (!load_file(in_paths[k], data)) {
                         std::fprintf(stderr, "error: cannot open %s\n", in_paths[k].c_str());

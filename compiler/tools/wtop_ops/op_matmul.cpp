@@ -33,10 +33,13 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
         std::fprintf(stderr, "error: %s extra 未提取 (M/K/N=0)\n", nm.c_str());
         return 4;
     }
-    /* Q4_0 打包权重(K*N/2 字节)→ W4A16;f16 池权重 → MATMUL_F16
-     * (float 图; probe 首撞: f16 权重被按 W4A16 执行直接失败) */
+    /* Q4_0 打包权重 → W4A16; f16 池权重 → MATMUL_F16。
+     * 槽大小两种: 裸 Q4_0 = K*N/2; tile-major 重排 = K*N/2 + K*N/8
+     * (每 32×32 tile 640B = 512 nibbles + 128 scales → K*N*5/8)。
+     * tile 槽漏判 → MATMUL_F16 把 tile 字节当 f16 读 → +inf (实锤) */
     bool w4 = w_is_const && (w_s != em.dummy_slot_id) &&
-              (em.slots[w_s & 0x7FFFu].len == (k * nn / 2u));
+              (em.slots[w_s & 0x7FFFu].len == (k * nn / 2u) ||
+               em.slots[w_s & 0x7FFFu].len == (k * nn / 2u) + (k * nn / 8u));
     if (w4) {
         em.add_op(OP_MATMUL_W4A16, {a_t, w_s, out_t, m, k, nn});
     } else {

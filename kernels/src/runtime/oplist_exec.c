@@ -756,7 +756,10 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
         uint16_t* y = (uint16_t*)temp_get(op->args[3], an * 2u);
         if (!c || !tv || !fv || !y || an == 0) { snprintf(err, errn, "select ref fail"); return -1; }
         for (uint32_t i = 0; i < an; i++) {
-            float cv = f16_to_f32(c[cn <= 1u ? 0 : i]);
+            /* cond 广播: cn<an 时按 an/cn 平铺 (numpy 广播语义;
+               GDN tril 掩码 [64,64] 复用于 16 头 [16,64,64],
+               旧 c[i] 越界读 → 陈旧池 → select 垃圾 → +inf) */
+            float cv = f16_to_f32(c[cn <= 1u ? 0 : (cn < an ? i % cn : i)]);
             float r = (cv != 0.0f) ? f16_to_f32(tv[i]) : f16_to_f32(fv[fn <= 1u ? 0 : i]);
             y[i] = f32_to_f16(r);
         }
@@ -1452,6 +1455,25 @@ static int xop_pad(const struct wt_op_ctx* cx) {
     return exec_pad(cx->b, cx->op, cx->err, cx->errn);
 }
 
+/* GEHTP Cast 真语义: int32 位模式 → f16 数值 (参考实现同款)。
+ * RoPE 位置链: int32 经恒等链保持位模式, 只在 Cast 处转数值。
+ * 恒等冒充 → 位置 1 读成 f16 次正规 5.96e-8 → RoPE 角全 0 → 注意全错 */
+static int exec_cast_i32(const struct wt_blob* b, const struct wt_op* op,
+                         char* err, size_t errn) {
+    const uint8_t* x = ref_ptr(b, op->args[0]);
+    uint32_t out_t = op->args[1], n = op->args[2];
+    uint16_t* y = (uint16_t*)temp_get(out_t, n * 2u);
+    if (!x || !y) { snprintf(err, errn, "cast_i32 ref fail"); return -1; }
+    const int32_t* i32 = (const int32_t*)x;
+    for (uint32_t i = 0; i < n; i++)
+        y[i] = f32_to_f16((float)i32[i]);
+    return 0;
+}
+
+static int xop_cast_i32(const struct wt_op_ctx* cx) {
+    return exec_cast_i32(cx->b, cx->op, cx->err, cx->errn);
+}
+
 static int xop_concat(const struct wt_op_ctx* cx) {
     return exec_concat(cx->b, cx->op, cx->err, cx->errn);
 }
@@ -1537,6 +1559,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,
     [OP_SCATTER_ND_F16] = xop_scatter_nd,
     [OP_PAD_F16] = xop_pad,
+    [OP_CAST_I32_F16] = xop_cast_i32,
 };
 
 /* opcode 名表 —— 失败日志定位用 (与 oplist_parse.h 枚举同步) */

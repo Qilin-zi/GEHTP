@@ -122,6 +122,9 @@ enum {
                                真 Pad (CONSTANT scheme): out 先填 pad 值, 再按
                                前 pad 偏移把 in 拷入 (C 序, rank≤4)。恒等冒充
                                → 后半段读陈旧池字节 = 0.8B 全 -inf 根因 */
+    OP_CAST_I32_F16 = 30,     /* [x_ref,out_t,n_i32] int32 位模式 → f16 数值
+                               (参考实现同款: RoPE 位置链 Cast 才转数值;
+                               恒等冒充 → 位置值=次正规 → RoPE 全错) */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -155,6 +158,7 @@ enum {
 #define WT_ARITY_TRANSPOSE_GEN_F16 8
 #define WT_ARITY_SCATTER_ND_F16 12
 #define WT_ARITY_PAD_F16 16
+#define WT_ARITY_CAST_I32_F16 3
 
 struct wt_slot {
     uint32_t len;
