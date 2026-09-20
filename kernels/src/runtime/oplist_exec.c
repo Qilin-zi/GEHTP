@@ -43,6 +43,12 @@ struct wt_exec {
     uint8_t* pool;
     uint32_t pool_cap;
     uint32_t pool_used;
+    /* 静态模式预留区耗尽后的独立 bump 池(泄漏式扩容, 静态区不动)。
+     * 全模型 47070 op 表外 temp 数千, 16MB 预留必然耗尽 ——
+     * 无此池则 temp_get NULL → matmul ref fail (op5580 实锤) */
+    uint8_t* bump_pool;
+    uint32_t bump_cap;
+    uint32_t bump_used;
     const uint32_t* static_offsets; /* 编译期 temp→池内偏移表 (TEMPOFF 槽; NULL=运行时 bump) */
     uint32_t static_off_arr[MAX_TEMPS]; /* 表本体(哨兵 0xFFFFFFFF = 表外) */
     /* 第7步阶段二: VTCM 驻留池(0x4000|temp 编码)。vtcm_off_arr[temp] =
@@ -233,6 +239,24 @@ static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
      * 静态模式禁扩容(池含编译期偏移, 搬坏静态区)。 */
     if (!g_exec.temps[id] || g_exec.temp_bytes[id] < bytes) {
         uint32_t aligned = (bytes + 127u) & ~127u;
+        /* 静态模式: 预留区耗尽 → 独立 bump 池(泄漏式代际扩容,
+         * 静态偏移表与旧 bump 地址均不受影响) */
+        if (g_exec.static_offsets && g_exec.pool_used + aligned > g_exec.pool_cap) {
+            if (!g_exec.bump_pool || g_exec.bump_used + aligned > g_exec.bump_cap) {
+                uint32_t ncap = g_exec.bump_cap ? g_exec.bump_cap * 2u : (64u << 20);
+                while (ncap < aligned) ncap *= 2u;
+                uint8_t* np = memalign(128, ncap);
+                if (!np) return NULL;
+                g_exec.bump_pool = np;   /* 旧代池泄漏至进程退出 (同既有策略) */
+                g_exec.bump_cap = ncap;
+                g_exec.bump_used = 0;
+            }
+            g_exec.temps[id] = g_exec.bump_pool + g_exec.bump_used;
+            g_exec.bump_used += aligned;
+            g_exec.temp_bytes[id] = bytes;
+            g_last_bytes[id] = bytes;
+            return g_exec.temps[id];
+        }
         if (g_exec.pool_used + aligned > g_exec.pool_cap) {
             if (g_exec.static_offsets) return NULL;  /* 静态模式: 预留区耗尽 */
             uint32_t ncap = g_exec.pool_cap ? g_exec.pool_cap : (64u << 20);
