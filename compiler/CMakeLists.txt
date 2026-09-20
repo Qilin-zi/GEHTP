@@ -244,6 +244,7 @@ add_executable(wtop_emit tools/wtop_emit.cpp
                tools/wtop_ops/op_matmul.cpp
                tools/wtop_ops/op_gather.cpp
                tools/wtop_ops/op_scatter_nd.cpp
+               tools/wtop_ops/op_pad.cpp
                tools/wtop_ops/op_copy_sem.cpp
                tools/wtop_ops/op_dwconv.cpp
                tools/wtop_ops/op_concat.cpp

@@ -2051,11 +2051,15 @@ std::vector<uint8_t> extract_transpose_extra(const GraphPrepare& gp, const OpDef
 
 std::vector<uint8_t> extract_depthwise_conv_extra(const GraphPrepare& gp, const OpDef& opdef) {
     ExtraDepthwiseConv e{};
-    // 权重 const [1,1,K,C] 或 [Kh,Kw,C,1](depthwise); 这里按 [1,k,1,C] QNN 布局
+    // 权重 const [1,k,1,C] (QNN DepthWiseConv 布局: 核在 dims[1];
+    // GDN conv1d [1,4,1,6144] 实锤: 旧 dims[r-2]=dims[2]=1 → kw=1
+    // 只读单核 = 门全错 → exp 溢出 → 全 -inf)
     const OpDef* w = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
     if (w && w->output_def.rank >= 2) {
         uint32_t r = w->output_def.rank;
-        e.kw = w->output_def.dims[r - 2];
+        e.kw = (r >= 4 && w->output_def.dims[0] == 1 && w->output_def.dims[2] == 1)
+                   ? w->output_def.dims[1]
+                   : w->output_def.dims[r - 2];
         e.kh = 1;
     }
     // stride/pad 在 tensor_param(stride/pad_amount), 名匹配

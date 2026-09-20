@@ -511,6 +511,7 @@ inline uint32_t qnn_neuron_to_sub(uint32_t op) {
     case 1:  return 10;  /* GELU */
     case 4:  return 11;  /* RELU */
     case 3:  return 12;  /* HARD_SWISH → SWISH 近似 */
+    case 7:  return 13;  /* SOFTPLUS (设备侧 case 13; 缺失=恒等→cumsum 爆炸) */
     default: return 0xFFFFFFFFu;
     }
 }

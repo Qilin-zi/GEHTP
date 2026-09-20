@@ -18,7 +18,7 @@ static int op_copy_sem(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<
 
 static const wtop::OpRegistrar g_reg_op_copy_sem{
     {"Reshape", op_copy_sem},
-    {"Pad", op_copy_sem},
+    /* Pad 移出: 真语义在 op_pad.cpp (opcode 29; 恒等冒充 = 0.8B 全 -inf 根因) */
     /* ScatterNd 移出: 真语义在 op_scatter_nd.cpp (A3 暗雷收口, 不再恒等冒充) */
     {"Cast", op_copy_sem},
 };

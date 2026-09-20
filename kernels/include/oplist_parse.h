@@ -118,6 +118,10 @@ enum {
                                对 n_idx 个坐标 (每坐标 K 维, idx_s int32 槽)
                                写 upd[e] 到 out[base]; block=1 (GDN attn_iter
                                每步写单点; 恒等拷贝冒充在 0.8B 1154 处全错) */
+    OP_PAD_F16 = 29,          /* [x_ref,out_t,rk,in_d0..3,out_d0..3,pb0..3,padv_f16] arity 16
+                               真 Pad (CONSTANT scheme): out 先填 pad 值, 再按
+                               前 pad 偏移把 in 拷入 (C 序, rank≤4)。恒等冒充
+                               → 后半段读陈旧池字节 = 0.8B 全 -inf 根因 */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -150,6 +154,7 @@ enum {
 #define WT_ARITY_BROADCAST_F16 12
 #define WT_ARITY_TRANSPOSE_GEN_F16 8
 #define WT_ARITY_SCATTER_ND_F16 12
+#define WT_ARITY_PAD_F16 16
 
 struct wt_slot {
     uint32_t len;

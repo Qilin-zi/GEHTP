@@ -725,6 +725,13 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
         case 10: r = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); break;
         case 11: r = fmaxf(0.0f, v); break;
         case 12: r = v / (1.0f + expf(-v)); break;
+        case 13: /* SOFTPLUS: 稳定化 log(1+e^x) (x 大时 exp 溢出; GDN 门)
+                    —— 缺失时 fallthrough=恒等 → cumsum 无界增长 → exp +inf
+                    → 全 -inf (0.8B 全模型实锤) */
+            if (v > 30.0f) r = v;
+            else if (v < -30.0f) r = expf(v);
+            else r = log1pf(expf(v));
+            break;
         default: break;
         }
         y[i] = f32_to_f16(r);
@@ -1401,6 +1408,50 @@ static int xop_scatter_nd(const struct wt_op_ctx* cx) {
     return exec_scatter_nd(cx->b, cx->op, cx->err, cx->errn);
 }
 
+/* GEHTP Pad 真语义: [x_ref,out_t,rk,in_d0..3,out_d0..3,pb0..3,padv_f16]
+ * out 先全填 pad 值, 再按前 pad 偏移把 in 拷入 (C 序, rank≤4)。
+ * GDN 用例: [1,16,32] 轴 1 前 pad 32 → [1,16,64] (chunk 边界零)。
+ * 恒等冒充时后半 512 elems 读陈旧池字节 = 全 -inf 根因 */
+static int exec_pad(const struct wt_blob* b, const struct wt_op* op,
+                    char* err, size_t errn) {
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, op->args[0]);
+    uint32_t out_t = op->args[1], rk = op->args[2];
+    if (rk == 0 || rk > 4) { snprintf(err, errn, "pad rank %u", (unsigned)rk); return -1; }
+    uint32_t id_[4] = {op->args[3], op->args[4], op->args[5], op->args[6]};
+    uint32_t od_[4] = {op->args[7], op->args[8], op->args[9], op->args[10]};
+    uint32_t pb[4] = {op->args[11], op->args[12], op->args[13], op->args[14]};
+    uint16_t padv = (uint16_t)op->args[15];
+    size_t n_in = 1, n_out = 1;
+    for (uint32_t i = 0; i < rk; i++) { n_in *= id_[i]; n_out *= od_[i]; }
+    uint16_t* y = (uint16_t*)temp_get(out_t, (uint32_t)n_out * 2u);
+    if (!x || !y) { snprintf(err, errn, "pad ref fail"); return -1; }
+    for (size_t i = 0; i < n_out; i++) y[i] = padv;
+    /* C 序逐元素: 输出坐标 → 检查是否在前 pad 区域内 → 输入坐标 */
+    uint32_t os[4]; os[rk - 1] = 1;
+    for (int i = (int)rk - 2; i >= 0; i--) os[i] = os[i + 1] * od_[i + 1];
+    for (size_t t = 0; t < n_out; t++) {
+        uint32_t rem = (uint32_t)t;
+        uint32_t ic[4] = {0, 0, 0, 0};
+        int inside = 1;
+        for (uint32_t i = 0; i < rk; i++) {
+            uint32_t c = rem / os[i];
+            rem %= os[i];
+            if (c < pb[i] || c >= pb[i] + id_[i]) { inside = 0; break; }
+            ic[i] = c - pb[i];
+        }
+        if (!inside) continue;
+        uint32_t in_lin = 0;
+        uint32_t s = 1;
+        for (int i = (int)rk - 1; i >= 0; i--) { in_lin += ic[i] * s; s *= id_[i]; }
+        y[t] = x[in_lin];
+    }
+    return 0;
+}
+
+static int xop_pad(const struct wt_op_ctx* cx) {
+    return exec_pad(cx->b, cx->op, cx->err, cx->errn);
+}
+
 static int xop_concat(const struct wt_op_ctx* cx) {
     return exec_concat(cx->b, cx->op, cx->err, cx->errn);
 }
@@ -1485,6 +1536,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_BROADCAST_F16] = xop_broadcast,
     [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,
     [OP_SCATTER_ND_F16] = xop_scatter_nd,
+    [OP_PAD_F16] = xop_pad,
 };
 
 /* opcode 名表 —— 失败日志定位用 (与 oplist_parse.h 枚举同步) */
@@ -1504,6 +1556,7 @@ static const char* opcode_name(uint32_t code) {
         [OP_RMSNORM2_F16] = "rmsnorm2", [OP_BROADCAST_F16] = "broadcast",
         [OP_TRANSPOSE_GEN_F16] = "transpose_gen",
         [OP_SCATTER_ND_F16] = "scatter_nd",
+        [OP_PAD_F16] = "pad",
     };
     if (code < sizeof(nm) / sizeof(nm[0]) && nm[code]) return nm[code];
     return "op?";
