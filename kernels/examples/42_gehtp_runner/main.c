@@ -120,14 +120,14 @@ int main(void) {
         return ex_summary() || 1;
     }
     ex_log("M3 job keys ok %s %s", blob_p, out_p);
-    static char wgt_size_s[32];
+    static char wgt_size_s[32], blob_size_s[32];
     memset(wgt_size_s, 0, sizeof(wgt_size_s));
+    memset(blob_size_s, 0, sizeof(blob_size_s));
     int have_wgt_size = (job_get((char*)job, "weights_size", wgt_size_s, sizeof(wgt_size_s)) == 0);
+    /* blob_size 必须 free(job) 前解析 (job 缓冲无 null 终止且要 free) */
+    int have_blob_size = (job_get((char*)job, "blob_size", blob_size_s, sizeof(blob_size_s)) == 0);
     free(job);
     uint32_t out_temp = (uint32_t)strtoul(temp_s, NULL, 10);
-    static char blob_size_s[32];
-    memset(blob_size_s, 0, sizeof(blob_size_s));
-    int have_blob_size = (job_get((char*)job, "blob_size", blob_size_s, sizeof(blob_size_s)) == 0);
     ex_log("M4 wgt_size=%s blob_size=%s", have_wgt_size ? wgt_size_s : "(none)",
            have_blob_size ? blob_size_s : "(none)");
 
