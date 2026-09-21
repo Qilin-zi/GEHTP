@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "hnnx/ir/op_id.hpp" // hnnx::op_id_t (原经 types.hpp 传递)
+#include "hnnx/vtcm/runtime_alloc.hpp" // fa::RuntimeAllocator 中间层 (P3 恢复, §1.1)
 
 // Op 双世界桥 (同 ser_ops_interface.hpp): 真身为全局类 (mangling
 // _ZN2fa14FancyAllocator20allow_tensor_overlapEPK2Op)。旧族 TU 用 hnnx::Op ——
@@ -33,6 +34,9 @@ namespace fa {
 
 // fa14::FancyAllocator - VTCM memory allocator
 // Source: vtcm_alloc.cc, fa_alloc.cc (libHtpPrepare.so x86_64)
+// 层级 (P3 恢复, BACKPORT_PLAN §1.1): fa::RuntimeAllocator ← fa::FancyAllocator
+// (.so 真三层 hnnx::Allocator → fa::RuntimeAllocator → fa::FancyAllocator;
+//  RuntimeAllocator 不继承 hnnx::Allocator 的原因见 runtime_alloc.hpp 头注)。
 //
 // Memory reuse has two mechanisms (both verified from disassembly):
 //
@@ -59,9 +63,12 @@ namespace fa {
 //      (d) 组间: 事件扫描复用 life_end < 当前组 life_begin 的已过期区域
 //      (e) 超预算 → spill 到 DDR
 
-class FancyAllocator {
+class FancyAllocator : public RuntimeAllocator {
 public:
     FancyAllocator();
+    // .so ctor @0xf3f2c0 首调基类 RuntimeAllocator(Mode, Graph&) —— 同形转发
+    // (make_allocator 槽位工厂 fancy 分支用; 两分支 Mode 均传 0, §1.2)
+    FancyAllocator(uint32_t mode, HNNX_GRAPH_T &graph);
     ~FancyAllocator();
 
     // ===== Lifetime-aware allocation (反汇编路径 allocate_tcm_blocks_internal) =====
@@ -257,7 +264,8 @@ private:
 
     std::vector<Pool> pools_;
     std::unordered_map<const void*, MemBlock*> block_map_;
-    int mode_ = 0;
+    // mode_ 已上移至 RuntimeAllocator (§1.3 +0x10 定稿字段, P3 字段搬移);
+    // set_mode(int) 与 allow_tensor_overlap_opdef 的 mode_!=0 检查语义不变。
 
     // Taken ranges for lifetime overlap analysis
     struct TakenRange {

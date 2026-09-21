@@ -59,6 +59,7 @@
 
 #include "op_def.hpp" // ::OutputDef (0x50), ::DType, hnnx::MAX_DIMENSIONS;
 #include "hnnx/serialize/deserz.hpp" // Deserz 真类 (顶层包含; 原处嵌于 namespace 内致 hnnx::std 污染)
+#include "hnnx/vtcm/runtime_alloc.hpp" // fa::RuntimeAllocator 真类 (P3 恢复中间层; 取代本文件旧 stub)
                       // 全局前置 class Tensor (本文件随后给出完整定义)
 
 class Op;    // 全局作用域 (mangling: _ZN6TensorC2EPK2Op)
@@ -157,13 +158,9 @@ static_assert(sizeof(DTypeScaleOff) == 12);
 
 // RuntimeAllocator 为全局 fa:: (mangling N2fa16RuntimeAllocator); 原嵌于 hnnx
 // 内与 deserz.hpp 的全局前置声明分裂 —— M33 移至全局 (M35 完成全树统一)。
-namespace fa {
-// 两个外部符号 (经 @plt 调用)
-struct RuntimeAllocator {
-    void const *map_block_reference(unsigned off, unsigned size) const noexcept; // @0xd8d640 (jj)
-    void deserialize_blocks(hnnx::Deserz &dctx, void const **table, size_t nblocks); // @0xd8d6e0
-};
-} // namespace fa
+// P3: 完整定义移至 hnnx/vtcm/runtime_alloc.hpp (中间层恢复, §1.1/§1.3 布局
+// 定稿); 本文件内联调用点 (map_block_reference @0xd8d640 (jj) /
+// deserialize_blocks @0xd8d6e0, 经 @plt 调用的两个外部符号) 签名不变。
 
 namespace hnnx {
 

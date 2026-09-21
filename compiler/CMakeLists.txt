@@ -26,6 +26,7 @@ add_library(htp_core STATIC
     src/opt/pass_shape_fold.cpp
     src/cost/cost_model.cpp
     src/vtcm/fancy_allocator.cpp
+    src/vtcm/runtime_alloc.cpp
     src/vtcm/cp_solver.cpp
     src/vtcm/dp_group_graph.cpp
     src/vtcm/supertile.cpp

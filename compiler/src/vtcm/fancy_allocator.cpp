@@ -12,6 +12,8 @@ namespace fa {
 using hnnx::VtcmCacheInstance;
 
 FancyAllocator::FancyAllocator() = default;
+FancyAllocator::FancyAllocator(uint32_t mode, HNNX_GRAPH_T &graph)
+    : RuntimeAllocator(mode, graph) {}
 FancyAllocator::~FancyAllocator() = default;
 
 // allocate: 线性 bump 分配 (host 端 reimplementation)。
@@ -76,8 +78,9 @@ void FancyAllocator::deallocate(void* ptr) {
 //
 // 关键: 同 (life_begin, life_end) 的 tensor 必须共存, 不能共享 offset,
 // 只能顺序 bump。跨组复用在 .so 中由 RuntimeAllocator::make_allocator 负责,
-// 非本函数职责。REQNN host reimplementation 无独立 RuntimeAllocator,
-// 此处用顺序 bump 代替。
+// 非本函数职责。P3 已恢复 RuntimeAllocator 中间层 (继承 + 字段搬移 +
+// make_allocator 槽位工厂), 跨组复用算法属 P5+ 升级; 本函数维持顺序 bump,
+// 行为与恢复前完全一致。
 std::unordered_map<hnnx::op_id_t, FancyAllocator::AllocResult>
 FancyAllocator::allocate_with_lifetime(const std::vector<AllocRequest>& requests,
                                         size_t vtcm_budget, size_t alignment) {
