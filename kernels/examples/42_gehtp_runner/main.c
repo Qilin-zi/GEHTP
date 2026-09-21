@@ -156,6 +156,22 @@ int main(void) {
     if (!w) { ex_log("[FAIL] wt_blob alloc"); free(blob); free(in); return ex_summary() || 1; }
     ex_log("M6 before wt_parse");
     {
+        /* 独立预检: 自己数 op 流 (与 wt_parse 同布局), 打印首个异常点字节 */
+        uint32_t pn_slots = *(uint32_t*)(blob + 8);
+        uint32_t pn_ops = *(uint32_t*)(blob + 12);
+        size_t pp = 16 + (size_t)pn_slots * 16;
+        for (uint32_t pi = 0; pi < pn_ops && pp + 4 <= blob_len; pi++) {
+            uint16_t opc = (uint16_t)(blob[pp] | (blob[pp + 1] << 8));
+            uint16_t na = (uint16_t)(blob[pp + 2] | (blob[pp + 3] << 8));
+            if (opc > 42 || na > 16) {
+                ex_log("[pre] op%u @%zu opc=%u na=%u bytes=%02X%02X%02X%02X%02X%02X%02X%02X",
+                       (unsigned)pi, pp, (unsigned)opc, (unsigned)na,
+                       blob[pp], blob[pp+1], blob[pp+2], blob[pp+3],
+                       blob[pp+4], blob[pp+5], blob[pp+6], blob[pp+7]);
+                break;
+            }
+            pp += 4 + (size_t)na * 4;
+        }
         int prc = wt_parse(blob, blob_len, w);
         if (prc != WT_OK) {
             ex_log("[FAIL] wt_parse rc=%d %s (blob0=%02X%02X%02X%02X)", prc,
