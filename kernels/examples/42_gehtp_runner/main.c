@@ -150,9 +150,14 @@ int main(void) {
     struct wt_blob* w = calloc(1, sizeof(*w));
     if (!w) { ex_log("[FAIL] wt_blob alloc"); free(blob); free(in); return ex_summary() || 1; }
     ex_log("M6 before wt_parse");
-    if (wt_parse(blob, blob_len, w) != WT_OK) {
-        ex_log("[FAIL] wt_parse"); free(blob); free(in); free(w);
-        return ex_summary() || 1;
+    {
+        int prc = wt_parse(blob, blob_len, w);
+        if (prc != WT_OK) {
+            ex_log("[FAIL] wt_parse rc=%d %s (blob0=%02X%02X%02X%02X)", prc,
+                   wt_err_str(prc), blob[0], blob[1], blob[2], blob[3]);
+            free(blob); free(in); free(w);
+            return ex_summary() || 1;
+        }
     }
     ex_log("M7 wt_parse ok");
 
