@@ -23,7 +23,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+/* JOB_PATH 可用 -DJOB_PATH=... 覆盖 (共享板身份制: 变体通道独立 job 文件,
+ * 避免与标准通道 job.txt last-writer-wins 撞车) */
+#ifndef JOB_PATH
 #define JOB_PATH "/data/local/tmp/hvxhmx23/gehtp/job.txt"
+#endif
 
 static uint8_t* read_file(const char* p, size_t* out_len) {
     /* POSIX read: qurt stdio fread 对 >某量文件死循环, open/read 无此问题 */
@@ -121,10 +125,21 @@ int main(void) {
     int have_wgt_size = (job_get((char*)job, "weights_size", wgt_size_s, sizeof(wgt_size_s)) == 0);
     free(job);
     uint32_t out_temp = (uint32_t)strtoul(temp_s, NULL, 10);
-    ex_log("M4 wgt_size=%s", have_wgt_size ? wgt_size_s : "(none)");
+    static char blob_size_s[32];
+    memset(blob_size_s, 0, sizeof(blob_size_s));
+    int have_blob_size = (job_get((char*)job, "blob_size", blob_size_s, sizeof(blob_size_s)) == 0);
+    ex_log("M4 wgt_size=%s blob_size=%s", have_wgt_size ? wgt_size_s : "(none)",
+           have_blob_size ? blob_size_s : "(none)");
 
     size_t blob_len = 0, in_len = 0;
-    uint8_t* blob = read_file(blob_p, &blob_len);
+    uint8_t* blob = NULL;
+    if (have_blob_size) {
+        /* qurt off_t=32 位: fseek/ftell 对 >2GB 溢出 — blob 大小由 job 给 */
+        blob_len = (size_t)strtoull(blob_size_s, NULL, 10);
+        blob = read_file_size(blob_p, blob_len);
+    } else {
+        blob = read_file(blob_p, &blob_len);
+    }
     uint8_t* in = read_file(in_p, &in_len);
     if (!blob || !in) { ex_log("[FAIL] read blob/input"); free(blob); free(in); return ex_summary() || 1; }
     ex_log("M5 blob %zu in %zu", blob_len, in_len);
