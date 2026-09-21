@@ -285,6 +285,11 @@ add_executable(test_spill_fill_serialize tests/test_spill_fill_serialize.cpp)
 target_link_libraries(test_spill_fill_serialize htp_core)
 add_test(NAME test_spill_fill_serialize COMMAND test_spill_fill_serialize)
 
+# P4: SFCD spill/fill 写侧 ↔ g4_dump_sfcd 读侧 round-trip 自洽门
+add_executable(test_g4_sfcd_roundtrip tests/test_g4_sfcd_roundtrip.cpp)
+target_link_libraries(test_g4_sfcd_roundtrip htp_core)
+add_test(NAME test_g4_sfcd_roundtrip COMMAND test_g4_sfcd_roundtrip)
+
 # 阶段8: wtop_emit 转换验收(.bin → WTOP blob 契约 + 负例)
 add_executable(test_wtop_emit tests/test_wtop_emit.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
