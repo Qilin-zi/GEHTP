@@ -68,6 +68,7 @@ static uint8_t* read_file_size(const char* p, size_t sz) {
         if (want > (16u << 20)) want = 16u << 20;  /* qurt read 单次超大有上限, 限 16MB */
         ssize_t n = read(fd, buf + got, want);
         if (n <= 0) break;
+        if ((size_t)n != want) ex_log("[rfs] SHORT read %zd/%zu @%zu", (ssize_t)n, want, got);
         got += (size_t)n;
         if ((got & ((256u << 20) - 1)) < (16u << 20)) ex_log("[rfs] read %zu/%zu", got, sz);
     }
