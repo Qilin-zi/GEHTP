@@ -67,11 +67,18 @@
   act/out 不再走 DMA 包装 (CPU 写 out_ddr → FLUSH; 旧 DMA-out 的 INVALIDATE
   会丢 CPU 写)。**M pad 256 由 ② 收编, ③ 只剩 lm_head N 分块。**
 
-### ③ N 分块 (lm_head)
-- lm_head N=248320: 权重槽 127MB > 8MB VTCM → N 分块 (每块 N≤4096),
-  每块: 权重块 UDMA 入 VTCM → invoke → 输出块出; 复用 htp-hardware-scheduling 的
-  DMA 双缓冲套路。其余 GEMM 最大组合 (qkv: act 512KB + wt 3MB + out 3MB +
-  bias 96KB ≈ 6.6MB) 已可单次装入。
+### ③ N 分块 (lm_head) — 已完成 (2026-09-21)
+- W4_N_CHUNK=4096: 每块 wt 2MB + out 2MB + bias 64KB + act 512KB ≈ 4.6MB
+  (< 8MB VTCM 池; qkv 全量 6.6MB 单次可装); lm_head N=248320 → 61 块。
+- **wt 槽 kb-major 布局 (闭包 pack) 列块不连续** → 每块按 kb 段 gather
+  (槽内段步长 N·16B, 段长 nc·16B) + FLUSH; bias 连续 → dma 加列偏移。
+- 每块按精确 nc invoke (kernel 只算 nc 列, 槽尾陈旧数据不被读); otbl 每块
+  运行时生成 ((mt·nct+i)·0x800, 表内容只依赖 nc); dequant 加 out_row_bytes
+  行跨度参数 (分块列写在 row·N_full + c0)。
+- 坑: host dc_w4_run 行指针化后 store 残留 mm·N 双重索引 = 越界写
+  (全模型 99.99% 元素变值, 非分块 GEMM 也中招 — 修后 byte-exact)。
+- 门: host 全模型 (qkv 6144→4096+2048 + lm_head 61 块) vs ② 参考
+  7946240 元素 byte-exact; 设备 lib 编译+签过。剩余: ④ 上板对拍。
 
 ### ④ 单 GEMM 对拍门
 - 先用闭包资产 (s256) 验证新打包器产出的面 == 闭包资产 (byte-exact)。
