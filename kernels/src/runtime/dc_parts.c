@@ -216,7 +216,8 @@ void dc_w4_read_out(const struct dc_w4* e, void* recv) {
  * 铁律: a16 域 q=0 是 real=-1.0 — pad 零行填 32768 (零值点)。
  * 出面 = A_s·S[n]·(q-32768)/32767 (S=权重列 scale 槽, 已含 /7)。 */
 int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
-              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr) {
+              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
+              uint32_t out_row_bytes) {
     if (!e || !act_ddr || !out_ddr || !scale_ddr) return 0xD400;
     if (m % 32 || k % 32 || n % 32) return 0xD401;
     uint32_t m_pad = (m + 255u) & ~255u;
@@ -254,6 +255,7 @@ int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
     qurt_mem_cache_clean((qurt_addr_t)e->out, m_pad * n * 2,
                          QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
     w4a16_dequant_crouton((const uint16_t*)e->out, m_pad, n, m, as,
-                          (const uint16_t*)scale_ddr, (uint16_t*)out_ddr);
+                          (const uint16_t*)scale_ddr, (uint16_t*)out_ddr,
+                          out_row_bytes);
     return 0;
 }

@@ -27,15 +27,18 @@ void w4a16_pack_crouton(const uint16_t* lin, uint32_t m, uint32_t k, uint16_t* s
 /* crouton16_row4 面 → u16 线性 [m,k] (pack 的精确逆) */
 void w4a16_unpack_crouton(const uint16_t* surf, uint32_t m, uint32_t k, uint16_t* lin);
 
-/* u16 线性输出 [m,n] → f16: A_s·S[n]·(q-32768)/32767 (S 为 f16 槽, 已含 /7) */
+/* u16 线性输出 [m,n] → f16: A_s·S[n]·(q-32768)/32767 (S 为 f16 槽, 已含 /7;
+ * out_row_bytes = 目标行跨度字节, 分块写全宽 N_full 时传 N_full*2) */
 void w4a16_dequant_out(const uint16_t* lin_q, uint32_t m, uint32_t n,
-                       float act_scale, const uint16_t* scale_f16, uint16_t* out_f16);
+                       float act_scale, const uint16_t* scale_f16, uint16_t* out_f16,
+                       uint32_t out_row_bytes);
 
 /* crouton 面 (m_pad×n) → 前 m_out 行 f16 (crouton 序直读, 无中间缓冲;
- * 行≥m_out 的 pad 行丢弃) */
+ * 行≥m_out 的 pad 行丢弃; out_row_bytes 同上) */
 void w4a16_dequant_crouton(const uint16_t* surf, uint32_t m_pad, uint32_t n,
                            uint32_t m_out, float act_scale,
-                           const uint16_t* scale_f16, uint16_t* out_f16);
+                           const uint16_t* scale_f16, uint16_t* out_f16,
+                           uint32_t out_row_bytes);
 
 #ifdef __cplusplus
 }

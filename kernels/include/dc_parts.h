@@ -82,8 +82,10 @@ int dc_w4_invoke(struct dc_w4* e);
 /* out 面 CPU 读回 (HMX 写绕过 dcache → 先 INVALIDATE) */
 void dc_w4_read_out(const struct dc_w4* e, void* recv);
 /* 全链: f16 DDR act → 量化(a16 域)+M→256 pad+crouton → kernel →
- * 出面反量化(A_s·S[n]) f16 DDR。carve 须按 pad 后 M (e->m == pad256(m))。 */
+ * 出面反量化(A_s·S[n]) f16 DDR。carve 须按 pad 后 M (e->m == pad256(m))。
+ * out_row_bytes = 输出行跨度字节 (分块写全宽 N_full 时传 N_full*2)。 */
 int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
-              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr);
+              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
+              uint32_t out_row_bytes);
 
 #endif

@@ -105,20 +105,23 @@ void w4a16_unpack_crouton(const uint16_t* surf, uint32_t m, uint32_t k, uint16_t
 }
 
 void w4a16_dequant_out(const uint16_t* lin_q, uint32_t m, uint32_t n,
-                       float act_scale, const uint16_t* scale_f16, uint16_t* out_f16) {
+                       float act_scale, const uint16_t* scale_f16, uint16_t* out_f16,
+                       uint32_t out_row_bytes) {
     const float inv = 1.0f / 32767.0f;
     for (uint32_t row = 0; row < m; row++)
         for (uint32_t col = 0; col < n; col++) {
             int32_t aq = (int32_t)lin_q[(size_t)row * n + col] - 32768;
             float S = f16_to_f32(scale_f16[col]);
             float v = act_scale * S * (float)aq * inv;
-            out_f16[(size_t)row * n + col] = f32_to_f16_rne(v);
+            *(uint16_t*)((uint8_t*)out_f16 + (size_t)row * out_row_bytes + col * 2u) =
+                f32_to_f16_rne(v);
         }
 }
 
 void w4a16_dequant_crouton(const uint16_t* surf, uint32_t m_pad, uint32_t n,
                            uint32_t m_out, float act_scale,
-                           const uint16_t* scale_f16, uint16_t* out_f16) {
+                           const uint16_t* scale_f16, uint16_t* out_f16,
+                           uint32_t out_row_bytes) {
     const float inv = 1.0f / 32767.0f;
     uint32_t n_nt = n / 32, n_m32 = m_pad / 32;
     uint32_t out = 0;
@@ -134,12 +137,14 @@ void w4a16_dequant_crouton(const uint16_t* surf, uint32_t m_pad, uint32_t n,
                         if (row0 < m_out) {
                             float S = f16_to_f32(scale_f16[n_base + c]);
                             float v = act_scale * S * (float)((int32_t)q0 - 32768) * inv;
-                            out_f16[(size_t)row0 * n + n_base + c] = f32_to_f16_rne(v);
+                            *(uint16_t*)((uint8_t*)out_f16 + (size_t)row0 * out_row_bytes +
+                                         (n_base + c) * 2u) = f32_to_f16_rne(v);
                         }
                         if (row1 < m_out) {
                             float S = f16_to_f32(scale_f16[n_base + c]);
                             float v = act_scale * S * (float)((int32_t)q1 - 32768) * inv;
-                            out_f16[(size_t)row1 * n + n_base + c] = f32_to_f16_rne(v);
+                            *(uint16_t*)((uint8_t*)out_f16 + (size_t)row1 * out_row_bytes +
+                                         (n_base + c) * 2u) = f32_to_f16_rne(v);
                         }
                     }
                 }

@@ -26,6 +26,9 @@
 #include "hvxhmx_v2_f16face.h"
 
 #define MAX_TEMPS 4096
+/* lm_head N 分块宽: 每块 wt 2MB + out 2MB + bias 64KB + act 512KB ≈ 4.6MB
+ * (< VTCM 8MB 池; qkv 全量 6.6MB 不触发分块) */
+#define W4_N_CHUNK 4096u
 
 struct wt_exec {
     struct wtcache_ctx* wc;
@@ -33,6 +36,8 @@ struct wt_exec {
     struct dc_w4 e;
     int engine_ready;   /* wtcache 已开(懒初始化/exec_matmul 共用) */
     int matmul_carved;  /* exec_matmul 的 arena/carve 已完成(0=未 carve) */
+    /* lm_head N 分块: 每块 otbl 运行时生成 (内容只依赖 nc) */
+    uint32_t otbl_chunk[8u * (W4_N_CHUNK / 32u)];
     uint32_t pinned_count;
     struct wt_exec_stats st;
     uint8_t* temps[MAX_TEMPS];
@@ -403,11 +408,13 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         return -1;
     }
     uint32_t m_pad = (M + 255u) & ~255u;
-    if (!g_exec.matmul_carved || g_exec.e.m != m_pad || g_exec.e.k != K || g_exec.e.n != N) {
+    uint32_t n_eff = N > W4_N_CHUNK ? W4_N_CHUNK : N;  /* carve 按分块宽 */
+    if (!g_exec.matmul_carved || g_exec.e.m != m_pad || g_exec.e.k != K || g_exec.e.n != n_eff) {
         /* 形状变化重 carve (transformer 多 GEMM 形状: 2048/6144/248320;
          * 旧 t10 统一形状 carve-once 契约不成立 — 用旧形状 invoke
          * 输出尾部读未初始化 VTCM = 垃圾 = +inf 实锤)。
-         * carve 按 M pad 后 (HMX kernel M=256 硬约束, m_total_minus_step=8) */
+         * carve 按 M pad 后 (HMX kernel M=256 硬约束, m_total_minus_step=8)
+         * 与 N 分块宽 (lm_head 权重槽 127MB > VTCM 8MB) */
         int rc = 0;
         if (!g_exec.engine_ready) {
             rc = wtcache_open(&g_exec.wc, 4096);
@@ -417,8 +424,8 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
         uint32_t off = (pc + 2047u) & ~2047u;
         dc_arena_init(&g_exec.arena, (uint8_t*)vb + off, vs - off);
-        if (dc_w4_carve(&g_exec.e, &g_exec.arena, m_pad, K, N, atbl, otbl)) {
-            snprintf(err, errn, "carve m%u k%u n%u", (unsigned)m_pad, (unsigned)K, (unsigned)N);
+        if (dc_w4_carve(&g_exec.e, &g_exec.arena, m_pad, K, n_eff, atbl, otbl)) {
+            snprintf(err, errn, "carve m%u k%u n%u", (unsigned)m_pad, (unsigned)K, (unsigned)n_eff);
             return -1;
         }
         /* wtcache_open 末尾 memset(VTCM,0) 留 dirty 零行, 驱逐会覆盖 HMX 直写的 e.out
@@ -431,17 +438,44 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     g_exec.e.scale_ddr = scale;
     uint8_t* out_ddr = temp_get(out_t, out_b);
     if (!out_ddr) { snprintf(err, errn, "temp %u alloc", (unsigned)out_t); return -1; }
+    const uint8_t* wt_base = b->weight_base + b->slots[w_s].offset;
 
-    /* T1: 权重/偏置搬入改 UDMA (原同步标量 memcpy → DMA 引擎)。
-     * 只读 blob 区每次 clean 保守正确; A/B 若 flush 成大头再加会话级一次标志。 */
-    int rc_wt = dma_to_vtcm(g_exec.e.wt, b->weight_base + b->slots[w_s].offset, wt_b, &mu);
-    int rc_bs = dma_to_vtcm(g_exec.e.bias, bias, bias_b, &mu);
-    if (rc_wt || rc_bs) { snprintf(err, errn, "wt/bias dma"); return -1; }
-
-    /* act/out 由 dc_w4_run 内部处理 (设备: 量化+pack 入 VTCM, 出面反量化直写
-     * DDR; host: 纯数学直读 DDR) — 不再走 act/out DMA 包装 */
-    int bad = dc_w4_run(&g_exec.e, act_src, out_ddr, M, K, N, scale);
-    if (bad) { snprintf(err, errn, "dc_w4_run"); return -1; }
+    /* 分块循环 (lm_head N=248320 → 61 块; 每块按精确 nc invoke, kernel 只算
+     * nc 列, 槽尾陈旧数据不会被读)。非分块 op 单次即退。 */
+    for (uint32_t c0 = 0; c0 < N; c0 += W4_N_CHUNK) {
+        uint32_t nc = (N - c0 < W4_N_CHUNK) ? N - c0 : W4_N_CHUNK;
+        if (N > W4_N_CHUNK) {
+            /* wt 槽 kb-major 布局 (闭包 pack): 列块 c0 的字节按 kb 分散
+             * (段步长 N*16B, 段长 nc*16B) — CPU gather 进 e.wt */
+            for (uint32_t kb = 0; kb < K / 32; kb++)
+                memcpy(g_exec.e.wt + (size_t)kb * (nc * 16u),
+                       wt_base + (size_t)kb * (N * 16u) + (size_t)(c0 / 32u) * 512u,
+                       nc * 16u);
+            qurt_mem_cache_clean((qurt_addr_t)g_exec.e.wt, nc * K / 2u,
+                                 QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+        } else {
+            int rc_wt = dma_to_vtcm(g_exec.e.wt, wt_base, wt_b, &mu);
+            if (rc_wt) { snprintf(err, errn, "wt dma"); return -1; }
+        }
+        int rc_bs = dma_to_vtcm(g_exec.e.bias, bias + (size_t)(c0 / 32u) * 512u,
+                                (nc / 32u) * 512u, &mu);
+        if (rc_bs) { snprintf(err, errn, "bias dma"); return -1; }
+        if (N > W4_N_CHUNK) {
+            /* 分块 otbl: (mt·nct+i)·0x800 运行时生成 (表内容只依赖 nc) */
+            uint32_t nct = nc / 32u;
+            for (uint32_t mt = 0; mt < 8u; mt++)
+                for (uint32_t i = 0; i < nct; i++)
+                    g_exec.otbl_chunk[(size_t)mt * nct + i] =
+                        (uint32_t)(((size_t)mt * nct + i) * 0x800u);
+            g_exec.e.otbl_ddr = (const uint8_t*)g_exec.otbl_chunk;
+        }
+        /* act/out 由 dc_w4_run 内部处理 (设备: 量化+pack 入 VTCM, 出面反量化
+         * 直写 DDR; host: 纯数学直读 DDR); 行跨度 = 全宽 N (分块列写在
+         * row·N + c0 处) */
+        int bad = dc_w4_run(&g_exec.e, act_src, out_ddr + (size_t)c0 * 2u,
+                            M, K, nc, scale + (size_t)c0 * 2u, N * 2u);
+        if (bad) { snprintf(err, errn, "dc_w4_run c0=%u", (unsigned)c0); return -1; }
+    }
     /* CPU 写 out_ddr → FLUSH (旧 DMA-out 时代是 INVALIDATE; 现在写者是 CPU) */
     qurt_mem_cache_clean((qurt_addr_t)out_ddr, out_b,
                          QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);

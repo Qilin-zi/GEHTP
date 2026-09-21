@@ -187,7 +187,8 @@ int  dc_w4_invoke(struct dc_w4* e) {
  * 设备 a16 量化 + >>8 截断噪声由 ④ 容差门承担)。与设备 dc_w4_run 同签名:
  *   out_f16 = Σ_k act[m,k]·wq[k,n]·S[n]  (S=列 scale, 已含 /7) */
 int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
-              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr) {
+              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
+              uint32_t out_row_bytes) {
     if (!e || !act_ddr || !out_ddr || !scale_ddr) return -1;
     if (m % 32 || k % 32 || n % 32) return -2;
     uint32_t M = m, K = k, N = n;
@@ -223,8 +224,8 @@ int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
         S[nn] = sv;  /* scale 槽已含 /7 */
     }
     const uint16_t* act = (const uint16_t*)act_ddr;
-    uint16_t* out = (uint16_t*)out_ddr;
     for (uint32_t mm = 0; mm < M; mm++) {
+        uint16_t* out = (uint16_t*)((uint8_t*)out_ddr + (size_t)mm * out_row_bytes);
         for (uint32_t nn = 0; nn < N; nn++) {
             double acc = 0.0;
             for (uint32_t kk = 0; kk < K; kk++) {
@@ -249,25 +250,25 @@ int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
                 uint32_t sgn = (u >> 16) & 0x8000u;
                 int32_t ex = (int32_t)((u >> 23) & 0xFF) - 127 + 15;
                 uint32_t mn = u & 0x7FFFFFu;
-                if (((u >> 23) & 0xFF) == 0xFF) { out[(size_t)mm * N + nn] = (uint16_t)(sgn | 0x7C00u | (mn ? 0x200u : 0u)); continue; }
-                if (((u >> 23) & 0xFF) == 0) { out[(size_t)mm * N + nn] = (uint16_t)sgn; continue; }
-                if (ex >= 31) { out[(size_t)mm * N + nn] = (uint16_t)(sgn | 0x7C00u); continue; }
+                if (((u >> 23) & 0xFF) == 0xFF) { out[nn] = (uint16_t)(sgn | 0x7C00u | (mn ? 0x200u : 0u)); continue; }
+                if (((u >> 23) & 0xFF) == 0) { out[nn] = (uint16_t)sgn; continue; }
+                if (ex >= 31) { out[nn] = (uint16_t)(sgn | 0x7C00u); continue; }
                 uint32_t half;
                 if (ex <= 0) {
-                    if (ex < -10) { out[(size_t)mm * N + nn] = (uint16_t)sgn; continue; }
+                    if (ex < -10) { out[nn] = (uint16_t)sgn; continue; }
                     mn |= 0x800000u;
                     int32_t sh = 14 - ex;
                     half = mn >> sh;
                     uint32_t rm = mn & ((1u << sh) - 1);
                     half += (rm > (1u << (sh - 1))) || (rm == (1u << (sh - 1)) && (half & 1));
-                    out[(size_t)mm * N + nn] = (uint16_t)(sgn | half);
+                    out[nn] = (uint16_t)(sgn | half);
                 } else {
                     half = (mn >> 13) & 0x3FFu;
                     uint32_t rm = mn & 0x1FFFu;
                     half += (rm > 0x1000u) || (rm == 0x1000u && (half & 1));
                     if (half == 0x400u) { ex++; half = 0; }
-                    if (ex >= 31) { out[(size_t)mm * N + nn] = (uint16_t)(sgn | 0x7C00u); continue; }
-                    out[(size_t)mm * N + nn] = (uint16_t)(sgn | ((uint32_t)ex << 10) | half);
+                    if (ex >= 31) { out[nn] = (uint16_t)(sgn | 0x7C00u); continue; }
+                    out[nn] = (uint16_t)(sgn | ((uint32_t)ex << 10) | half);
                 }
             }
         }
