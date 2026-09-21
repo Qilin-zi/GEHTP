@@ -780,7 +780,14 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
         case 5:  r = fabsf(v); break;
         case 6:  r = sinf(v); break;
         case 7:  r = cosf(v); break;
-        case 8:  r = 1.0f / (1.0f + expf(-v)); break;
+        case 8:  /* SIGMOID: hexagon libm expf 在 |x|≳88 溢出区返回垃圾常数
+                  * (设备实测 gate∈[-155,-90] → σ 恒为 0.370117; 软判据证明
+                  * [-87,-40] 正常)。f16 输出在 |x|≥80 已饱和 (σ(80)=1-2.2e-35
+                  * → 1.0; σ(-80)=2.2e-35 → 0), 钳制与正确 libm 位级等价。 */
+            if (v >= 80.0f) r = 1.0f;
+            else if (v <= -80.0f) r = 0.0f;
+            else r = 1.0f / (1.0f + expf(-v));
+            break;
         case 9:  r = tanhf(v); break;
         case 10: r = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); break;
         case 11: r = fmaxf(0.0f, v); break;
