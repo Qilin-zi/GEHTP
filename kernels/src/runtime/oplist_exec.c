@@ -558,40 +558,63 @@ static int exec_add(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
-/* GEHTP 阶段9: spill/fill (DDR temp ↔ 池, 标量拷贝; DMA 快路径 M3)。
- * spill: [src_t, pool_s, off, n_elem]  fill: [pool_s, off, dst_t, n_elem] */
+/* GEHTP 阶段9: spill/fill (DDR temp ↔ 池)。
+ * spill: [src_ref, pool_s, off, n_elem]  fill: [pool_s, off, dst_ref, n_elem]
+ * 快路径: 两端均 DDR 走 dc_dma_once(硬件 DMA); 任一端 VTCM 驻留回退标量 memcpy
+ *         —— VTCM↔DDR 描述符 + fence 收编为后续项(GEHTP_MEMPLAN_GAP_CLOSURE P1)。 */
+static int ptr_in_vtcm(const uint8_t* p) {
+    return g_exec.vtcm_pool && p >= g_exec.vtcm_pool &&
+           p < g_exec.vtcm_pool + g_exec.vtcm_pool_size;
+}
+static int dma_copy_ddr(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
+    if (bytes == 0) return 0;
+    static dc_mutex_t mu;
+    static int mu_ready;
+    if (!mu_ready) { dc_mutex_init(&mu); mu_ready = 1; }
+    dc_clean_ddr(src, bytes);          /* 铁律①: 写者写 DDR → DMA bypass 读, 先写回 */
+    struct dc_dma d;
+    if (dc_dma_init(&d, (uint8_t*)src, dst, bytes, &mu) != 0) return -1;
+    int rc = dc_dma_once(&d);
+    dc_dma_destroy(&d);
+    qurt_mem_cache_clean((qurt_addr_t)dst, bytes,   /* 铁律③: DMA 写 → CPU 读, 先 INVALIDATE */
+                         QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+    return rc ? -1 : 0;
+}
 static int exec_spill(const struct wt_blob* b, const struct wt_op* op,
                       char* err, size_t errn) {
-    uint32_t n = op->args[3];
+    uint32_t n = op->args[3], bytes = n * 2u;
     /* src 位置支持 0x8000|slot 编码(输入张量经 slot 引用) */
     const uint8_t* src = ref_ptr(b, op->args[0]);
     if (!src) { snprintf(err, errn, "spill src empty"); return -1; }
     const uint8_t* pool = slot_ptr(b, op->args[1]);
-    if (!pool || b->slots[op->args[1]].len < op->args[2] + n * 2u) {
+    if (!pool || b->slots[op->args[1]].len < op->args[2] + bytes) {
         snprintf(err, errn, "spill pool oob"); return -1;
     }
-    memcpy((uint8_t*)pool + op->args[2], src, n * 2u);
+    uint8_t* dst = (uint8_t*)pool + op->args[2];
+    if (!ptr_in_vtcm(src) && (bytes & 7u) == 0) return dma_copy_ddr(dst, src, bytes);   /* DDR→DDR 快路径(8B 粒度门) */
+    memcpy(dst, src, bytes);   /* src VTCM 驻留: 回退标量(VTCM→DDR 后续) */
     return 0;
 }
 static int exec_fill(const struct wt_blob* b, const struct wt_op* op,
                      char* err, size_t errn) {
-    uint32_t n = op->args[3];
+    uint32_t n = op->args[3], bytes = n * 2u;
     const uint8_t* pool = slot_ptr(b, op->args[0]);
-    if (!pool || b->slots[op->args[0]].len < op->args[1] + n * 2u) {
+    if (!pool || b->slots[op->args[0]].len < op->args[1] + bytes) {
         snprintf(err, errn, "fill pool oob"); return -1;
     }
+    const uint8_t* src = pool + op->args[1];
     /* dst 位置支持 0x8000|slot 编码 */
     uint8_t* dst = NULL;
     if (op->args[2] & 0x8000u) {
         dst = (uint8_t*)slot_ptr(b, op->args[2] & 0x7FFFu);
     } else {
-        dst = temp_get(op->args[2], n * 2u);
+        dst = temp_get(op->args[2], bytes);
     }
     if (!dst) { snprintf(err, errn, "fill dst empty"); return -1; }
-    memcpy(dst, pool + op->args[1], n * 2u);
+    if (!ptr_in_vtcm(dst) && (bytes & 7u) == 0) return dma_copy_ddr(dst, src, bytes);   /* DDR→DDR 快路径(8B 粒度门) */
+    memcpy(dst, src, bytes);   /* dst VTCM 驻留: 回退标量(DDR→VTCM 后续) */
     return 0;
 }
-
 /* GEHTP 阶段9: f16 4-D 转置 (perm 每轴 1 字节, N=1 契约)。
  * args: [src_ref, out_t, H, W, C, perm_u32] */
 static int exec_transpose(const struct wt_blob* b, const struct wt_op* op,

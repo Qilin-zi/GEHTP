@@ -26,7 +26,7 @@
 
 #define D "/data/local/tmp/hvxhmx23/g37"
 #define N_ELEM (32u * 32u * 32u)
-#define OUT_TEMP 4u   /* manifest: output_temp (末段 Transpose 输出) */
+#define OUT_TEMP 0u   /* manifest: output_temp (末段 Transpose 输出) */
 
 static uint8_t* read_file(const char* p, size_t* out_len) {
     FILE* f = fopen(p, "rb");
