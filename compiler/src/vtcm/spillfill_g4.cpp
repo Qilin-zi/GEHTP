@@ -385,4 +385,237 @@ G4CheckpointOp g4_make_dma_checkpoint_op(uint64_t graph, uint64_t opid,
     return op;
 }
 
+// ============================================================================
+// §E SFCD 写侧真体（construct_sfcd 本体 @0x101eee0 的记录级模型）
+// ============================================================================
+
+G4SfcdWriter::G4SfcdWriter() {
+    words.resize(3, 0);                           // 3 词头占位（记录自 +0xc [0x1013b33]）
+}
+
+// ---- §2.1 tcm 块记录两词头 ----
+size_t G4SfcdWriter::begin_block_record(uint32_t blob_off) {
+    if (open_rec_ != SIZE_MAX)
+        throw std::invalid_argument("g4 sfcd: block record already open");
+    open_rec_ = words.size();
+    open_blocks_ = 0;
+    words.push_back(0);                           // w0 占位（end 回填 (pool<<16)|nblocks）
+    words.push_back(blob_off);                    // w1 = blob 偏移 [§2.1]
+    return open_rec_;
+}
+
+void G4SfcdWriter::push_block_entry(uint32_t tcm_offset, uint32_t type_nibble,
+                                    uint32_t len) {
+    if (open_rec_ == SIZE_MAX)
+        throw std::invalid_argument("g4 sfcd: no open block record");
+    if ((tcm_offset & 0xfu) != 0)                 // 读侧 tcm_off = w & ~0xF [0x1013bfe]
+        throw std::invalid_argument("g4 sfcd: tcm_offset not 16B aligned");
+    if (type_nibble > 0xfu)                       // 读侧 type = w & 0xF [0x1013c0b]
+        throw std::invalid_argument("g4 sfcd: type nibble > 0xF");
+    if (open_blocks_ == 0xffffu)                  // nblocks 须 ≤ 0xFFFF [0x1013ba1]
+        throw std::invalid_argument("g4 sfcd: too many block entries");
+    words.push_back(tcm_offset | type_nibble);    // 子项词 0 {w}
+    words.push_back(len);                         // 子项词 1 {len}
+    ++open_blocks_;
+}
+
+void G4SfcdWriter::end_block_record(size_t rec, uint32_t pool) {
+    if (rec != open_rec_)
+        throw std::invalid_argument("g4 sfcd: end_block_record mismatch");
+    if (pool > 0x7fffu)                           // w0 须 < 0x80000000 [0x1013b8a js]
+        throw std::invalid_argument("g4 sfcd: pool id > 0x7FFF");
+    words[rec] = (pool << 16) | open_blocks_;     // §2.1 占位回填
+    open_rec_ = SIZE_MAX;
+    open_blocks_ = 0;
+    ++records;
+}
+
+// 终结器 @0x1012460：push {0, blob_off}
+void G4SfcdWriter::push_terminator(uint32_t blob_off) {
+    if (open_rec_ != SIZE_MAX)
+        throw std::invalid_argument("g4 sfcd: block record already open");
+    words.push_back(0);                           // w0=0 → pool=0/nblocks=0 合法空记录
+    words.push_back(blob_off);                    //      [0x1013bcc je]
+    ++records;
+}
+
+// ---- §2.2 wait 记录窄/宽式 [0x10210f0] ----
+void G4SfcdWriter::write_waits(const G4SfcdWaitEntry* pairs, size_t n) {
+    if (n == 0) return;
+    bool narrow = true;
+    for (size_t i = 0; i < n; ++i) {
+        if (pairs[i].val > 0xffu || pairs[i].mb_idx > 0xffffffu) {
+            narrow = false;                       // 任一超限 → 宽式对形态
+            break;
+        }
+    }
+    const size_t chunk = narrow ? 0xffffu : 0x7fffu;   // low16 容量（宽式 n<<1）
+    for (size_t base = 0; base < n; base += chunk) {
+        const size_t cnt = (n - base < chunk) ? (n - base) : chunk;
+        if (narrow) {
+            words.push_back(0x80000000u | (uint32_t)cnt);      // bit16 清零
+            for (size_t i = 0; i < cnt; ++i)
+                words.push_back((pairs[base + i].val << 24) |
+                                pairs[base + i].mb_idx);       // 字 = (val<<24)|mb
+        } else {
+            words.push_back(0x80000000u | 0x10000u |
+                            ((uint32_t)cnt << 1));             // bit16 置位, low16=n<<1
+            for (size_t i = 0; i < cnt; ++i) {
+                words.push_back(pairs[base + i].mb_idx);       // 对形态 {mb, val}
+                words.push_back(pairs[base + i].val);
+            }
+        }
+        ++records;
+    }
+}
+
+void G4SfcdWriter::write_set_progress(uint32_t mb_idx, uint32_t val) {
+    if (mb_idx > 0xffffffu)                       // 读侧 mb_idx = w0 & 0xFFFFFF
+        throw std::invalid_argument("g4 sfcd: set_progress mb_idx > 0xFFFFFF");
+    words.push_back(0x81000000u | mb_idx);        // top byte 0x81 [0x1013cd6]
+    words.push_back(val);
+    ++records;
+}
+
+void G4SfcdWriter::finish_header(int32_t checkpoint_index) {
+    if (open_rec_ != SIZE_MAX)
+        throw std::invalid_argument("g4 sfcd: finish with open block record");
+    // 尾校验口径: 游标−基址 == [+0]+4 [0x1013e93] → total = 4*size − 4
+    words[0] = (uint32_t)(4 * words.size() - 4);
+    words[1] = (uint32_t)checkpoint_index;
+    words[2] = records & 0xffffffu;               // 记录数低 24 位 [0x1013b12]
+}
+
+// ---- §E 拷贝记录收尾：合并子项 ----
+std::vector<G4SlcCopy> g4_sfcd_finalize_copies(const std::vector<G4SlcCopy>& copies) {
+    std::vector<G4SlcCopy> out;
+    out.reserve(copies.size());
+    for (const auto& c : copies) {
+        if (!out.empty() &&
+            out.back().cache_hints == c.cache_hints &&
+            (uint64_t)out.back().tcm_offset + out.back().copy_len == c.tcm_offset) {
+            out.back().copy_len += c.copy_len;    // tcm 连续 + hints 同 → 合并
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+// ---- §2.3 find_peak_tcm_usage @0x1018c50 ----
+G4PeakTcmUsage g4_find_peak_tcm_usage(const uint32_t* arr, size_t two_n) {
+    G4PeakTcmUsage u;
+    uint64_t running = 0, peak = 0;
+    for (size_t i = 0; i < two_n; ++i) {
+        running += arr[i];
+        if (running > peak) peak = running;
+    }
+    // :78 残差 = running − arr[2n−1]（末次释放后的净剩），不是 running 本身
+    const uint64_t net = (two_n != 0 && running >= arr[two_n - 1])
+                             ? running - arr[two_n - 1] : 0;
+    u.peak_blocks = (uint32_t)(peak >> 11);       // blocks = bytes >> 11（2KB）
+    u.net_blocks  = (uint32_t)(net >> 11);
+    return u;
+}
+
+// ---- §E mgroup 校验（写前可发射性子集）----
+bool g4_fill_mgroup_check(const G4SlcArea& area, std::string& err) {
+    char buf[128];
+    for (size_t i = 0; i < area.records.size(); ++i) {
+        const auto& r = area.records[i];
+        switch (r.rec_type) {
+        case G4_REC_SPILLFILL:
+            if (r.ddr_pool > 0x7fffu) {
+                std::snprintf(buf, sizeof buf, "rec %zu: ddr_pool > 0x7FFF", i);
+                err = buf; return false;
+            }
+            if (r.copies.size() > 0xffffu) {
+                std::snprintf(buf, sizeof buf, "rec %zu: too many copies", i);
+                err = buf; return false;
+            }
+            for (const auto& c : r.copies) {
+                if ((c.tcm_offset & 0xfu) != 0) {
+                    std::snprintf(buf, sizeof buf,
+                                  "rec %zu: tcm_offset 0x%x not 16B aligned",
+                                  i, c.tcm_offset);
+                    err = buf; return false;
+                }
+            }
+            break;
+        case G4_REC_WAITFOR:
+            for (const auto& p : r.pairs) {
+                if (p.mb_idx > 0xffffffu) {
+                    std::snprintf(buf, sizeof buf, "rec %zu: wait mb > 0xFFFFFF", i);
+                    err = buf; return false;
+                }
+            }
+            break;
+        case G4_REC_SETPROGRESS:
+            if (r.mb_idx > 0xffffffu) {
+                std::snprintf(buf, sizeof buf, "rec %zu: set mb > 0xFFFFFF", i);
+                err = buf; return false;
+            }
+            break;
+        default:
+            std::snprintf(buf, sizeof buf, "rec %zu: bad rec_type %u",
+                          i, r.rec_type);
+            err = buf; return false;
+        }
+    }
+    return true;
+}
+
+// ---- construct_sfcd 本体 @0x101eee0 的记录级模型 ----
+std::vector<uint32_t> g4_construct_sfcd(const G4SlcArea& area) {
+    std::string err;
+    if (!g4_fill_mgroup_check(area, err))
+        throw std::invalid_argument("g4_construct_sfcd: " + err);
+    G4SfcdWriter w;
+    for (const auto& r : area.records) {
+        switch (r.rec_type) {
+        case G4_REC_SPILLFILL: {
+            const auto copies = g4_sfcd_finalize_copies(r.copies);
+            const size_t rec = w.begin_block_record(r.sf_offset);
+            for (const auto& c : copies)
+                w.push_block_entry(c.tcm_offset, /*type_nibble=*/0, c.copy_len);
+            w.end_block_record(rec, r.ddr_pool);
+            break;
+        }
+        case G4_REC_WAITFOR:
+            w.write_waits(r.pairs.data(), r.pairs.size());
+            break;
+        case G4_REC_SETPROGRESS:
+            w.write_set_progress(r.mb_idx, r.value_to_set);
+            break;
+        }
+    }
+    w.finish_header(area.dma_checkpoint);
+    return w.words;
+}
+
+// ---- §E DLBC 写侧 setup ----
+uint64_t g4_dlbc_spill_fill_setup(G4FancyAllocator& fa, const uint32_t peaks[3],
+                                  bool is_multi_nsp) {
+    uint32_t slots[3];
+    if (is_multi_nsp)                             // [0x1010c02 cmpb/je !=0]
+        g4_fill_slots_multi(peaks, slots);
+    else
+        g4_fill_slots_single(peaks, slots);
+    if (slots[0] == 0 && slots[1] == 0 && slots[2] == 0)
+        return 0;                                 // 三峰值和 0 → 不分配 [0x1010c64]
+    return g4_set_spillfill_size(fa, slots);
+}
+
+// ---- 薄适配器（不触真分配器头文件）----
+void g4_fancy_fill(G4FancyAllocator& g4, const G4PoolDesc* pools, size_t npools,
+                   uint64_t spillfill_pool, const uint32_t slot_sizes[3],
+                   uint64_t shared_size_290) {
+    g4.pools.assign(pools, pools + npools);
+    g4.spillfill_pool = spillfill_pool;
+    g4.slot_sizes[0] = slot_sizes[0];
+    g4.slot_sizes[1] = slot_sizes[1];
+    g4.slot_sizes[2] = slot_sizes[2];
+    g4.shared_size_290 = shared_size_290;
+}
+
 } // namespace hnnx

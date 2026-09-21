@@ -15,6 +15,7 @@
 // (PoolDesc+0x1e bit0/bit4) [0xf4ce98/0xf4cec2]。
 // ============================================================================
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -234,5 +235,97 @@ struct G4CheckpointOp {
 };
 G4CheckpointOp g4_make_dma_checkpoint_op(uint64_t graph, uint64_t opid,
                                          uint32_t mb_idx, bool is_set);
+
+// ============================================================================
+// §E SFCD 写侧真体（grdep_spillfill.cc 引擎侧；construct_sfcd 本体 @0x101eee0）
+// ============================================================================
+// 写侧语义全部锚定 BACKPORT_PLAN §2 + 读侧 g4_dump_sfcd 的回读契约：
+//   §2.1 tcm 块记录 = 两词头 {w0 占位→回填 (pool<<16)|nblocks, w1=blob 偏移}，
+//        终结器 @0x1012460 = push {0, blob_off}（w0=0 → pool=0/nblocks=0 合法空记录）
+//   §2.2 wait 记录窄/宽式判定 @0x10210f0：窄式 iff 全部 val ≤ 0xff 且 mb ≤ 0xFFFFFF
+//        （单词 (val<<24)|mb，bit16 清零）；宽式 = 对形态（bit16 置位，low16 = n<<1）
+//   §2.3 find_peak_tcm_usage @0x1018c50：blocks = bytes >> 11（2KB 块）；
+//        :78 字段 = 残差 net = running − arr[2n−1]（末次释放后的净剩）
+// 尾校验口径（读侧 [0x1013e93]）：游标−基址 == [+0] + 4
+//   → 写侧 total_bytes = 4*words.size() − 4。
+
+// SFCD 写缓冲：词向量，构造时压 3 词头占位，finish_header 回填
+struct G4SfcdWriter {
+    std::vector<uint32_t> words;   // [0]=total_bytes [1]=checkpoint_index [2]=记录数
+    uint32_t records = 0;          // 已压外层记录数（finish 写进 words[2] 低 24 位）
+
+    G4SfcdWriter();                // 压 3 词头占位 [0x1013b33 记录自 +0xc 起]
+
+    // ---- §2.1 tcm 块记录两词头 ----
+    // begin 压 {占位 w0, blob_off} 并返回记录头下标；随后 push_block_entry 压子项；
+    // end 回填 w0 = (pool<<16)|nblocks。要求 pool ≤ 0x7FFF（w0 须 < 0x80000000
+    // [0x1013b8a js]）、nblocks ≤ 0xFFFF、tcm_offset 16B 对齐、type_nibble ≤ 0xF
+    // （读侧 w&~0xF / w&0xF 拆分 [0x1013bfe/0x1013c0b]）。违反 → invalid_argument。
+    size_t begin_block_record(uint32_t blob_off);
+    void   push_block_entry(uint32_t tcm_offset, uint32_t type_nibble, uint32_t len);
+    void   end_block_record(size_t rec, uint32_t pool);
+
+    // 终结器 @0x1012460：push {0, blob_off} 两词记录（计一条外层记录）
+    void   push_terminator(uint32_t blob_off);
+
+    // ---- §2.2 wait 记录 [0x10210f0] ----
+    // 窄式 iff 全部 val ≤ 0xff 且 mb ≤ 0xFFFFFF；超出低 16 位容量时自动分块
+    // （窄块 ≤ 0xFFFF 条/块，宽块 ≤ 0x7FFF 对/块，每块计一条外层记录）。n==0 空操作。
+    void   write_waits(const G4SfcdWaitEntry* pairs, size_t n);
+    // set_progress 记录：w0 = 0x81000000|(mb & 0xFFFFFF)，w1 = val
+    void   write_set_progress(uint32_t mb_idx, uint32_t val);
+
+    // 收尾：words[0] = 4*size − 4（尾校验口径），words[1] = checkpoint_index，
+    //        words[2] = records & 0xFFFFFF（回填 record_count，§E finish_header）
+    void   finish_header(int32_t checkpoint_index = 0);
+
+  private:
+    size_t   open_rec_ = SIZE_MAX; // 进行中的块记录头下标（无 → SIZE_MAX）
+    uint32_t open_blocks_ = 0;     // 进行中记录的子项计数
+};
+
+// g4_sfcd_finalize_copies（§E 拷贝记录收尾·合并子项）：
+// 相邻子项 tcm 区间连续（next.tcm_offset == cur.tcm_offset + cur.copy_len）
+// 且 cache_hints 相同 → 合并为一条；保序不重排。记录级模型（合并谓词的
+// .so 指令级解码属 G4b 遗留，此处按「连续即并」对齐读侧游标语义）。
+std::vector<G4SlcCopy> g4_sfcd_finalize_copies(const std::vector<G4SlcCopy>& copies);
+
+// g4_find_peak_tcm_usage @0x1018c50（§2.3）：
+//   arr = 2n 词的用量剖面（字节）；running = 全程累计；peak = 最大前缀；
+//   :78 残差 net = running − arr[2n−1]；两个输出均以 blocks = bytes>>11 计。
+struct G4PeakTcmUsage {
+    uint32_t peak_blocks = 0;
+    uint32_t net_blocks = 0;   // :78
+};
+G4PeakTcmUsage g4_find_peak_tcm_usage(const uint32_t* arr, size_t two_n);
+
+// g4_fill_mgroup_check（§E mgroup 校验）：写前校验 slc 区域可发射为 SFCD
+// （rec_type ∈ {0,1,2}；spillfill 的 ddr_pool ≤ 0x7FFF、子项数 ≤ 0xFFFF、
+//  tcm_offset 16B 对齐；wait/set 的 mb ≤ 0xFFFFFF）。err 回填首条违例。
+// 记录级模型：真身校验 mgroup tags（fill_mgroup_after_ops 谓词，G4b 遗留未解），
+// 此处实现其写侧可发射性子集。
+bool g4_fill_mgroup_check(const G4SlcArea& area, std::string& err);
+
+// construct_sfcd 本体 @0x101eee0 的记录级模型：slc 区域 → SFCD 词缓冲。
+// 映射：rec_type 0 → tcm 块记录（pool=ddr_pool，blob_off=sf_offset，子项 =
+//   finalize_copies 后的 copies，type nibble 恒 0——nibble 语义 G4b 遗留无生产者）；
+//   rec_type 1 → wait 记录（§2.2 窄/宽判定）；rec_type 2 → set_progress。
+// 头 checkpoint_index = area.dma_checkpoint。终结器 {0, blob_off} 属 blob
+// epilogue 收尾（@0x1012460），由调用方按需 push_terminator，不在本体内。
+std::vector<uint32_t> g4_construct_sfcd(const G4SlcArea& area);
+
+// g4_dlbc_spill_fill_setup（§E DLBC 写侧 setup）：三域峰值 → 三槽 → 池 2。
+// is_multi_nsp → g4_fill_slots_multi（逐槽 64K 取整）；
+// 否则 → g4_fill_slots_single（argmax 单槽）。三槽全 0 → 不分配返回 0；
+// 否则 g4_set_spillfill_size（池 2，每槽 +64KB），返回池总字节。
+// 只操作 G4FancyAllocator 镜像（+0x88/+0xa0/+0xa8/+0x290），不触真分配器。
+uint64_t g4_dlbc_spill_fill_setup(G4FancyAllocator& fa, const uint32_t peaks[3],
+                                  bool is_multi_nsp);
+
+// 薄适配器：由调用方从真 FancyAllocator/RuntimeAllocator 读出原语后填入镜像。
+// 刻意不 include fancy_allocator.hpp（P3 并行重构中，视为不稳定接口）。
+void g4_fancy_fill(G4FancyAllocator& g4, const G4PoolDesc* pools, size_t npools,
+                   uint64_t spillfill_pool, const uint32_t slot_sizes[3],
+                   uint64_t shared_size_290);
 
 } // namespace hnnx
