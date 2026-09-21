@@ -21,6 +21,7 @@
 #include "oplist_parse.h"
 #include "oplist_exec.h"
 #include <fcntl.h>
+#include <qurt.h>
 #include <unistd.h>
 
 /* JOB_PATH 可用 -DJOB_PATH=... 覆盖 (共享板身份制: 变体通道独立 job 文件,
@@ -68,7 +69,10 @@ static uint8_t* read_file_size(const char* p, size_t sz) {
         if (want > (16u << 20)) want = 16u << 20;  /* qurt read 单次超大有上限, 限 16MB */
         ssize_t n = read(fd, buf + got, want);
         if (n <= 0) break;
-        if ((size_t)n != want) ex_log("[rfs] SHORT read %zd/%zu @%zu", (ssize_t)n, want, got);
+        /* qurt read 大缓冲可能走 DMA 绕 dcache 写 — 立即 INVALIDATE 该块,
+         * 否则 CPU 读到 stale 行 (wt_parse ARITY 概率性失败根因) */
+        qurt_mem_cache_clean((qurt_addr_t)(uintptr_t)(buf + got), (uint32_t)n,
+                             QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
         got += (size_t)n;
         if ((got & ((256u << 20) - 1)) < (16u << 20)) ex_log("[rfs] read %zu/%zu", got, sz);
     }
