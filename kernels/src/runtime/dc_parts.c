@@ -12,6 +12,7 @@
 
 #include "dma_utils.h"
 #include "wtcache.h"
+#include "w4a16_quant.h"
 
 /* w4a16_driver_dc.c */
 int w4a16_invoke(const uint8_t* vtcm_act, const uint8_t* vtcm_weight,
@@ -207,4 +208,52 @@ void dc_w4_read_out(const struct dc_w4* e, void* recv) {
     qurt_mem_cache_clean((qurt_addr_t)e->out, e->m * e->n * 2,
                          QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
     memcpy(recv, e->out, e->m * e->n * 2);
+}
+
+/* dc_w4_run — f16 DDR act → (量化 a16 域 + M→256 零行 pad + crouton 面) →
+ * kernel → 出面反量化 f16 DDR。exec_matmul 走本入口; 例程/dd_worker 的
+ * dc_w4_invoke 旧契约 (act 预置 u16 面) 不变。
+ * 铁律: a16 域 q=0 是 real=-1.0 — pad 零行填 32768 (零值点)。
+ * 出面 = A_s·S[n]·(q-32768)/32767 (S=权重列 scale 槽, 已含 /7)。 */
+int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
+              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr) {
+    if (!e || !act_ddr || !out_ddr || !scale_ddr) return 0xD400;
+    if (m % 32 || k % 32 || n % 32) return 0xD401;
+    uint32_t m_pad = (m + 255u) & ~255u;
+    if (m_pad != e->m) return 0xD402;  /* carve 必须按 pad 后 M */
+    float as = w4a16_act_scale((const uint16_t*)act_ddr, m * k);
+
+    /* 量化+crouton 融合 (零行 pad = 32768) */
+    uint16_t* surf = (uint16_t*)e->act;
+    uint32_t n_kt = k / 32, n_m32 = m_pad / 32;
+    uint32_t out = 0;
+    for (uint32_t phase = 0; phase < 8; phase++)
+        for (uint32_t kt = 0; kt < n_kt; kt++) {
+            uint32_t k_base = kt * 32;
+            for (uint32_t g = 0; g < n_m32; g++)
+                for (uint32_t rp = 0; rp < 2; rp++) {
+                    uint32_t row0 = g * 32 + phase * 4 + rp * 2;
+                    uint32_t row1 = row0 + 1;
+                    for (uint32_t c = 0; c < 32; c++) {
+                        surf[out++] = row0 < m
+                            ? w4a16_quant_f16(((const uint16_t*)act_ddr)[(size_t)row0 * k + k_base + c], as)
+                            : 32768u;
+                        surf[out++] = row1 < m
+                            ? w4a16_quant_f16(((const uint16_t*)act_ddr)[(size_t)row1 * k + k_base + c], as)
+                            : 32768u;
+                    }
+                }
+        }
+    /* CPU 写完 act 面, FLUSH 给 HMX 读 (wt/bias 由 dma_to_vtcm 保证) */
+    qurt_mem_cache_clean((qurt_addr_t)e->act, m_pad * k * 2,
+                         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+
+    if (dc_w4_invoke(e)) return 0xD403;
+
+    /* HMX 直写出面, INVALIDATE 后 CPU 读; crouton 序直读反量化 (行≥m 丢弃) */
+    qurt_mem_cache_clean((qurt_addr_t)e->out, m_pad * n * 2,
+                         QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+    w4a16_dequant_crouton((const uint16_t*)e->out, m_pad, n, m, as,
+                          (const uint16_t*)scale_ddr, (uint16_t*)out_ddr);
+    return 0;
 }

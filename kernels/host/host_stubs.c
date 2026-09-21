@@ -183,6 +183,100 @@ int  dc_w4_invoke(struct dc_w4* e) {
     return 0;
 }
 
+/* dc_w4_run — host 实现: 与设备同语义但纯 f32 数学 (act 不量化, 直读 DDR;
+ * 设备 a16 量化 + >>8 截断噪声由 ④ 容差门承担)。与设备 dc_w4_run 同签名:
+ *   out_f16 = Σ_k act[m,k]·wq[k,n]·S[n]  (S=列 scale, 已含 /7) */
+int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
+              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr) {
+    if (!e || !act_ddr || !out_ddr || !scale_ddr) return -1;
+    if (m % 32 || k % 32 || n % 32) return -2;
+    uint32_t M = m, K = k, N = n;
+    int8_t* wq = (int8_t*)malloc(sizeof(int8_t) * K * N);
+    float* S = (float*)malloc(sizeof(float) * N);
+    if (!wq || !S) { free(wq); free(S); return -1; }
+    size_t o = 0;
+    for (uint32_t kb = 0; kb < K / 32; kb++)
+        for (uint32_t n_base = 0; n_base < N; n_base += 32)
+            for (uint32_t kg = 0; kg < 4; kg++) {
+                uint32_t k_base = kb * 32 + kg * 8;
+                for (uint32_t nn = n_base; nn < n_base + 32; nn++)
+                    for (uint32_t kr = 0; kr < 4; kr++) {
+                        uint8_t b = e->wt[o++];
+                        int lo = (int)(b & 0xF), hi = (int)(b >> 4);
+                        wq[(size_t)(k_base + kr) * N + nn] = (int8_t)(lo >= 8 ? lo - 16 : lo);
+                        wq[(size_t)(k_base + kr + 4) * N + nn] = (int8_t)(hi >= 8 ? hi - 16 : hi);
+                    }
+            }
+    for (uint32_t nn = 0; nn < N; nn++) {
+        uint16_t s16;
+        memcpy(&s16, scale_ddr + (size_t)nn * 2, 2);
+        float sv = 0.0f;
+        { /* f16 → f32 */
+            uint32_t sign = (uint32_t)(s16 & 0x8000u) << 16;
+            uint32_t ex = (s16 >> 10) & 0x1F, mn = s16 & 0x3FF;
+            uint32_t u;
+            if (ex == 0) u = sign;
+            else if (ex == 31) u = sign | 0x7F800000u | (mn << 13);
+            else u = sign | ((ex - 15 + 127) << 23) | (mn << 13);
+            memcpy(&sv, &u, 4);
+        }
+        S[nn] = sv;  /* scale 槽已含 /7 */
+    }
+    const uint16_t* act = (const uint16_t*)act_ddr;
+    uint16_t* out = (uint16_t*)out_ddr;
+    for (uint32_t mm = 0; mm < M; mm++) {
+        for (uint32_t nn = 0; nn < N; nn++) {
+            double acc = 0.0;
+            for (uint32_t kk = 0; kk < K; kk++) {
+                float av;
+                uint16_t ah = act[(size_t)mm * K + kk];
+                { /* f16 → f32 */
+                    uint32_t sign = (uint32_t)(ah & 0x8000u) << 16;
+                    uint32_t ex = (ah >> 10) & 0x1F, mn = ah & 0x3FF;
+                    uint32_t u;
+                    if (ex == 0) u = sign;
+                    else if (ex == 31) u = sign | 0x7F800000u | (mn << 13);
+                    else u = sign | ((ex - 15 + 127) << 23) | (mn << 13);
+                    memcpy(&av, &u, 4);
+                }
+                acc += (double)av * (double)wq[(size_t)kk * N + nn] * (double)S[nn];
+            }
+            float r = (float)acc;
+            uint16_t rh;
+            { /* f32 → f16 RNE */
+                uint32_t u;
+                memcpy(&u, &r, 4);
+                uint32_t sgn = (u >> 16) & 0x8000u;
+                int32_t ex = (int32_t)((u >> 23) & 0xFF) - 127 + 15;
+                uint32_t mn = u & 0x7FFFFFu;
+                if (((u >> 23) & 0xFF) == 0xFF) { out[(size_t)mm * N + nn] = (uint16_t)(sgn | 0x7C00u | (mn ? 0x200u : 0u)); continue; }
+                if (((u >> 23) & 0xFF) == 0) { out[(size_t)mm * N + nn] = (uint16_t)sgn; continue; }
+                if (ex >= 31) { out[(size_t)mm * N + nn] = (uint16_t)(sgn | 0x7C00u); continue; }
+                uint32_t half;
+                if (ex <= 0) {
+                    if (ex < -10) { out[(size_t)mm * N + nn] = (uint16_t)sgn; continue; }
+                    mn |= 0x800000u;
+                    int32_t sh = 14 - ex;
+                    half = mn >> sh;
+                    uint32_t rm = mn & ((1u << sh) - 1);
+                    half += (rm > (1u << (sh - 1))) || (rm == (1u << (sh - 1)) && (half & 1));
+                    out[(size_t)mm * N + nn] = (uint16_t)(sgn | half);
+                } else {
+                    half = (mn >> 13) & 0x3FFu;
+                    uint32_t rm = mn & 0x1FFFu;
+                    half += (rm > 0x1000u) || (rm == 0x1000u && (half & 1));
+                    if (half == 0x400u) { ex++; half = 0; }
+                    if (ex >= 31) { out[(size_t)mm * N + nn] = (uint16_t)(sgn | 0x7C00u); continue; }
+                    out[(size_t)mm * N + nn] = (uint16_t)(sgn | ((uint32_t)ex << 10) | half);
+                }
+            }
+        }
+    }
+    free(wq);
+    free(S);
+    return 0;
+}
+
 /* HAP perf stub */
 unsigned long long HAP_perf_get_time_us(void) { return 0; }
 

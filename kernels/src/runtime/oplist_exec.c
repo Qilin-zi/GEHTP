@@ -362,7 +362,7 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                        char* err, size_t errn) {
     uint32_t act_s = op->args[0] & 0x7FFFu, w_s = op->args[1] & 0x7FFFu, out_t = op->args[2];
     uint32_t M = op->args[3], K = op->args[4], N = op->args[5];
-    uint32_t act_b = M * K * 2u, out_b = M * N * 2u;
+    uint32_t out_b = M * N * 2u;
     /* act 支持 temp 引用 (transformer emit: src_ref 给 temp; t10 契约
      * 是 slot — 两种形态 ref_ptr 统一解码) */
     const uint8_t* act_src = ref_ptr(b, act_s);
@@ -402,10 +402,12 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                  (const void*)act_src, (unsigned)wt_b, (unsigned)(K * N / 2u));
         return -1;
     }
-    if (!g_exec.matmul_carved || g_exec.e.m != M || g_exec.e.k != K || g_exec.e.n != N) {
+    uint32_t m_pad = (M + 255u) & ~255u;
+    if (!g_exec.matmul_carved || g_exec.e.m != m_pad || g_exec.e.k != K || g_exec.e.n != N) {
         /* 形状变化重 carve (transformer 多 GEMM 形状: 2048/6144/248320;
          * 旧 t10 统一形状 carve-once 契约不成立 — 用旧形状 invoke
-         * 输出尾部读未初始化 VTCM = 垃圾 = +inf 实锤) */
+         * 输出尾部读未初始化 VTCM = 垃圾 = +inf 实锤)。
+         * carve 按 M pad 后 (HMX kernel M=256 硬约束, m_total_minus_step=8) */
         int rc = 0;
         if (!g_exec.engine_ready) {
             rc = wtcache_open(&g_exec.wc, 4096);
@@ -415,8 +417,8 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
         uint32_t off = (pc + 2047u) & ~2047u;
         dc_arena_init(&g_exec.arena, (uint8_t*)vb + off, vs - off);
-        if (dc_w4_carve(&g_exec.e, &g_exec.arena, M, K, N, atbl, otbl)) {
-            snprintf(err, errn, "carve m%u k%u n%u", (unsigned)M, (unsigned)K, (unsigned)N);
+        if (dc_w4_carve(&g_exec.e, &g_exec.arena, m_pad, K, N, atbl, otbl)) {
+            snprintf(err, errn, "carve m%u k%u n%u", (unsigned)m_pad, (unsigned)K, (unsigned)N);
             return -1;
         }
         /* wtcache_open 末尾 memset(VTCM,0) 留 dirty 零行, 驱逐会覆盖 HMX 直写的 e.out
@@ -436,16 +438,13 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     int rc_bs = dma_to_vtcm(g_exec.e.bias, bias, bias_b, &mu);
     if (rc_wt || rc_bs) { snprintf(err, errn, "wt/bias dma"); return -1; }
 
-    struct dc_dma d_act, d_out;
-    dc_dma_init(&d_act, (uint8_t*)act_src, g_exec.e.act, act_b, &mu);
-    dc_dma_init(&d_out, g_exec.e.out, out_ddr, out_b, &mu);
-    int bad = dc_dma_once(&d_act) || dc_w4_invoke(&g_exec.e) || dc_dma_once(&d_out);
-    dc_dma_destroy(&d_act);
-    dc_dma_destroy(&d_out);
-    if (bad) { snprintf(err, errn, "dma/invoke"); return -1; }
-    /* dst_bypass=0 写落内存; CPU 后续读 (rmsnorm/dump) 前丢弃驻留旧行 */
+    /* act/out 由 dc_w4_run 内部处理 (设备: 量化+pack 入 VTCM, 出面反量化直写
+     * DDR; host: 纯数学直读 DDR) — 不再走 act/out DMA 包装 */
+    int bad = dc_w4_run(&g_exec.e, act_src, out_ddr, M, K, N, scale);
+    if (bad) { snprintf(err, errn, "dc_w4_run"); return -1; }
+    /* CPU 写 out_ddr → FLUSH (旧 DMA-out 时代是 INVALIDATE; 现在写者是 CPU) */
     qurt_mem_cache_clean((qurt_addr_t)out_ddr, out_b,
-                         QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+                         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
     return 0;
 }
 
