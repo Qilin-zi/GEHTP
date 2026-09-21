@@ -1,6 +1,7 @@
 /* dc_parts.c — 部件层实现 */
 #include "dc_parts.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -217,12 +218,21 @@ void dc_w4_read_out(const struct dc_w4* e, void* recv) {
  * 出面 = A_s·S[n]·(q-32768)/32767 (S=权重列 scale 槽, 已含 /7)。 */
 int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
               uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
-              uint32_t out_row_bytes) {
+              uint32_t out_row_bytes, float wq_rms, float f_fixed) {
     if (!e || !act_ddr || !out_ddr || !scale_ddr) return 0xD400;
     if (m % 32 || k % 32 || n % 32) return 0xD401;
     uint32_t m_pad = (m + 255u) & ~255u;
     if (m_pad != e->m) return 0xD402;  /* carve 必须按 pad 后 M */
     float as = w4a16_act_scale((const uint16_t*)act_ddr, m * k);
+    /* 输出域因子: kernel 固定 ±1 u16 出面 (闭包金标自身 14.1% 饱和) —
+     * f>1 把 C_int 压进域内, act 有效精度 8-log2(f) 位 (>>8 读顶字节)。
+     * 固定 f (闭包对拍 f=1) 或运行时自适应 (est = √k·RMS(a/max)·wq_rms/7,
+     * headroom 4 — 模型级折衷由 ⑤ judge_logits 裁定)。 */
+    float f = f_fixed > 0.0f ? f_fixed
+              : w4a16_pow2ceil(4.0f * sqrtf((float)k) *
+                               w4a16_act_rms_norm((const uint16_t*)act_ddr, m * k, as) *
+                               wq_rms / 7.0f);
+    float a_scale = as * f;  /* dequant 用 a_scale, f 精确抵消 */
 
     /* 量化+crouton 融合 (零行 pad = 32768) */
     uint16_t* surf = (uint16_t*)e->act;
@@ -237,10 +247,10 @@ int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
                     uint32_t row1 = row0 + 1;
                     for (uint32_t c = 0; c < 32; c++) {
                         surf[out++] = row0 < m
-                            ? w4a16_quant_f16(((const uint16_t*)act_ddr)[(size_t)row0 * k + k_base + c], as)
+                            ? w4a16_quant_f16(((const uint16_t*)act_ddr)[(size_t)row0 * k + k_base + c], a_scale)
                             : 32768u;
                         surf[out++] = row1 < m
-                            ? w4a16_quant_f16(((const uint16_t*)act_ddr)[(size_t)row1 * k + k_base + c], as)
+                            ? w4a16_quant_f16(((const uint16_t*)act_ddr)[(size_t)row1 * k + k_base + c], a_scale)
                             : 32768u;
                     }
                 }
@@ -254,7 +264,7 @@ int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
     /* HMX 直写出面, INVALIDATE 后 CPU 读; crouton 序直读反量化 (行≥m 丢弃) */
     qurt_mem_cache_clean((qurt_addr_t)e->out, m_pad * n * 2,
                          QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
-    w4a16_dequant_crouton((const uint16_t*)e->out, m_pad, n, m, as,
+    w4a16_dequant_crouton((const uint16_t*)e->out, m_pad, n, m, a_scale,
                           (const uint16_t*)scale_ddr, (uint16_t*)out_ddr,
                           out_row_bytes);
     return 0;

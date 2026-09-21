@@ -4,6 +4,7 @@
  *       float_ref.py a16 域契约 (scale=1/32767, offset=-32768)。
  * 铁律: a16 域里 q=0 代表 real=-1.0 — 零行 pad 必须填 32768 (零值点)。
  */
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -59,6 +60,22 @@ float w4a16_act_scale(const uint16_t* a_f16, uint32_t n) {
     return mx > 0.0f ? mx : 1.0f;
 }
 
+float w4a16_act_rms_norm(const uint16_t* a_f16, uint32_t n, float scale) {
+    double acc = 0.0;
+    for (uint32_t i = 0; i < n; i++) {
+        double v = (double)f16_to_f32(a_f16[i]) / (double)scale;
+        acc += v * v;
+    }
+    return (float)sqrt(acc / (double)n);
+}
+
+float w4a16_pow2ceil(float x) {
+    if (x <= 1.0f) return 1.0f;
+    float p = 1.0f;
+    while (p < x) p *= 2.0f;
+    return p;
+}
+
 uint16_t w4a16_quant_f16(uint16_t a_f16, float scale) {
     float v = f16_to_f32(a_f16) / scale * 32767.0f;
     if (v > 32767.0f) return 65535u;   /* round(v) 已 ≥ 32768 → 钳 */
@@ -112,7 +129,10 @@ void w4a16_dequant_out(const uint16_t* lin_q, uint32_t m, uint32_t n,
         for (uint32_t col = 0; col < n; col++) {
             int32_t aq = (int32_t)lin_q[(size_t)row * n + col] - 32768;
             float S = f16_to_f32(scale_f16[col]);
-            float v = act_scale * S * (float)aq * inv;
+            /* ×7 铁律: kernel 固定 ÷7 域假定权重实值 = wq/7, 而 S 槽是相对 wq
+             * 的列 scale (max|col|/7) — 折算回 wq/7 域须乘 7。漏乘 = 整体 /7
+             * (cos 对均匀缩放失明; 列向各异时 cos≈0.83/548 量级误差 板实锤) */
+            float v = act_scale * S * 7.0f * (float)aq * inv;
             *(uint16_t*)((uint8_t*)out_f16 + (size_t)row * out_row_bytes + col * 2u) =
                 f32_to_f16_rne(v);
         }
@@ -136,13 +156,13 @@ void w4a16_dequant_crouton(const uint16_t* surf, uint32_t m_pad, uint32_t n,
                         uint16_t q0 = surf[out++], q1 = surf[out++];
                         if (row0 < m_out) {
                             float S = f16_to_f32(scale_f16[n_base + c]);
-                            float v = act_scale * S * (float)((int32_t)q0 - 32768) * inv;
+                            float v = act_scale * S * 7.0f * (float)((int32_t)q0 - 32768) * inv;
                             *(uint16_t*)((uint8_t*)out_f16 + (size_t)row0 * out_row_bytes +
                                          (n_base + c) * 2u) = f32_to_f16_rne(v);
                         }
                         if (row1 < m_out) {
                             float S = f16_to_f32(scale_f16[n_base + c]);
-                            float v = act_scale * S * (float)((int32_t)q1 - 32768) * inv;
+                            float v = act_scale * S * 7.0f * (float)((int32_t)q1 - 32768) * inv;
                             *(uint16_t*)((uint8_t*)out_f16 + (size_t)row1 * out_row_bytes +
                                          (n_base + c) * 2u) = f32_to_f16_rne(v);
                         }

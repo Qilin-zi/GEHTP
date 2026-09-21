@@ -83,9 +83,13 @@ int dc_w4_invoke(struct dc_w4* e);
 void dc_w4_read_out(const struct dc_w4* e, void* recv);
 /* 全链: f16 DDR act → 量化(a16 域)+M→256 pad+crouton → kernel →
  * 出面反量化(A_s·S[n]) f16 DDR。carve 须按 pad 后 M (e->m == pad256(m))。
- * out_row_bytes = 输出行跨度字节 (分块写全宽 N_full 时传 N_full*2)。 */
+ * out_row_bytes = 输出行跨度字节 (分块写全宽 N_full 时传 N_full*2)。
+ * wq_rms = 权重列 RMS 均值 (发射器 scale 槽尾 f16; 自适应输出域因子用)。
+ * f_fixed > 0 = 固定域因子 (测试/闭包对拍); 0 = 运行时自适应
+ *   f = pow2ceil(4·√k·RMS(a/max|a|)·wq_rms/7) — kernel ±1 输出域限制
+ *   (闭包金标自身 14.1% 饱和), f 内部抵消 (dequant 用 a_scale 含 f)。 */
 int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
               uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
-              uint32_t out_row_bytes);
+              uint32_t out_row_bytes, float wq_rms, float f_fixed);
 
 #endif

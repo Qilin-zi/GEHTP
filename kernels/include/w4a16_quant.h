@@ -17,6 +17,12 @@ extern "C" {
 /* DDR f16 [n] → max|a| (GEMM 级 act scale; 全零 → 1.0) */
 float w4a16_act_scale(const uint16_t* a_f16, uint32_t n);
 
+/* DDR f16 [n] 归一化 RMS = sqrt(Σ(a/max|a|)²/n) (自适应输出域因子 f 用) */
+float w4a16_act_rms_norm(const uint16_t* a_f16, uint32_t n, float scale);
+
+/* pow2ceil: 1 → 1, 否则上取整到 2 的幂 */
+float w4a16_pow2ceil(float x);
+
 /* f16 → a16 域 u16 (scale = max|a|; 越界钳 [0,65535]) */
 uint16_t w4a16_quant_f16(uint16_t a_f16, float scale);
 

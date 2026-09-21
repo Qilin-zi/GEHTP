@@ -260,6 +260,20 @@ struct Emitter {
                 wq[k * N + n] = (int8_t)q;
             }
         }
+        /* 槽尾: wq 列 RMS 均值 (设备自适应输出域因子 f 用: kernel ±1 出面
+         * 域限制, f = pow2ceil(4·√K·RMS(a/max)·wq_rms/7) 内部抵消) */
+        {
+            double sum_rms = 0.0;
+            for (size_t n = 0; n < N; n++) {
+                double s2 = 0.0;
+                for (size_t k = 0; k < K; k++)
+                    s2 += (double)wq[k * N + n] * (double)wq[k * N + n];
+                sum_rms += std::sqrt(s2 / (double)K);
+            }
+            uint16_t r16 = f32_to_f16_rne((float)(sum_rms / (double)N));
+            scale_out.push_back((uint8_t)(r16 & 0xFF));
+            scale_out.push_back((uint8_t)(r16 >> 8));
+        }
         wt_out.assign(K * N / 2, 0);
         size_t o = 0;
         for (size_t kb = 0; kb < K / 32; kb++)
@@ -324,7 +338,7 @@ struct Emitter {
                         pack_w4a16_kernel(src, e.nbytes, K, NN, wtb, biasb, scaleb);
                         id = slot_for((uint32_t)wtb.size(), (uint32_t)(K * NN), wtb.data());
                         uint32_t bid = slot_for((uint32_t)biasb.size(), (uint32_t)(biasb.size() / 2u), biasb.data());
-                        uint32_t sid = slot_for((uint32_t)scaleb.size(), (uint32_t)NN, scaleb.data());
+                        uint32_t sid = slot_for((uint32_t)scaleb.size(), (uint32_t)(NN + 1), scaleb.data());
                         cache[w->op_id] = id;
                         w4_bias_slots[w->op_id] = bid;
                         w4_scale_slots[w->op_id] = sid;

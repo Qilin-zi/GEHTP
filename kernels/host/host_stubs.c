@@ -188,7 +188,8 @@ int  dc_w4_invoke(struct dc_w4* e) {
  *   out_f16 = Σ_k act[m,k]·wq[k,n]·S[n]  (S=列 scale, 已含 /7) */
 int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
               uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
-              uint32_t out_row_bytes) {
+              uint32_t out_row_bytes, float wq_rms, float f_fixed) {
+    (void)wq_rms; (void)f_fixed;  /* host 纯数学, 无固定域, f 不参与 */
     if (!e || !act_ddr || !out_ddr || !scale_ddr) return -1;
     if (m % 32 || k % 32 || n % 32) return -2;
     uint32_t M = m, K = k, N = n;

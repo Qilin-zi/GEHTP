@@ -394,12 +394,12 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     }
     if (b->slots[bias_s].len != bias_b || b->slots[atbl_s].len != tbl_b ||
         b->slots[otbl_s].len != 8u * (N / 32u) * 4u ||
-        b->slots[scale_s].len != N * 2u) {
+        b->slots[scale_s].len != N * 2u + 2u) {
         snprintf(err, errn, "supply slot 尺寸错 (bias %u/%u atbl %u/%u otbl %u/%u scale %u/%u)",
                  (unsigned)b->slots[bias_s].len, (unsigned)bias_b,
                  (unsigned)b->slots[atbl_s].len, (unsigned)tbl_b,
                  (unsigned)b->slots[otbl_s].len, (unsigned)(8u * (N / 32u) * 4u),
-                 (unsigned)b->slots[scale_s].len, (unsigned)(N * 2u));
+                 (unsigned)b->slots[scale_s].len, (unsigned)(N * 2u + 2u));
         return -1;
     }
     if (!act_src || wt_b != K * N / 2u) {
@@ -439,6 +439,10 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     uint8_t* out_ddr = temp_get(out_t, out_b);
     if (!out_ddr) { snprintf(err, errn, "temp %u alloc", (unsigned)out_t); return -1; }
     const uint8_t* wt_base = b->weight_base + b->slots[w_s].offset;
+    /* scale 槽尾 = 权重列 RMS 均值 f16 (设备自适应输出域因子 f 用; host 忽略) */
+    uint16_t rms16;
+    memcpy(&rms16, scale + (size_t)N * 2u, 2);
+    float wq_rms = f16_to_f32(rms16);
 
     /* 分块循环 (lm_head N=248320 → 61 块; 每块按精确 nc invoke, kernel 只算
      * nc 列, 槽尾陈旧数据不会被读)。非分块 op 单次即退。 */
@@ -473,7 +477,8 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
          * 直写 DDR; host: 纯数学直读 DDR); 行跨度 = 全宽 N (分块列写在
          * row·N + c0 处) */
         int bad = dc_w4_run(&g_exec.e, act_src, out_ddr + (size_t)c0 * 2u,
-                            M, K, nc, scale + (size_t)c0 * 2u, N * 2u);
+                            M, K, nc, scale + (size_t)c0 * 2u, N * 2u,
+                            wq_rms, 0.0f /* f_fixed=0 → 运行时自适应 */);
         if (bad) { snprintf(err, errn, "dc_w4_run c0=%u", (unsigned)c0); return -1; }
     }
     /* CPU 写 out_ddr → FLUSH (旧 DMA-out 时代是 INVALIDATE; 现在写者是 CPU) */
