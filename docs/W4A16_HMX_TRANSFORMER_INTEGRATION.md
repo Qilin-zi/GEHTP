@@ -1,6 +1,7 @@
 # W4A16 HMX → Transformer 管线集成任务书
 
 状态: 2026-09-21。HMX kernel 已在 110 板验证 (256³ 位恒等 65536/65536, 1290 GFLOPS)。
+① 发射器 kernel 格式已完成 (129 W4A16 op, blob 2.63GB, 闭包 byte-exact)。
 本任务书 = 把 HMX 接进 0.8B transformer 的 W4A16 GEMM 路径。相关提交 a284e63 (host 标量参考)。
 
 ## 已完成的基线
@@ -29,14 +30,26 @@
 
 ## 集成步骤 (按序)
 
-### ① 发射器: 640B tile → kernel 格式 (编译期全可做)
-- `wtop_ops.hpp` 的 `repack_q4_0_tiles` 换成 kernel 格式:
-  gguf Q4_0 反量化 → 每 32×32 块量化到 int8[-7,7] (scale=max|v|/7, 行向或块向)
-  → k4-lohi + XOR 0x88 → 槽 = K*N/2 字节; scale 折叠进 folded_bias 槽。
-- 生成的 bias/atbl/otbl 槽: bias=(N/32)*512 (折叠 scale), atbl=8*(K/32)*4 偏移表,
-  otbl=8*(N/32)*4 偏移表 — 偏移公式按闭包 m2_pack_surfaces 的 COMPACT_STRIDE 0x800。
-- 校验: host 标量参考 (dc_w4_invoke 桩) 改为按新格式解码 → 与 python 独立解码 bit-exact
-  (现 tile 解码已在 host_stubs.c, 改格式同步改)。
+### ① 发射器: 640B tile → kernel 格式 (编译期全可做) — 已完成 (2026-09-21)
+- `wtop_ops.hpp` 的 `repack_q4_0_tiles` 换成 `pack_w4a16_kernel`:
+  gguf Q4_0 反量化 → **每列** int8[-7,7] (scale=max|col|/7, 全零列→1)
+  → k4-lohi + XOR 0x88 → 槽 = K*N/2 字节; 列 scale f16 → 独立槽 (N*2)。
+  (列向而非块向: 块向 scale 无法从 GEMM 提因子, 列向可在出面反量化按列乘回 —
+  见 ②; 这也与 W4A16 业界 per-channel 惯例一致。)
+- bias=(N/32)*512 折叠 bias 槽 + atbl=8*(K/32)*4 / otbl=8*(N/32)*4 真实
+  0x800-stride 偏移表槽 (闭包 m2_pack_surfaces COMPACT_STRIDE; 驱动运行时重写
+  绝对指针)。
+- **预收集遍坑**: wtop_emit 的通用权重槽收集遍先按 f16 建槽并缓存, 后续发射器
+  全部撞缓存 → W4A16 129 op 全落 MATMUL_F16 (实锤)。修法 = OpW4Registrar 注册表:
+  kernel-格式消费方由发射器自身注册, 预收集遍查同一张表 (单一真相源, 无硬编码)。
+- **tie 权重双格式**: 嵌入表被 GATHER 与 GEMM 共享 → kernel-格式独立缓存
+  (w4_wslots) 与 f16 缓存并存, 各消费方取各格式。
+- 校验 (全绿): wt/bias 槽 vs 闭包 pack byte-exact (129/129); scale vs gguf 真值
+  cos=1.0; host 参考全有限自洽; 每 GEMM vs 旧 tile 路径 cos 0.978 (列向量化
+  噪声, 预期)。
+- **解码双坑** (host 标量参考): ① 存储字节 = ((w+8)&0xF)^0x88 = w 的 4-bit 补码
+  本身, 解码直接补码, 再 XOR = 双重变换 (w≥0 错 w-8, cos -0.58); ② scale 槽
+  已含 /7, 解码勿再除 (多除 = 幅度 7× 错)。
 
 ### ② 设备侧: act f16 → u16 a16 域 + crouton 打包 (新 dc 函数)
 - 运行时新函数 (dc_parts.c 或 oplist_exec.c): f16 面 → u16 量化 (encoding 常量
