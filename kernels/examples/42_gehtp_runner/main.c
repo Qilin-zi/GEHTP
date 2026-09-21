@@ -126,6 +126,9 @@ int main(void) {
     int have_wgt_size = (job_get((char*)job, "weights_size", wgt_size_s, sizeof(wgt_size_s)) == 0);
     /* blob_size 必须 free(job) 前解析 (job 缓冲无 null 终止且要 free) */
     int have_blob_size = (job_get((char*)job, "blob_size", blob_size_s, sizeof(blob_size_s)) == 0);
+    static char upto_s[32];
+    memset(upto_s, 0, sizeof(upto_s));
+    int have_upto = (job_get((char*)job, "upto", upto_s, sizeof(upto_s)) == 0);
     free(job);
     uint32_t out_temp = (uint32_t)strtoul(temp_s, NULL, 10);
     ex_log("M4 wgt_size=%s blob_size=%s", have_wgt_size ? wgt_size_s : "(none)",
@@ -196,8 +199,15 @@ int main(void) {
     if (w->n_ops) op_us = (int64_t*)malloc(sizeof(int64_t) * w->n_ops);
     if (!op_us) ex_log("[timing] op_us alloc failed (%u ops), 走无计时路径", (unsigned)w->n_ops);
     int64_t t0 = HAP_perf_get_time_us();
-    ex_log("M10 before wt_exec_run_io");
-    int rc = wt_exec_run_io(w, in, NULL, out_temp, NULL, op_us, err, sizeof(err));
+    ex_log("M10 before wt_exec_run_io (upto=%s)", have_upto ? upto_s : "all");
+    int rc;
+    if (have_upto) {
+        uint32_t n_upto = (uint32_t)strtoul(upto_s, NULL, 10);
+        if (n_upto > w->n_ops) n_upto = w->n_ops;
+        rc = wt_exec_run_range(w, 0, n_upto, NULL, op_us, err, sizeof(err));
+    } else {
+        rc = wt_exec_run_io(w, in, NULL, out_temp, NULL, op_us, err, sizeof(err));
+    }
     int64_t total_us = HAP_perf_get_time_us() - t0;
     if (rc) {
         ex_log("[FAIL] wt_exec_run_io rc=%d %s", rc, err);
