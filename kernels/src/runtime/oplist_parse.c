@@ -1,4 +1,5 @@
 /* oplist_parse.c — 平台无关纯 C 解析器 (host 单测 + 设备实跑同一份源码) */
+#include <stdio.h>
 #include <string.h>
 
 #include "oplist_parse.h"
@@ -111,7 +112,13 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
         uint16_t n_args = wt_rd_u16(buf + p + 2);
         int ar = arity_of(opcode);
         if (ar < 0) return WT_ERR_OPCODE;
-        if (n_args != (uint16_t)ar) return WT_ERR_ARITY;
+        if (n_args != (uint16_t)ar) {
+            fprintf(stderr, "[wtparse] ARITY op%u @%u opc=%u na=%u ar=%d bytes=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                    (unsigned)i, (unsigned)p, (unsigned)opcode, (unsigned)n_args, ar,
+                    buf[p], buf[p+1], buf[p+2], buf[p+3],
+                    buf[p+4], buf[p+5], buf[p+6], buf[p+7]);
+            return WT_ERR_ARITY;
+        }
         if (size < p + 4u + (size_t)n_args * 4u) return WT_ERR_OP_TRUNC;
         out->ops[i].opcode = opcode;
         out->ops[i].n_args = n_args;
