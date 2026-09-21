@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -107,6 +108,8 @@ struct Emitter {
     uint64_t ddr_static_cap = 0;   // 编译期静态区大小(表外 temp 池尾 bump)
     uint64_t ddr_vtcm_cap = 0;     // VTCM 驻留池大小(0=无驻留)
     uint64_t bump_reserve = 0;     // 表外 bump 预留(字节; M2 起由 TAG_MEM_PLAN 供给)
+    std::set<uint64_t> supply_slots;  // W4A16 供给槽去重 (高32位=种类)
+    std::map<uint64_t, uint32_t> supply_slot_ids;  // 种类键 → 已发槽 id
     // 阶段二: 溢出张量 → SPILL/FILL 插桩
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> ddr_spill_map;  // op_id → {溢出区偏移, size}
     uint32_t spill_pool_slot = 0;

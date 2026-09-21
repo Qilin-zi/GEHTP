@@ -129,7 +129,7 @@ enum {
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
 #define WT_ARITY_NOP 0
-#define WT_ARITY_MATMUL 6
+#define WT_ARITY_MATMUL 9   /* [a,w,out,M,K,N,bias_s,atbl_s,otbl_s] 显式供给槽 */
 #define WT_ARITY_RMSNORM 4
 #define WT_ARITY_PIN 1
 #define WT_ARITY_SILU 3
