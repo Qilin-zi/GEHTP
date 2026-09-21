@@ -21,7 +21,7 @@ import argparse
 import json
 import sys
 
-sys.path.insert(0, "/disk2/GEHTP/scripts")
+sys.path.insert(0, "/disk1/GEHTP/scripts")
 from golden_qwen35 import gguf_read_full, GGUF_Q4_0, GGUF_F32  # noqa: E402
 
 # GGUF 角色表(arch=qwen35; 由 golden_qwen35.py 的实测映射固化)

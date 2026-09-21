@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define WT_EXEC_MAX_TEMPS 256
+#define WT_EXEC_MAX_TEMPS 4096
 
 /* 顺序执行 b->ops。engine_m 回填引擎形状 (0=无 MATMUL op)。
  * op_us (可 NULL) 回填每 op 耗时表数组 (长度必须 >= n_ops)。

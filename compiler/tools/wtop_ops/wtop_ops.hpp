@@ -22,6 +22,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // WTOP 契约(kernels/include/oplist_parse.h 的编译期副本语义; 头从 kernels 取)
@@ -110,6 +111,14 @@ struct Emitter {
     uint64_t bump_reserve = 0;     // 表外 bump 预留(字节; M2 起由 TAG_MEM_PLAN 供给)
     std::set<uint64_t> supply_slots;  // W4A16 供给槽去重 (高32位=种类)
     std::map<uint64_t, uint32_t> supply_slot_ids;  // 种类键 → 已发槽 id
+    // W4A16 kernel 格式: bias/scale 槽内容随权重而定 (per-weight-op,
+    // 不能按尺寸去重 — 同 N 不同权重内容不同), 由 ensure_weight_slot 发射
+    // 后按 op_id 挂账, op_matmul 取用
+    std::map<uint64_t, uint32_t> w4_bias_slots;
+    std::map<uint64_t, uint32_t> w4_scale_slots;
+    // kernel-格式权重槽独立缓存 (与 wslots 分离): tie 权重被 GATHER 与
+    // GEMM 共享时 f16 槽与 kernel 槽必须并存, 各自消费方取各自格式
+    std::map<uint64_t, uint32_t> w4_wslots;
     // 阶段二: 溢出张量 → SPILL/FILL 插桩
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> ddr_spill_map;  // op_id → {溢出区偏移, size}
     uint32_t spill_pool_slot = 0;
@@ -212,14 +221,18 @@ struct Emitter {
     bool use_gguf = false;
     uint32_t gguf_hits = 0, gguf_miss = 0;
 
-    // GGUF Q4_0 → tile-major repack(tile 契约 = 例15 ref_dequant_q4_0_tile):
-    // tile 640B = [4×128B 列对 quants][32 fp16 scales@+512][pad];
-    // 列对(c,c+1) 32B: byte r = lo(列c nib r) | hi(列c+1 nib r)<<4;
-    // GGUF 块(n 列, kt)= 18B [2B d][16B nibbles: 元素0..15=lo, 16..31=hi]。
-    // tile 的 per-row scale 与 GGUF per-block d 分组不同 → 反量化 f32 后按行重量化。
-    static std::vector<uint8_t> repack_q4_0_tiles(const uint8_t* src, size_t nbytes,
-                                                  size_t K, size_t N) {
-        size_t n_k_tiles = K / 32, n_col_tiles = N / 32;
+    // GGUF Q4_0 → W4A16 HMX kernel 格式 (闭包权威 = /4090disk2/htpw4a16_v81
+    // prepare_owned_inputs.py; 110 板 256³ 位恒等验证):
+    //   f32 反量化 [K,N] → 每列 int8[-7,7] (scale = max|col|/7, 全零列→1) →
+    //   wt: pack_w4_kblock32_nmajor_k4_lohi = nib(w+8)&0xF, kb(外)×N32×
+    //       kg(4)×n×kr(4) lohi 字节 → K*N/2, 整区 XOR 0x88 (4-bit 补码)
+    //   bias: pack_native_a16_bias = (N/32)*512, 每列 eff=-128*Σw (i32 LE)
+    //       + 控制字 0x5524/0x8040/0x0092/0x4000 (u16 LE)
+    //   scale: 每列 f16 (kernel 固定 ÷7 域, 出面反量化用)
+    static void pack_w4a16_kernel(const uint8_t* src, size_t nbytes, size_t K, size_t N,
+                                  std::vector<uint8_t>& wt_out,
+                                  std::vector<uint8_t>& bias_out,
+                                  std::vector<uint8_t>& scale_out) {
         std::vector<float> w(K * N);
         for (size_t b = 0; b < nbytes / 18; b++) {
             uint16_t d_raw;
@@ -231,29 +244,50 @@ struct Emitter {
                 w[(b * 32) + 16 + j] = d * ((nib[j] >> 4) - 8);
             }
         }
-        std::vector<uint8_t> out(n_col_tiles * n_k_tiles * 640, 0);
-        for (size_t ct = 0; ct < n_col_tiles; ct++)
-            for (size_t kt = 0; kt < n_k_tiles; kt++) {
-                uint8_t* tile = out.data() + (ct * n_k_tiles + kt) * 640;
-                for (size_t r = 0; r < 32; r++) {
-                    float mx = 0.0f;
-                    for (size_t c = 0; c < 32; c++)
-                        mx = std::max(mx, std::fabs(w[(kt * 32 + r) * N + ct * 32 + c]));
-                    float d = mx / 7.0f;
-                    uint16_t d16 = f32_to_f16_rne(d);
-                    std::memcpy(tile + 512 + r * 2, &d16, 2);
-                    for (size_t c = 0; c < 32; c++) {
-                        float v = w[(kt * 32 + r) * N + ct * 32 + c];
-                        int q = (int)std::lround(v / d) + 8;
-                        if (q < 0) q = 0;
-                        if (q > 15) q = 15;
-                        uint8_t& byte = tile[(c / 2) * 32 + r];
-                        if (c & 1) byte |= (uint8_t)(q << 4);
-                        else byte = (uint8_t)q;
-                    }
+        std::vector<int8_t> wq(K * N);
+        scale_out.assign(N * 2, 0);
+        for (size_t n = 0; n < N; n++) {
+            float mx = 0.0f;
+            for (size_t k = 0; k < K; k++)
+                mx = std::max(mx, std::fabs(w[k * N + n]));
+            float S = mx > 0.0f ? mx / 7.0f : 1.0f;
+            uint16_t s16 = f32_to_f16_rne(S);
+            std::memcpy(&scale_out[n * 2], &s16, 2);
+            for (size_t k = 0; k < K; k++) {
+                int q = (int)std::lround(w[k * N + n] / S);
+                if (q < -7) q = -7;
+                if (q > 7) q = 7;
+                wq[k * N + n] = (int8_t)q;
+            }
+        }
+        wt_out.assign(K * N / 2, 0);
+        size_t o = 0;
+        for (size_t kb = 0; kb < K / 32; kb++)
+            for (size_t n_base = 0; n_base < N; n_base += 32)
+                for (size_t kg = 0; kg < 4; kg++) {
+                    size_t k_base = kb * 32 + kg * 8;
+                    for (size_t n = n_base; n < n_base + 32; n++)
+                        for (size_t kr = 0; kr < 4; kr++) {
+                            uint32_t lo = ((uint32_t)(uint8_t)wq[(k_base + kr) * N + n] + 8u) & 0xFu;
+                            uint32_t hi = ((uint32_t)(uint8_t)wq[(k_base + kr + 4) * N + n] + 8u) & 0xFu;
+                            wt_out[o++] = (uint8_t)((lo | (hi << 4)) ^ 0x88u);
+                        }
+                }
+        bias_out.assign((N / 32) * 512, 0);
+        static const uint8_t cw[8] = {0x24, 0x55, 0x40, 0x80, 0x92, 0x00, 0x00, 0x40};
+        for (size_t nt = 0; nt < N / 32; nt++)
+            for (int parity = 0; parity < 2; parity++) {
+                size_t half = (size_t)parity * 256;
+                for (int lane = 0; lane < 16; lane++) {
+                    size_t col = nt * 32 + (size_t)parity + (size_t)(2 * lane);
+                    size_t base = nt * 512 + half + (size_t)(8 * lane);
+                    std::memcpy(&bias_out[base], cw, 8);
+                    int32_t sum_w = 0;
+                    for (size_t k = 0; k < K; k++) sum_w += (int32_t)wq[k * N + col];
+                    int32_t eff = -128 * sum_w;
+                    std::memcpy(&bias_out[base + 128], &eff, 4);
                 }
             }
-        return out;
     }
 
     // 权重消费 op 的 const 输入 → 权重槽(按 const id 去重; GGUF 供给优先)
@@ -261,9 +295,12 @@ struct Emitter {
     // 权重 const 自身没有; TSV 键 = 消费节点名)
     uint32_t ensure_weight_slot(GraphPrepare& gp, const OpDef* w,
                                 std::map<uint64_t, uint32_t>& wslots,
-                                const std::string& consumer_grp = "") {
-        auto it = wslots.find(w->op_id);
-        if (it != wslots.end()) return it->second;
+                                const std::string& consumer_grp = "",
+                                bool kernel_fmt = false) {
+        /* kernel-格式调用方用独立缓存 (tie 权重两种格式并存, 互不遮蔽) */
+        std::map<uint64_t, uint32_t>& cache = kernel_fmt ? w4_wslots : wslots;
+        auto it = cache.find(w->op_id);
+        if (it != cache.end()) return it->second;
         /* 路线B: 外置模式权重进 ext_weight_area(addr=EXT_WGT), 内置进 blob */
         auto slot_for = [&](uint32_t len, uint32_t cnt, const uint8_t* d) {
             return ext_weights ? add_ext_slot(len, cnt, d) : add_slot(len, cnt, d);
@@ -279,11 +316,20 @@ struct Emitter {
                     uint32_t id;
                     size_t K = e.dims[0], NN = 1;
                     for (size_t i = 1; i < e.dims.size(); i++) NN *= e.dims[i];
-                    if (e.type == 2 && K % 32 == 0 && NN % 32 == 0 && getenv("GEHTP_TILE")) {
-                        // Q4_0 → tile-major(32×32 tile 契约; 门控: 主机侧
-                        // W4A16 标量参考未接前默认走反量化 f16, 数值先行)
-                        auto tile = repack_q4_0_tiles(src, e.nbytes, K, NN);
-                        id = slot_for((uint32_t)tile.size(), (uint32_t)(K * NN), tile.data());
+                    if (e.type == 2 && K % 32 == 0 && NN % 32 == 0 && kernel_fmt && getenv("GEHTP_TILE")) {
+                        // Q4_0 → W4A16 HMX kernel 格式 (wt + 折叠 bias + 列 scale;
+                        // 仅 GEMM 消费方 — GATHER 表等仍走 f16 反量化, 否则
+                        // 嵌入表被 nibble 打包 → gather 读垃圾 token)
+                        std::vector<uint8_t> wtb, biasb, scaleb;
+                        pack_w4a16_kernel(src, e.nbytes, K, NN, wtb, biasb, scaleb);
+                        id = slot_for((uint32_t)wtb.size(), (uint32_t)(K * NN), wtb.data());
+                        uint32_t bid = slot_for((uint32_t)biasb.size(), (uint32_t)(biasb.size() / 2u), biasb.data());
+                        uint32_t sid = slot_for((uint32_t)scaleb.size(), (uint32_t)NN, scaleb.data());
+                        cache[w->op_id] = id;
+                        w4_bias_slots[w->op_id] = bid;
+                        w4_scale_slots[w->op_id] = sid;
+                        gguf_hits++;
+                        return id;
                     } else if (e.type == 2) {
                         // 小维度(<32)不走 tile: 反量化 f16 直存
                         std::vector<float> wf2(K * NN);
@@ -311,7 +357,7 @@ struct Emitter {
                         std::memcpy(wb.data(), w16.data(), wb.size());
                         id = slot_for((uint32_t)wb.size(), (uint32_t)n4, wb.data());
                     }
-                    wslots[w->op_id] = id;
+                    cache[w->op_id] = id;
                     gguf_hits++;
                     return id;
                 }
@@ -325,7 +371,7 @@ struct Emitter {
                          (unsigned long long)w->op_id);
             std::vector<uint8_t> zeros(128, 0);
             uint32_t id = slot_for(128, 64, zeros.data());
-            wslots[w->op_id] = id;
+            cache[w->op_id] = id;
             return id;
         }
         std::vector<uint16_t> w16(n);
@@ -338,7 +384,7 @@ struct Emitter {
         std::vector<uint8_t> wbytes(n * 2);
         std::memcpy(wbytes.data(), w16.data(), wbytes.size());
         uint32_t id = slot_for((uint32_t)wbytes.size(), (uint32_t)n, wbytes.data());
-        wslots[w->op_id] = id;
+        cache[w->op_id] = id;
         return id;
     }
     // 输入节点 = slot 0; const 生产者 = 权重槽(0x8000|slot 编码);
@@ -467,6 +513,21 @@ struct OpRegistrar {
         for (const auto& e : entries) op_registry()[e.first] = e.second;
     }
 };
+
+// W4A16 kernel-格式权重消费方注册 (同 OpRegistrar 机制: 发射器自身注册,
+// emit 预收集遍查同一张表决定 kernel_fmt — 单一真相源, 不做名字硬编码)
+inline std::unordered_set<std::string>& op_w4_registry() {
+    static std::unordered_set<std::string> t;
+    return t;
+}
+struct OpW4Registrar {
+    explicit OpW4Registrar(std::initializer_list<const char*> names) {
+        for (const char* n : names) op_w4_registry().insert(n);
+    }
+};
+inline bool wants_w4_kernel_weight(const std::string& nm) {
+    return op_w4_registry().count(nm) > 0;
+}
 
 // 权重消费 op 的 const 输入下标(weight input 位置)
 inline int weight_input_index(const std::string& nm) {

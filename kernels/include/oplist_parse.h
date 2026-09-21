@@ -15,7 +15,8 @@
  *   temp 位置的 arg 可用 (0x8000|slot_id) 引用 slot —— 输入注入(首层
  *   transpose 读输入 slot 0, 引擎按位 0x8000 区分 temp/slot 空间)。
  *   OP_NOP          = 0  : []
- *   OP_MATMUL_W4A16 = 1  : [act_slot, w_slot, out_temp, M, K, N]
+ *   OP_MATMUL_W4A16 = 1  : [act_slot, w_slot, out_temp, M, K, N,
+ *                           bias_s, atbl_s, otbl_s, scale_s] (显式供给槽)
  *   OP_RMSNORM_F16  = 2  : [x_temp, w_slot, y_temp, n]
  *   OP_PIN          = 3  : [slot]
  *   OP_SILU_F16     = 4  : [x_temp, y_temp, n_elem]   (V2.3 U16)
@@ -129,7 +130,7 @@ enum {
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
 #define WT_ARITY_NOP 0
-#define WT_ARITY_MATMUL 9   /* [a,w,out,M,K,N,bias_s,atbl_s,otbl_s] 显式供给槽 */
+#define WT_ARITY_MATMUL 10  /* [a,w,out,M,K,N,bias_s,atbl_s,otbl_s,scale_s] 显式供给槽 */
 #define WT_ARITY_RMSNORM 4
 #define WT_ARITY_PIN 1
 #define WT_ARITY_SILU 3

@@ -71,6 +71,8 @@ struct dc_w4 {
     uint8_t* extra;    /* 16 */
     const uint8_t* atbl_ddr;  /* 重写源 (每次 invoke 前 memcpy 进 atbl) */
     const uint8_t* otbl_ddr;
+    const uint8_t* scale_ddr; /* 列 scale f16 N*2 (host 参考/设备出面反量化用;
+                                 kernel 固定 ÷7 域不消费) */
 };
 /* 从 arena 一性 carve 全部面 (HMX 面 2KB 对齐) */
 int dc_w4_carve(struct dc_w4* e, struct dc_arena* a, uint32_t m, uint32_t k,

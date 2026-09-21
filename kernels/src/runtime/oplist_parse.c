@@ -10,7 +10,7 @@ static uint32_t align_up(uint32_t x, uint32_t a) {
 static int arity_of(uint16_t opcode) {
     switch (opcode) {
     case OP_NOP: return WT_ARITY_NOP;
-    case OP_MATMUL_W4A16: return 9; /* [a,w,out,M,K,N,bias_s,atbl_s,otbl_s] */
+    case OP_MATMUL_W4A16: return WT_ARITY_MATMUL; /* [a,w,out,M,K,N,bias_s,atbl_s,otbl_s,scale_s] */
     case OP_RMSNORM_F16: return WT_ARITY_RMSNORM;
     case OP_PIN: return WT_ARITY_PIN;
     case OP_SILU_F16: return WT_ARITY_SILU;
@@ -47,7 +47,7 @@ static int arity_of(uint16_t opcode) {
 /* 该 arg 下标是否是 slot 引用 */
 static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     switch (opcode) {
-    case OP_MATMUL_W4A16: return idx == 0 || idx == 1;
+    case OP_MATMUL_W4A16: return idx == 0 || idx == 1 || (idx >= 6 && idx <= 9);
     case OP_RMSNORM_F16: return idx == 1;
     case OP_PIN: return idx == 0;
     case OP_CONV2D_F16: return idx == 1 || idx == 2;

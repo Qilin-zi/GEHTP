@@ -348,7 +348,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (wi < 0 || od->inputs.size() <= (size_t)wi) continue;
             const OpDef* w = gp.get_op_at(od->inputs[wi].src_id);
             if (!w || w->const_data_size == 0) continue;
-            em.ensure_weight_slot(gp, w, wslots, od->grouping);
+            /* kernel-格式消费方 (W4A16 GEMM) 按注册表决定 — 否则预收集遍
+             * 先建 f16 槽并缓存, 发射器后取时被 f16 遮蔽 (W4A16 全落空) */
+            em.ensure_weight_slot(gp, w, wslots, od->grouping,
+                                  wants_w4_kernel_weight(nm));
         }
     }
     // conv 分支的便捷引用(无 conv 图时为 0, conv 分支不会触发)

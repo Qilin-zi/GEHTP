@@ -360,31 +360,52 @@ static void inv_crouton(const uint16_t* surf, int16_t* dst, uint32_t M, uint32_t
 
 static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                        char* err, size_t errn) {
-    uint32_t act_s = op->args[0], w_s = op->args[1], out_t = op->args[2];
+    uint32_t act_s = op->args[0] & 0x7FFFu, w_s = op->args[1] & 0x7FFFu, out_t = op->args[2];
     uint32_t M = op->args[3], K = op->args[4], N = op->args[5];
-    uint32_t act_b = M * K * 2u, wt_b = K * N / 2u, out_b = M * N * 2u;
+    uint32_t act_b = M * K * 2u, out_b = M * N * 2u;
+    /* act 支持 temp 引用 (transformer emit: src_ref 给 temp; t10 契约
+     * 是 slot — 两种形态 ref_ptr 统一解码) */
+    const uint8_t* act_src = ref_ptr(b, act_s);
+    /* wt 槽尺寸: kernel 格式 = K*N/2 (发射器 pack_w4a16_kernel) */
+    uint32_t wt_b = b->slots[w_s].len;
     uint32_t bias_b = (N / 32u) * 512u, tbl_b = 8u * (K / 32u) * 4u;
     static dc_mutex_t mu;
     static int mu_ready;
     if (!mu_ready) { dc_mutex_init(&mu); mu_ready = 1; }
 
-    const uint8_t *bias = NULL, *atbl = NULL, *otbl = NULL;
-    for (uint32_t i = 0; i < b->n_slots; i++) {
-        const uint8_t* p = b->weight_base + b->slots[i].offset;
-        uint32_t L = b->slots[i].len;
-        if (!bias && L == bias_b) bias = p;
-        else if (!atbl && L == tbl_b) atbl = p;
-        else if (!otbl && L == tbl_b) otbl = p;
-    }
-    if (!bias || !atbl || !otbl) {
-        snprintf(err, errn, "supply slots missing (bias/atbl/otbl)");
+    /* 显式供给槽 (发射器 10 参 [.., bias_s, atbl_s, otbl_s, scale_s]):
+     * 旧按尺寸扫槽把同尺寸真实权重当 bias (32768=in_proj_a 实锤
+     * → u16 位模式当偏置 +15360 → +inf), 且 K≠N 时 atbl/otbl 尺寸不同
+     * 扫不到第二张表 */
+    uint32_t bias_s = op->args[6] & 0x7FFFu, atbl_s = op->args[7] & 0x7FFFu;
+    uint32_t otbl_s = op->args[8] & 0x7FFFu, scale_s = op->args[9] & 0x7FFFu;
+    const uint8_t *bias = (bias_s < b->n_slots) ? b->weight_base + b->slots[bias_s].offset : NULL;
+    const uint8_t *atbl = (atbl_s < b->n_slots) ? b->weight_base + b->slots[atbl_s].offset : NULL;
+    const uint8_t *otbl = (otbl_s < b->n_slots) ? b->weight_base + b->slots[otbl_s].offset : NULL;
+    const uint8_t *scale = (scale_s < b->n_slots) ? b->weight_base + b->slots[scale_s].offset : NULL;
+    if (!bias || !atbl || !otbl || !scale) {
+        snprintf(err, errn, "supply slots missing (bias/atbl/otbl/scale)");
         return -1;
     }
-    if (b->slots[act_s].len != act_b || b->slots[w_s].len != wt_b) {
-        snprintf(err, errn, "act/w slot size mismatch");
+    if (b->slots[bias_s].len != bias_b || b->slots[atbl_s].len != tbl_b ||
+        b->slots[otbl_s].len != 8u * (N / 32u) * 4u ||
+        b->slots[scale_s].len != N * 2u) {
+        snprintf(err, errn, "supply slot 尺寸错 (bias %u/%u atbl %u/%u otbl %u/%u scale %u/%u)",
+                 (unsigned)b->slots[bias_s].len, (unsigned)bias_b,
+                 (unsigned)b->slots[atbl_s].len, (unsigned)tbl_b,
+                 (unsigned)b->slots[otbl_s].len, (unsigned)(8u * (N / 32u) * 4u),
+                 (unsigned)b->slots[scale_s].len, (unsigned)(N * 2u));
         return -1;
     }
-    if (!g_exec.matmul_carved) {
+    if (!act_src || wt_b != K * N / 2u) {
+        snprintf(err, errn, "act/w slot size mismatch (act_src=%p wt_b=%u exp=%u)",
+                 (const void*)act_src, (unsigned)wt_b, (unsigned)(K * N / 2u));
+        return -1;
+    }
+    if (!g_exec.matmul_carved || g_exec.e.m != M || g_exec.e.k != K || g_exec.e.n != N) {
+        /* 形状变化重 carve (transformer 多 GEMM 形状: 2048/6144/248320;
+         * 旧 t10 统一形状 carve-once 契约不成立 — 用旧形状 invoke
+         * 输出尾部读未初始化 VTCM = 垃圾 = +inf 实锤) */
         int rc = 0;
         if (!g_exec.engine_ready) {
             rc = wtcache_open(&g_exec.wc, 4096);
@@ -404,6 +425,8 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         g_exec.engine_ready = 1;
         g_exec.matmul_carved = 1;
     }
+    /* scale 槽随权重 op 变 (同形状不同权重 → 不同 scale), 每次 invoke 前重挂 */
+    g_exec.e.scale_ddr = scale;
     uint8_t* out_ddr = temp_get(out_t, out_b);
     if (!out_ddr) { snprintf(err, errn, "temp %u alloc", (unsigned)out_t); return -1; }
 
@@ -414,8 +437,7 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     if (rc_wt || rc_bs) { snprintf(err, errn, "wt/bias dma"); return -1; }
 
     struct dc_dma d_act, d_out;
-    dc_dma_init(&d_act, (uint8_t*)b->weight_base + b->slots[act_s].offset,
-                g_exec.e.act, act_b, &mu);
+    dc_dma_init(&d_act, (uint8_t*)act_src, g_exec.e.act, act_b, &mu);
     dc_dma_init(&d_out, g_exec.e.out, out_ddr, out_b, &mu);
     int bad = dc_dma_once(&d_act) || dc_w4_invoke(&g_exec.e) || dc_dma_once(&d_out);
     dc_dma_destroy(&d_act);
