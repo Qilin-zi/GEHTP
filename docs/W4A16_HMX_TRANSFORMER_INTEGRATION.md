@@ -94,8 +94,24 @@
   f = pow2ceil(4·√k·RMS(a/max|a|)·wq_rms/7) (权重统计 = 发射器 scale 槽尾
   f16, dequant 精确抵消; 测试 f_fixed 覆盖)。
 
-### ⑤ 全模型上板
-- GEHTP_TILE=1 重编 blob (权重新格式) → host 数值门 → 110 板全模型 → judge_logits。
+### ⑤ 全模型上板 — 已完成 (2026-09-21, 110 板)
+- GEHTP_TILE=1 blob (2.63GB) → host 数值门 (byte-exact 参考) → 110 板全模型
+  47070 op rc=0 → 板 vs host **cos=0.9687** (设备量化链 24 层累积噪声;
+  逐 GEMM 板 vs host 0.99999) → judge_logits vs golden cos=0.036
+  (≈ host 参考 0.034 — §5 数值链分歧为既有问题, 非设备引入)。
+- **⑤ 过程实锤的坑**:
+  1. PD 堆 malloc 上限 3.0GB (例 45 探针) — 2.63GB blob 可读, 但 qurt
+     off_t=32 位 fseek/ftell 溢出 → job blob_size 键 + read_file_size
+  2. 共享路径全面战争 (job.txt/lib/input/结果文件被并行会话反复覆盖) →
+     JOB_PATH #ifndef 身份制 + 私有目录 (/data/local/tmp/w4a16run) 装
+     lib+runner+job — 全隔离后稳定
+  3. wt_parse 概率性 ARITY = 板上 lib 被并行会话覆盖的旧版本 (非读坏)
+  4. **分块根因 (最大坑)**: dc_w4_invoke otbl refill 尺寸按 carve 宽
+     (e->n=n_eff) 而表按 invoke 宽 (nc) — carve 4096+invoke 2048 时 refill
+     4KB 越界读 2KB 表 → 板挂/块2 数据错 (全模型 -inf 源头); 修复 = invoke
+     前临时 e->n=nc。例 44 r2chunk 连续两块 case 复现-隔离-验证闭环
+  5. 例程复现的分块假象 = 生成器 otbl 硬编码块宽 (nct 未按每块 nc)
+  6. hunt 假阳性: attention mask 的 -inf 是语义正常 (softmax 屏蔽)
 
 ## 挂账项 (§5)
 
