@@ -259,7 +259,15 @@ int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
     qurt_mem_cache_clean((qurt_addr_t)e->act, m_pad * k * 2,
                          QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 
-    if (dc_w4_invoke(e)) return 0xD403;
+    /* refill 尺寸按本次 invoke 的 n (dc_w4_invoke 用 e->n; carve 按分块宽
+     * n_eff 时 e->n > nc — refill 4KB 越界读 2KB 表, 板挂/数据错实锤) */
+    {
+        uint32_t en = e->n;
+        e->n = n;
+        int irc = dc_w4_invoke(e);
+        e->n = en;
+        if (irc) return 0xD403;
+    }
 
     /* HMX 直写出面, INVALIDATE 后 CPU 读; crouton 序直读反量化 (行≥m 丢弃) */
     qurt_mem_cache_clean((qurt_addr_t)e->out, m_pad * n * 2,

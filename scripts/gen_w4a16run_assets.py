@@ -87,6 +87,46 @@ def main():
         write_case(name, m, k, n, act, wq, scale, yexp, 0.0)  # 0=运行时自适应 f
         manifest.append(name)
 
+    # ---- r2chunk: 两块流式 (复现 exec 分块; 每块 wt/bias/otbl 独立文件) ----
+    m, k, n = 32, 1024, 6144
+    nc = 4096
+    rng2 = np.random.default_rng(11)
+    W = rng2.normal(0, rng2.uniform(0.8, 1.2, (1, n)), (k, n)).astype(np.float64)
+    mx = np.abs(W).max(axis=0)
+    scale = np.where(mx > 0, mx / 7.0, 1.0).astype(np.float32)
+    wq = np.clip(np.rint(W / scale[None, :]), -7, 7).astype(np.int8)
+    act = np.clip(rng2.normal(0, 1.0, (m, k)), -11.0, 11.0).astype(np.float32)
+    yexp = (act.astype(np.float64) @ (wq.astype(np.float64) * scale)).astype(np.float32)
+    d = os.path.join(OUT, "r2chunk")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "meta.txt"), "wb") as f:
+        f.write(struct.pack("<IIIf", m, k, n, 0.0))
+    f16(act).tofile(os.path.join(d, "act.f16.raw"))
+    wq_rms = float(np.sqrt((wq.astype(np.float64)**2).sum(axis=0).mean() / k))
+    sc = np.concatenate([f16(scale), f16([wq_rms])])
+    sc.tofile(os.path.join(d, "scale.f16.raw"))
+    f16(yexp).tofile(os.path.join(d, "yexp.f16.raw"))
+    kt = k // 32
+    atbl = np.zeros(8 * kt, np.uint32)
+    for mt in range(8):
+        for i in range(kt):
+            atbl[mt * kt + i] = (mt * kt + i) * 0x800
+    atbl.tofile(os.path.join(d, "act_table.raw"))
+    for ci, c0 in enumerate((0, 4096)):
+        ncc = n - c0 if n - c0 < nc else nc   # 每块实际宽 (末块可窄)
+        cwq = wq[:, c0:c0+ncc]
+        pack_w4_kblock32_nmajor_k4_lohi(cwq).tofile(
+            os.path.join(d, f"packed_weight.c{ci}.raw"))
+        pack_native_a16_bias(4, cwq.astype(np.int32))[0].tofile(
+            os.path.join(d, f"folded_bias.c{ci}.raw"))
+        nct = ncc // 32
+        otbl = np.zeros(8 * nct, np.uint32)
+        for mt in range(8):
+            for i in range(nct):
+                otbl[mt * nct + i] = (mt * nct + i) * 0x800
+        otbl.tofile(os.path.join(d, f"out_table.c{ci}.raw"))
+    manifest.append("r2chunk")
+
     with open(os.path.join(OUT, "manifest.txt"), "w") as f:
         f.write("\n".join(manifest) + "\n")
     print(f"manifest: {manifest}")

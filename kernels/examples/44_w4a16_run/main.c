@@ -50,6 +50,102 @@ static float h2f(uint16_t h) {
     return f;
 }
 
+/* r2chunk: 两块流式 (复现 exec 分块路径; 每块 wt/bias/otbl 独立文件,
+ * 与 exec_matmul 的 c0 循环同逻辑) */
+static int run_case_chunked(struct wtcache_ctx* wc, uint8_t* vb, uint32_t vs, const char* name) {
+    char p[512];
+    uint32_t bm = 0, ba = 0, bs = 0, by = 0;
+    uint32_t m = 0, k = 0, n = 0;
+    /* 所有 r2chunk* 变体共用 assets 目录 r2chunk */
+    char base[64];
+    if (strncmp(name, "r2chunk", 7) == 0) strcpy(base, "r2chunk");
+    else { strncpy(base, name, 63); base[63] = 0; }
+    snprintf(p, sizeof(p), ADIR "/%s/meta.txt", base);
+    uint8_t* mt = rd(p, &bm);
+    if (!mt || bm < 16) { ex_log("[%s] meta missing", name); return 1; }
+    m = *(uint32_t*)(mt + 0);
+    k = *(uint32_t*)(mt + 4);
+    n = *(uint32_t*)(mt + 8);
+    free(mt);
+    snprintf(p, sizeof(p), ADIR "/%s/act.f16.raw", base);
+    uint8_t* act = rd(p, &ba);
+    snprintf(p, sizeof(p), ADIR "/%s/scale.f16.raw", base);
+    uint8_t* sc = rd(p, &bs);
+    snprintf(p, sizeof(p), ADIR "/%s/yexp.f16.raw", base);
+    uint8_t* yexp = rd(p, &by);
+    snprintf(p, sizeof(p), ADIR "/%s/act_table.raw", base);
+    uint8_t* at = rd(p, &bm);
+    if (!act || !sc || !yexp || !at ||
+        ba != m * k * 2 || bs != n * 2 + 2 || by != m * n * 2) {
+        ex_log("[%s] assets missing/size", name);
+        return 1;
+    }
+    float wq_rms = h2f(*(const uint16_t*)(sc + (size_t)n * 2));
+
+    uint32_t m_pad = (m + 255u) & ~255u;
+    struct dc_arena ar;
+    dc_arena_init(&ar, vb, vs);
+    struct dc_w4 e;
+    uint32_t n_eff = n > 4096u ? 4096u : n;
+    if (dc_w4_carve(&e, &ar, m_pad, k, n_eff, at, at)) { ex_log("[%s] carve FAIL", name); return 1; }
+
+    uint8_t* out = malloc(m * n * 2);
+    if (!out) { ex_log("[%s] out alloc FAIL", name); return 1; }
+    /* 块集控制: 名含 "c0" → 只块0; "c1" → 只块1 (隔离实验) */
+    uint32_t c0_first = strstr(name, "c1") ? 4096u : 0u;
+    uint32_t c0_last = strstr(name, "c0") ? 0u : n;
+    for (uint32_t c0 = c0_first; c0 <= c0_last; c0 += 4096u) {
+        if (c0 >= n) break;
+        uint32_t nc = (n - c0 < 4096u) ? n - c0 : 4096u;
+        uint32_t ci = c0 / 4096u;
+        uint32_t bw = 0, bb = 0, bo = 0;
+        snprintf(p, sizeof(p), ADIR "/%s/packed_weight.c%u.raw", base, (unsigned)ci);
+        uint8_t* wt = rd(p, &bw);
+        snprintf(p, sizeof(p), ADIR "/%s/folded_bias.c%u.raw", base, (unsigned)ci);
+        uint8_t* bis = rd(p, &bb);
+        snprintf(p, sizeof(p), ADIR "/%s/out_table.c%u.raw", base, (unsigned)ci);
+        uint8_t* ot = rd(p, &bo);
+        if (!wt || !bis || !ot) { ex_log("[%s] chunk%u assets", name, (unsigned)ci); free(out); return 1; }
+        dc_clean_ddr(wt, bw); dc_clean_ddr(bis, bb);
+        cpu_to_vtcm(e.wt, wt, k * nc / 2);
+        cpu_to_vtcm(e.bias, bis, (nc / 32) * 512);
+        free(wt); free(bis);
+        e.otbl_ddr = ot;
+        ex_log("[%s] chunk%u invoke (c0=%u nc=%u)", name, (unsigned)ci, (unsigned)c0, (unsigned)nc);
+        if (dc_w4_run(&e, act, out + (size_t)c0 * 2u, m, k, nc,
+                      sc + (size_t)c0 * 2u, n * 2u, wq_rms, 0.0f)) {
+            ex_log("[%s] chunk%u run FAIL", name, (unsigned)ci);
+            free(ot); free(out);
+            return 1;
+        }
+        free(ot);
+    }
+    uint32_t n_exact = 0;
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    float maxd = 0.0f;
+    const uint16_t* o = (const uint16_t*)out;
+    const uint16_t* y = (const uint16_t*)yexp;
+    uint32_t c_cmp_end = (c0_last == 0u) ? 4096u : n;  /* 只块0 → 比 0..4096 */
+    for (uint32_t c = c0_first; c < c_cmp_end; c++)
+      for (uint32_t r = 0; r < m; r++) {
+        uint32_t i = (size_t)r * n + c;
+        float a = h2f(o[i]), b = h2f(y[i]);
+        if (o[i] == y[i]) n_exact++;
+        dot += (double)a * b;
+        na += (double)a * a;
+        nb += (double)b * b;
+        float d = fabsf(a - b);
+        if (d > maxd) maxd = d;
+    }
+    double cos = dot / (sqrt(na) * sqrt(nb) + 1e-30);
+    uint32_t n_cmp = (c_cmp_end - c0_first) * m;
+    ex_log("[%s] m=%u k=%u n=%u cos=%.6f exact=%u/%u max|d|=%.5f %s",
+           name, (unsigned)m, (unsigned)k, (unsigned)n, cos,
+           (unsigned)n_exact, (unsigned)n_cmp, maxd, cos >= 0.94 ? "PASS" : "FAIL");
+    free(out);
+    return cos >= 0.94 ? 0 : 1;
+}
+
 static int run_case(struct wtcache_ctx* wc, uint8_t* vb, uint32_t vs, const char* name) {
     char p[512];
     uint32_t bw = 0, bb = 0, ba = 0, bo = 0, bs = 0, by = 0, bm = 0, bt = 0;
@@ -157,7 +253,12 @@ int main(int argc, char** argv) {
 
     int fails = 0;
     for (int i = 0; i < n_cases; i++) {
-        if (run_case(wc, (uint8_t*)vb + off, vs - off, names[i])) fails++;
+        int rc;
+        if (strncmp(names[i], "r2chunk", 7) == 0)
+            rc = run_case_chunked(wc, (uint8_t*)vb + off, vs - off, names[i]);
+        else
+            rc = run_case(wc, (uint8_t*)vb + off, vs - off, names[i]);
+        if (rc) fails++;
     }
     wtcache_close(wc);
     ex_check("all_cases_pass", fails == 0 ? 0 : 1, 0);
