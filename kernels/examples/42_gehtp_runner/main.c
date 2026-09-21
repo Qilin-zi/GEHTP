@@ -157,15 +157,25 @@ int main(void) {
     ex_log("M6 before wt_parse");
     {
         /* 独立预检: 自己数 op 流 (与 wt_parse 同布局), 打印首个异常点字节 */
+        /* 与 wt_parse 同源的 arity 表 (oplist_parse.c arity_of; 设备 lib 若
+         * 过期与此不一致即 ARITY 根因) */
+        /* oplist_parse.h WT_ARITY_* 表 (opcode 0..30; 31+ arity_of 无 case) */
+        static const int16_t ar_tab[43] = {
+            0, 10, 4, 1, 3, 15, 13, 4, 4, 4, 6, 4, 5, 4, 16, 16,
+            16, 9, 7, 6, 5, 3, 4, 5, 7, 5, 12, 8, 12, 16, 3,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+        };
         uint32_t pn_slots = *(uint32_t*)(blob + 8);
         uint32_t pn_ops = *(uint32_t*)(blob + 12);
         size_t pp = 16 + (size_t)pn_slots * 16;
         for (uint32_t pi = 0; pi < pn_ops && pp + 4 <= blob_len; pi++) {
             uint16_t opc = (uint16_t)(blob[pp] | (blob[pp + 1] << 8));
             uint16_t na = (uint16_t)(blob[pp + 2] | (blob[pp + 3] << 8));
-            if (opc > 42 || na > 16) {
-                ex_log("[pre] op%u @%zu opc=%u na=%u bytes=%02X%02X%02X%02X%02X%02X%02X%02X",
+            if (opc > 42 || na > 16 || opc > 30 ||
+                (int16_t)na != ar_tab[opc]) {
+                ex_log("[pre] op%u @%zu opc=%u na=%u (arity=%d) bytes=%02X%02X%02X%02X%02X%02X%02X%02X",
                        (unsigned)pi, pp, (unsigned)opc, (unsigned)na,
+                       opc < 43 ? (int)ar_tab[opc] : -1,
                        blob[pp], blob[pp+1], blob[pp+2], blob[pp+3],
                        blob[pp+4], blob[pp+5], blob[pp+6], blob[pp+7]);
                 break;
