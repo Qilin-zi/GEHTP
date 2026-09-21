@@ -299,3 +299,8 @@ add_test(NAME test_wtop_emit COMMAND test_wtop_emit)
 add_executable(test_qwen35_ir tests/test_qwen35_ir.cpp)
 target_link_libraries(test_qwen35_ir htp_core)
 add_test(NAME test_qwen35_ir COMMAND test_qwen35_ir)
+
+# P3: fa::RuntimeAllocator 中间层 — §1.3 布局定稿钉死 + make_allocator 分派路径
+add_executable(test_runtime_alloc tests/test_runtime_alloc.cpp)
+target_link_libraries(test_runtime_alloc htp_core)
+add_test(NAME test_runtime_alloc COMMAND test_runtime_alloc)
