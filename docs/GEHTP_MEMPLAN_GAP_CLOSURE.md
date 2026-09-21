@@ -87,6 +87,19 @@ A/D/F 三件互不重叠、文件零冲突，可并行开工。
   逐步填进 RuntimeAllocator（算法升级，见 P5 之后的最终态）。
 - 门：ctest 全绿；conv_add / L3 byte-exact 回归；`make_allocator` 分派路径单测。
 
+- 实施记录（2026-09-21，task/p3-runtime-alloc）：中间层已恢复——新增
+  `compiler/include/hnnx/vtcm/runtime_alloc.hpp` + `compiler/src/vtcm/runtime_alloc.cpp`；
+  `FancyAllocator : public RuntimeAllocator`，`mode_` 上移至基类（§1.3 +0x10）；
+  `make_allocator`/`make_allocator_at` 槽位工厂落地（§1.2，fancy 分派 + Mode 恒 0 +
+  旧者经虚析构删除）；§1.3 字段布局定稿（sizeof 0xb8，含 slot_sizes[3] @+0xa8/+0xac/+0xb0，
+  P4 接口承诺，成员偏移由 test_runtime_alloc 运行时钉死）；tensor_base.hpp 旧
+  fa::RuntimeAllocator stub 移除改含 runtime_alloc.hpp（ODR 收口）；
+  map_block_reference/deserialize_blocks 维持仅声明（记录面算法属 P5+）；
+  RuntimeAllocator 暂不继承 hnnx::Allocator（原因见 runtime_alloc.hpp 头注，M35 统一）。
+  验收：ctest 45/45 全绿（44 旧 + test_runtime_alloc 53 项）；本机 GCC 9.4 构建需
+  `-include /tmp/p3_gcc9_bit_cast_shim.h`（__builtin_bit_cast 为 GCC11+ 内置，
+  仅构建目录注入）。跨组复用算法不在本阶段，行为与基线逐字节一致。
+
 ### P4 SFCD spill/fill 写侧（B，依赖 E）
 - 内容：`spillfill_g4.cpp`（现 388 行，仅读侧）补 §C 分配面 / §D checkpoint op / §E 写侧真体。
 - 落点：`compiler/src/vtcm/spillfill_g4.cpp` + `include/hnnx/vtcm/spillfill_g4.hpp`。
