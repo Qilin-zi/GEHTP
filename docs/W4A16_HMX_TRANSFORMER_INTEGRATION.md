@@ -51,17 +51,27 @@
   本身, 解码直接补码, 再 XOR = 双重变换 (w≥0 错 w-8, cos -0.58); ② scale 槽
   已含 /7, 解码勿再除 (多除 = 幅度 7× 错)。
 
-### ② 设备侧: act f16 → u16 a16 域 + crouton 打包 (新 dc 函数)
-- 运行时新函数 (dc_parts.c 或 oplist_exec.c): f16 面 → u16 量化 (encoding 常量
-  对齐闭包 _a16_encoding) → crouton16_row4 面 (闭包 pack 公式) → atbl 偏移表生成
-  (编译期槽已给模板? 否 — atbl 偏移 = 纯公式, 设备侧或发射器都可生成; 驱动只重写指针)。
-- 输出: u16 面 → 反量化 f16 (otbl 面 + inv_crouton)。
+### ② 设备侧: act f16 → u16 a16 域 + crouton 打包 (新 dc 函数) — 已完成 (2026-09-21)
+- 新平台无关文件 `kernels/src/runtime/w4a16_quant.c` (host 单测 + 设备 lib 同源):
+  `w4a16_act_scale` = max|a| (全零→1); `w4a16_quant_f16` = round-half-away
+  (a/A_s·32767)+32768 纯 C 实现 (libc roundf 设备运行时未证; 钳位边界 v>-32767→
+  65535 / v<-32768→0); `w4a16_pack/unpack_crouton` (闭包 crouton16_row4 精确正逆);
+  `w4a16_dequant_out/_crouton` = A_s·S[n]·(q-32768)/32767 (S=列 scale 槽, 已含 /7)。
+- 新入口 `dc_w4_run` (exec_matmul 全链调用; 例程旧 dc_w4_invoke 契约不变):
+  - 设备 (dc_parts.c): 量化+crouton 融合写 VTCM 面 (**M→256 零行 pad=32768 —
+    a16 域 q=0 是 real=-1.0, 零行必须填零值点!**) → FLUSH → invoke → INVALIDATE
+    → crouton 序直读反量化 (行≥m 丢弃, 无中间缓冲)。
+  - host (host_stubs.c): 同签名纯 f32 数学 (act 不量化; 设备 a16/>>8 噪声由
+    ④ 容差门承担) — 全模型 7946240 元素 vs 旧参考 byte-exact。
+- exec_matmul: carve 按 M pad 后 (kernel M=256 硬约束, m_total_minus_step=8);
+  act/out 不再走 DMA 包装 (CPU 写 out_ddr → FLUSH; 旧 DMA-out 的 INVALIDATE
+  会丢 CPU 写)。**M pad 256 由 ② 收编, ③ 只剩 lm_head N 分块。**
 
-### ③ M pad 256 + N 分块
-- M=32 → 零行填充到 256 (act 面 pad, 输出取前 32 行)。
-- lm_head N=248320: 权重 tile 159MB > 8MB VTCM → N 分块 (每块 N≤4096),
+### ③ N 分块 (lm_head)
+- lm_head N=248320: 权重槽 127MB > 8MB VTCM → N 分块 (每块 N≤4096),
   每块: 权重块 UDMA 入 VTCM → invoke → 输出块出; 复用 htp-hardware-scheduling 的
-  DMA 双缓冲套路。
+  DMA 双缓冲套路。其余 GEMM 最大组合 (qkv: act 512KB + wt 3MB + out 3MB +
+  bias 96KB ≈ 6.6MB) 已可单次装入。
 
 ### ④ 单 GEMM 对拍门
 - 先用闭包资产 (s256) 验证新打包器产出的面 == 闭包资产 (byte-exact)。
