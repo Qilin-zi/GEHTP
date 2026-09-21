@@ -120,8 +120,11 @@
   双 sigmoid/int32 输入/bias 槽/tile 路由/malloc 截断 — 见 git log 0e61587 前)。
   剩余疑点: conv 因果核与 gguf 权重序对齐 (params.bin 布局未对上)、
   权重 [K,N]vs[N,K] 布局 (转置实验 cos 0.094 未决)、attn_iter 递归链细节。
-- **设备 PD 堆**: 3.3GB (反量化) blob read fail; 1.67GB 可跑; 新格式权重 = K*N/2
-  更小, 2.68GB tile 待测; 长期需流式/映射权重。
+- **设备 PD 堆**: 实测 malloc 上限 3.0GB (例 45 探针); 2.63GB kernel 格式 blob
+  可跑 (需 blob_size 键绕过 off_t 32 位); 长期需流式/映射权重。
+- **剩余质量杠杆** (⑤ 后): 板 vs host cos 0.9687 的量化噪声 (act 量化
+  16-log2(f) 位 + f16 输出舍入 ×24 层累积) — 若需提升, 换更大 f 余量
+  或 f16→f32 出面; 但与 §5 的 0.03 级分歧相比非当前瓶颈。
 
 ## 关键文件
 
