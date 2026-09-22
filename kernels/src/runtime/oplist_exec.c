@@ -1052,9 +1052,12 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
     if (!tbl || !idx || !y) { snprintf(err, errn, "gather ref fail"); return -1; }
     uint32_t row_n = row_bytes / 2;
     if (row_n == 0) { snprintf(err, errn, "gather row_bytes"); return -1; }
-    for (uint32_t i = 0; i < n / row_n; i++) {
+    /* idx[i] 必须落在 [0, n/row_n) 内, 防止 const idx 槽短于 n/row_n
+     * 时静默越界读 (Gather 索引槽长门) */
+    uint32_t n_idx = n / row_n;
+    for (uint32_t i = 0; i < n_idx; i++) {
         int32_t r = idx[i];
-        if (r < 0) r = 0;
+        if (r < 0 || (uint32_t)r >= n_idx) { snprintf(err, errn, "gather idx %u out of range", i); return -1; }
         memcpy(y + (size_t)i * row_n, tbl + (size_t)r * row_bytes, row_bytes);
     }
     return 0;
@@ -1246,8 +1249,12 @@ static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
     uint16_t* y = (uint16_t*)temp_get(y_t, n_out * 2u);
     if (!x || !y) { snprintf(err, errn, "slice ref fail"); return -1; }
     if (rk < 1 || rk > 3) { snprintf(err, errn, "slice rank %u", rk); return -1; }
-    uint32_t bb[3] = {b0, b1, b2}, ee[3] = {e0, e1, e2}, ss[3] = {s0, s1, s2};
     uint32_t dd[3] = {d0, d1, d2};
+    /* in_lin 必须落在 [0, n_input) 内, 防止 begin/stride 组合
+     * 导致越界读 (切片输入线性地址门) */
+    uint32_t n_input = 1;
+    for (uint32_t ax = 0; ax < rk; ax++) n_input *= dd[ax];
+    uint32_t bb[3] = {b0, b1, b2}, ee[3] = {e0, e1, e2}, ss[3] = {s0, s1, s2};
     uint32_t od[3] = {1, 1, 1};
     for (uint32_t ax = 0; ax < rk; ax++) {
         if (ss[ax] == 0) ss[ax] = 1;
@@ -1267,6 +1274,7 @@ static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
             rem %= ostr[ax];
             in_lin += (bb[ax] + c * ss[ax]) * istr[ax];
         }
+        if (in_lin >= n_input) { snprintf(err, errn, "slice lin %u oob", in_lin); return -1; }
         y[i] = x[in_lin];
     }
     return 0;
@@ -1459,11 +1467,12 @@ static int exec_scatter_nd(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* data = (const uint16_t*)ref_ptr(b, data_t);
     const int32_t* idx = (const int32_t*)slot_ptr(b, idx_s);
     const uint16_t* upd = (const uint16_t*)ref_ptr(b, upd_t);
-    /* out 元素数 = data 元素数 (与 data 同形); od[0..4] 为 data 形状 */
+    /* n = data 全部元素数; od[0..K-1] = 最后 K 维形状,
+     * od[K..4] = 前导批维 (输出按 n 个元素线性寻址) */
     uint32_t od[5] = {1, 1, 1, 1, 1};
     for (uint32_t k = 0; k < K && k < 5; k++) od[k] = op->args[6 + k];
     uint32_t n = 1;
-    for (uint32_t k = 0; k < K && k < 5; k++) n *= od[k];
+    for (uint32_t k = K; k < 5; k++) n *= od[k];
     uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)n * 2u);
     if (!data || !idx || !upd || !y) { snprintf(err, errn, "scatter_nd ref fail"); return -1; }
     memcpy(y, data, (size_t)n * 2u);

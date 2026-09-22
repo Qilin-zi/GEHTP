@@ -59,17 +59,17 @@ static int op_scatter_nd(Emitter& em, GraphPrepare& gp, const OpDef* od, std::ma
 
     uint32_t out_t = em.fresh_temp(gp, od->op_id);
 
-    /* data 形状 od[0..K-1](取 data 输入的 output_def 末 K 维, C 序) */
+    /* data 全形 od[0..4]; od[0..K-1] = 最后 K 维 (索引参照),
+     * od[K..r-1] = 前导批维 (输出总元素积)。 */
     const OpDef* data_od = gp.get_op_at(od->inputs[0].src_id);
     uint32_t odims[5] = {1, 1, 1, 1, 1};
     if (data_od) {
         uint32_t r = data_od->output_def.rank;
-        /* 末 K 维(右对齐); 前导维折入 */
         uint32_t off = (r > K) ? (r - K) : 0;
-        for (uint32_t k = 0; k < K; k++) {
-            uint32_t dv = (off + k < r) ? (uint32_t)data_od->output_def.dims[off + k] : 1;
-            odims[k] = dv;
-        }
+        for (uint32_t k = 0; k < K && off + k < r; k++)
+            odims[k] = data_od->output_def.dims[off + k];
+        for (uint32_t k = 0; k < off && K + k < 5; k++)
+            odims[K + k] = data_od->output_def.dims[k];
     }
 
     em.add_op(OP_SCATTER_ND_F16,
