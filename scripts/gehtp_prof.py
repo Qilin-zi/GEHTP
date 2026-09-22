@@ -45,11 +45,14 @@ OP_NAMES = {
 }
 # 搬运类 op (三分账的"搬"): 纯数据移动/重排, 零 FLOPs
 MOVE_OPS = {3, 5, 8, 9, 10, 14, 15, 16, 20, 26, 27}
+# W-P3: 设备侧 enum wt_engine 同序 (oplist_exec.h)
+ENGINE_NAMES = {0: "scalar", 1: "HVX", 2: "HMX"}
 
 
 class OpRec:
     __slots__ = ("idx", "opcode", "args", "name", "in_b", "w_b", "out_b",
-                 "pool_b", "flops", "vtcm", "note", "start_us", "dur_us")
+                 "pool_b", "flops", "vtcm", "note", "start_us", "dur_us",
+                 "dma_us", "dma_bytes", "engine")
 
     def __init__(self, idx, opcode, args):
         self.idx = idx
@@ -61,6 +64,8 @@ class OpRec:
         self.vtcm = False
         self.note = ""
         self.start_us = self.dur_us = None
+        self.dma_us = self.dma_bytes = None
+        self.engine = 0
 
     @property
     def total_b(self):
@@ -113,20 +118,25 @@ def parse_wtop(path):
 
 
 def parse_op_ts(path):
-    """op_ts.bin (WTS1): magic|ver|n_ops|pad|wall_us u64|n×(start,dur) u32."""
+    """op_ts.bin (WTS1): magic|ver|n_ops|pad|wall_us u64|n×(start,dur[,dma_us,dma_bytes,engine]).
+    ver=1: 每 op 8B {start,dur}; ver=2: 每 op 20B 加 dma_us/dma_bytes/engine。
+    统一返回 5 元组 (start,dur,dma_us,dma_bytes,engine), ver=1 后三项补 0。"""
     data = open(path, "rb").read()
     if data[:4] != b"WTS1":
         raise SystemExit(f"bad op_ts magic: {path}")
     ver, n_ops = struct.unpack_from("<II", data, 4)
-    if ver != 1:
+    if ver not in (1, 2):
         raise SystemExit(f"unsupported op_ts ver {ver}")
     (wall_us,) = struct.unpack_from("<Q", data, 16)
     ts = []
     off = 24
     for _ in range(n_ops):
-        s, d = struct.unpack_from("<II", data, off)
-        ts.append((s, d))
-        off += 8
+        if ver == 1:
+            s, d = struct.unpack_from("<II", data, off); off += 8
+            ts.append((s, d, 0, 0, 0))
+        else:
+            s, d, dus, db, eng = struct.unpack_from("<IIIII", data, off); off += 20
+            ts.append((s, d, dus, db, eng))
     return wall_us, ts
 
 
@@ -302,6 +312,8 @@ def main():
     ap.add_argument("--csv", default=None)
     ap.add_argument("--peak-flops", type=float, default=PEAK_FLOPS_F16)
     ap.add_argument("--peak-bw", type=float, default=PEAK_DRAM_BW)
+    ap.add_argument("--strict", action="store_true",
+                    help="op_ts 与 blob 长度不齐时报错退出 (默认仅 warn)")
     args = ap.parse_args()
 
     ver, slots, raw_ops = parse_wtop(args.wtop)
@@ -336,10 +348,15 @@ def main():
         wall_us, ts = parse_optrace(args.optrace)
     if ts:
         if len(ts) != len(ops):
-            print(f"warn: ts n={len(ts)} != blob n_ops={len(ops)} (join 按 min)",
-                  file=sys.stderr)
-        for rec, (s, d) in zip(ops, ts):
+            msg = (f"ts n={len(ts)} != blob n_ops={len(ops)} — op_ts.bin 陈腐"
+                   f"(上轮别模型/别会话)或未重跑; join 按 min={min(len(ts), len(ops))}")
+            if args.strict:
+                raise SystemExit(f"strict: {msg}  (跑前 gehtp run 已清设备侧 op_ts.bin; "
+                                 f"若仍不齐 = 该 blob 未在本轮重跑)")
+            print(f"warn: {msg}", file=sys.stderr)
+        for rec, (s, d, dus, db, eng) in zip(ops, ts):
             rec.start_us, rec.dur_us = s, d
+            rec.dma_us, rec.dma_bytes, rec.engine = dus, db, eng
 
     # ---- [run] 分段 (可选)
     if args.device_txt:
@@ -376,24 +393,38 @@ def main():
     print(f"标定: peak_flops={args.peak_flops / 1e12:.2f}TFLOPS f16 "
           f"peak_bw={args.peak_bw / 1e9:.1f}GB/s "
           f"(源: V81HexSim 器件权威行; --peak-* 可覆盖)")
+    # W-P3: 真 UserDMA 搬运实测 (只含 dc_dma_once 的 DRAM↔VTCM; CPU 拷贝不计)
+    t_dma = sum(r.dma_us or 0 for r in ops)
+    b_dma = sum(r.dma_bytes or 0 for r in ops)
+    if t_dma > 0:
+        print(f"DMA 搬运实测: Σdma_us={t_dma / 1e3:.2f}ms Σdma={fmt_b(b_dma)} "
+              f"有效带宽={b_dma / (t_dma * 1e-6) / 1e9:.1f}GB/s "
+              f"({b_dma / (t_dma * 1e-6) / args.peak_bw * 100:.0f}%峰值)")
+    else:
+        print("DMA 搬运实测: Σdma_us=0 (本 blob 无 W4A16 matmul 的 UserDMA 搬运)")
     print()
 
     # ---- top N
     ranked = sorted((r for r in ops if r.dur_us is not None),
                     key=lambda r: -r.dur_us)
     print(f"== top {args.top} by dur ==")
-    print(f"{'idx':>6} {'dur_us':>9} {'%wall':>6} {'bytes':>12} {'GB/s':>7} "
-          f"{'GFLOP/s':>8} {'opcode':<18} {'name':<40} verdict")
+    print(f"{'idx':>6} {'dur_us':>9} {'dma_us':>8} {'%wall':>6} {'bytes':>12} {'GB/s':>7} "
+          f"{'GFLOP/s':>8} {'opcode':<18} {'eng':<7} {'name':<40} verdict")
     dw = denom
     for r in ranked[:args.top]:
         tb = r.total_b
         bw = f"{tb / (r.dur_us * 1e-6) / 1e9:.1f}" if tb and r.dur_us else "-"
         gf = f"{r.flops / (r.dur_us * 1e-6) / 1e9:.1f}" if r.flops and r.dur_us else "-"
         vt = " [vtcm]" if r.vtcm else ""
-        print(f"{r.idx:>6} {r.dur_us:>9} {r.dur_us / dw * 100:>5.1f}% "
+        dma_s = f"{r.dma_us:>8}" if r.dma_us is not None else "       -"
+        eng = ENGINE_NAMES.get(r.engine, f"e{r.engine}")
+        v = verdict(r, args.peak_flops, args.peak_bw)
+        if r.dma_us:
+            v += f" dma={r.dma_us}us ({r.dma_bytes / (r.dma_us * 1e-6) / 1e9:.1f}GB/s)"
+        print(f"{r.idx:>6} {r.dur_us:>9} {dma_s} {r.dur_us / dw * 100:>5.1f}% "
               f"{fmt_b(tb):>12} {bw:>7} {gf:>8} "
-              f"{OP_NAMES.get(r.opcode, f'OP{r.opcode}'):<18} "
-              f"{(r.name[:40] + vt):<40} {verdict(r, args.peak_flops, args.peak_bw)}")
+              f"{OP_NAMES.get(r.opcode, f'OP{r.opcode}'):<18} {eng:<7} "
+              f"{(r.name[:40] + vt):<40} {v}")
     print()
 
     # ---- per-opcode 聚合
@@ -427,7 +458,8 @@ def main():
             evs.append({"name": f"{r.idx}:{r.name}", "cat": OP_NAMES.get(r.opcode, "?"),
                         "ph": "X", "ts": s, "dur": r.dur_us, "pid": 1, "tid": 1,
                         "args": {"opcode": r.opcode, "bytes": r.total_b,
-                                 "flops": r.flops}})
+                                 "flops": r.flops, "engine": r.engine,
+                                 "dma_us": r.dma_us}})
             cur = s + r.dur_us
         json.dump({"traceEvents": evs,
                    "displayTimeUnit": "ms"}, open(args.trace_json, "w"))
@@ -439,11 +471,13 @@ def main():
         with open(args.csv, "w", newline="") as f:
             wcsv = csvmod.writer(f)
             wcsv.writerow(["idx", "name", "opcode", "opcode_name", "start_us",
-                           "dur_us", "in_b", "w_b", "out_b", "pool_b", "flops",
-                           "vtcm", "note"])
+                           "dur_us", "dma_us", "dma_bytes", "engine", "in_b",
+                           "w_b", "out_b", "pool_b", "flops", "vtcm", "note"])
             for r in ops:
                 wcsv.writerow([r.idx, r.name, r.opcode,
                                OP_NAMES.get(r.opcode, "?"), r.start_us, r.dur_us,
+                               r.dma_us, r.dma_bytes,
+                               ENGINE_NAMES.get(r.engine, r.engine),
                                r.in_b, r.w_b, r.out_b, r.pool_b, r.flops,
                                int(r.vtcm), r.note])
         print(f"csv: {args.csv}")

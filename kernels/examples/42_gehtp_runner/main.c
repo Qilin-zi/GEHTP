@@ -37,7 +37,8 @@
 #define OP_TS_PATH "/data/local/tmp/hrt/gehtp/op_ts.bin"
 
 /* op_ts.bin 线格式 (全小端): magic 'WTS1' u32 | ver u32 | n_ops u32 | pad u32
- * | exec_wall_us u64 | n_ops × {start_us u32, dur_us u32} (相对 exec 入口) */
+ * | exec_wall_us u64 | n_ops × wt_op_ts 记录 (相对 exec 入口)。
+ * ver=1: 8B {start,dur}; ver=2: 20B {start,dur,dma_us,dma_bytes,engine} (W-P3)。 */
 static int write_op_ts(const char* path, const struct wt_op_ts* ts, uint32_t n,
                        uint64_t wall_us) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -45,7 +46,7 @@ static int write_op_ts(const char* path, const struct wt_op_ts* ts, uint32_t n,
     uint8_t hdr[24];
     memset(hdr, 0, sizeof(hdr));
     hdr[0] = 'W'; hdr[1] = 'T'; hdr[2] = 'S'; hdr[3] = '1';
-    uint32_t v = 1; memcpy(hdr + 4, &v, 4);
+    uint32_t v = 2; memcpy(hdr + 4, &v, 4);
     memcpy(hdr + 8, &n, 4);
     memcpy(hdr + 16, &wall_us, 8);
     int ok = 0;
