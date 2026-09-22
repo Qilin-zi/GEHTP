@@ -1,0 +1,26 @@
+{
+  "manifest_ver": 2,
+  "input_slot": 0,
+  "input_elems": 64,
+  "output_temp": 2,
+  "n_slots": 2,
+  "n_ops": 7,
+  "opcodes": [
+    9,
+    9,
+    22,
+    9,
+    9,
+    22,
+    23
+  ],
+  "op_names": [
+    "Fill",
+    "Fill",
+    "KvAppend",
+    "Fill",
+    "Fill",
+    "KvAppend",
+    "KvGather"
+  ]
+}

@@ -25,3 +25,18 @@ scripts/venv_qpm/
 scripts/venv_qpm210/
 .scratch_d59/
 tmp/
+
+# 临时 scratch / 备份 / wtop 中间工作目录
+.scratch_*/
+*.wtop.work/
+*.bak_*
+*.old_*
+
+# 设备运行输出 (prof 日志/时间戳)
+blobs_*/prof/
+test_models/*/prof/
+
+# 大模型权重目录 (本地资产, 不上库)
+test_models/minicpm5_2b*/
+test_models/qwen35_4b/
+test_models/qwen3vl_4b*/
