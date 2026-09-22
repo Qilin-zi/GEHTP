@@ -107,5 +107,6 @@ gehtp run m.wtop --input x0_new.f16.raw --output out.f16.raw   # x1 用编译时
 | conv_add spill 变体（`--ddr-budget 4096`） | 13 op 含 6×SPILL/FILL | **byte-exact 32768/32768** |
 | L3 注意力层（[test_assets/l3/](../test_assets/)） | 81 op / 45MB blob | **max_valdiff=0.000488 = M4.2 golden 判据** |
 | L0 GDN 层 | 903 op / 119MB blob | 前 91 op 通过；rank 三修复（16af35d + c5d4c2a）已落，新编码资产由例41线收口后复跑 |
+| **Qwen3-0.6B 全模型 prefill**（[GEHTP_QWEN3_06B_LINE.md](GEHTP_QWEN3_06B_LINE.md)） | 1682 op / 1.34GB blob / 649 槽（11 型 opcode） | **编译+host 门 4/4 绿**（cos≥0.99999998，top1 32/32×4）；设备门待板恢复（2026-09-17 设备事故见 runbook §7） |
 
 已知边界：单运行时主输入、单输出、f16 only、编译器 20 型 opcode 覆盖。

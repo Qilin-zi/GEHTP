@@ -73,6 +73,11 @@ struct dc_w4 {
     const uint8_t* otbl_ddr;
     const uint8_t* scale_ddr; /* 列 scale f16 N*2 (host 参考/设备出面反量化用;
                                  kernel 固定 ÷7 域不消费) */
+    /* 分块重绑激活: 同一 act 多块 GEMM (lm_head 61 块) 时, act 量化+crouton
+     * 面 + 输出域因子只算一次, 各块 invoke 复用。valid=面已备。 */
+    const uint8_t* act_ddr; /* 已绑定的 DDR act 源 (位地址判 repack) */
+    float    act_scale; /* 已量化的 a_scale = as·f */
+    int      act_valid;
 };
 /* 从 arena 一性 carve 全部面 (HMX 面 2KB 对齐) */
 int dc_w4_carve(struct dc_w4* e, struct dc_arena* a, uint32_t m, uint32_t k,
@@ -91,5 +96,23 @@ void dc_w4_read_out(const struct dc_w4* e, void* recv);
 int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
               uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
               uint32_t out_row_bytes, float wq_rms, float f_fixed);
+
+/* lm_head N 分块优化: 复用 act 量化+crouton 面.
+ * 调用序列:
+ *   1. dc_w4_run_prep(e, act_src, M, K, wq_rms, f_fixed) — 量化一次
+ *   2. for each chunk c0: dc_w4_run_invoke(e, scale+c0*2, nc,
+ *        out_ddr+c0*2, N*2, M, wq_rms, f_fixed) — 只 kernel+dequant
+ *   3. dc_w4_run_fini(e) — 释放重绑状态 (下次 prep 重新量化)
+ * m_out = 真实行数 M (e->m 是 pad256(M), 反量化只用前 M 行);
+ * out_ddr 由调用方给到本块列偏移。复用期内 e->n 须由 invoke 临时改回
+ * (dc_w4_invoke 按 e->n refill 表; carve 宽 n_eff ≥ 块宽 nc)。
+ * 数值契约与逐块 dc_w4_run 完全等价 (同 a_scale、同 32768 pad、同
+ * w4a16_dequant_crouton); 仅消除 61 次重复的 act 全面 pass。 */
+int dc_w4_run_prep(struct dc_w4* e, const uint8_t* act_src, uint32_t m,
+                     uint32_t k, float wq_rms, float f_fixed);
+int dc_w4_run_invoke(struct dc_w4* e, const uint8_t* scale, uint32_t n,
+                       uint8_t* out_ddr, uint32_t out_row_bytes,
+                       uint32_t m_out, float wq_rms, float f_fixed);
+void dc_w4_run_fini(struct dc_w4* e);
 
 #endif

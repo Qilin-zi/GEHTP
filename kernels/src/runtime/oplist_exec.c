@@ -444,6 +444,11 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     memcpy(&rms16, scale + (size_t)N * 2u, 2);
     float wq_rms = f16_to_f32(rms16);
 
+    /* 激活量化/重排只做一次；lm_head 的所有 N 分块共享同一 act 面和 a_scale。 */
+    int bad = dc_w4_run_prep(&g_exec.e, act_src, M, K, wq_rms,
+                              0.0f /* f_fixed=0 → 运行时自适应 */);
+    if (bad) { snprintf(err, errn, "dc_w4_run_prep"); return -1; }
+
     /* 分块循环 (lm_head N=248320 → 61 块; 每块按精确 nc invoke, kernel 只算
      * nc 列, 槽尾陈旧数据不会被读)。非分块 op 单次即退。 */
     for (uint32_t c0 = 0; c0 < N; c0 += W4_N_CHUNK) {
@@ -459,11 +464,11 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                                  QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
         } else {
             int rc_wt = dma_to_vtcm(g_exec.e.wt, wt_base, wt_b, &mu);
-            if (rc_wt) { snprintf(err, errn, "wt dma"); return -1; }
+            if (rc_wt) { dc_w4_run_fini(&g_exec.e); snprintf(err, errn, "wt dma"); return -1; }
         }
         int rc_bs = dma_to_vtcm(g_exec.e.bias, bias + (size_t)(c0 / 32u) * 512u,
                                 (nc / 32u) * 512u, &mu);
-        if (rc_bs) { snprintf(err, errn, "bias dma"); return -1; }
+        if (rc_bs) { dc_w4_run_fini(&g_exec.e); snprintf(err, errn, "bias dma"); return -1; }
         if (N > W4_N_CHUNK) {
             /* 分块 otbl: (mt·nct+i)·0x800 运行时生成 (表内容只依赖 nc) */
             uint32_t nct = nc / 32u;
@@ -473,14 +478,17 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                         (uint32_t)(((size_t)mt * nct + i) * 0x800u);
             g_exec.e.otbl_ddr = (const uint8_t*)g_exec.otbl_chunk;
         }
-        /* act/out 由 dc_w4_run 内部处理 (设备: 量化+pack 入 VTCM, 出面反量化
-         * 直写 DDR; host: 纯数学直读 DDR); 行跨度 = 全宽 N (分块列写在
-         * row·N + c0 处) */
-        int bad = dc_w4_run(&g_exec.e, act_src, out_ddr + (size_t)c0 * 2u,
-                            M, K, nc, scale + (size_t)c0 * 2u, N * 2u,
-                            wq_rms, 0.0f /* f_fixed=0 → 运行时自适应 */);
-        if (bad) { snprintf(err, errn, "dc_w4_run c0=%u", (unsigned)c0); return -1; }
+        /* act 面已由 prep 构造；invoke 只跑 kernel 并把出面反量化到本块列。 */
+        bad = dc_w4_run_invoke(&g_exec.e, scale + (size_t)c0 * 2u, nc,
+                               out_ddr + (size_t)c0 * 2u, N * 2u, M,
+                               wq_rms, 0.0f /* f_fixed=0 → 运行时自适应 */);
+        if (bad) {
+            dc_w4_run_fini(&g_exec.e);
+            snprintf(err, errn, "dc_w4_run_invoke c0=%u", (unsigned)c0);
+            return -1;
+        }
     }
+    dc_w4_run_fini(&g_exec.e);
     /* CPU 写 out_ddr → FLUSH (旧 DMA-out 时代是 INVALIDATE; 现在写者是 CPU) */
     qurt_mem_cache_clean((qurt_addr_t)out_ddr, out_b,
                          QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);

@@ -1,6 +1,7 @@
 /* host_stubs.c — wt_host_exec 的 QURT/HAP/dc 桩 (标量 blob 路径不触达) */
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* qurt_mem_cache_clean: host 无 DSP cache, 空操作 */
 void qurt_mem_cache_clean(uint64_t addr, uint32_t size, int op, int type) {
@@ -183,102 +184,73 @@ int  dc_w4_invoke(struct dc_w4* e) {
     return 0;
 }
 
+/* ---- lm_head N 分块优化: host 纯数学版本 (直拷 f16, 无量化/crouton) ---- */
+
+int dc_w4_run_prep(struct dc_w4* e, const uint8_t* act_src, uint32_t m,
+                    uint32_t k, float wq_rms, float f_fixed) {
+    (void)wq_rms; (void)f_fixed;
+    if (!e || !act_src) return 0xD400;
+    if (m % 32 || k % 32) return 0xD401;
+    uint32_t m_pad = (m + 255u) & ~255u;
+    if (m_pad != e->m) return 0xD402;
+    /* 直拷 f16 act; pad 行归零 (GEMM 零贡献, 与设备 32768→dequant→0 等价) */
+    memcpy(e->act, act_src, (size_t)m * k * 2);
+    memset(e->act + (size_t)m * k * 2, 0, (size_t)(m_pad - m) * k * 2);
+    e->act_scale = 1.0f;  /* host 无量化域 */
+    e->act_ddr = act_src;
+    e->act_valid = 1;
+    return 0;
+}
+
+int dc_w4_run_invoke(struct dc_w4* e, const uint8_t* scale, uint32_t n,
+                      uint8_t* out_ddr, uint32_t out_row_bytes,
+                      uint32_t m_out, float wq_rms, float f_fixed) {
+    (void)wq_rms; (void)f_fixed;
+    if (!e || !scale || !out_ddr) return 0xD400;
+    if (!e->act_valid) return 0xD405;
+    if (m_out % 32 || n % 32) return 0xD401;
+    {
+        uint32_t en = e->n;
+        e->n = n;
+        e->scale_ddr = scale;  /* host dc_w4_invoke 经 e->scale_ddr 读列 scale */
+        int irc = dc_w4_invoke(e);
+        e->n = en;
+        if (irc) return 0xD403;
+    }
+    /* host 无 cache; e->out f16 stride=N*2 → out_ddr stride=out_row_bytes */
+    const uint16_t* src = (const uint16_t*)e->out;
+    for (uint32_t row = 0; row < m_out; row++)
+        memcpy(out_ddr + (size_t)row * out_row_bytes,
+               src + (size_t)row * n, (size_t)n * 2);
+    return 0;
+}
+
+void dc_w4_run_fini(struct dc_w4* e) {
+    if (e) e->act_valid = 0;
+}
+
 /* dc_w4_run — host 实现: 与设备同语义但纯 f32 数学 (act 不量化, 直读 DDR;
  * 设备 a16 量化 + >>8 截断噪声由 ④ 容差门承担)。与设备 dc_w4_run 同签名:
  *   out_f16 = Σ_k act[m,k]·wq[k,n]·S[n]  (S=列 scale, 已含 /7) */
 int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
               uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
               uint32_t out_row_bytes, float wq_rms, float f_fixed) {
-    (void)wq_rms; (void)f_fixed;  /* host 纯数学, 无固定域, f 不参与 */
+    (void)wq_rms; (void)f_fixed;
     if (!e || !act_ddr || !out_ddr || !scale_ddr) return -1;
     if (m % 32 || k % 32 || n % 32) return -2;
-    uint32_t M = m, K = k, N = n;
-    int8_t* wq = (int8_t*)malloc(sizeof(int8_t) * K * N);
-    float* S = (float*)malloc(sizeof(float) * N);
-    if (!wq || !S) { free(wq); free(S); return -1; }
-    size_t o = 0;
-    for (uint32_t kb = 0; kb < K / 32; kb++)
-        for (uint32_t n_base = 0; n_base < N; n_base += 32)
-            for (uint32_t kg = 0; kg < 4; kg++) {
-                uint32_t k_base = kb * 32 + kg * 8;
-                for (uint32_t nn = n_base; nn < n_base + 32; nn++)
-                    for (uint32_t kr = 0; kr < 4; kr++) {
-                        uint8_t b = e->wt[o++];
-                        int lo = (int)(b & 0xF), hi = (int)(b >> 4);
-                        wq[(size_t)(k_base + kr) * N + nn] = (int8_t)(lo >= 8 ? lo - 16 : lo);
-                        wq[(size_t)(k_base + kr + 4) * N + nn] = (int8_t)(hi >= 8 ? hi - 16 : hi);
-                    }
-            }
-    for (uint32_t nn = 0; nn < N; nn++) {
-        uint16_t s16;
-        memcpy(&s16, scale_ddr + (size_t)nn * 2, 2);
-        float sv = 0.0f;
-        { /* f16 → f32 */
-            uint32_t sign = (uint32_t)(s16 & 0x8000u) << 16;
-            uint32_t ex = (s16 >> 10) & 0x1F, mn = s16 & 0x3FF;
-            uint32_t u;
-            if (ex == 0) u = sign;
-            else if (ex == 31) u = sign | 0x7F800000u | (mn << 13);
-            else u = sign | ((ex - 15 + 127) << 23) | (mn << 13);
-            memcpy(&sv, &u, 4);
-        }
-        S[nn] = sv;  /* scale 槽已含 /7 */
+    uint32_t m_pad = (m + 255u) & ~255u;
+    if (m_pad != e->m) return -2;
+    /* 复用检测: 同 act 源 → 只 invoke */
+    if (e->act_valid && e->act_ddr == act_ddr) {
+        return dc_w4_run_invoke(e, scale_ddr, n, out_ddr, out_row_bytes, m, wq_rms, f_fixed);
     }
-    const uint16_t* act = (const uint16_t*)act_ddr;
-    for (uint32_t mm = 0; mm < M; mm++) {
-        uint16_t* out = (uint16_t*)((uint8_t*)out_ddr + (size_t)mm * out_row_bytes);
-        for (uint32_t nn = 0; nn < N; nn++) {
-            double acc = 0.0;
-            for (uint32_t kk = 0; kk < K; kk++) {
-                float av;
-                uint16_t ah = act[(size_t)mm * K + kk];
-                { /* f16 → f32 */
-                    uint32_t sign = (uint32_t)(ah & 0x8000u) << 16;
-                    uint32_t ex = (ah >> 10) & 0x1F, mn = ah & 0x3FF;
-                    uint32_t u;
-                    if (ex == 0) u = sign;
-                    else if (ex == 31) u = sign | 0x7F800000u | (mn << 13);
-                    else u = sign | ((ex - 15 + 127) << 23) | (mn << 13);
-                    memcpy(&av, &u, 4);
-                }
-                acc += (double)av * (double)wq[(size_t)kk * N + nn] * (double)S[nn];
-            }
-            float r = (float)acc;
-            uint16_t rh;
-            { /* f32 → f16 RNE */
-                uint32_t u;
-                memcpy(&u, &r, 4);
-                uint32_t sgn = (u >> 16) & 0x8000u;
-                int32_t ex = (int32_t)((u >> 23) & 0xFF) - 127 + 15;
-                uint32_t mn = u & 0x7FFFFFu;
-                if (((u >> 23) & 0xFF) == 0xFF) { out[nn] = (uint16_t)(sgn | 0x7C00u | (mn ? 0x200u : 0u)); continue; }
-                if (((u >> 23) & 0xFF) == 0) { out[nn] = (uint16_t)sgn; continue; }
-                if (ex >= 31) { out[nn] = (uint16_t)(sgn | 0x7C00u); continue; }
-                uint32_t half;
-                if (ex <= 0) {
-                    if (ex < -10) { out[nn] = (uint16_t)sgn; continue; }
-                    mn |= 0x800000u;
-                    int32_t sh = 14 - ex;
-                    half = mn >> sh;
-                    uint32_t rm = mn & ((1u << sh) - 1);
-                    half += (rm > (1u << (sh - 1))) || (rm == (1u << (sh - 1)) && (half & 1));
-                    out[nn] = (uint16_t)(sgn | half);
-                } else {
-                    half = (mn >> 13) & 0x3FFu;
-                    uint32_t rm = mn & 0x1FFFu;
-                    half += (rm > 0x1000u) || (rm == 0x1000u && (half & 1));
-                    if (half == 0x400u) { ex++; half = 0; }
-                    if (ex >= 31) { out[nn] = (uint16_t)(sgn | 0x7C00u); continue; }
-                    out[nn] = (uint16_t)(sgn | ((uint32_t)ex << 10) | half);
-                }
-            }
-        }
-    }
-    free(wq);
-    free(S);
-    return 0;
+    /* 首次: prep + invoke */
+    int rc = dc_w4_run_prep(e, act_ddr, m, k, wq_rms, f_fixed);
+    if (rc) return rc;
+    return dc_w4_run_invoke(e, scale_ddr, n, out_ddr, out_row_bytes, m, wq_rms, f_fixed);
 }
 
 /* HAP perf stub */
 unsigned long long HAP_perf_get_time_us(void) { return 0; }
+
 

@@ -25,8 +25,18 @@
 | 单 CDSP 双线程 HMX | 并发/串行 ratio **0.963 ≈ 1**（单 DMA+HMX 锁线程，无线程级扩展） | 例 22 | ✅ 实测 |
 
 复测：`cd kernels && ./examples/build_examples.sh 43`（含 A1/A3/A4/B1 四门）。
-2026-09-17 注记：当日设备双 CDSP 域 PD open 失败（0x80000406，已知良好的 01 同样失败，
-非探针问题；疑前序会话残留/子系统楔形），探针待设备恢复后跑，上表 ⏳ 项随之回填。
+2026-09-17 注记：当日设备故障链——guest(52f67807, Android GVM) 双域 PD open 失败
+（0x80000406/0x39/0x72，已知良好的 01 同样失败，排除探针本身）；整板当日被反复重启
+（guest 与宿主 VM f69bec03 的 uptime 同步归零 ×2）；guest boot 期
+`init.qti.write.sh /sys/kernel/boot_cdsp/boot 1` 60s 超时（boot_adsp/cvp 同病），
+单独 reboot guest（宿主 vhost-device-ssr/glink_service_lrm/fastrpc-rm 均在跑）不恢复；
+进一步铁证：guest /dev 从未创建 fastrpc 节点（DSP device discovery 未完成）、
+guest boot 期 hab 通道协商被拒（`hab_open_listen failed -11, vcid 6a5ff001`，与宿主
+dmesg `open cancelled` 对上）、探针尝试期间宿主 journal 零 SSR 活动（请求未出 guest）、
+root 运行同样失败（非权限问题）——**虚拟化 SSR 通道协商层故障，需板级/hypervisor 恢复**。
+注：同日更早该板另一会话曾跑通 894-op L0（见 GEHTP_DEVICE_RUNBOOK.md §6），
+故障是整板反复重启后才出现的。
+探针待设备恢复后跑，上表 ⏳ 项随之回填。
 
 **对设计的直接含义（无论待测项结果如何都成立）：**
 - VTCM 16MiB 是驻留池硬上限 → 编译器 `--plan-vtcm-budget` 的物理天花板（当前双池分配
