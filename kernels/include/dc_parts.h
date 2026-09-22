@@ -54,6 +54,9 @@ uint64_t dc_dma_checksum(const struct dc_dma* d); /* dst 校验和 (cache 安全
 
 /* 会话隔离: 引擎 IDLE + 清 g_last_desc (wtcache_dma_fence 同款, 自持实现) */
 void dc_dma_fence(void);
+/* PROF W-P3: UserDMA 累加器 (每 op 前 reset, 后 get) — dc_dma_once 内累计 */
+void dc_dma_reset(void);
+void dc_dma_get(int64_t* us, int64_t* bytes);
 
 /* ---- W4A16 引擎 (P3/C2/C3/C4/M) ----
  * 每个 dc_w4 一套独立 VTCM 面 (act/out/wt/bias 表面全 2KB 对齐 — T10 教训),

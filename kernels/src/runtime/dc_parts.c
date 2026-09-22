@@ -7,6 +7,7 @@
 
 #include <HAP_farf.h>
 #include <HAP_power.h>
+#include <HAP_perf.h>
 #include <qurt.h>
 #include <hexagon_types.h>
 
@@ -131,6 +132,15 @@ void dc_dma_fence(void) {
     g_last_desc = NULL;
 }
 
+/* PROF W-P3: UserDMA 累加器 (dc_dma_once 内累计, 每 op reset/get) */
+static int64_t g_dma_us = 0;
+static int64_t g_dma_bytes = 0;
+void dc_dma_reset(void) { g_dma_us = 0; g_dma_bytes = 0; }
+void dc_dma_get(int64_t* us, int64_t* bytes) {
+    if (us) *us = g_dma_us;
+    if (bytes) *bytes = g_dma_bytes;
+}
+
 void dc_clean_ddr(const void* p, uint32_t bytes) {
     qurt_mem_cache_clean((qurt_addr_t)p, bytes,
                          QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE);
@@ -139,6 +149,7 @@ void dc_clean_ddr(const void* p, uint32_t bytes) {
 void dc_dma_clean_src(struct dc_dma* d) { dc_clean_ddr(d->src, d->bytes); }
 
 int dc_dma_once(struct dc_dma* d) {
+    const int64_t t_dma0 = HAP_perf_get_time_us();
     dma_desc_1d_params_t p;
     memset(&p, 0, sizeof(p));
     /* src 已由 dc_dma_clean_src 一次性清过; bypass 1/0 契约同 1-C */
@@ -160,6 +171,8 @@ int dc_dma_once(struct dc_dma* d) {
     /* 完成: 先 dmwait 排空写 pipeline, 再 poll 自己 desc dstate (1-C 顺序教训) */
     while (dma_wait_for_idle() != DMA_SUCCESS) { }
     while (dma_desc_is_done(d->desc) == DMA_INCOMPLETE) { }
+    g_dma_us += HAP_perf_get_time_us() - t_dma0;
+    g_dma_bytes += d->bytes;
     return 0;
 }
 

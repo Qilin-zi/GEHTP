@@ -70,6 +70,26 @@ int  wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
 /* 路线B: 外部权重区注入(run/run_io 前调一次; 权重 slot addr==WT_SLOT_EXT_WGT
  * 时从此基址+slot.offset 读)。NULL=禁用。与 run_io 解耦(权重常驻)。 */
 void wt_exec_set_ext_weights(const void* wgt_ptr);
+/* ---- PROF 战役 W-P2: 逐 op 时间戳对 + optrace 开关 ----
+ * wt_op_ts: 每 op 的 {start_us, dur_us, dma_us, dma_bytes, engine}, start_us 相对
+ * run_range 入口 (u32 us, 约 71min 回绕, 单 run 不会超)。注册后 run/run_range 自动
+ * 回填; 索引 = 全局 op 序号, 缓冲须 >= n_ops (run_range 分段调用时按绝对序号写)。
+ * 不注册 = 零开销旧行为。 */
+enum wt_engine { WT_ENG_SCALAR = 0, WT_ENG_HVX = 1, WT_ENG_HMX = 2 };
+struct wt_op_ts {
+    uint32_t start_us;    /* 相对 run_range 入口 */
+    uint32_t dur_us;      /* 本 op 总耗时 */
+    uint32_t dma_us;      /* 本 op 内 UserDMA 累计耗时 */
+    uint32_t dma_bytes;   /* 本 op 内 UserDMA 累计搬运字节 */
+    uint32_t engine;      /* WT_ENG_* 主计算引擎 */
+};
+void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap);
+
+/* optrace 逐 op 行开关。默认开(=旧行为, 存量 runner 零回归); 性能测量前
+ * 显式 set_trace(0) 关 = 无落盘污染。只控 run_range 内 per-op pre/post
+ * fprintf; run 级 rtrace 里程碑常开 (M4.2 崩溃取证命脉)。句柄铁律不动:
+ * 仍只有 g_rtrace 一个 FILE*, 开关只控 fopen 与否, 绝不新建路径。 */
+void wt_exec_set_trace(int on);
 
 /* W3 解析报告 (源: wt_w3.c)。emit 逐行收到 JSON 行; host wt_inspect 与
  * 设备输出共用此函数, 行逐字节一致。 */

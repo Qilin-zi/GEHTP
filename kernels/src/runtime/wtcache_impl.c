@@ -122,10 +122,15 @@ int wtcache_open(struct wtcache_ctx** out, uint32_t pin_cap_bytes) {
 
     compute_res_attr_t attr;
     HAP_compute_res_attr_init(&attr);
-    /* T10: 与 htpw4a16_v81 (ch02 proven) 完全一致的 v1 路径。
-     * v2(…,0,0) 在真 deep kernel 上 fault (T10-c 阶段 2 崩溃根因);
-     * 不设 cache_mode/serialize — hmx_lock 会失败 (ch02 note)。 */
-    HAP_compute_res_attr_set_vtcm_param(&attr, total, 1);
+    /* Step2c (apple-ec): v1 单页(b_single_page=1) 在 SA8797P 上 acquire=0
+     * (WTC_ERR_VTCM_ACQUIRE); hmx_runtime_setup 同设备 v2(best-fit) 可用 → v2 优先,
+     * v2 不可用时回落 v1。注意 T10 旧结论: v2(…,0,0) 曾在真 deep kernel
+     * (htpw4a16_v81) 上 fault (T10-c 阶段 2 崩溃根因) —— 深核回归前需复核。 */
+    if (compute_resource_attr_set_vtcm_param_v2) {
+        compute_resource_attr_set_vtcm_param_v2(&attr, total, 0, 0);
+    } else {
+        HAP_compute_res_attr_set_vtcm_param(&attr, total, 1);
+    }
     if (compute_resource_attr_set_hmx_param) {
         compute_resource_attr_set_hmx_param(&attr, 1);
     }

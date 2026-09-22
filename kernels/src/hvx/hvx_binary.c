@@ -214,3 +214,57 @@ void hvhx_v2_add_f16(uint16_t * __restrict__ dst,
 #endif
 }
 
+void hvhx_v2_cvt_f16_to_f32(float * __restrict__ dst,
+                            const uint16_t * __restrict__ src,
+                            uint32_t n)
+{
+#if HVX_V2_KERNELS_ENABLED
+    uint32_t i = 0;
+    /* dst 是 f32 (4B/元素): 前导至 128B 对齐 */
+    uintptr_t daddr = (uintptr_t)dst;
+    uint32_t lead = (uint32_t)(((128u - (daddr & 127u)) & 127u) / 4u);
+    if (lead > n) lead = n;
+    for (; i < lead; ++i) dst[i] = hb_f16_to_f32(src[i]);
+    /* 主体: f16 (64 元素) -> 2x f32 (lo=前 32, hi=后 32), 保 C 序 */
+    uint32_t body = (n - i) / VLEN_F16;
+    for (uint32_t v = 0; v < body; ++v) {
+        uint32_t base = i + v * VLEN_F16;
+        HVX_Vector va = hvx_vmemu(src + base);
+        HVX_VectorPair fa = hvx_vec_f16_to_f32(va);
+        *(HVX_Vector *)(dst + base)            = Q6_V_lo_W(fa);
+        *(HVX_Vector *)(dst + base + VLEN_F32) = Q6_V_hi_W(fa);
+    }
+    i += body * VLEN_F16;
+    for (; i < n; ++i) dst[i] = hb_f16_to_f32(src[i]);
+#else
+    for (uint32_t i = 0; i < n; ++i) dst[i] = hb_f16_to_f32(src[i]);
+#endif
+}
+
+void hvhx_v2_cvt_f32_to_f16(uint16_t * __restrict__ dst,
+                            const float * __restrict__ src,
+                            uint32_t n)
+{
+#if HVX_V2_KERNELS_ENABLED
+    uint32_t i = 0;
+    /* dst 是 f16 (2B/元素): 前导至 128B 对齐 */
+    uintptr_t daddr = (uintptr_t)dst;
+    uint32_t lead = (uint32_t)(((128u - (daddr & 127u)) & 127u) / 2u);
+    if (lead > n) lead = n;
+    for (; i < lead; ++i) dst[i] = hb_f32_to_f16(src[i]);
+    /* 主体: 2x f32 -> f16 (64 元素) */
+    uint32_t body = (n - i) / VLEN_F16;
+    for (uint32_t v = 0; v < body; ++v) {
+        uint32_t base = i + v * VLEN_F16;
+        HVX_Vector lo = hvx_vmemu(src + base);
+        HVX_Vector hi = hvx_vmemu(src + base + VLEN_F32);
+        HVX_Vector vr = hvx_vec_f32_to_f16(lo, hi);
+        *(HVX_Vector *)(dst + base) = vr;
+    }
+    i += body * VLEN_F16;
+    for (; i < n; ++i) dst[i] = hb_f32_to_f16(src[i]);
+#else
+    for (uint32_t i = 0; i < n; ++i) dst[i] = hb_f32_to_f16(src[i]);
+#endif
+}
+

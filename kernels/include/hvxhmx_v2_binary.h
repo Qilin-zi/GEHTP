@@ -41,6 +41,13 @@ void hvhx_v2_add_f16(uint16_t * __restrict__ dst,
                      const uint16_t * __restrict__ a, const uint16_t * __restrict__ b,
                      uint32_t n);
 
+/* f16 <-> f32 整面转换 (HVX 快路径 + 标量尾) — oplist 执行器 f16 直收直发用。
+ * dst/src 任意地址安全; 128B 对齐时全向量化。位级等价于标量 RNE 参考。 */
+void hvhx_v2_cvt_f16_to_f32(float * __restrict__ dst,
+                            const uint16_t * __restrict__ src, uint32_t n);
+void hvhx_v2_cvt_f32_to_f16(uint16_t * __restrict__ dst,
+                            const float * __restrict__ src, uint32_t n);
+
 #ifdef __cplusplus
 }
 #endif
