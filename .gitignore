@@ -12,9 +12,25 @@ kernels/results/
 compiler/our_simple_linear_context.bin
 *.raw
 *.wtop
+*.npy
 
 # 阶段1 converter 产物(gen_all.sh 可重生成)
 test_models/**/conv_add_qnn/
+
+# 编译产物 (qwen3_06b 部署, 不上库)
+test_models/qwen3_06b/wtop_manifest.json
+test_models/qwen3_06b/match_map.json
+test_models/qwen3_06b/match_map.tsv
+test_models/qwen3_06b/model.onnx
+test_models/qwen3_06b/qwen3_06b_q4.wtop.manifest.json
+test_models/qwen3_06b/cpu_golden/
+test_models/qwen3_06b/cpu_golden_q4/
+test_models/qwen3_06b/host_q4/
+
+# 大资产目录 (C1 拷贝自 4090; 不进 git, 源树在 4090 只读)
+test_models/qwen35_08b/
+test_models/qnn_probe/
+test_assets/
 
 # python
 __pycache__/

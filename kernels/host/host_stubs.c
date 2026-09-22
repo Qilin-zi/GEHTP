@@ -197,7 +197,7 @@ int dc_w4_run_prep(struct dc_w4* e, const uint8_t* act_src, uint32_t m,
     memcpy(e->act, act_src, (size_t)m * k * 2);
     memset(e->act + (size_t)m * k * 2, 0, (size_t)(m_pad - m) * k * 2);
     e->act_scale = 1.0f;  /* host 无量化域 */
-    e->act_ddr = act_src;
+    e->act_ddr = act_src;  /* 关键: 绑定 act 源, dc_w4_run 复用检测依赖此字段 */
     e->act_valid = 1;
     return 0;
 }
