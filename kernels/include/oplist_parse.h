@@ -90,8 +90,8 @@ enum {
     OP_FILL = 9,
     OP_TRANSPOSE_F16 = 10,
     /* M2/M3 契约(D6 清单, QNN op 语义; 0-10 不动, 向后兼容) */
-    OP_UNARY_F16 = 11,      /* [x_t,y_t,n,subtype]   subtype: 0=NEG 1=EXP 2=SQRT 3=RSQRT 4=LOG 5=ABS 6=SIN 7=COS; (Neuron) 8=SIGMOID 9=TANH 10=GELU 11=RELU 12=SWISH */
-    OP_BINARY_F16 = 12,     /* [a_t,b_t,y_t,n,subtype] subtype: 0=ADD 1=SUB 2=MUL 3=DIV */
+    OP_UNARY_F16 = 11,      /* [x_t,y_t,n,subtype]   subtype: 0=NEG 1=EXP 2=SQRT 3=RSQRT 4=LOG 5=ABS 6=SIN 7=COS; (Neuron) 8=SIGMOID 9=TANH 10=GELU 11=RELU 12=SWISH 13=SOFTPLUS(稳定化, host ops.cpp 同款) */
+    OP_BINARY_F16 = 12,     /* [a_t,b_t,y_t,n,subtype] subtype: 0=ADD 1=SUB 2=MUL 3=DIV 4=EQ(bool 0/1); 8=SELECT 三元(另 4 参形态) */
     OP_SOFTMAX_F16 = 13,    /* [x_t,y_t,rows,n]       rows = 行数(每行 n 元素) */
     OP_CONCAT_F16 = 14,     /* [in_t0..7,out_t,axis,n_segments,n_elems,size0..3] arity 16
                                 (每段 axis 维尺寸显式; ≤4 段, 0.8B 实测 2-3 段) */
@@ -126,6 +126,10 @@ enum {
                                arity 14 (A3② 真语义; 恒等拷贝=数值死刑, docs/A3 判决)
                                data/upd f16, idx i32 (0x8000|slot 或 temp 引用);
                                out=data 拷贝后按 n_idx 组 K 维坐标写 block 块 */
+    OP_DMA = 29,           /* [src_ref,dst_ref,bytes,src_bypass,dst_bypass,
+                               fence_w,fence_r,fence_mem,slot_off] arity 9
+                               (P5 真 DMA runlist 算子; 独立于 spill/fill,
+                                dc_dma_once 带 bypass + fence_handoff(dst)) */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -158,6 +162,7 @@ enum {
 #define WT_ARITY_BROADCAST_F16 12
 #define WT_ARITY_TRANSPOSE_GEN_F16 8
 #define WT_ARITY_SCATTER_ND_F16 14
+#define WT_ARITY_DMA 9
 
 struct wt_slot {
     uint32_t len;

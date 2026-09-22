@@ -76,6 +76,16 @@ void OpEmitter::emit_dma_op(const DmaOpInfo& info, size_t position) {
             // Create HVX fork/join for thread management
             // "default_hvx_spawn (_fork / _join)"
             break;
+        case DmaOpType::DmaCheckpointSet:
+            // Create DmaCheckpointSetOp: records DMA completion tag in table
+            // Source: make_dma_checkpoint_op @0xd95ac0 (typeinfo 0x5ec2568);
+            // real .bin serializes this as an OP_TYPE_DMA record.
+            break;
+        case DmaOpType::DmaCheckpointWait:
+            // Create DmaCheckpointWaitOp: waits for a previously started DMA
+            // Source: make_dma_checkpoint_op @0xd95ac0 (typeinfo 0x5ec2488);
+            // real .bin serializes this as an OP_TYPE_DMA record.
+            break;
     }
 }
 
@@ -259,7 +269,7 @@ void OpEmitter::insert_mcast_pair_sync(
 void OpEmitter::insert_dma_checkpoint_set(uint32_t synctoken_id, size_t pos,
                                            const std::string& name) {
     DmaOpInfo info{};
-    info.type = DmaOpType::Spill;  // placeholder type; real .bin uses OP_TYPE_DMA
+    info.type = DmaOpType::DmaCheckpointSet;  // M36: typeinfo 0x5ec2568
     info.synctoken_id = synctoken_id;
     emit_dma_op(info, pos);
     synctoken_mgr_.signal(synctoken_id, pos, name);
@@ -267,7 +277,7 @@ void OpEmitter::insert_dma_checkpoint_set(uint32_t synctoken_id, size_t pos,
 
 void OpEmitter::insert_dma_checkpoint_wait(uint32_t synctoken_id, size_t pos) {
     DmaOpInfo info{};
-    info.type = DmaOpType::Fill;  // placeholder type; real .bin uses OP_TYPE_DMA
+    info.type = DmaOpType::DmaCheckpointWait;  // M36: typeinfo 0x5ec2488
     info.synctoken_id = synctoken_id;
     emit_dma_op(info, pos);
     synctoken_mgr_.wait(synctoken_id, pos);

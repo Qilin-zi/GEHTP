@@ -19,6 +19,7 @@
 #include <qurt.h>
 
 #include "dc_parts.h"
+#include "fence.h"
 #include "oplist_parse.h"
 #include "oplist_exec.h"
 #include "wtcache.h"
@@ -774,6 +775,61 @@ static int exec_fill(const struct wt_blob* b, const struct wt_op* op,
     memcpy(dst, src, bytes);   /* dst VTCM 驻留: 回退标量(DDR→VTCM 后续) */
     return 0;
 }
+
+/* GEHTP P5: 真 DMA runlist 算子 (独立 OP_DMA, 不动 matmul 内嵌 DMA)。
+ * args: [src_ref, dst_ref, bytes, src_bypass, dst_bypass, fence_w, fence_r, fence_mem, slot_off]
+ *   src_ref/dst_ref: temp id / 0x8000|slot / 0x4000|vtcm 引用 (同 spill/fill 族)
+ *   src_bypass/dst_bypass: 0/1, 透传 dc_dma_once (真 UserDMA, 非标量 memcpy)
+ *   fence_w/r/mem: FC_* / FM_* 三元组, DMA 写 dst 后调 fence_handoff(dst,...)
+ *     (方向对偶 cache handoff; 与 exec_matmul out 侧 INVALIDATE 同语义, 见 fence.h)
+ * 引擎走 dc_dma_once + fence_handoff, 而非 xop 内硬编码。 */
+static int exec_dma(const struct wt_blob* b, const struct wt_op* op,
+                    char* err, size_t errn) {
+    uint32_t bytes = op->args[2];
+    uint32_t src_bypass = op->args[3], dst_bypass = op->args[4];
+    uint32_t fw = op->args[5], fr = op->args[6], fm = op->args[7];
+    uint32_t slot_off = op->args[8];   /* 溢出池等 slot 内字节偏移(0x8000|slot 引用) */
+    if (bytes == 0) return 0;
+
+    const uint8_t* src = ref_ptr(b, op->args[0]);
+    if (!src) { snprintf(err, errn, "dma src empty"); return -1; }
+    if (op->args[0] & 0x8000u) src += slot_off;
+    uint8_t* dst = NULL;
+    if (op->args[1] & 0x8000u) {
+        const uint8_t* s = slot_ptr(b, op->args[1] & 0x7FFFu);
+        dst = s ? (uint8_t*)(s + slot_off) : NULL;
+    } else if (op->args[1] & 0x4000u) {
+        uint32_t t = op->args[1] & 0x3FFFu;
+        if (t < MAX_TEMPS && g_exec.vtcm_pool && g_exec.vtcm_off_arr[t] != 0xFFFFFFFFu)
+            dst = g_exec.vtcm_pool + g_exec.vtcm_off_arr[t];
+    } else {
+        dst = temp_get(op->args[1], bytes);
+    }
+    if (!dst) { snprintf(err, errn, "dma dst empty"); return -1; }
+
+    static dc_mutex_t mu;
+    static int mu_ready;
+    if (!mu_ready) { dc_mutex_init(&mu); mu_ready = 1; }
+
+    /* 铁律①: DDR src + DMA bypass 直读 → 写者(CPU)先 FLUSH_INVALIDATE (dma_copy_ddr 同款) */
+    if (!ptr_in_vtcm(src) && src_bypass) dc_clean_ddr(src, bytes);
+
+    struct dc_dma d;
+    if (dc_dma_init(&d, (uint8_t*)src, dst, bytes, &mu) != 0) {
+        snprintf(err, errn, "dma init"); return -1;
+    }
+    d.src_bypass = src_bypass;
+    d.dst_bypass = dst_bypass;
+    int rc = dc_dma_once(&d);
+    dc_dma_destroy(&d);
+    if (rc != 0) { snprintf(err, errn, "dma once 0x%X", rc); return -1; }
+
+    /* fence 三元组: DMA 写 dst 后按 (writer,reader,mem) 方向对偶 handoff */
+    if (fence_handoff(dst, bytes, (int)fw, (int)fr, (int)fm) != FENCE_OK) {
+        snprintf(err, errn, "dma fence combo"); return -1;
+    }
+    return 0;
+}
 /* GEHTP 阶段9: f16 4-D 转置 (perm 每轴 1 字节, N=1 契约)。
  * args: [src_ref, out_t, H, W, C, perm_u32] */
 static int exec_transpose(const struct wt_blob* b, const struct wt_op* op,
@@ -853,6 +909,8 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
         case 10: r = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); break;
         case 11: r = fmaxf(0.0f, v); break;
         case 12: r = v / (1.0f + expf(-v)); break;
+        case 13: /* SOFTPLUS: 稳定化 log(1+e^x), 与 host ops.cpp Neuron case 7 逐字同款 */
+            r = (v > 30.0f) ? v : (v < -30.0f ? expf(v) : log1pf(expf(v))); break;
         default: break;
         }
         y[i] = f32_to_f16(r);
@@ -925,6 +983,7 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
         case 1: r = x0 - x1; break;
         case 2: r = x0 * x1; break;
         case 3: r = (x1 != 0) ? x0 / x1 : 0.0f; break;
+        case 4: r = (x0 == x1) ? 1.0f : 0.0f; break;  /* EQ: bool 语义, 与 host ops.cpp oper==3 同款 */
         default: break;
         }
         y[i] = f32_to_f16(r);
@@ -1641,6 +1700,10 @@ static int xop_fill(const struct wt_op_ctx* cx) {
     return exec_fill(cx->b, cx->op, cx->err, cx->errn);
 }
 
+static int xop_dma(const struct wt_op_ctx* cx) {
+    return exec_dma(cx->b, cx->op, cx->err, cx->errn);
+}
+
 static int xop_transpose(const struct wt_op_ctx* cx) {
     g_exec.st.transpose++;
     return exec_transpose(cx->b, cx->op, cx->err, cx->errn);
@@ -1727,6 +1790,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_ADD_F16] = xop_add,
     [OP_SPILL] = xop_spill,
     [OP_FILL] = xop_fill,
+    [OP_DMA] = xop_dma,
     [OP_TRANSPOSE_F16] = xop_transpose,
     [OP_UNARY_F16] = xop_unary,
     [OP_BINARY_F16] = xop_binary,
