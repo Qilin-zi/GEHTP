@@ -83,8 +83,8 @@ static void pack_k4lohi(const int8_t* wq, uint8_t* wt, uint32_t K, uint32_t N) {
                     for (uint32_t kr = 0; kr < 4; kr++) {
                         int8_t v0 = wq[(size_t)(kb0+kr)*N + nb+n];
                         int8_t v1 = wq[(size_t)(kb0+kr+4)*N + nb+n];
-                        uint8_t lo = (uint8_t)(((v0 >= 0 ? v0 : v0+16) & 0xF) ^ 0x8);
-                        uint8_t hi = (uint8_t)(((v1 >= 0 ? v1 : v1+16) & 0xF) ^ 0x8);
+                        uint8_t lo = (uint8_t)(((v0 >= 0 ? v0 : v0+16) + 8) & 0xF);
+                        uint8_t hi = (uint8_t)(((v1 >= 0 ? v1 : v1+16) + 8) & 0xF);
                         wt[o++] = (uint8_t)((hi << 4) | lo);
                     }
             }
