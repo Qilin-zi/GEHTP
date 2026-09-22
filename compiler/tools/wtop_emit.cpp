@@ -73,7 +73,6 @@ static std::vector<std::string> split_str(const std::string& st, char sep) {
 int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& out_path, const std::string& manifest_path,
          const std::string& gguf_path, const std::string& match_path,
-         uint64_t ddr_budget = 0, uint64_t vtcm_budget = 0,
          bool ext_weights = false, const std::string& ext_weights_path = "",
          bool force_v2 = false) {
     // 1. deserialize .bin
@@ -129,62 +128,6 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         std::fprintf(stderr, "[ddr] TAG_MEM_PLAN: cap=%llu vtcm_cap=%llu n_temps=%zu n_spills=%zu\n",
                      (unsigned long long)em.ddr_static_cap, (unsigned long long)em.ddr_vtcm_cap,
                      mp.entries.size(), mp.spills.size());
-        if (ddr_budget > 0) {
-            // shadow 期(M2): 旗标重算与 plan 比对, 不一致 warn(以 plan 为准)
-            std::vector<GraphPrepare::DdrTempEntry> se;
-            std::vector<GraphPrepare::DdrSpillEntry> ss;
-            uint64_t scap = 0, stotal = 0, svcap = 0;
-            if (gp.compute_ddr_offsets(ddr_budget, &se, &scap, &ss, &stotal,
-                                       vtcm_budget, &svcap) == 0) {
-                size_t nd = 0;
-                if (scap != em.ddr_static_cap || svcap != em.ddr_vtcm_cap ||
-                    se.size() != mp.entries.size() || ss.size() != mp.spills.size()) nd++;
-                for (const auto& e : se) {
-                    auto it = em.ddr_op_map.find(e.op_id);
-                    if (it == em.ddr_op_map.end() || it->second.first != (uint32_t)e.offset ||
-                        it->second.second != (uint32_t)e.size) nd++;
-                }
-                for (const auto& s : ss) {
-                    auto it = em.ddr_spill_map.find(s.op_id);
-                    if (it == em.ddr_spill_map.end() || it->second.first != (uint32_t)s.offset ||
-                        it->second.second != (uint32_t)s.size) nd++;
-                }
-                if (nd)
-                    std::fprintf(stderr,
-                                 "warn: TAG_MEM_PLAN 与 --ddr-budget 本地重算不一致 (%zu 处)——以 plan 为准\n", nd);
-            }
-        }
-    } else if (ddr_budget > 0) {
-        // 旧 bin(无 TAG_MEM_PLAN): 本地自算(M2 前路径, 一个版本周期后退役)
-        std::vector<GraphPrepare::DdrTempEntry> ddr_entries;
-        uint64_t ddr_cap = 0;
-        std::vector<GraphPrepare::DdrSpillEntry> ddr_spills;
-        uint64_t spill_total = 0;
-        if (gp.compute_ddr_offsets(ddr_budget, &ddr_entries, &ddr_cap,
-                                   &ddr_spills, &spill_total,
-                                   vtcm_budget, &em.ddr_vtcm_cap) != 0) {
-            std::fprintf(stderr, "error: compute_ddr_offsets failed\n");
-            return 2;
-        }
-        for (const auto& e : ddr_entries) {
-            em.ddr_op_map[e.op_id] = {(uint32_t)e.offset, (uint32_t)e.size};
-            if (e.in_vtcm) em.ddr_op_vtcm[e.op_id] = true;
-        }
-        em.ddr_static_cap = ddr_cap;
-        em.bump_reserve = std::max<uint64_t>(4u << 20, ddr_cap / 4);
-        em.ddr_static = true;
-        std::fprintf(stderr, "[ddr] static pool cap=%llu vtcm_cap=%llu n_temps=%zu\n",
-                     (unsigned long long)ddr_cap, (unsigned long long)em.ddr_vtcm_cap,
-                     ddr_entries.size());
-        // 阶段二: 溢出张量的独立溢出区(SPILL/FILL 搬运目标)。
-        // spill 池槽的 add_slot 延迟到输入段之后 —— 槽 0 必须是主输入
-        // (src_ref 对 input_node_id 硬编码 0x8000|0), 提前建会占位错位。
-        for (const auto& e : ddr_spills)
-            em.ddr_spill_map[e.op_id] = {(uint32_t)e.offset, (uint32_t)e.size};
-        if (spill_total > 0) {
-            std::fprintf(stderr, "[ddr] spill pool total=%llu n_spilled=%zu\n",
-                         (unsigned long long)spill_total, ddr_spills.size());
-        }
     }
 
     // 输入槽: 主输入 = slot0 EXT_IN; 其余图输入(--input-f16 逗号分隔
@@ -413,8 +356,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 static_cast<uint32_t>(order.size());
     }
     // spill/fill 不钉 temp: 0.8B 默认预算下全图溢出 → 上千 spill 记录,
-    // 钉住会把整个活跃集抬到 16879。spill 段(循环后)用保留 temp 引用。
-    uint32_t spill_pool_slot = 0;  // 0 = 未创建
+    // 钉住会把整个活跃集抬到 16879。(M3: 旧 spill 段已删, 溢出走 TAG_MEM_PLAN 阶段二)
     WtopEmitShared sh{H, W, C, w_slot, b_slot};
     for (size_t pos = 0; pos < order.size(); pos++) {
         op_id_t id = order[pos];
@@ -477,25 +419,6 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             em.release_at(Emitter::tkey(c.src_id, c.out_idx), pos);
     }
 
-    // 5. spill/fill 段跳过: M2 结构闭环曾 emit 占位 SPILL/FILL(固定
-    //    保留 temp 0xFFFFFFFE, 设备侧 ref_ptr 空 → "spill src empty" 死)。
-    //    真实溢出语义 = 第7步阶段一(静态 DDR 偏移)/阶段二(VTCM 驻留+
-    //    DMA 算子)重做; 设备 temp 池为 heap malloc, 正确性不依赖此段。
-    //    (blob 尾部 spill/fill 记录保留在 manifest op_ids/opcodes 观察
-    //     成本模型活跃集, 不再发射)
-    for (const auto& r : gp.spill_fill_recs()) {
-        (void)r;
-        if (spill_pool_slot == 0) {
-            // DDR 池 slot: 尺寸 = 最大 ddr_offset+size, 128B 对齐
-            uint64_t pool_end = 0;
-            for (const auto& r2 : gp.spill_fill_recs())
-                pool_end = std::max(pool_end, r2.ddr_offset + r2.size);
-            pool_end = (pool_end + 127) & ~uint64_t(127);
-            std::vector<uint8_t> zeros((size_t)pool_end, 0);
-            spill_pool_slot = em.add_slot((uint32_t)pool_end, (uint32_t)pool_end / 2, zeros.data());
-        }
-        continue;
-    }
 
     // 5b. 第7步阶段一: 静态 temp 偏移表 → TEMPOFF 槽
     // [cap u32][reserve u32][n u32][n × {temp_id u32, offset u32, size u32}]
@@ -690,8 +613,6 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
 int main(int argc, char** argv) {
     std::string bin_path, in_f16, out_path, manifest_path, gguf_path, match_path, ext_weights_path;
-    uint64_t ddr_budget = 0;   // --ddr-budget: 第7步阶段一静态 DDR 池(0=禁用)
-    uint64_t vtcm_budget = 0;  // --vtcm-budget: 第7步阶段二 VTCM 驻留池(0=禁用)
     bool ext_weights = false;  // --ext-weights: 路线B 权重外置(blob 描述符 + model.weights.bin)
     bool force_v2 = false;     // --force-v2: 小模型强制 v2 槽记录(设备回归 v2 通路用)
     for (int i = 1; i < argc; i++) {
@@ -710,17 +631,15 @@ int main(int argc, char** argv) {
         else if (a == "--manifest") manifest_path = next();
         else if (a == "--gguf") gguf_path = next();
         else if (a == "--match") match_path = next();
-        else if (a == "--ddr-budget") ddr_budget = strtoull(next().c_str(), nullptr, 0);
-        else if (a == "--vtcm-budget") vtcm_budget = strtoull(next().c_str(), nullptr, 0);
         else if (a == "--ext-weights") ext_weights = true;
         else if (a == "--weights-bin") ext_weights_path = next();
         else if (a == "--force-v2") force_v2 = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (bin_path.empty() || out_path.empty()) {
-        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ddr-budget <bytes>] [--vtcm-budget <bytes>] [--ext-weights [--weights-bin <params.bin>]]\n");
+        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ext-weights [--weights-bin <params.bin>]]\n");
         return 2;
     }
     return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path,
-                ddr_budget, vtcm_budget, ext_weights, ext_weights_path, force_v2);
+                ext_weights, ext_weights_path, force_v2);
 }

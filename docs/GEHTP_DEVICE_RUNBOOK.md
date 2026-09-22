@@ -117,3 +117,63 @@ adb -s $D pull $GDIR/output.f16.raw out.f16.raw
 - host 参考链 L0 已闭合（cos=1.0）：NCF 输入布局 + Gather compact axis 前导1对齐（commit `2b60f41`）。
 - L0 blob（894 op）已重生成，设备 runner 已跑通 894 op 全执行、temp7 写 65536B。
 - **设备输出 vs gold cos=0.10** —— 根因 = **ScatterNd 恒等拷贝**（A3 暗雷）：`compiler/tools/wtop_ops/op_copy_sem.cpp` 把 ScatterNd 发射成恒等，attn_iter 在设备上未真正迭代。这是 L0 设备闭合的最后缺口，下一步 = 真 ScatterNd（emit + 设备 opcode + host 对齐）。
+
+
+---
+
+## 7. 新板 d0f1784（SA8797P）上板记录（2026-09-18）
+
+### 7.1 板子身份与链路
+
+- **SA8797P v2**（Gen5，与 SA8397 同软件基线），固件 `ER9.4.48.E0V8397.263571`，Android 16 (SDK 36)，userdebug，`adb root` 可用。
+- **Gunyah GVM 架构**：Android 是 guest VM，DSP 子系统由宿主分配——这是与 52f67807 最大的差别。
+- NPU：Hexagon **V81**，**4×NSP**（fastrpc 域 nsp1000~1003，内核 rpmsg probe 全过）。
+- 链路：板子 USB → **110**（ThinkStation-D30，`speech@192.168.0.110`，Ubuntu 20.04，Mac 上已配 ssh 别名 `110`）。QNN 库齐（`/vendor/lib64`），skel 在 `/vendor/lib64/hexagon/`。
+
+### 7.2 NPU 硬件探针（已通过，2026-09-18）
+
+用 QAIRT 官方栈做 bring-up 验证（**仅探针，非 GEHTP 主流程**）：InceptionV3 首层 Conv+ReLU（1x299x299x3）HTP 后端直接 compose 执行，2 次推理全过，输出落盘正常。
+
+```bash
+# 板上（adb root 后）
+cd /data/local/tmp/qnn
+export LD_LIBRARY_PATH=/vendor/lib64
+export ADSP_LIBRARY_PATH=/vendor/lib64/hexagon
+./qnn-net-run --backend /vendor/lib64/libQnnHtp.so \
+    --model libqnn_model_float.so --input_list list.txt --output_dir out
+# 判据：输出目录出现 Result_N/ + execution_metadata.yaml，yaml 里 backend 是 libQnnHtp.so
+# input_list 格式：一行 = 一次推理；同一行多个文件 = 多个输入张量
+```
+
+环境资产：
+
+- 板上 `/data/local/tmp/qnn/`：qnn-net-run、qnn-context-binary-generator、示例模型 `libqnn_model_float.so` + 输入，已留好可复用。
+- 模型库在 **105** 编译（QAIRT 2.40.1.251119 + 已解压 NDK r26c）：
+
+```bash
+export PATH=/disk2/twang/qnnlib/android-ndk-r26c:$PATH
+Q=/disk2/twang/qnnlib/qairt/2.40.1.251119
+$Q/bin/x86_64-linux-clang/qnn-model-lib-generator \
+    -c model.cpp -b model.bin -t aarch64-android -o 输出目录
+```
+
+### 7.3 本板新坑（排错速查增补）
+
+| 症状 | 根因 | 解法 |
+|---|---|---|
+| `No Snapdragon SOC detected` | 公开版 QAIRT 2.40.1 的 libQnnHtp.so 型号表不含 SA8797P | **用 vendor 自带 `/vendor/lib64/libQnnHtp.so`** |
+| `0x80000406` remote_handle64_open（QNN 路径） | skel 搜索路径为空 | `ADSP_LIBRARY_PATH=/vendor/lib64/hexagon` |
+| `0x72` / `fastrpc_tests_apps -d 3` 失败 | 该测试工具需往 DSP 加载**自有测试 skel**（板上无此文件），与域是否存在无关 | 工具自身局限，忽略；**domain 3 本板实测可用**（见 7.4） |
+| `SNPE is not supported on this SoC` | Gen5 已废弃 SNPE | 只用 QNN |
+| `Unknown Snapdragon Model` | qnn-platform-validator 型号表旧 | 该工具弃用 |
+| `0x138d` / `Failed to validate num cores` | context 二进制跨会话加载核数校验 | 别用 `--retrieve_context`，直接 `--model` compose |
+| `Graph contains 1 inputs, but found input data for 2` | input_list 一行写了多个文件 | 一行 = 一次推理一个输入文件 |
+| QAIRT x86 宿主工具 `GLIBC_2.34 not found` | 110 是 Ubuntu 20.04（glibc 2.31） | 宿主侧编译/转换一律去 105（22.04） |
+| 110 上 `dl.google.com` 拉 NDK 失败 | 110 系统时钟停在 2023（主板电池），TLS 全炸 + 外网环境 | 先 `sudo timedatectl set-ntp true`；或从 105 `/disk2/twang/qnnlib/` 直接拿 |
+
+### 7.4 GEHTP 主流程在本板的状态（2026-09-18 晚，已实证）
+
+- **domain 3（CDSP）本板可用**：GEHTP 四件套（run_main_on_hexagon / skel / libhvxhmx_v23 / gehtp_runner）已就位并实跑——设备侧 optrace（`/data/local/tmp/hrt/gehtp/optrace.txt`）记录数百 op `rc=0` 逐 op 耗时；runner 最终停在未实现的 broadcast opcode（编译器覆盖缺口，非域问题）。
+- **纠错**：本节初版（09-18 白天）误写「domain 3 在本板不存在」。两处误读：① `fastrpc_tests_apps -d 3` 的 0x72 是该工具缺自有测试 skel，非域缺失；② dmesg 的 `boot_cdsp` 60s 超时是 GVM guest 遗留 init 动作（DSP 子系统由宿主侧管理），不代表 CDSP 离线。**教训：判域死活必须以自有 runner 实测为准，第三方测试工具的 open 失败不足为据。**
+- **NSP 域客观存在**：nsp1000~1003 是内核注册的独立 fastrpc 域（QNN HTP 经 `_dom=nsp1000` 路由，日志 domain 16 / effective 1600）。GEHTP 主流程维持 domain 3 即可；NSP 多核分流是未来的性能选项，不是迁移前提。
+- 110 上网靠 USB 无线网卡（RTL8812AU，8812au DKMS 已装）；板载双网口免驱。110 系统时钟停在 2023（主板电池），用 110 干活前先 `sudo timedatectl set-ntp true`。

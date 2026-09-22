@@ -73,8 +73,7 @@ cmd_compile() {
     fi
 
     echo "== [3/5] hnnx_compile (tagged runlist) =="
-    # M2: 静态规划预算随编译进 TAG_MEM_PLAN(wtop_emit 照抄); 第 4 步旗标
-    # 在 shadow 期保留作比对, M3 删。
+    # M2/M3: 静态规划预算随编译进 TAG_MEM_PLAN; wtop_emit 只读 plan, 不再收预算旗标。
     local c_args=()
     [ -n "$ddr" ] && c_args+=(--ddr-budget "$ddr")
     [ -n "$vtcm" ] && c_args+=(--plan-vtcm-budget "$vtcm")
@@ -88,8 +87,6 @@ cmd_compile() {
     echo "== [4/5] wtop_emit (blob) =="
     local in_args=()
     [ -n "$in_f16" ] && in_args+=(--input-f16 "$in_f16")
-    [ -n "$vtcm" ] && in_args+=(--vtcm-budget "$vtcm")
-    [ -n "$ddr" ] && in_args+=(--ddr-budget "$ddr")
     if [ -n "$gguf" ]; then
         gguf="$(realpath "$gguf")"; match="$(realpath "$match" 2>/dev/null || true)"
         [ -f "$gguf" ] && [ -f "$match" ] || die "--gguf 需配 --match <tsv>"
@@ -210,6 +207,34 @@ cmd_setup() {
     local CC="$HT/Tools/bin/hexagon-clang"
     [ -x "$CC" ] || die "Hexagon SDK toolchain missing: $CC"
 
+    echo "== [0/5] skel 治理 (SWIV 签名强制) =="
+    # 2026-09-17 事故定案: 未签 SWIV 的 skel 上板 → 失败 open 楔死 fastrpc 通道
+    # (全板 0x39, 须物理复位)。好坏件二进制本体逐字节相同, 唯一差=SWIV 段;
+    # 对未签件补签 = 已知好件 md5 380f3cbf (确定性, 已实锤)。
+    # 真源 = 树内 ship/ 预编译件; 缺失则从源码重建 (SDK 例程, qaic+clang)。
+    local RMOH="$KD/third_party/run_main_on_hexagon"
+    local skel_src="$RMOH/ship/librun_main_on_hexagon_skel.so"
+    if [ ! -f "$skel_src" ]; then
+        echo "  ship/ skel 缺失, 从源码重建 (make V=hexagon_ReleaseG_toolv19_v81)..."
+        local bdir="/tmp/gehtp_rmoh_build.$$"
+        rm -rf "$bdir"; cp -r "$RMOH" "$bdir"
+        # 末尾 hexagon-sim 冒烟步缺 libncurses5 会挂, 不影响 skel 产物 — 故 || true
+        ( cd "$bdir" && make V=hexagon_ReleaseG_toolv19_v81 \
+            HEXAGON_SDK_ROOT="$HEX" SDK_SETUP_ENV=1 \
+            HEXAGON_TOOLS_ROOT="$HT" >/dev/null 2>&1 || true )
+        skel_src="$bdir/hexagon_ReleaseG_toolv19_v81/librun_main_on_hexagon_skel.so"
+        [ -f "$skel_src" ] || die "skel 源码重建失败"
+    fi
+    local skel_push="$skel_src"
+    if strings "$skel_src" | grep -q SWIV; then
+        echo "  skel 已带 SWIV 段 ✓ ($(md5sum "$skel_src" | cut -c1-8))"
+    else
+        echo "  warn: ship/ skel 无 SWIV 段 (陈旧血统, 4090 树同款毒源) — 现场补签"
+        skel_push="/tmp/librun_main_on_hexagon_skel.signed.$$.so"
+        python3 "$SWIV" -i "$skel_src" -o "$skel_push" >/dev/null || die "skel SWIV 补签失败"
+        echo "  补签后 md5=$(md5sum "$skel_push" | cut -c1-8) (期望 380f3cbf)"
+    fi
+
     echo "== [1/4] kernels lib =="
     [ -f "$KD/lib/libhvxhmx_v23.signed.so" ] || (cd "$KD" && ./build_libs.sh >/dev/null)
 
@@ -229,11 +254,19 @@ cmd_setup() {
     adb -s "$device" shell "mkdir -p $GDIR" >/dev/null
     adb -s "$device" push "$KD/lib/libhvxhmx_v23.signed.so" "$DEVROOT/libhvxhmx_v23.so" >/dev/null
     adb -s "$device" push /tmp/gehtp_runner.so.signed "$DEVROOT/gehtp_runner.so" >/dev/null
-    adb -s "$device" shell "test -x $DEVROOT/run_main_on_hexagon" 2>/dev/null \
-        || die "run_main_on_hexagon 装载器不在 $DEVROOT (从既有部署拷贝)"
+    # skel: 治理后推送 + 读回 SWIV 段校验 (覆盖即治好; 旧流程盲推是毒化源头)
+    adb -s "$device" push "$skel_push" "$DEVROOT/librun_main_on_hexagon_skel.so" >/dev/null
+    adb -s "$device" shell "strings $DEVROOT/librun_main_on_hexagon_skel.so | grep -q SWIV" \
+        || die "skel 设备侧 SWIV 段读回校验失败 (通道会楔死, 勿继续)"
+    # 装载器缺失时从 ship/ 补 (旧行为: 仅报错)
+    if ! adb -s "$device" shell "test -x $DEVROOT/run_main_on_hexagon" 2>/dev/null; then
+        echo "  装载器缺失, 从 ship/ 补推"
+        adb -s "$device" push "$RMOH/ship/run_main_on_hexagon" "$DEVROOT/run_main_on_hexagon" >/dev/null
+        adb -s "$device" shell "chmod 755 $DEVROOT/run_main_on_hexagon"
+    fi
 
     echo "== [4/4] done =="
-    echo "device side ready: $DEVROOT/{libhvxhmx_v23.so, gehtp_runner.so, run_main_on_hexagon}"
+    echo "device side ready: $DEVROOT/{libhvxhmx_v23.so, gehtp_runner.so, run_main_on_hexagon, librun_main_on_hexagon_skel.so(SWIV✓)}"
 }
 
 case "${1:-}" in

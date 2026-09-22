@@ -154,6 +154,12 @@ shadow 校验，M3 删除。（历史注脚：旧 `conv_add_pipeline.sh` 本就�
 
 ### M3 旧链路退役
 
+- 状态：已落地（待提交）。删 wtop_emit shadow 重算 + 旧 bin 自算 + `spill_fill_recs()`
+  量池段 + 两预算旗标（emit 签名/CLI）；gehtp 第 4 步不再传预算；conv_add_pipeline.sh
+  spill 变体改规范 `--ddr-budget 4096`（旧 `--vtcm-budget` 链路退役）。
+  门全绿：ctest 45/45；conv_add 主变体与基线逐字节全同；spill 变体（TAG_MEM_PLAN
+  n_spills=4 → 13 op）确定性 byte-identical；host 全链 EXIT=0。
+
 - 删 `wtop_emit.cpp:389-401` 的 `spill_fill_recs()` 量池段（spill 池尺寸已有真源）。
 - 编译器贪心 spill → TAG_SPILL_FILL_OP 重定语义为「成本模型观察记录」（或禁用发射）；
   文档同步。

@@ -58,6 +58,10 @@ adb shell "su 0 sh -c 'mkdir -p $DEVDIR && \
        /data/local/tmp/hvxhmx23/librun_main_on_hexagon_skel.so \
        /data/local/tmp/hvxhmx23/libhvxhmx_v23.so $DEVDIR/ && chmod 755 $DEVDIR/*'" >/dev/null
 adb shell "su 0 ls $DEVDIR/run_main_on_hexagon" >/dev/null
+# skel 门卫 (2026-09-17 事故): 拷来的 skel 若无 SWIV 段, 其失败 open 会楔死
+# fastrpc 通道 (全板 0x39 须物理复位) — 跑前必查, 缺签即中止并提示治源
+adb shell "su 0 sh -c 'strings $DEVDIR/librun_main_on_hexagon_skel.so | grep -q SWIV'" \
+    || { echo "FATAL: skel 无 SWIV 签名段 — 跑会楔死通道; 先跑 gehtp setup 治源"; exit 1; }
 
 echo "=== device run ==="
 adb push "${SO}.signed" "/sdcard/test_vtcm_engine_probe.so" >/dev/null

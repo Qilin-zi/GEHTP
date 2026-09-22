@@ -22,9 +22,9 @@
 #include "oplist_parse.h"
 #include "oplist_exec.h"
 
-#define D "/data/local/tmp/hrt/gehtp"
+#define D "/data/local/tmp/hvxhmx_c1"
 #define N_ELEM (1u * 1024u * 32u)   /* 输出 [1,1024,32] = 32768 */
-#define OUT_TEMP 1u                  /* manifest: output_temp */
+#define OUT_TEMP 7u                  /* manifest: output_temp */
 
 static uint8_t* read_file(const char* p, size_t* out_len) {
     FILE* f = fopen(p, "rb");
@@ -77,7 +77,7 @@ int main(void) {
     char err[128] = {0};
 
     /* C2(分段诊断): GEHTP_SPLIT_RUN=1 时把整段拆成两半跑, 定位崩溃 op 段 */
-    FILE* sflag = fopen("/data/local/tmp/hvxhmx23/split_flag", "r");
+    FILE* sflag = fopen("/data/local/tmp/hvxhmx_c1/split_flag", "r");
     if (sflag) {
         uint32_t lim = 0;
         if (fscanf(sflag, "%u", &lim) == 1 && lim == 0) lim = w->n_ops / 2u;
@@ -92,7 +92,7 @@ int main(void) {
     }
 
     /* 二分定位第一个输出含 inf/nan 的 op (g41/diag_mode 存在时) */
-    FILE* dflag = fopen("/data/local/tmp/hrt/gehtp/diag_mode", "r");
+    FILE* dflag = fopen("/data/local/tmp/hvxhmx_c1/diag_mode", "r");
     if (dflag) {
         char dm[64] = {0};
         (void)!fread(dm, 1, sizeof(dm) - 1, dflag);
@@ -150,6 +150,7 @@ int main(void) {
                 case OP_FILL: out_t = o->args[2]; break;
                 case OP_CONCAT_F16: out_t = o->args[8]; break;
                 case OP_RMSNORM2_F16: out_t = o->args[3]; break;
+                case OP_SCATTER_ND_F16: out_t = o->args[3]; break;
                 case OP_RMSNORM_F16: out_t = o->args[2]; break;
                 default: break;
                 }
@@ -181,6 +182,7 @@ int main(void) {
                 case OP_MATMUL_F16: case OP_RMSNORM_F16: case OP_RMSNORM2_F16:
                 case OP_CONV2D_F16: case OP_FILL: case OP_GATHER_F16:
                 case OP_CONV1D_SSM_F16: oa = 2; break;
+                case OP_SCATTER_ND_F16: oa = 3; break;
                 case OP_SILU_F16: case OP_IM2COL: case OP_TRANSPOSE_F16:
                 case OP_UNARY_F16: case OP_SOFTMAX_F16: case OP_STRIDED_SLICE_F16:
                 case OP_SPLIT_F16: case OP_REDUCE_F16: case OP_CUMSUM_F32:

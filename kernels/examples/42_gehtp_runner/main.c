@@ -7,8 +7,11 @@
  *   input   f16 原始输入文件 (slot0 EXT_IN 注入)
  *   output  输出写出路径
  *   out_temp 输出 temp id (来自 blob 配套 manifest.json 的 output_temp)
+ *   trace   (PROF W-P2, 可选) =1 开 per-op optrace 落盘行 (默认关)
  * 流程: wt_parse → wt_exec_run_io(out_ptr=NULL) → wt_exec_temp_bytes 定长
  *       → fwrite 输出。判据: rc==0 且输出非空 → [PASS]。
+ * PROF W-P2: 分段 run 计时 ([run] seg_us 行) + op_ts.bin 逐 op 时间戳对
+ *       (host gehtp_prof.py 的 join 输入)。run_id 省略: 每次上板为独立进程。
  * wt_blob ≈4.5MB 必须堆分配 (ribbon 栈 256KB, M2 死因教训)。
  */
 #include <stdint.h>
@@ -23,7 +26,35 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#define JOB_PATH "/data/local/tmp/hvxhmx23/gehtp/job.txt"
+/* PROF W-P2: 共享板防撞车通道。标准构建读 $GDIR/job.txt; 变体构建经
+ *   -DGEHTP_JOB_PATH='"/.../job_prof.txt"' + -o gehtp_runner_prof.so
+ * 得到独立二进制+独立 job 文件, 与在途会话零共享状态 (W33 身份制同律)。 */
+#ifndef GEHTP_JOB_PATH
+#define GEHTP_JOB_PATH "/data/local/tmp/hvxhmx23/gehtp/job.txt"
+#endif
+#define JOB_PATH GEHTP_JOB_PATH
+/* PROF W-P2: 逐 op 时间戳对产物 (host gehtp run 拉回, gehtp_prof.py 消费) */
+#define OP_TS_PATH "/data/local/tmp/hrt/gehtp/op_ts.bin"
+
+/* op_ts.bin 线格式 (全小端): magic 'WTS1' u32 | ver u32 | n_ops u32 | pad u32
+ * | exec_wall_us u64 | n_ops × {start_us u32, dur_us u32} (相对 exec 入口) */
+static int write_op_ts(const char* path, const struct wt_op_ts* ts, uint32_t n,
+                       uint64_t wall_us) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return -1;
+    uint8_t hdr[24];
+    memset(hdr, 0, sizeof(hdr));
+    hdr[0] = 'W'; hdr[1] = 'T'; hdr[2] = 'S'; hdr[3] = '1';
+    uint32_t v = 1; memcpy(hdr + 4, &v, 4);
+    memcpy(hdr + 8, &n, 4);
+    memcpy(hdr + 16, &wall_us, 8);
+    int ok = 0;
+    if (write(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) ok = -1;
+    size_t body = (size_t)n * sizeof(*ts);
+    if (!ok && write(fd, ts, body) != (ssize_t)body) ok = -1;
+    close(fd);
+    return ok;
+}
 
 static uint8_t* read_file(const char* p, size_t* out_len) {
     /* POSIX read: qurt stdio fread 对 >某量文件死循环, open/read 无此问题 */
@@ -119,16 +150,27 @@ int main(void) {
     static char wgt_size_s[32];
     memset(wgt_size_s, 0, sizeof(wgt_size_s));
     int have_wgt_size = (job_get((char*)job, "weights_size", wgt_size_s, sizeof(wgt_size_s)) == 0);
+    /* PROF W-P2: trace 键决定 per-op 落盘行 (缺省=0 净测量; =1 取证)。
+     * 引擎默认开(兼容存量 runner), 故此处必须显式两态下发。 */
+    {
+        static char trace_s[8];
+        memset(trace_s, 0, sizeof(trace_s));
+        int tr = (job_get((char*)job, "trace", trace_s, sizeof(trace_s)) == 0 && atoi(trace_s)) ? 1 : 0;
+        wt_exec_set_trace(tr);
+        ex_log("[prof] per-op optrace %s", tr ? "ON" : "OFF");
+    }
     free(job);
     uint32_t out_temp = (uint32_t)strtoul(temp_s, NULL, 10);
     ex_log("M4 wgt_size=%s", have_wgt_size ? wgt_size_s : "(none)");
 
+    int64_t t_read0 = HAP_perf_get_time_us();  /* PROF W-P2: seg=read */
     size_t blob_len = 0, in_len = 0;
     uint8_t* blob = read_file(blob_p, &blob_len);
     uint8_t* in = read_file(in_p, &in_len);
     if (!blob || !in) { ex_log("[FAIL] read blob/input"); free(blob); free(in); return ex_summary() || 1; }
     ex_log("M5 blob %zu in %zu", blob_len, in_len);
 
+    int64_t t_parse0 = HAP_perf_get_time_us();  /* PROF W-P2: seg=parse */
     struct wt_blob* w = calloc(1, sizeof(*w));
     if (!w) { ex_log("[FAIL] wt_blob alloc"); free(blob); free(in); return ex_summary() || 1; }
     ex_log("M6 before wt_parse");
@@ -136,6 +178,7 @@ int main(void) {
         ex_log("[FAIL] wt_parse"); free(blob); free(in); free(w);
         return ex_summary() || 1;
     }
+    int64_t t_parse1 = HAP_perf_get_time_us();
     ex_log("M7 wt_parse ok");
 
     /* 路线B: 加载外部权重区 (model.weights.bin 与 .wtop 同名前缀) */
@@ -156,6 +199,7 @@ int main(void) {
     uint8_t* wgt = NULL;
     size_t wgt_len = 0;
     ex_log("M8 before weights load");
+    int64_t t_wgt0 = HAP_perf_get_time_us();  /* PROF W-P2: seg=weights */
     if (wgt_p[0]) {
         if (have_wgt_size) {
             wgt_len = (size_t)strtoul(wgt_size_s, NULL, 10);
@@ -180,6 +224,11 @@ int main(void) {
     int64_t* op_us = NULL;
     if (w->n_ops) op_us = (int64_t*)malloc(sizeof(int64_t) * w->n_ops);
     if (!op_us) ex_log("[timing] op_us alloc failed (%u ops), 走无计时路径", (unsigned)w->n_ops);
+    /* PROF W-P2: 逐 op 时间戳对 (start/dur, join gehtp_prof.py 用) */
+    struct wt_op_ts* op_ts = NULL;
+    if (w->n_ops) op_ts = (struct wt_op_ts*)malloc(sizeof(*op_ts) * w->n_ops);
+    if (op_ts) wt_exec_set_ts(op_ts, w->n_ops);
+    else ex_log("[prof] op_ts alloc failed (%u ops), 无 ts 产物", (unsigned)w->n_ops);
     int64_t t0 = HAP_perf_get_time_us();
     ex_log("M10 before wt_exec_run_io");
     int rc = wt_exec_run_io(w, in, NULL, out_temp, NULL, op_us, err, sizeof(err));
@@ -187,7 +236,7 @@ int main(void) {
     if (rc) {
         ex_log("[FAIL] wt_exec_run_io rc=%d %s", rc, err);
         wt_exec_shutdown();
-        free(blob); free(in); free(w); free(op_us);
+        free(blob); free(in); free(w); free(op_us); free(op_ts);
         return ex_summary() || 1;
     }
 
@@ -224,16 +273,24 @@ int main(void) {
                    w->ops[i_top1].opcode, (long long)top1);
         }
     }
+    /* PROF W-P2: op_ts.bin 落盘 (rc==0 才写; 失败 run 的 ts 无意义不产) */
+    if (op_ts) {
+        if (write_op_ts(OP_TS_PATH, op_ts, w->n_ops, (uint64_t)total_us) == 0)
+            ex_log("[prof] op_ts.bin %u ops", (unsigned)w->n_ops);
+        else
+            ex_log("[prof] op_ts.bin write FAIL");
+    }
+    int64_t t_write0 = HAP_perf_get_time_us();  /* PROF W-P2: seg=write */
     uint32_t obytes = wt_exec_temp_last_bytes(out_temp);
     const uint8_t* optr = wt_exec_temp(out_temp);
     if (!obytes || !optr) {
         ex_log("[FAIL] out temp %u empty", (unsigned)out_temp);
         wt_exec_shutdown();
-        free(blob); free(in); free(w); free(op_us);
+        free(blob); free(in); free(w); free(op_us); free(op_ts);
         return ex_summary() || 1;
     }
     int ofd = open(out_p, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (ofd < 0) { ex_log("[FAIL] open %s", out_p); wt_exec_shutdown(); free(blob); free(in); free(w); free(op_us); return ex_summary() || 1; }
+    if (ofd < 0) { ex_log("[FAIL] open %s", out_p); wt_exec_shutdown(); free(blob); free(in); free(w); free(op_us); free(op_ts); return ex_summary() || 1; }
     size_t wgot = 0;
     while (wgot < obytes) {
         ssize_t n = write(ofd, optr + wgot, obytes - wgot);
@@ -244,15 +301,22 @@ int main(void) {
     if (wgot != obytes) {
         ex_log("[FAIL] short write %s", out_p);
         wt_exec_shutdown();
-        free(blob); free(in); free(w); free(op_us);
+        free(blob); free(in); free(w); free(op_us); free(op_ts);
         return ex_summary() || 1;
     }
+    int64_t t_write1 = HAP_perf_get_time_us();
     ex_log("M12 wrote %u bytes", (unsigned)obytes);
+    /* PROF W-P2: run 级结构化摘要 (分段拼轴: 读入/解析/权重/执行/写回) */
+    ex_log("[run] seg_us read=%lld parse=%lld wgt=%lld exec=%lld write=%lld wall=%lld",
+           (long long)(t_parse0 - t_read0), (long long)(t_parse1 - t_parse0),
+           (long long)(t0 - t_wgt0), (long long)total_us,
+           (long long)(t_write1 - t_write0),
+           (long long)(t_write1 - t_read0));
     ex_log("[PASS] %u ops, out temp %u = %u bytes -> %s",
            (unsigned)w->n_ops, (unsigned)out_temp, (unsigned)obytes, out_p);
 
     wt_exec_shutdown();
-    free(blob); free(in); free(w); free(wgt);
+    free(blob); free(in); free(w); free(wgt); free(op_ts);
     ex_log(bad ? "[FAIL] 42_gehtp_runner overall" : "[PASS] 42_gehtp_runner overall");
     return ex_summary() || bad;
 }

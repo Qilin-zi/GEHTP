@@ -1,9 +1,11 @@
 {
+  "manifest_ver": 2,
   "input_slot": 0,
   "input_elems": 32768,
   "output_temp": 0,
-  "n_slots": 4,
-  "n_ops": 17,
-  "op_ids": [6,11,11,12,14,100,100,100,100,100,100,100,100,100,100,100,100],
-  "opcodes": [27,5,6,7,27,8,9,8,9,8,9,8,9,8,9,8,9]
+  "n_slots": 5,
+  "n_ops": 13,
+  "op_ids": [6,6,11,11,11,11,12,12,12,12,14,14,14],
+  "opcodes": [27,8,9,5,6,8,9,9,7,8,9,27,8],
+  "op_names": ["Transpose","Transpose","Conv2d","Conv2d","Conv2d","Conv2d","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Transpose","Transpose","Transpose"]
 }
