@@ -232,16 +232,37 @@ struct Emitter {
     static void pack_w4a16_kernel(const uint8_t* src, size_t nbytes, size_t K, size_t N,
                                   std::vector<uint8_t>& wt_out,
                                   std::vector<uint8_t>& bias_out,
-                                  std::vector<uint8_t>& scale_out) {
+                                  std::vector<uint8_t>& scale_out,
+                                  uint32_t gtype = 2) {
         std::vector<float> w(K * N);
-        for (size_t b = 0; b < nbytes / 18; b++) {
-            uint16_t d_raw;
-            std::memcpy(&d_raw, src + b * 18, 2);
-            float d = f16_to_f32(d_raw);
-            const uint8_t* nib = src + b * 18 + 2;
-            for (int j = 0; j < 16; j++) {
-                w[(b * 32) + j] = d * ((nib[j] & 0xF) - 8);
-                w[(b * 32) + 16 + j] = d * ((nib[j] >> 4) - 8);
+        if (gtype == 14) {
+            /* BF16: 2B/元素, f32 = bf16 << 16 (符号 1 + 指数 8 + 尾数 7) */
+            for (size_t i = 0; i < K * N; i++) {
+                uint16_t b16;
+                std::memcpy(&b16, src + i * 2, 2);
+                uint32_t u = (uint32_t)b16 << 16;
+                std::memcpy(&w[i], &u, 4);
+            }
+        } else if (gtype == 0 || gtype == 3) {
+            /* F32 (params.bin 回退): gtype 0 = [N,K] 转置读入;
+             * gtype 3 = [K,N] 直读 (MatMul 消费方布局) */
+            if (gtype == 0) {
+                for (size_t n = 0; n < N; n++)
+                    for (size_t k = 0; k < K; k++)
+                        std::memcpy(&w[k * N + n], src + ((size_t)n * K + k) * 4, 4);
+            } else {
+                std::memcpy(w.data(), src, K * N * 4);
+            }
+        } else {
+            for (size_t b = 0; b < nbytes / 18; b++) {
+                uint16_t d_raw;
+                std::memcpy(&d_raw, src + b * 18, 2);
+                float d = f16_to_f32(d_raw);
+                const uint8_t* nib = src + b * 18 + 2;
+                for (int j = 0; j < 16; j++) {
+                    w[(b * 32) + j] = d * ((nib[j] & 0xF) - 8);
+                    w[(b * 32) + 16 + j] = d * ((nib[j] >> 4) - 8);
+                }
             }
         }
         std::vector<int8_t> wq(K * N);
@@ -310,7 +331,8 @@ struct Emitter {
     uint32_t ensure_weight_slot(GraphPrepare& gp, const OpDef* w,
                                 std::map<uint64_t, uint32_t>& wslots,
                                 const std::string& consumer_grp = "",
-                                bool kernel_fmt = false) {
+                                bool kernel_fmt = false,
+                                bool fc_layout = true) {
         /* kernel-格式调用方用独立缓存 (tie 权重两种格式并存, 互不遮蔽) */
         std::map<uint64_t, uint32_t>& cache = kernel_fmt ? w4_wslots : wslots;
         auto it = cache.find(w->op_id);
@@ -321,8 +343,21 @@ struct Emitter {
         };
         if (use_gguf && gguf_tab && gguf_bytes) {
             auto mit = gguf_tab->find(w->grouping);
-            if (mit == gguf_tab->end() && !consumer_grp.empty())
+            if (mit == gguf_tab->end() && !consumer_grp.empty()) {
                 mit = gguf_tab->find(consumer_grp);
+                if (mit == gguf_tab->end()) {
+                    /* qairt reshape 重命名 (X → X_pre_reshape): 规范化后缀再试 */
+                    std::string norm = consumer_grp;
+                    for (const char* suf : {"_pre_reshape", "_post_reshape", "_reshape"}) {
+                        size_t sl = std::strlen(suf);
+                        if (norm.size() > sl && norm.compare(norm.size() - sl, sl, suf) == 0) {
+                            norm.resize(norm.size() - sl);
+                            break;
+                        }
+                    }
+                    if (norm != consumer_grp) mit = gguf_tab->find(norm);
+                }
+            }
             if (mit != gguf_tab->end()) {
                 const GgufEntry& e = mit->second;
                 if (e.file_offset + e.nbytes <= gguf_bytes->size()) {
@@ -330,12 +365,12 @@ struct Emitter {
                     uint32_t id;
                     size_t K = e.dims[0], NN = 1;
                     for (size_t i = 1; i < e.dims.size(); i++) NN *= e.dims[i];
-                    if (e.type == 2 && K % 32 == 0 && NN % 32 == 0 && kernel_fmt && getenv("GEHTP_TILE")) {
+                    if ((e.type == 2 || e.type == 14) && K % 32 == 0 && NN % 32 == 0 && kernel_fmt && getenv("GEHTP_TILE")) {
                         // Q4_0 → W4A16 HMX kernel 格式 (wt + 折叠 bias + 列 scale;
                         // 仅 GEMM 消费方 — GATHER 表等仍走 f16 反量化, 否则
                         // 嵌入表被 nibble 打包 → gather 读垃圾 token)
                         std::vector<uint8_t> wtb, biasb, scaleb;
-                        pack_w4a16_kernel(src, e.nbytes, K, NN, wtb, biasb, scaleb);
+                        pack_w4a16_kernel(src, e.nbytes, K, NN, wtb, biasb, scaleb, e.type);
                         id = slot_for((uint32_t)wtb.size(), (uint32_t)(K * NN), wtb.data());
                         uint32_t bid = slot_for((uint32_t)biasb.size(), (uint32_t)(biasb.size() / 2u), biasb.data());
                         uint32_t sid = slot_for((uint32_t)scaleb.size(), (uint32_t)(NN + 1), scaleb.data());
@@ -388,12 +423,46 @@ struct Emitter {
             cache[w->op_id] = id;
             return id;
         }
+        /* kernel-格式消费方: gguf 无数据的大权重 (lm_head tie 嵌入, gguf 里
+         * token_embd 为 0 字节占位) 从 params.bin 回退 F32 直接列量化 —
+         * 形状 = w->output_def.dims ([N,K] HF 序), %32 约束同 gguf 路径 */
+        const float* wf = reinterpret_cast<const float*>(
+            gp.const_pool().data() + w->const_data_offset);
+        if (kernel_fmt && getenv("GEHTP_TILE") &&
+            w->output_def.rank >= 2 &&
+            w->output_def.dims[w->output_def.rank - 2] % 32 == 0 &&
+            w->output_def.dims[w->output_def.rank - 1] % 32 == 0) {
+            /* qairt 4D 化 (如 [1,1,N,K]) — 用最后两维 (N, K HF 序)。
+             * batched 权重 (如 SSM A/B [16,128,128]) 元素数 > K·N →
+             * 不回退会丢批维 (runlist 2651 实锤) — 总元素数须 == K·N */
+            size_t N2 = w->output_def.dims[w->output_def.rank - 2];
+            size_t K2 = w->output_def.dims[w->output_def.rank - 1];
+            uint64_t total_dims = 1;
+            for (uint32_t di = 0; di < w->output_def.rank; di++)
+                total_dims *= w->output_def.dims[di];
+            if (total_dims != K2 * N2) goto w4_f16_fallback;
+            /* 仅宽输出投影 (N > 4K) kernel 化: 标量执行瓶颈集中在分类头等
+             * 宽 GEMM; 残差出口 (out_proj N/K=0.5) 的量化噪声直接注入主链 —
+             * 22 个中间 GEMM kernel 化后 logits cos 0.999→0.327 实锤 */
+            if (N2 <= K2 * 4) goto w4_f16_fallback;
+            std::vector<uint8_t> wtb, biasb, scaleb;
+            /* FC 权重存 [N,K] (flags=2), MatMul 存 [K,N] — 按消费方布局 */
+            pack_w4a16_kernel(reinterpret_cast<const uint8_t*>(wf),
+                              n * 4, K2, N2, wtb, biasb, scaleb,
+                              fc_layout ? 0u : 3u);
+            uint32_t id = slot_for((uint32_t)wtb.size(), (uint32_t)(K2 * N2), wtb.data());
+            uint32_t bid = slot_for((uint32_t)biasb.size(), (uint32_t)(biasb.size() / 2u), biasb.data());
+            uint32_t sid = slot_for((uint32_t)scaleb.size(), (uint32_t)(N2 + 1), scaleb.data());
+            cache[w->op_id] = id;
+            w4_bias_slots[w->op_id] = bid;
+            w4_scale_slots[w->op_id] = sid;
+            return id;
+        }
+    w4_f16_fallback:
         std::vector<uint16_t> w16(n);
         /* 权重字节源始终从 const_pool 读 (const_data_offset 是 const_pool 内偏移)。
          * 路线B 仅改变槽路由: slot_for 已按 ext_weights 选 add_ext_slot/add_slot。
          * ext_weights_bin(params.bin) 的字节布局与 const_pool 不同, 不能作为源。 */
-        const float* wf = reinterpret_cast<const float*>(
-            gp.const_pool().data() + w->const_data_offset);
         for (size_t i = 0; i < n; i++) w16[i] = f32_to_f16_rne(wf[i]);
         std::vector<uint8_t> wbytes(n * 2);
         std::memcpy(wbytes.data(), w16.data(), wbytes.size());

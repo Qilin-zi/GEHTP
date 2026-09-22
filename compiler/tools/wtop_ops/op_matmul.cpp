@@ -13,7 +13,8 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
     /* B 为 const(权重)→ 槽; 运行时(q·kᵀ 的 k)→ temp 引用 */
     bool w_is_const = w && (w->is_const() || w->const_data_size > 0);
     uint32_t w_s = w_is_const
-        ? (0x8000u | em.ensure_weight_slot(gp, w, wslots, od->grouping, /*kernel_fmt=*/true))
+        ? (0x8000u | em.ensure_weight_slot(gp, w, wslots, od->grouping, /*kernel_fmt=*/true,
+                                            /*fc_layout=*/nm == "FullyConnected"))
         : (od->inputs.size() > 1
                ? em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots)
                : em.dummy_slot_id);
