@@ -11,7 +11,9 @@ static int op_rmsnorm(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<u
     const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
     uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
     const OpDef* bs = od->inputs.size() > 2 ? gp.get_op_at(od->inputs[2].src_id) : nullptr;
-    uint32_t b_s = bs ? em.ensure_weight_slot(gp, bs, wslots, od->grouping) : em.dummy_slot_id;
+    /* bias 不带 consumer_grp: gguf 表按 consumer 名回落会把权重当 bias 塞
+     * (slot 322=权重 1+w 实锤 → norm 输出 100× 放大 → 全链错) */
+    uint32_t b_s = bs ? em.ensure_weight_slot(gp, bs, wslots, "") : em.dummy_slot_id;
     uint32_t out_t = em.fresh_temp(gp, od->op_id);
     em.add_op(OP_RMSNORM2_F16, {x_t, w_s, b_s, out_t, (uint32_t)elems_of(od)});
     return 0;

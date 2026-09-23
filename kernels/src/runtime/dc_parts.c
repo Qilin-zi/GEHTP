@@ -1,6 +1,7 @@
 /* dc_parts.c — 部件层实现 */
 #include "dc_parts.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 
 #include "dma_utils.h"
 #include "wtcache.h"
+#include "w4a16_quant.h"
 
 /* w4a16_driver_dc.c */
 int w4a16_invoke(const uint8_t* vtcm_act, const uint8_t* vtcm_weight,
@@ -187,37 +189,99 @@ uint64_t dc_dma_checksum(const struct dc_dma* d) {
 }
 
 /* ================= W4A16 引擎 ================= */
-int dc_w4_carve(struct dc_w4* e, struct dc_arena* a, uint32_t m, uint32_t k,
-                uint32_t n, const uint8_t* atbl_ddr, const uint8_t* otbl_ddr) {
-    memset(e, 0, sizeof(*e));
-    e->m = m; e->k = k; e->n = n;
-    e->act  = dc_arena_alloc(a, m * k * 2, 2048);
-    e->out  = dc_arena_alloc(a, m * n * 2, 2048);
-    e->wt   = dc_arena_alloc(a, k * n / 2, 2048);
-    e->bias = dc_arena_alloc(a, (n / 32) * 512, 2048);
-    e->atbl = dc_arena_alloc(a, 8 * (k / 32) * 4, 128);
-    e->otbl = dc_arena_alloc(a, 8 * (n / 32) * 4, 128);
-    e->mask = dc_arena_alloc(a, 32, 128);
-    e->extra = dc_arena_alloc(a, 16, 128);
-    e->atbl_ddr = atbl_ddr;
-    e->otbl_ddr = otbl_ddr;
-    if (!e->act || !e->out || !e->wt || !e->bias || !e->atbl || !e->otbl ||
-        !e->mask || !e->extra) return 0xD300;
+static int act_is_bound(const struct dc_w4* e, const uint8_t* act_src) {
+    return e->act_valid && e->act_ddr == act_src;
+}
+
+int dc_w4_run_prep(struct dc_w4* e, const uint8_t* act_src, uint32_t m,
+                      uint32_t k, float wq_rms, float f_fixed) {
+    if (!e || !act_src) return 0xD400;
+    if (m % 32 || k % 32) return 0xD401;
+    uint32_t m_pad = (m + 255u) & ~255u;
+    if (m_pad != e->m) return 0xD402;  /* carve 必须按 pad 后 M */
+    float as = w4a16_act_scale((const uint16_t*)act_src, m * k);
+    float f = f_fixed > 0.0f ? f_fixed
+              : w4a16_pow2ceil(4.0f * sqrtf((float)k) *
+                               w4a16_act_rms_norm((const uint16_t*)act_src, m * k, as) *
+                               wq_rms / 7.0f);
+    e->act_scale = as * f;  /* dequant 用 a_scale, f 精确抵消 */
+    /* 量化+crouton 融合 (零行 pad = 32768) */
+    uint16_t* surf = (uint16_t*)e->act;
+    uint32_t n_kt = k / 32, n_m32 = m_pad / 32;
+    uint32_t out = 0;
+    for (uint32_t phase = 0; phase < 8; phase++)
+        for (uint32_t kt = 0; kt < n_kt; kt++) {
+            uint32_t k_base = kt * 32;
+            for (uint32_t g = 0; g < n_m32; g++)
+                for (uint32_t rp = 0; rp < 2; rp++) {
+                    uint32_t row0 = g * 32 + phase * 4 + rp * 2;
+                    uint32_t row1 = row0 + 1;
+                    for (uint32_t c = 0; c < 32; c++) {
+                        surf[out++] = row0 < m
+                            ? w4a16_quant_f16(((const uint16_t*)act_src)[(size_t)row0 * k + k_base + c], e->act_scale)
+                            : 32768u;
+                        surf[out++] = row1 < m
+                            ? w4a16_quant_f16(((const uint16_t*)act_src)[(size_t)row1 * k + k_base + c], e->act_scale)
+                            : 32768u;
+                    }
+                }
+        }
+    qurt_mem_cache_clean((qurt_addr_t)e->act, m_pad * k * 2,
+                         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    e->act_ddr = act_src;
+    e->act_valid = 1;
     return 0;
 }
 
-int dc_w4_invoke(struct dc_w4* e) {
-    /* 表每次回填 host 原始 offset (w4a16_invoke 会重写成绝对指针, 破坏性) */
-    uint32_t ab = 8 * (e->k / 32) * 4, ob = 8 * (e->n / 32) * 4;
-    memcpy(e->atbl, e->atbl_ddr, ab);
-    memcpy(e->otbl, e->otbl_ddr, ob);
-    return w4a16_invoke(e->act, e->wt, e->bias, e->out,
-                        e->atbl, e->otbl, e->mask, e->extra,
-                        e->m, e->k, e->n);
+int dc_w4_run_invoke(struct dc_w4* e, const uint8_t* scale, uint32_t n,
+                        uint8_t* out_ddr, uint32_t out_row_bytes,
+                        uint32_t m_out, float wq_rms, float f_fixed) {
+    if (!e || !scale || !out_ddr) return 0xD400;
+    if (!e->act_valid) return 0xD405;  /* 须先 prep */
+    if (m_out % 32 || n % 32) return 0xD401;
+    /* refill 尺寸按本次 invoke 的 n (dc_w4_invoke 用 e->n; carve 按分块宽
+     * n_eff 时 e->n > nc — refill 4KB 越界读 2KB 表, 板挂/数据错实锤) */
+    {
+        uint32_t en = e->n;
+        e->n = n;
+        int irc = dc_w4_invoke(e);
+        e->n = en;
+        if (irc) return 0xD403;
+    }
+    /* HMX 直写出面, INVALIDATE 后 CPU 读; crouton 序直读反量化 (行≥m_out 丢弃) */
+    qurt_mem_cache_clean((qurt_addr_t)e->out, e->m * n * 2,
+                         QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+    w4a16_dequant_crouton((const uint16_t*)e->out, e->m, n, m_out, e->act_scale,
+                             (const uint16_t*)scale, (uint16_t*)out_ddr,
+                             out_row_bytes);
+    return 0;
 }
 
-void dc_w4_read_out(const struct dc_w4* e, void* recv) {
-    qurt_mem_cache_clean((qurt_addr_t)e->out, e->m * e->n * 2,
-                         QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
-    memcpy(recv, e->out, e->m * e->n * 2);
+void dc_w4_run_fini(struct dc_w4* e) {
+    if (e) e->act_valid = 0;
+}
+
+/* dc_w4_run — f16 DDR act → (量化 a16 域 + M→256 零行 pad + crouton 面) →
+ * kernel → 出面反量化 f16 DDR。exec_matmul 走本入口; 例程/dd_worker 的
+ * dc_w4_invoke 旧契约 (act 预置 u16 面) 不变。
+ * 铁律: a16 域 q=0 是 real=-1.0 — pad 零行填 32768 (零值点)。
+ * 出面 = A_s·S[n]·(q-32768)/32767 (S=权重列 scale 槽, 已含 /7)。
+ * lm_head 多块复用: act 源相同 → prep 一次, 各块 invoke 复用。 */
+int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
+              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
+              uint32_t out_row_bytes, float wq_rms, float f_fixed) {
+    if (!e || !act_ddr || !out_ddr || !scale_ddr) return 0xD400;
+    if (m % 32 || k % 32 || n % 32) return 0xD401;
+    uint32_t m_pad = (m + 255u) & ~255u;
+    if (m_pad != e->m) return 0xD402;  /* carve 必须按 pad 后 M */
+    if (act_is_bound(e, act_ddr)) {
+        /* 复用已 prep 的 act 面 + a_scale */
+        return dc_w4_run_invoke(e, scale_ddr, n, out_ddr,
+                                 out_row_bytes, m, wq_rms, f_fixed);
+    }
+    /* 首次: 完整 prep */
+    int rc = dc_w4_run_prep(e, act_ddr, m, k, wq_rms, f_fixed);
+    if (rc) return rc;
+    return dc_w4_run_invoke(e, scale_ddr, n, out_ddr,
+                             out_row_bytes, m, wq_rms, f_fixed);
 }

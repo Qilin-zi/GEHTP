@@ -38,17 +38,14 @@ static int op_strided_slice(Emitter& em, GraphPrepare& gp, const OpDef* od, std:
         args.push_back(b0); args.push_back(b1); args.push_back(b2);
         args.push_back(e0); args.push_back(e1); args.push_back(e2);
         args.push_back(s0); args.push_back(s1); args.push_back(s2);
-        /* 输入 dims(轴 1..3, C 序) */
+        /* 输入 dims(轴 1..3, C 序); 二维 [ax0,ax1] 线性步长须 ax0*dims[1]+ax1 */
         uint32_t d0 = 1, d1 = 1, d2 = 1;
         {
             uint32_t ar = srk;
             while (ar > 0 && srcp->output_def.dims[ar - 1] == 1) ar--;
-            if (ar >= 1) d0 = srcp->output_def.dims[ar - 3 < ar ? ar - 3 : ar - 1];
-            if (ar >= 2) d1 = srcp->output_def.dims[ar - 2];
-            if (ar >= 1) d2 = srcp->output_def.dims[ar - 1];
-            if (ar == 1) d0 = 1;
-            if (ar == 2) { d1 = srcp->output_def.dims[0]; d2 = srcp->output_def.dims[1]; }
-            if (ar == 1) { d2 = srcp->output_def.dims[0]; d1 = 1; }
+            if (ar >= 3) { d0 = srcp->output_def.dims[ar - 3]; d1 = srcp->output_def.dims[ar - 2]; d2 = srcp->output_def.dims[ar - 1]; }
+            if (ar == 2) { d0 = srcp->output_def.dims[0]; d1 = srcp->output_def.dims[1]; d2 = 1; }
+            if (ar == 1) { d0 = 1; d1 = 1; d2 = srcp->output_def.dims[0]; }
         }
         args.push_back(d0); args.push_back(d1); args.push_back(d2);
         em.add_op(OP_STRIDED_SLICE_F16, args);

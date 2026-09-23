@@ -6,7 +6,10 @@ using namespace wtop;
 namespace {
 
 static int op_copy_sem(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
-    (void)nm;
+    if (nm == "Cast") {
+        /* int32 值语义已在输入注入时转 f16 (wtop_emit 2a 段), 此处恒等。
+         * (opcode 30 保留: 未来 4B 位模式直存路径可再启用) */
+    }
     // 数据搬运/常量填充/状态更新语义 → 恒等(设备 M4 数值门兜底)
     uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
     uint32_t out_t = em.fresh_temp(gp, od->op_id);
@@ -18,7 +21,7 @@ static int op_copy_sem(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<
 
 static const wtop::OpRegistrar g_reg_op_copy_sem{
     {"Reshape", op_copy_sem},
-    {"Pad", op_copy_sem},
-    /* A3②: ScatterNd 已迁出 (op_scatter_nd.cpp 真语义发射, L0 cos 0.102 死刑判决) */
+    /* Pad 移出: 真语义在 op_pad.cpp (opcode 29; 恒等冒充 = 0.8B 全 -inf 根因) */
+    /* ScatterNd 移出: 真语义在 op_scatter_nd.cpp (A3 暗雷收口, 不再恒等冒充) */
     {"Cast", op_copy_sem},
 };

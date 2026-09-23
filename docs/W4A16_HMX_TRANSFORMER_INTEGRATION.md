@@ -1,0 +1,136 @@
+# W4A16 HMX → Transformer 管线集成任务书
+
+状态: 2026-09-21。HMX kernel 已在 110 板验证 (256³ 位恒等 65536/65536, 1290 GFLOPS)。
+① 发射器 kernel 格式已完成 (129 W4A16 op, blob 2.63GB, 闭包 byte-exact)。
+本任务书 = 把 HMX 接进 0.8B transformer 的 W4A16 GEMM 路径。相关提交 a284e63 (host 标量参考)。
+
+## 已完成的基线
+
+- 例 17_w4a16_gemm 上板: `vs_gold2563_byteexact / rerun_byteexact / invoke_sanity` 3 门全绿。
+  资产 `/data/local/tmp/hvxhmx23/assets/s256/`, 主机源 `kernels/assets/s256/`。
+- Host 标量 W4A16 参考 (tile 解码+f32 GEMM) bit-exact, 129 个 W4A16 op 全过,
+  输出全有限 (cos 0.127 vs memplan9 基线 — 即数值分歧与 W4A16 无关, 见 §5)。
+- 发射器 GEHTP_TILE=1 tile 路由 + 显式供给槽 9 参 arity (bias/atbl/otbl 槽 id 进 args)。
+
+## kernel 精确契约 (闭包权威来源)
+
+来源: `/4090disk2/htpw4a16_v81/closure_host/m2_pack_surfaces.py` +
+`qcom_htp_link/example/handwritten_hmx_matmul/prepare_owned_inputs.py`
+
+- **权重**: int8 [-7,7] → `nib=(w+8)&0xF` → `pack_w4_kblock32_nmajor_k4_lohi`:
+  kb(外) × N32 × kg(4) × n×kr(4) lohi → K*N/2 字节 → **XOR 0x88**。
+- **folded bias**: `pack_native_a16_bias` → (N/32)*512 字节 (scale 折叠, u16 饱和铁律)。
+- **激活**: u16 [M,K] a16 域 (反量化 (q+offset)×scale; encoding min=-8/7 max=1.0,
+  ÷7 域常量 −18 在 kernel 内) → `pack_a16_crouton16_row4_surface`:
+  row4_phase(8) 外 × kt × m32_group × row_pair(2), 相邻两行成对。
+- **atbl/otbl**: 8×(K/32) 个 u32 字节偏移 (表 stride 0x800/条目), 驱动重写为绝对指针。
+- **约束**: m/k/n %32==0; M 按 256 行批量 (m_total_minus_step=8); wtcache 独占 VTCM。
+- **驱动**: `dc_parts.c` carve (act/out/wt/bias/atbl/otbl/mask/extra, 2KB 对齐) +
+  `w4a16_invoke` (表重写+FLUSH+裸 kernel); 权重/偏置 UDMA 搬 VTCM (dma_to_vtcm)。
+
+## 集成步骤 (按序)
+
+### ① 发射器: 640B tile → kernel 格式 (编译期全可做) — 已完成 (2026-09-21)
+- `wtop_ops.hpp` 的 `repack_q4_0_tiles` 换成 `pack_w4a16_kernel`:
+  gguf Q4_0 反量化 → **每列** int8[-7,7] (scale=max|col|/7, 全零列→1)
+  → k4-lohi + XOR 0x88 → 槽 = K*N/2 字节; 列 scale f16 → 独立槽 (N*2)。
+  (列向而非块向: 块向 scale 无法从 GEMM 提因子, 列向可在出面反量化按列乘回 —
+  见 ②; 这也与 W4A16 业界 per-channel 惯例一致。)
+- bias=(N/32)*512 折叠 bias 槽 + atbl=8*(K/32)*4 / otbl=8*(N/32)*4 真实
+  0x800-stride 偏移表槽 (闭包 m2_pack_surfaces COMPACT_STRIDE; 驱动运行时重写
+  绝对指针)。
+- **预收集遍坑**: wtop_emit 的通用权重槽收集遍先按 f16 建槽并缓存, 后续发射器
+  全部撞缓存 → W4A16 129 op 全落 MATMUL_F16 (实锤)。修法 = OpW4Registrar 注册表:
+  kernel-格式消费方由发射器自身注册, 预收集遍查同一张表 (单一真相源, 无硬编码)。
+- **tie 权重双格式**: 嵌入表被 GATHER 与 GEMM 共享 → kernel-格式独立缓存
+  (w4_wslots) 与 f16 缓存并存, 各消费方取各格式。
+- 校验 (全绿): wt/bias 槽 vs 闭包 pack byte-exact (129/129); scale vs gguf 真值
+  cos=1.0; host 参考全有限自洽; 每 GEMM vs 旧 tile 路径 cos 0.978 (列向量化
+  噪声, 预期)。
+- **解码双坑** (host 标量参考): ① 存储字节 = ((w+8)&0xF)^0x88 = w 的 4-bit 补码
+  本身, 解码直接补码, 再 XOR = 双重变换 (w≥0 错 w-8, cos -0.58); ② scale 槽
+  已含 /7, 解码勿再除 (多除 = 幅度 7× 错)。
+
+### ② 设备侧: act f16 → u16 a16 域 + crouton 打包 (新 dc 函数) — 已完成 (2026-09-21)
+- 新平台无关文件 `kernels/src/runtime/w4a16_quant.c` (host 单测 + 设备 lib 同源):
+  `w4a16_act_scale` = max|a| (全零→1); `w4a16_quant_f16` = round-half-away
+  (a/A_s·32767)+32768 纯 C 实现 (libc roundf 设备运行时未证; 钳位边界 v>-32767→
+  65535 / v<-32768→0); `w4a16_pack/unpack_crouton` (闭包 crouton16_row4 精确正逆);
+  `w4a16_dequant_out/_crouton` = A_s·S[n]·(q-32768)/32767 (S=列 scale 槽, 已含 /7)。
+- 新入口 `dc_w4_run` (exec_matmul 全链调用; 例程旧 dc_w4_invoke 契约不变):
+  - 设备 (dc_parts.c): 量化+crouton 融合写 VTCM 面 (**M→256 零行 pad=32768 —
+    a16 域 q=0 是 real=-1.0, 零行必须填零值点!**) → FLUSH → invoke → INVALIDATE
+    → crouton 序直读反量化 (行≥m 丢弃, 无中间缓冲)。
+  - host (host_stubs.c): 同签名纯 f32 数学 (act 不量化; 设备 a16/>>8 噪声由
+    ④ 容差门承担) — 全模型 7946240 元素 vs 旧参考 byte-exact。
+- exec_matmul: carve 按 M pad 后 (kernel M=256 硬约束, m_total_minus_step=8);
+  act/out 不再走 DMA 包装 (CPU 写 out_ddr → FLUSH; 旧 DMA-out 的 INVALIDATE
+  会丢 CPU 写)。**M pad 256 由 ② 收编, ③ 只剩 lm_head N 分块。**
+
+### ③ N 分块 (lm_head) — 已完成 (2026-09-21)
+- W4_N_CHUNK=4096: 每块 wt 2MB + out 2MB + bias 64KB + act 512KB ≈ 4.6MB
+  (< 8MB VTCM 池; qkv 全量 6.6MB 单次可装); lm_head N=248320 → 61 块。
+- **wt 槽 kb-major 布局 (闭包 pack) 列块不连续** → 每块按 kb 段 gather
+  (槽内段步长 N·16B, 段长 nc·16B) + FLUSH; bias 连续 → dma 加列偏移。
+- 每块按精确 nc invoke (kernel 只算 nc 列, 槽尾陈旧数据不被读); otbl 每块
+  运行时生成 ((mt·nct+i)·0x800, 表内容只依赖 nc); dequant 加 out_row_bytes
+  行跨度参数 (分块列写在 row·N_full + c0)。
+- 坑: host dc_w4_run 行指针化后 store 残留 mm·N 双重索引 = 越界写
+  (全模型 99.99% 元素变值, 非分块 GEMM 也中招 — 修后 byte-exact)。
+- 门: host 全模型 (qkv 6144→4096+2048 + lm_head 61 块) vs ② 参考
+  7946240 元素 byte-exact; 设备 lib 编译+签过。剩余: ④ 上板对拍。
+
+### ④ 单 GEMM 对拍门 — 已完成 (2026-09-21, 110 板)
+- 板测例 `kernels/examples/44_w4a16_run` (dc_w4_run 全链; 资产生成
+  `scripts/gen_w4a16run_assets.py`), 4 case 全 PASS:
+  `s256` (闭包资产 f=1) cos=0.999999; `r256_256_256` 0.999990;
+  `r256_1024_2048` 0.999986; `r32_1024_3584` (M pad) 0.999988。
+- 实测 act 走全精度路径 (>>8 截断假设不成立 — 观测记录, 不深究机制);
+  误差仅 act 量化 + f16 输出舍入 ~0.5% RMS。
+- **×7 域换算坑** (板实锤): dequant 缺 ×7 (S 槽相对 wq, kernel 域相对 wq/7)。
+  漏乘 = 整体 /7 — s256 的 cos 对均匀缩放失明 (max|d|=0.857=6/7 暴露),
+  列向各异时 cos≈0.83/max|d|=548。
+- **±1 出面域限制**: 闭包金标自身 14.1% 饱和; 引入运行时自适应输出域因子
+  f = pow2ceil(4·√k·RMS(a/max|a|)·wq_rms/7) (权重统计 = 发射器 scale 槽尾
+  f16, dequant 精确抵消; 测试 f_fixed 覆盖)。
+
+### ⑤ 全模型上板 — 已完成 (2026-09-21, 110 板)
+- GEHTP_TILE=1 blob (2.63GB) → host 数值门 (byte-exact 参考) → 110 板全模型
+  47070 op rc=0 → 板 vs host **cos=0.9687** (设备量化链 24 层累积噪声;
+  逐 GEMM 板 vs host 0.99999) → judge_logits vs golden cos=0.036
+  (≈ host 参考 0.034 — §5 数值链分歧为既有问题, 非设备引入)。
+- **⑤ 过程实锤的坑**:
+  1. PD 堆 malloc 上限 3.0GB (例 45 探针) — 2.63GB blob 可读, 但 qurt
+     off_t=32 位 fseek/ftell 溢出 → job blob_size 键 + read_file_size
+  2. 共享路径全面战争 (job.txt/lib/input/结果文件被并行会话反复覆盖) →
+     JOB_PATH #ifndef 身份制 + 私有目录 (/data/local/tmp/w4a16run) 装
+     lib+runner+job — 全隔离后稳定
+  3. wt_parse 概率性 ARITY = 板上 lib 被并行会话覆盖的旧版本 (非读坏)
+  4. **分块根因 (最大坑)**: dc_w4_invoke otbl refill 尺寸按 carve 宽
+     (e->n=n_eff) 而表按 invoke 宽 (nc) — carve 4096+invoke 2048 时 refill
+     4KB 越界读 2KB 表 → 板挂/块2 数据错 (全模型 -inf 源头); 修复 = invoke
+     前临时 e->n=nc。例 44 r2chunk 连续两块 case 复现-隔离-验证闭环
+  5. 例程复现的分块假象 = 生成器 otbl 硬编码块宽 (nct 未按每块 nc)
+  6. hunt 假阳性: attention mask 的 -inf 是语义正常 (softmax 屏蔽)
+
+## 挂账项 (§5)
+
+- **全模型数值 cos≈0.06-0.11 vs golden (所有路径共有, 非 W4A16 特有)**。
+  已修 12+ 真 bug (末轴/池耗尽/gguf match 表偏移/Softplus/Pad/kw/SELECT 广播/
+  双 sigmoid/int32 输入/bias 槽/tile 路由/malloc 截断 — 见 git log 0e61587 前)。
+  剩余疑点: conv 因果核与 gguf 权重序对齐 (params.bin 布局未对上)、
+  权重 [K,N]vs[N,K] 布局 (转置实验 cos 0.094 未决)、attn_iter 递归链细节。
+- **设备 PD 堆**: 实测 malloc 上限 3.0GB (例 45 探针); 2.63GB kernel 格式 blob
+  可跑 (需 blob_size 键绕过 off_t 32 位); 长期需流式/映射权重。
+- **剩余质量杠杆** (⑤ 后): 板 vs host cos 0.9687 的量化噪声 (act 量化
+  16-log2(f) 位 + f16 输出舍入 ×24 层累积) — 若需提升, 换更大 f 余量
+  或 f16→f32 出面; 但与 §5 的 0.03 级分歧相比非当前瓶颈。
+
+## 关键文件
+
+- kernel: kernels/src/hmx/w4a16_driver_dc.c, w4a16_v81deep_conv1x1_kernel.inc
+- 驱动/执行: kernels/src/runtime/dc_parts.c (carve/invoke), oplist_exec.c exec_matmul
+- host 标量参考: kernels/host/host_stubs.c (dc_w4_carve/invoke 真数学)
+- 发射器: compiler/tools/wtop_ops/op_matmul.cpp (w4 路由+供给槽), wtop_ops.hpp (repack)
+- 闭包资产: /4090disk2/htpw4a16_v81/ (closure_host/*.py = 格式权威)
+- 板测: kernels/examples/17_w4a16_gemm/main.c

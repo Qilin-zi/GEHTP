@@ -1,4 +1,5 @@
 /* oplist_parse.c — 平台无关纯 C 解析器 (host 单测 + 设备实跑同一份源码) */
+#include <stdio.h>
 #include <string.h>
 
 #include "oplist_parse.h"
@@ -10,7 +11,7 @@ static uint32_t align_up(uint32_t x, uint32_t a) {
 static int arity_of(uint16_t opcode) {
     switch (opcode) {
     case OP_NOP: return WT_ARITY_NOP;
-    case OP_MATMUL_W4A16: return WT_ARITY_MATMUL;
+    case OP_MATMUL_W4A16: return WT_ARITY_MATMUL; /* [a,w,out,M,K,N,bias_s,atbl_s,otbl_s,scale_s] */
     case OP_RMSNORM_F16: return WT_ARITY_RMSNORM;
     case OP_PIN: return WT_ARITY_PIN;
     case OP_SILU_F16: return WT_ARITY_SILU;
@@ -38,6 +39,8 @@ static int arity_of(uint16_t opcode) {
     case OP_BROADCAST_F16: return WT_ARITY_BROADCAST_F16;
     case OP_TRANSPOSE_GEN_F16: return WT_ARITY_TRANSPOSE_GEN_F16;
     case OP_SCATTER_ND_F16: return WT_ARITY_SCATTER_ND_F16;
+    case OP_PAD_F16: return WT_ARITY_PAD_F16;
+    case OP_CAST_I32_F16: return WT_ARITY_CAST_I32_F16;
     default: return -1;
     }
 }
@@ -45,7 +48,7 @@ static int arity_of(uint16_t opcode) {
 /* 该 arg 下标是否是 slot 引用 */
 static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     switch (opcode) {
-    case OP_MATMUL_W4A16: return idx == 0 || idx == 1;
+    case OP_MATMUL_W4A16: return idx == 0 || idx == 1 || (idx >= 6 && idx <= 9);
     case OP_RMSNORM_F16: return idx == 1;
     case OP_PIN: return idx == 0;
     case OP_CONV2D_F16: return idx == 1 || idx == 2;
@@ -69,6 +72,8 @@ static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     case OP_BROADCAST_F16: return idx == 0;
     case OP_TRANSPOSE_GEN_F16: return idx == 0;
     case OP_SCATTER_ND_F16: return idx == 0 || idx == 1 || idx == 2;
+    case OP_PAD_F16: return idx == 0;
+    case OP_CAST_I32_F16: return idx == 0;
     default: return 0;
     }
 }
@@ -117,7 +122,13 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
         uint16_t n_args = wt_rd_u16(buf + p + 2);
         int ar = arity_of(opcode);
         if (ar < 0) return WT_ERR_OPCODE;
-        if (n_args != (uint16_t)ar) return WT_ERR_ARITY;
+        if (n_args != (uint16_t)ar) {
+            fprintf(stderr, "[wtparse] ARITY op%u @%u opc=%u na=%u ar=%d bytes=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                    (unsigned)i, (unsigned)p, (unsigned)opcode, (unsigned)n_args, ar,
+                    buf[p], buf[p+1], buf[p+2], buf[p+3],
+                    buf[p+4], buf[p+5], buf[p+6], buf[p+7]);
+            return WT_ERR_ARITY;
+        }
         if (size < p + 4u + (size_t)n_args * 4u) return WT_ERR_OP_TRUNC;
         out->ops[i].opcode = opcode;
         out->ops[i].n_args = n_args;

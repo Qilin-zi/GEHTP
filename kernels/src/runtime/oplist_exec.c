@@ -29,8 +29,12 @@
 #include "hvxhmx_runtime.h"
 #include "hvxhmx_v2_matmul.h"
 #include "hmx_crouton.h"
+#include "hvxhmx_v2_f16face.h"
 
-#define MAX_TEMPS 256
+#define MAX_TEMPS 4096
+/* lm_head N 分块宽: 每块 wt 2MB + out 2MB + bias 64KB + act 512KB ≈ 4.6MB
+ * (< VTCM 8MB 池; qkv 全量 6.6MB 不触发分块) */
+#define W4_N_CHUNK 4096u
 
 struct wt_exec {
     struct wtcache_ctx* wc;
@@ -38,6 +42,8 @@ struct wt_exec {
     struct dc_w4 e;
     int engine_ready;   /* wtcache 已开(懒初始化/exec_matmul 共用) */
     int matmul_carved;  /* exec_matmul 的 arena/carve 已完成(0=未 carve) */
+    /* lm_head N 分块: 每块 otbl 运行时生成 (内容只依赖 nc) */
+    uint32_t otbl_chunk[8u * (W4_N_CHUNK / 32u)];
     uint32_t pinned_count;
     struct wt_exec_stats st;
     uint8_t* temps[MAX_TEMPS];
@@ -48,6 +54,12 @@ struct wt_exec {
     uint8_t* pool;
     uint32_t pool_cap;
     uint32_t pool_used;
+    /* 静态模式预留区耗尽后的独立 bump 池(泄漏式扩容, 静态区不动)。
+     * 全模型 47070 op 表外 temp 数千, 16MB 预留必然耗尽 ——
+     * 无此池则 temp_get NULL → matmul ref fail (op5580 实锤) */
+    uint8_t* bump_pool;
+    uint32_t bump_cap;
+    uint32_t bump_used;
     const uint32_t* static_offsets; /* 编译期 temp→池内偏移表 (TEMPOFF 槽; NULL=运行时 bump) */
     uint32_t static_off_arr[MAX_TEMPS]; /* 表本体(哨兵 0xFFFFFFFF = 表外) */
     /* 第7步阶段二: VTCM 驻留池(0x4000|temp 编码)。vtcm_off_arr[temp] =
@@ -172,6 +184,27 @@ static void cpu_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
                          QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 }
 
+/* T1: 大搬运走 UDMA 引擎 (DDR→VTCM, 16GB/s 级 vs 标量 memcpy),
+ * 小搬运留 memcpy (DMA desc 构建 + src flush 开销反超)。
+ * 契约同 1-C: src=DDR 先 clean (src_bypass=1 直读物理), dst=VTCM 2KB 对齐面。 */
+#define DMA_TO_VTCM_MIN 8192u
+static int dma_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes,
+                       dc_mutex_t* mu) {
+    if (bytes < DMA_TO_VTCM_MIN) {
+        memcpy(dst, src, bytes);
+        qurt_mem_cache_clean((qurt_addr_t)dst, bytes,
+                             QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+        return 0;
+    }
+    struct dc_dma d;
+    int rc = dc_dma_init(&d, (uint8_t*)src, dst, bytes, mu);
+    if (rc) return rc;
+    dc_dma_clean_src(&d);
+    rc = dc_dma_once(&d);
+    dc_dma_destroy(&d);
+    return rc;
+}
+
 static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
     if (id >= MAX_TEMPS) return NULL;
     /* 第7步阶段二: VTCM 驻留 temp(0x4000|temp 引用的同款判定) ——
@@ -229,6 +262,24 @@ static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
      * 静态模式禁扩容(池含编译期偏移, 搬坏静态区)。 */
     if (!g_exec.temps[id] || g_exec.temp_bytes[id] < bytes) {
         uint32_t aligned = (bytes + 127u) & ~127u;
+        /* 静态模式: 预留区耗尽 → 独立 bump 池(泄漏式代际扩容,
+         * 静态偏移表与旧 bump 地址均不受影响) */
+        if (g_exec.static_offsets && g_exec.pool_used + aligned > g_exec.pool_cap) {
+            if (!g_exec.bump_pool || g_exec.bump_used + aligned > g_exec.bump_cap) {
+                uint32_t ncap = g_exec.bump_cap ? g_exec.bump_cap * 2u : (64u << 20);
+                while (ncap < aligned) ncap *= 2u;
+                uint8_t* np = memalign(128, ncap);
+                if (!np) return NULL;
+                g_exec.bump_pool = np;   /* 旧代池泄漏至进程退出 (同既有策略) */
+                g_exec.bump_cap = ncap;
+                g_exec.bump_used = 0;
+            }
+            g_exec.temps[id] = g_exec.bump_pool + g_exec.bump_used;
+            g_exec.bump_used += aligned;
+            g_exec.temp_bytes[id] = bytes;
+            g_last_bytes[id] = bytes;
+            return g_exec.temps[id];
+        }
         if (g_exec.pool_used + aligned > g_exec.pool_cap) {
             if (g_exec.static_offsets) return NULL;  /* 静态模式: 预留区耗尽 */
             uint32_t ncap = g_exec.pool_cap ? g_exec.pool_cap : (64u << 20);
@@ -352,31 +403,56 @@ static void inv_crouton(const uint16_t* surf, int16_t* dst, uint32_t M, uint32_t
 
 static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                        char* err, size_t errn) {
-    uint32_t act_s = op->args[0], w_s = op->args[1], out_t = op->args[2];
+    uint32_t act_s = op->args[0] & 0x7FFFu, w_s = op->args[1] & 0x7FFFu, out_t = op->args[2];
     uint32_t M = op->args[3], K = op->args[4], N = op->args[5];
-    uint32_t act_b = M * K * 2u, wt_b = K * N / 2u, out_b = M * N * 2u;
+    uint32_t out_b = M * N * 2u;
+    /* act 支持 temp 引用 (transformer emit: src_ref 给 temp; t10 契约
+     * 是 slot — 两种形态 ref_ptr 统一解码) */
+    const uint8_t* act_src = ref_ptr(b, act_s);
+    /* wt 槽尺寸: kernel 格式 = K*N/2 (发射器 pack_w4a16_kernel) */
+    uint32_t wt_b = b->slots[w_s].len;
     uint32_t bias_b = (N / 32u) * 512u, tbl_b = 8u * (K / 32u) * 4u;
     static dc_mutex_t mu;
     static int mu_ready;
     if (!mu_ready) { dc_mutex_init(&mu); mu_ready = 1; }
 
-    const uint8_t *bias = NULL, *atbl = NULL, *otbl = NULL;
-    for (uint32_t i = 0; i < b->n_slots; i++) {
-        const uint8_t* p = b->weight_base + b->slots[i].offset;
-        uint32_t L = b->slots[i].len;
-        if (!bias && L == bias_b) bias = p;
-        else if (!atbl && L == tbl_b) atbl = p;
-        else if (!otbl && L == tbl_b) otbl = p;
-    }
-    if (!bias || !atbl || !otbl) {
-        snprintf(err, errn, "supply slots missing (bias/atbl/otbl)");
+    /* 显式供给槽 (发射器 10 参 [.., bias_s, atbl_s, otbl_s, scale_s]):
+     * 旧按尺寸扫槽把同尺寸真实权重当 bias (32768=in_proj_a 实锤
+     * → u16 位模式当偏置 +15360 → +inf), 且 K≠N 时 atbl/otbl 尺寸不同
+     * 扫不到第二张表 */
+    uint32_t bias_s = op->args[6] & 0x7FFFu, atbl_s = op->args[7] & 0x7FFFu;
+    uint32_t otbl_s = op->args[8] & 0x7FFFu, scale_s = op->args[9] & 0x7FFFu;
+    const uint8_t *bias = (bias_s < b->n_slots) ? b->weight_base + b->slots[bias_s].offset : NULL;
+    const uint8_t *atbl = (atbl_s < b->n_slots) ? b->weight_base + b->slots[atbl_s].offset : NULL;
+    const uint8_t *otbl = (otbl_s < b->n_slots) ? b->weight_base + b->slots[otbl_s].offset : NULL;
+    const uint8_t *scale = (scale_s < b->n_slots) ? b->weight_base + b->slots[scale_s].offset : NULL;
+    if (!bias || !atbl || !otbl || !scale) {
+        snprintf(err, errn, "supply slots missing (bias/atbl/otbl/scale)");
         return -1;
     }
-    if (b->slots[act_s].len != act_b || b->slots[w_s].len != wt_b) {
-        snprintf(err, errn, "act/w slot size mismatch");
+    if (b->slots[bias_s].len != bias_b || b->slots[atbl_s].len != tbl_b ||
+        b->slots[otbl_s].len != 8u * (N / 32u) * 4u ||
+        b->slots[scale_s].len != N * 2u + 2u) {
+        snprintf(err, errn, "supply slot 尺寸错 (bias %u/%u atbl %u/%u otbl %u/%u scale %u/%u)",
+                 (unsigned)b->slots[bias_s].len, (unsigned)bias_b,
+                 (unsigned)b->slots[atbl_s].len, (unsigned)tbl_b,
+                 (unsigned)b->slots[otbl_s].len, (unsigned)(8u * (N / 32u) * 4u),
+                 (unsigned)b->slots[scale_s].len, (unsigned)(N * 2u + 2u));
         return -1;
     }
-    if (!g_exec.matmul_carved) {
+    if (!act_src || wt_b != K * N / 2u) {
+        snprintf(err, errn, "act/w slot size mismatch (act_src=%p wt_b=%u exp=%u)",
+                 (const void*)act_src, (unsigned)wt_b, (unsigned)(K * N / 2u));
+        return -1;
+    }
+    uint32_t m_pad = (M + 255u) & ~255u;
+    uint32_t n_eff = N > W4_N_CHUNK ? W4_N_CHUNK : N;  /* carve 按分块宽 */
+    if (!g_exec.matmul_carved || g_exec.e.m != m_pad || g_exec.e.k != K || g_exec.e.n != n_eff) {
+        /* 形状变化重 carve (transformer 多 GEMM 形状: 2048/6144/248320;
+         * 旧 t10 统一形状 carve-once 契约不成立 — 用旧形状 invoke
+         * 输出尾部读未初始化 VTCM = 垃圾 = +inf 实锤)。
+         * carve 按 M pad 后 (HMX kernel M=256 硬约束, m_total_minus_step=8)
+         * 与 N 分块宽 (lm_head 权重槽 127MB > VTCM 8MB) */
         int rc = 0;
         if (!g_exec.engine_ready) {
             rc = wtcache_open(&g_exec.wc, 4096);
@@ -386,8 +462,8 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
         uint32_t off = (pc + 2047u) & ~2047u;
         dc_arena_init(&g_exec.arena, (uint8_t*)vb + off, vs - off);
-        if (dc_w4_carve(&g_exec.e, &g_exec.arena, M, K, N, atbl, otbl)) {
-            snprintf(err, errn, "carve m%u k%u n%u", (unsigned)M, (unsigned)K, (unsigned)N);
+        if (dc_w4_carve(&g_exec.e, &g_exec.arena, m_pad, K, n_eff, atbl, otbl)) {
+            snprintf(err, errn, "carve m%u k%u n%u", (unsigned)m_pad, (unsigned)K, (unsigned)n_eff);
             return -1;
         }
         /* wtcache_open 末尾 memset(VTCM,0) 留 dirty 零行, 驱逐会覆盖 HMX 直写的 e.out
@@ -396,24 +472,65 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         g_exec.engine_ready = 1;
         g_exec.matmul_carved = 1;
     }
+    /* scale 槽随权重 op 变 (同形状不同权重 → 不同 scale), 每次 invoke 前重挂 */
+    g_exec.e.scale_ddr = scale;
     uint8_t* out_ddr = temp_get(out_t, out_b);
     if (!out_ddr) { snprintf(err, errn, "temp %u alloc", (unsigned)out_t); return -1; }
+    const uint8_t* wt_base = b->weight_base + b->slots[w_s].offset;
+    /* scale 槽尾 = 权重列 RMS 均值 f16 (设备自适应输出域因子 f 用; host 忽略) */
+    uint16_t rms16;
+    memcpy(&rms16, scale + (size_t)N * 2u, 2);
+    float wq_rms = f16_to_f32(rms16);
 
-    cpu_to_vtcm(g_exec.e.wt, b->weight_base + b->slots[w_s].offset, wt_b);
-    cpu_to_vtcm(g_exec.e.bias, bias, bias_b);
+    /* 激活量化/重排只做一次；lm_head 的所有 N 分块共享同一 act 面和 a_scale。 */
+    int bad = dc_w4_run_prep(&g_exec.e, act_src, M, K, wq_rms,
+                              0.0f /* f_fixed=0 → 运行时自适应 */);
+    if (bad) { snprintf(err, errn, "dc_w4_run_prep"); return -1; }
 
-    struct dc_dma d_act, d_out;
-    dc_dma_init(&d_act, (uint8_t*)b->weight_base + b->slots[act_s].offset,
-                g_exec.e.act, act_b, &mu);
-    dc_dma_init(&d_out, g_exec.e.out, out_ddr, out_b, &mu);
-    int bad = dc_dma_once(&d_act) || dc_w4_invoke(&g_exec.e) || dc_dma_once(&d_out);
-    g_last_engine = WT_ENG_HMX;  /* W-P3: W4A16 走 HMX 引擎 */
-    dc_dma_destroy(&d_act);
-    dc_dma_destroy(&d_out);
-    if (bad) { snprintf(err, errn, "dma/invoke"); return -1; }
-    /* dst_bypass=0 写落内存; CPU 后续读 (rmsnorm/dump) 前丢弃驻留旧行 */
+    /* 分块循环 (lm_head N=248320 → 61 块; 每块按精确 nc invoke, kernel 只算
+     * nc 列, 槽尾陈旧数据不会被读)。非分块 op 单次即退。 */
+    for (uint32_t c0 = 0; c0 < N; c0 += W4_N_CHUNK) {
+        uint32_t nc = (N - c0 < W4_N_CHUNK) ? N - c0 : W4_N_CHUNK;
+        if (N > W4_N_CHUNK) {
+            /* wt 槽 kb-major 布局 (闭包 pack): 列块 c0 的字节按 kb 分散
+             * (段步长 N*16B, 段长 nc*16B) — CPU gather 进 e.wt */
+            for (uint32_t kb = 0; kb < K / 32; kb++)
+                memcpy(g_exec.e.wt + (size_t)kb * (nc * 16u),
+                       wt_base + (size_t)kb * (N * 16u) + (size_t)(c0 / 32u) * 512u,
+                       nc * 16u);
+            qurt_mem_cache_clean((qurt_addr_t)g_exec.e.wt, nc * K / 2u,
+                                 QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+        } else {
+            int rc_wt = dma_to_vtcm(g_exec.e.wt, wt_base, wt_b, &mu);
+            if (rc_wt) { dc_w4_run_fini(&g_exec.e); snprintf(err, errn, "wt dma"); return -1; }
+        }
+        int rc_bs = dma_to_vtcm(g_exec.e.bias, bias + (size_t)(c0 / 32u) * 512u,
+                                (nc / 32u) * 512u, &mu);
+        if (rc_bs) { dc_w4_run_fini(&g_exec.e); snprintf(err, errn, "bias dma"); return -1; }
+        if (N > W4_N_CHUNK) {
+            /* 分块 otbl: (mt·nct+i)·0x800 运行时生成 (表内容只依赖 nc) */
+            uint32_t nct = nc / 32u;
+            for (uint32_t mt = 0; mt < 8u; mt++)
+                for (uint32_t i = 0; i < nct; i++)
+                    g_exec.otbl_chunk[(size_t)mt * nct + i] =
+                        (uint32_t)(((size_t)mt * nct + i) * 0x800u);
+            g_exec.e.otbl_ddr = (const uint8_t*)g_exec.otbl_chunk;
+        }
+        /* act 面已由 prep 构造；invoke 只跑 kernel 并把出面反量化到本块列。 */
+        bad = dc_w4_run_invoke(&g_exec.e, scale + (size_t)c0 * 2u, nc,
+                               out_ddr + (size_t)c0 * 2u, N * 2u, M,
+                               wq_rms, 0.0f /* f_fixed=0 → 运行时自适应 */);
+        if (bad) {
+            g_last_engine = WT_ENG_HMX;  /* W-P3: W4A16 走 HMX 引擎 (PROF 归属) */
+    dc_w4_run_fini(&g_exec.e);
+            snprintf(err, errn, "dc_w4_run_invoke c0=%u", (unsigned)c0);
+            return -1;
+        }
+    }
+    dc_w4_run_fini(&g_exec.e);
+    /* CPU 写 out_ddr → FLUSH (旧 DMA-out 时代是 INVALIDATE; 现在写者是 CPU) */
     qurt_mem_cache_clean((qurt_addr_t)out_ddr, out_b,
-                         QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+                         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
     return 0;
 }
 
@@ -479,6 +596,25 @@ static int exec_rmsnorm(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
+/* ---- W1 f16 面 HVX 族 (GEHTP 应用尽用一期): env 门默认关, 标量回落 ----
+ * 门: GEHTP_HVX_MUL / GEHTP_HVX_UNARY / GEHTP_HVX_SILU / GEHTP_HVX_SOFTMAX /
+ *     GEHTP_HVX_RMSNORM (=1 开)。数学 = f32 中间路径; unary 族为 HVX 向量近似
+ * (v2 内核), 与标量 libm 差异由长链值差判据覆盖 (A/B 协议: 同输入 A/B 值差不
+ * 劣化 + wall-µs 对照)。scratch = 静态 .bss (运行时零 malloc 铁律), 超容量回落。 */
+#define GEHTP_HVX_SCRATCH_ELEMS 131072u   /* 512KB f32 × 3 */
+static float g_scr_a[GEHTP_HVX_SCRATCH_ELEMS] __attribute__((aligned(128)));
+static float g_scr_b[GEHTP_HVX_SCRATCH_ELEMS] __attribute__((aligned(128)));
+static float g_scr_c[GEHTP_HVX_SCRATCH_ELEMS] __attribute__((aligned(128)));
+static int g_hvx_mul = -1, g_hvx_unary = -1, g_hvx_silu = -1,
+           g_hvx_softmax = -1, g_hvx_rmsnorm = -1;
+static int env_flag(const char* name, int* cache) {
+    if (*cache < 0) {
+        const char* e = getenv(name);
+        *cache = (e && e[0] == '1') ? 1 : 0;
+    }
+    return *cache;
+}
+
 /* U16: 元素 silu, f16 面 → f16 面 (x/(1+e^-x), f32 内算) */
 static int exec_silu(const struct wt_op* op, char* err, size_t errn) {
     uint32_t x_t = op->args[0], y_t = op->args[1], n_elem = op->args[2];
@@ -491,6 +627,10 @@ static int exec_silu(const struct wt_op* op, char* err, size_t errn) {
     uint16_t* y = (uint16_t*)temp_get(y_t, n_elem * 2u);
     if (!y) { snprintf(err, errn, "silu temp %u alloc", (unsigned)y_t); return -1; }
     const uint16_t* x = (const uint16_t*)g_exec.temps[x_t];
+    if (env_flag("GEHTP_HVX_SILU", &g_hvx_silu) && n_elem >= 64u && n_elem <= GEHTP_HVX_SCRATCH_ELEMS) {
+        gehtp_hvx_silu_f16(y, x, n_elem, g_scr_a, g_scr_b);
+        return 0;
+    }
     for (uint32_t i = 0; i < n_elem; i++) {
         float f = f16_to_f32(x[i]);
         y[i] = f32_to_f16(f / (1.0f + expf(-f)));
@@ -812,7 +952,11 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
     uint32_t subtype = op->args[3];
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, n * 2u);
-    if (!x || !y) { snprintf(err, errn, "unary ref fail"); return -1; }
+    if (!x || !y) { snprintf(err, errn, "unary ref fail x=%p(xt%u) y=%p(yt%u,n%u,sub%x) pu=%u pc=%u t252=%p so=%p", (void*)x, (unsigned)x_t, (void*)y, (unsigned)y_t, (unsigned)n, (unsigned)subtype, (unsigned)g_exec.pool_used, (unsigned)g_exec.pool_cap, (void*)g_exec.temps[252], (void*)g_exec.static_offsets); return -1; }
+    if (env_flag("GEHTP_HVX_UNARY", &g_hvx_unary) && n >= 64u && n <= GEHTP_HVX_SCRATCH_ELEMS) {
+        if (gehtp_hvx_unary_f16(y, x, n, subtype, g_scr_a, g_scr_b) == 0)
+            return 0;   /* 未覆盖 subtype 回落标量 */
+    }
     if (g_rtrace) { fprintf(g_rtrace, "unary x=%p y=%p n=%u sub=%u\n", (void*)x, (void*)y, (unsigned)n, (unsigned)subtype); fflush(g_rtrace); }
     /* HVX 快路径(策略 B): 有 f32 内核的 subtype, n >= 32 时走
      * f16→f32(向量 cvt)→内核(就地)→f32→f16。exp/sigmoid/tanh/silu 定义域
@@ -848,11 +992,25 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
         case 5:  r = fabsf(v); break;
         case 6:  r = sinf(v); break;
         case 7:  r = cosf(v); break;
-        case 8:  r = 1.0f / (1.0f + expf(-v)); break;
+        case 8:  /* SIGMOID: hexagon libm expf 在 |x|≳88 溢出区返回垃圾常数
+                  * (设备实测 gate∈[-155,-90] → σ 恒为 0.370117; 软判据证明
+                  * [-87,-40] 正常)。f16 输出在 |x|≥80 已饱和 (σ(80)=1-2.2e-35
+                  * → 1.0; σ(-80)=2.2e-35 → 0), 钳制与正确 libm 位级等价。 */
+            if (v >= 80.0f) r = 1.0f;
+            else if (v <= -80.0f) r = 0.0f;
+            else r = 1.0f / (1.0f + expf(-v));
+            break;
         case 9:  r = tanhf(v); break;
         case 10: r = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); break;
         case 11: r = fmaxf(0.0f, v); break;
         case 12: r = v / (1.0f + expf(-v)); break;
+        case 13: /* SOFTPLUS: 稳定化 log(1+e^x) (x 大时 exp 溢出; GDN 门)
+                    —— 缺失时 fallthrough=恒等 → cumsum 无界增长 → exp +inf
+                    → 全 -inf (0.8B 全模型实锤) */
+            if (v > 30.0f) r = v;
+            else if (v < -30.0f) r = expf(v);
+            else r = log1pf(expf(v));
+            break;
         default: break;
         }
         y[i] = f32_to_f16(r);
@@ -877,7 +1035,10 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
         uint16_t* y = (uint16_t*)temp_get(op->args[3], an * 2u);
         if (!c || !tv || !fv || !y || an == 0) { snprintf(err, errn, "select ref fail"); return -1; }
         for (uint32_t i = 0; i < an; i++) {
-            float cv = f16_to_f32(c[cn <= 1u ? 0 : i]);
+            /* cond 广播: cn<an 时按 an/cn 平铺 (numpy 广播语义;
+               GDN tril 掩码 [64,64] 复用于 16 头 [16,64,64],
+               旧 c[i] 越界读 → 陈旧池 → select 垃圾 → +inf) */
+            float cv = f16_to_f32(c[cn <= 1u ? 0 : (cn < an ? i % cn : i)]);
             float r = (cv != 0.0f) ? f16_to_f32(tv[i]) : f16_to_f32(fv[fn <= 1u ? 0 : i]);
             y[i] = f32_to_f16(r);
         }
@@ -891,6 +1052,15 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "binary ref fail");
         return -1;
     }
+    /* W1 HVX 接线: add 复用 GEHTP_HVX_ADD 门, mul 用 GEHTP_HVX_MUL 门 */
+    if (subtype == 0 && env_flag("GEHTP_HVX_ADD", &g_hvx_add) && n >= 64u) {
+        hvhx_v2_add_f16(y, a, bb, n);
+        return 0;
+    }
+    if (subtype == 2 && env_flag("GEHTP_HVX_MUL", &g_hvx_mul) && n >= 64u) {
+        gehtp_hvx_mul_f16(y, a, bb, n);
+        return 0;
+
     /* HVX 快路径(策略 B): add/sub/mul 位级保真, div < 1 ULP。n >= 32 时
      * f16→f32(向量 cvt)→f32 内核→f32→f16。 */
     if (n >= 32u) {
@@ -939,6 +1109,12 @@ static int exec_softmax(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)rows * n * 2u);
     if (!x || !y) { snprintf(err, errn, "softmax ref fail"); return -1; }
+    /* W1 HVX: n 须 32 倍数 (v2 fused 内核向量边界); 行内 n ≤ scratch 容量 */
+    if (env_flag("GEHTP_HVX_SOFTMAX", &g_hvx_softmax) && (n % 32u) == 0 &&
+        n >= 32u && n <= GEHTP_HVX_SCRATCH_ELEMS) {
+        gehtp_hvx_softmax_f16(y, x, rows, n, g_scr_a, g_scr_b, g_scr_c);
+        return 0;
+
     /* HVX 快路径(策略 B): 每行 n%32==0 时走 fused softmax(HVX), 否则回落标量。
      * 整面 f16→f32 一次 cvt → 逐行 softmax_f32 → f32→f16。 */
     if (rows >= 1u && (n % 32u) == 0u && (size_t)rows * n >= 32u) {
@@ -1032,6 +1208,13 @@ static int exec_reduce(const struct wt_blob* b, const struct wt_op* op,
     uint32_t x_t = op->args[0], y_t = op->args[1], n = op->args[2];
     uint32_t axis = op->args[3], subtype = op->args[4];
     uint32_t d[4] = {op->args[5], op->args[6], op->args[7], op->args[8]};
+    /* 末轴编码: emit 对 axes=[-1] 直通 0xFFFFFFFF, 须在此解析为实际末轴
+     * (取最后一个非 1 维; 全 1 回落 3)。不解析则 d[0xFFFFFFFF] 越界 —
+     * host 段错误 / 设备静默错算 (全 -inf 根因) */
+    if (axis == 0xFFFFFFFFu) {
+        axis = 3;
+        while (axis > 0 && d[axis] == 1) axis--;
+    }
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     if (!x) { snprintf(err, errn, "reduce in fail"); return -1; }
     uint32_t L = d[axis];
@@ -1092,8 +1275,10 @@ static int exec_conv1d_ssm(const struct wt_blob* b, const struct wt_op* op,
             for (uint32_t j = 0; j < k && (int32_t)(t - j) >= 0; j++)
                 acc += f16_to_f32(x[(size_t)(t - j) * C + c]) *
                        f16_to_f32(w[(size_t)j * C + c]);
-            float sv = acc / (1.0f + expf(-acc));
-            y[(size_t)t * C + c] = f32_to_f16(sv);
+            /* 双重 sigmoid 根因: 参考实现 Conv 为纯卷积, 图中另有独立
+             * Sigmoid 节点 (op199 subtype 8); 引擎融合 sigmoid 导致
+             * sigmoid(sigmoid(conv)) → 门值全错 (0.8B 全链偏) */
+            y[(size_t)t * C + c] = f32_to_f16(acc);
         }
     return 0;
 }
@@ -1111,9 +1296,12 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
     if (!tbl || !idx || !y) { snprintf(err, errn, "gather ref fail"); return -1; }
     uint32_t row_n = row_bytes / 2;
     if (row_n == 0) { snprintf(err, errn, "gather row_bytes"); return -1; }
-    for (uint32_t i = 0; i < n / row_n; i++) {
+    /* idx[i] 必须落在 [0, n/row_n) 内, 防止 const idx 槽短于 n/row_n
+     * 时静默越界读 (Gather 索引槽长门) */
+    uint32_t n_idx = n / row_n;
+    for (uint32_t i = 0; i < n_idx; i++) {
         int32_t r = idx[i];
-        if (r < 0) r = 0;
+        if (r < 0 || (uint32_t)r >= n_idx) { snprintf(err, errn, "gather idx %u out of range", i); return -1; }
         memcpy(y + (size_t)i * row_n, tbl + (size_t)r * row_bytes, row_bytes);
     }
     return 0;
@@ -1336,6 +1524,12 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
     uint32_t rw = b->slots[w_s].len / 2u;
     if (rw == 0 || n % rw != 0) { snprintf(err, errn, "rmsnorm2 shape n%u rw%u", n, rw); return -1; }
     uint32_t m = n / rw;
+    /* W1 HVX: 全程 f32 内核 (标量体为 f16 中间舍入); 值差由长链判据覆盖 */
+    if (env_flag("GEHTP_HVX_RMSNORM", &g_hvx_rmsnorm) && n >= 64u &&
+        n <= GEHTP_HVX_SCRATCH_ELEMS && rw <= GEHTP_HVX_SCRATCH_ELEMS) {
+        gehtp_hvx_rmsnorm_mul_f16(y, x, wv, bv, m, rw, 1e-6f, g_scr_a, g_scr_b, g_scr_c);
+        return 0;
+
     /* HVX 快路径(策略 B): 无 bias 时走 hvhx_v2_rms_norm_mul_f32_rows
      * (逐行 rmsnorm×weight, HVX/标量自适应)。有 bias 时回落标量
      * (HVX 无 rmsnorm+weight+bias 融合内核)。rw%32==0 才触发 HVX 主体。 */
@@ -1375,9 +1569,23 @@ static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
     uint32_t b_t = op->args[0], y_t = op->args[1], n = op->args[2], b_elems = op->args[3];
     uint32_t in_d[4] = {op->args[4], op->args[5], op->args[6], op->args[7]};
     uint32_t out_d[4] = {op->args[8], op->args[9], op->args[10], op->args[11]};
+    /* 入参校验: 维度乘积必须与 n/b_elems 自洽, 否则越界读 x 或写 y */
+    uint64_t in_prod = 1, out_prod = 1;
+    for (int k = 0; k < 4; k++) { in_prod *= in_d[k]; out_prod *= out_d[k]; }
+    if (b_elems == 0 || b_elems > in_prod || n != out_prod || b_elems > (1u << 30)) {
+        snprintf(err, errn, "broadcast shape bad: n=%u b_elems=%u in=%u,%u,%u,%u out=%u,%u,%u,%u",
+                 (unsigned)n, (unsigned)b_elems,
+                 (unsigned)in_d[0], (unsigned)in_d[1], (unsigned)in_d[2], (unsigned)in_d[3],
+                 (unsigned)out_d[0], (unsigned)out_d[1], (unsigned)out_d[2], (unsigned)out_d[3]);
+        return -1;
+    }
     const uint16_t* x = (const uint16_t*)ref_ptr(b, b_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)n * 2u);
-    if (!x || !y || b_elems == 0) { snprintf(err, errn, "broadcast ref fail"); return -1; }
+    if (!x || !y) {
+        snprintf(err, errn, "broadcast ref fail x=%p(bt=%u) y=%p(yt=%u) n=%u",
+                 (void*)x, (unsigned)b_t, (void*)y, (unsigned)y_t, (unsigned)n);
+        return -1;
+    }
     uint32_t r = 4;
     while (r > 0 && out_d[r - 1] == 1) r--;
     /* in 不去尾 1(末维 1 广播到 out 大维必须保留; host in_bc oid 1231 同款) */
@@ -1458,8 +1666,12 @@ static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
     uint16_t* y = (uint16_t*)temp_get(y_t, n_out * 2u);
     if (!x || !y) { snprintf(err, errn, "slice ref fail"); return -1; }
     if (rk < 1 || rk > 3) { snprintf(err, errn, "slice rank %u", rk); return -1; }
-    uint32_t bb[3] = {b0, b1, b2}, ee[3] = {e0, e1, e2}, ss[3] = {s0, s1, s2};
     uint32_t dd[3] = {d0, d1, d2};
+    /* in_lin 必须落在 [0, n_input) 内, 防止 begin/stride 组合
+     * 导致越界读 (切片输入线性地址门) */
+    uint32_t n_input = 1;
+    for (uint32_t ax = 0; ax < rk; ax++) n_input *= dd[ax];
+    uint32_t bb[3] = {b0, b1, b2}, ee[3] = {e0, e1, e2}, ss[3] = {s0, s1, s2};
     uint32_t od[3] = {1, 1, 1};
     for (uint32_t ax = 0; ax < rk; ax++) {
         if (ss[ax] == 0) ss[ax] = 1;
@@ -1479,6 +1691,7 @@ static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
             rem %= ostr[ax];
             in_lin += (bb[ax] + c * ss[ax]) * istr[ax];
         }
+        if (in_lin >= n_input) { snprintf(err, errn, "slice lin %u oob", in_lin); return -1; }
         y[i] = x[in_lin];
     }
     return 0;
@@ -1658,6 +1871,112 @@ static int xop_softmax(const struct wt_op_ctx* cx) {
     return exec_softmax(cx->b, cx->op, cx->err, cx->errn);
 }
 
+/* 真 ScatterND (A3 暗雷收口): out = data 拷贝, 再对 n_idx 个坐标
+ * (每坐标 K 维, idx_s 为 int32 槽) 把 upd[e] 写到 out[base], block=1。
+ * GDN attn_iter: data [16,64,64] f16, 每步写一个衰减更新点; 恒等拷贝冒充
+ * (op_copy_sem) 使 attn_iter 在设备上退化为 attn_pre, 0.8B 全链数值错。 */
+static int exec_scatter_nd(const struct wt_blob* b, const struct wt_op* op,
+                           char* err, size_t errn) {
+    uint32_t data_t = op->args[0], idx_s = op->args[1] & 0x7FFFu, upd_t = op->args[2];
+    uint32_t out_t = op->args[3];
+    uint32_t n_idx = op->args[4], K = op->args[5];
+    if (K == 0 || K > 5) { snprintf(err, errn, "scatter_nd K=%u", (unsigned)K); return -1; }
+    const uint16_t* data = (const uint16_t*)ref_ptr(b, data_t);
+    const int32_t* idx = (const int32_t*)slot_ptr(b, idx_s);
+    const uint16_t* upd = (const uint16_t*)ref_ptr(b, upd_t);
+    /* n = data 全部元素数; od[0..K-1] = 最后 K 维形状,
+     * od[K..4] = 前导批维 (输出按 n 个元素线性寻址) */
+    uint32_t od[5] = {1, 1, 1, 1, 1};
+    for (uint32_t k = 0; k < K && k < 5; k++) od[k] = op->args[6 + k];
+    uint32_t n = 1;
+    for (uint32_t k = K; k < 5; k++) n *= od[k];
+    uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)n * 2u);
+    if (!data || !idx || !upd || !y) { snprintf(err, errn, "scatter_nd ref fail"); return -1; }
+    memcpy(y, data, (size_t)n * 2u);
+    /* strides (C 序) */
+    uint32_t ostr[5] = {1, 1, 1, 1, 1};
+    for (int d = (int)K - 2; d >= 0; d--) ostr[d] = ostr[d + 1] * od[d + 1];
+    for (uint32_t e = 0; e < n_idx; e++) {
+        uint32_t base = 0;
+        int bad = 0;
+        for (uint32_t k = 0; k < K; k++) {
+            int32_t c = idx[e * K + k];
+            if (c < 0 || c >= (int32_t)od[k]) { bad = 1; break; }
+            base += (uint32_t)c * ostr[k];
+        }
+        if (bad || base >= n) continue;
+        y[base] = upd[e];
+    }
+    return 0;
+}
+
+static int xop_scatter_nd(const struct wt_op_ctx* cx) {
+    return exec_scatter_nd(cx->b, cx->op, cx->err, cx->errn);
+}
+
+/* GEHTP Pad 真语义: [x_ref,out_t,rk,in_d0..3,out_d0..3,pb0..3,padv_f16]
+ * out 先全填 pad 值, 再按前 pad 偏移把 in 拷入 (C 序, rank≤4)。
+ * GDN 用例: [1,16,32] 轴 1 前 pad 32 → [1,16,64] (chunk 边界零)。
+ * 恒等冒充时后半 512 elems 读陈旧池字节 = 全 -inf 根因 */
+static int exec_pad(const struct wt_blob* b, const struct wt_op* op,
+                    char* err, size_t errn) {
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, op->args[0]);
+    uint32_t out_t = op->args[1], rk = op->args[2];
+    if (rk == 0 || rk > 4) { snprintf(err, errn, "pad rank %u", (unsigned)rk); return -1; }
+    uint32_t id_[4] = {op->args[3], op->args[4], op->args[5], op->args[6]};
+    uint32_t od_[4] = {op->args[7], op->args[8], op->args[9], op->args[10]};
+    uint32_t pb[4] = {op->args[11], op->args[12], op->args[13], op->args[14]};
+    uint16_t padv = (uint16_t)op->args[15];
+    size_t n_in = 1, n_out = 1;
+    for (uint32_t i = 0; i < rk; i++) { n_in *= id_[i]; n_out *= od_[i]; }
+    uint16_t* y = (uint16_t*)temp_get(out_t, (uint32_t)n_out * 2u);
+    if (!x || !y) { snprintf(err, errn, "pad ref fail"); return -1; }
+    for (size_t i = 0; i < n_out; i++) y[i] = padv;
+    /* C 序逐元素: 输出坐标 → 检查是否在前 pad 区域内 → 输入坐标 */
+    uint32_t os[4]; os[rk - 1] = 1;
+    for (int i = (int)rk - 2; i >= 0; i--) os[i] = os[i + 1] * od_[i + 1];
+    for (size_t t = 0; t < n_out; t++) {
+        uint32_t rem = (uint32_t)t;
+        uint32_t ic[4] = {0, 0, 0, 0};
+        int inside = 1;
+        for (uint32_t i = 0; i < rk; i++) {
+            uint32_t c = rem / os[i];
+            rem %= os[i];
+            if (c < pb[i] || c >= pb[i] + id_[i]) { inside = 0; break; }
+            ic[i] = c - pb[i];
+        }
+        if (!inside) continue;
+        uint32_t in_lin = 0;
+        uint32_t s = 1;
+        for (int i = (int)rk - 1; i >= 0; i--) { in_lin += ic[i] * s; s *= id_[i]; }
+        y[t] = x[in_lin];
+    }
+    return 0;
+}
+
+static int xop_pad(const struct wt_op_ctx* cx) {
+    return exec_pad(cx->b, cx->op, cx->err, cx->errn);
+}
+
+/* GEHTP Cast 真语义: int32 位模式 → f16 数值 (参考实现同款)。
+ * RoPE 位置链: int32 经恒等链保持位模式, 只在 Cast 处转数值。
+ * 恒等冒充 → 位置 1 读成 f16 次正规 5.96e-8 → RoPE 角全 0 → 注意全错 */
+static int exec_cast_i32(const struct wt_blob* b, const struct wt_op* op,
+                         char* err, size_t errn) {
+    const uint8_t* x = ref_ptr(b, op->args[0]);
+    uint32_t out_t = op->args[1], n = op->args[2];
+    uint16_t* y = (uint16_t*)temp_get(out_t, n * 2u);
+    if (!x || !y) { snprintf(err, errn, "cast_i32 ref fail"); return -1; }
+    const int32_t* i32 = (const int32_t*)x;
+    for (uint32_t i = 0; i < n; i++)
+        y[i] = f32_to_f16((float)i32[i]);
+    return 0;
+}
+
+static int xop_cast_i32(const struct wt_op_ctx* cx) {
+    return exec_cast_i32(cx->b, cx->op, cx->err, cx->errn);
+}
+
 static int xop_concat(const struct wt_op_ctx* cx) {
     return exec_concat(cx->b, cx->op, cx->err, cx->errn);
 }
@@ -1746,7 +2065,44 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_RMSNORM2_F16] = xop_rmsnorm2,
     [OP_BROADCAST_F16] = xop_broadcast,
     [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,
+    [OP_SCATTER_ND_F16] = xop_scatter_nd,
+    [OP_PAD_F16] = xop_pad,
+    [OP_CAST_I32_F16] = xop_cast_i32,
 };
+
+/* opcode 名表 —— 失败日志定位用 (与 oplist_parse.h 枚举同步) */
+static const char* opcode_name(uint32_t code) {
+    static const char* const nm[] = {
+        [OP_NOP] = "nop", [OP_MATMUL_W4A16] = "matmul_w4a16",
+        [OP_RMSNORM_F16] = "rmsnorm", [OP_PIN] = "pin", [OP_SILU_F16] = "silu",
+        [OP_IM2COL] = "im2col", [OP_CONV2D_F16] = "conv2d", [OP_ADD_F16] = "add",
+        [OP_SPILL] = "spill", [OP_FILL] = "fill", [OP_TRANSPOSE_F16] = "transpose",
+        [OP_UNARY_F16] = "unary", [OP_BINARY_F16] = "binary",
+        [OP_SOFTMAX_F16] = "softmax", [OP_CONCAT_F16] = "concat",
+        [OP_STRIDED_SLICE_F16] = "slice", [OP_SPLIT_F16] = "split",
+        [OP_REDUCE_F16] = "reduce", [OP_CUMSUM_F32] = "cumsum",
+        [OP_CONV1D_SSM_F16] = "conv1d_ssm", [OP_GATHER_F16] = "gather",
+        [OP_ARGMAX_F16] = "argmax", [OP_KV_APPEND_F16] = "kv_append",
+        [OP_KV_GATHER_F16] = "kv_gather", [OP_MATMUL_F16] = "matmul_f16",
+        [OP_RMSNORM2_F16] = "rmsnorm2", [OP_BROADCAST_F16] = "broadcast",
+        [OP_TRANSPOSE_GEN_F16] = "transpose_gen",
+        [OP_SCATTER_ND_F16] = "scatter_nd",
+        [OP_PAD_F16] = "pad",
+    };
+    if (code < sizeof(nm) / sizeof(nm[0]) && nm[code]) return nm[code];
+    return "op?";
+}
+
+/* 失败日志包装: err 已有 exec_* 的函数级消息, 拼上 op 序号/opcode 名/前4个
+ * args, 直接定位 "挂在哪个函数"。err 与 inner 同缓冲, 先拷出再写回。 */
+static void err_wrap_op(char* err, size_t errn, uint32_t i, const struct wt_op* op) {
+    char inner[192];
+    snprintf(inner, sizeof(inner), "%s", err);
+    snprintf(err, errn, "op%u %s(%u) args=%u,%u,%u,%u: %s",
+             (unsigned)i, opcode_name(op->opcode), (unsigned)op->opcode,
+             (unsigned)op->args[0], (unsigned)op->args[1],
+             (unsigned)op->args[2], (unsigned)op->args[3], inner);
+}
 
 int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                       uint32_t* engine_m, int64_t* op_us, char* err, size_t errn) {
@@ -1812,7 +2168,7 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                 fflush(g_rtrace);
             }
         }
-        if (rc) return (int)i + 1;
+        if (rc) { err_wrap_op(err, errn, i, op); return (int)i + 1; }
     }
     return 0;
 }

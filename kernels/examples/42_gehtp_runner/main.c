@@ -24,15 +24,20 @@
 #include "oplist_parse.h"
 #include "oplist_exec.h"
 #include <fcntl.h>
+#include <qurt.h>
 #include <unistd.h>
 
-/* PROF W-P2: 共享板防撞车通道。标准构建读 $GDIR/job.txt; 变体构建经
- *   -DGEHTP_JOB_PATH='"/.../job_prof.txt"' + -o gehtp_runner_prof.so
- * 得到独立二进制+独立 job 文件, 与在途会话零共享状态 (W33 身份制同律)。 */
+/* JOB_PATH 身份制 (共享板防 last-writer-wins 撞车, W33 同律):
+ * 覆盖优先级: -DJOB_PATH=... > -DGEHTP_JOB_PATH=... > 默认 job.txt。
+ * PROF 变体: -DGEHTP_JOB_PATH + -o gehtp_runner_prof.so → 独立二进制+独立 job,
+ * 与在途会话零共享状态。 */
+#if !defined(JOB_PATH)
 #ifndef GEHTP_JOB_PATH
 #define GEHTP_JOB_PATH "/data/local/tmp/hvxhmx23/gehtp/job.txt"
 #endif
 #define JOB_PATH GEHTP_JOB_PATH
+#endif
+
 /* PROF W-P2: 逐 op 时间戳对产物 (host gehtp run 拉回, gehtp_prof.py 消费) */
 #define OP_TS_PATH "/data/local/tmp/hrt/gehtp/op_ts.bin"
 
@@ -96,6 +101,10 @@ static uint8_t* read_file_size(const char* p, size_t sz) {
         if (want > (16u << 20)) want = 16u << 20;  /* qurt read 单次超大有上限, 限 16MB */
         ssize_t n = read(fd, buf + got, want);
         if (n <= 0) break;
+        /* qurt read 大缓冲可能走 DMA 绕 dcache 写 — 立即 INVALIDATE 该块,
+         * 否则 CPU 读到 stale 行 (wt_parse ARITY 概率性失败根因) */
+        qurt_mem_cache_clean((qurt_addr_t)(uintptr_t)(buf + got), (uint32_t)n,
+                             QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
         got += (size_t)n;
         if ((got & ((256u << 20) - 1)) < (16u << 20)) ex_log("[rfs] read %zu/%zu", got, sz);
     }
@@ -148,9 +157,15 @@ int main(void) {
         return ex_summary() || 1;
     }
     ex_log("M3 job keys ok %s %s", blob_p, out_p);
-    static char wgt_size_s[32];
+    static char wgt_size_s[32], blob_size_s[32];
     memset(wgt_size_s, 0, sizeof(wgt_size_s));
+    memset(blob_size_s, 0, sizeof(blob_size_s));
     int have_wgt_size = (job_get((char*)job, "weights_size", wgt_size_s, sizeof(wgt_size_s)) == 0);
+    /* blob_size 必须 free(job) 前解析 (job 缓冲无 null 终止且要 free) */
+    int have_blob_size = (job_get((char*)job, "blob_size", blob_size_s, sizeof(blob_size_s)) == 0);
+    static char upto_s[32];
+    memset(upto_s, 0, sizeof(upto_s));
+    int have_upto = (job_get((char*)job, "upto", upto_s, sizeof(upto_s)) == 0);
     /* PROF W-P2: trace 键决定 per-op 落盘行 (缺省=0 净测量; =1 取证)。
      * 引擎默认开(兼容存量 runner), 故此处必须显式两态下发。 */
     {
@@ -162,11 +177,19 @@ int main(void) {
     }
     free(job);
     uint32_t out_temp = (uint32_t)strtoul(temp_s, NULL, 10);
-    ex_log("M4 wgt_size=%s", have_wgt_size ? wgt_size_s : "(none)");
+    ex_log("M4 wgt_size=%s blob_size=%s", have_wgt_size ? wgt_size_s : "(none)",
+           have_blob_size ? blob_size_s : "(none)");
 
     int64_t t_read0 = HAP_perf_get_time_us();  /* PROF W-P2: seg=read */
     size_t blob_len = 0, in_len = 0;
-    uint8_t* blob = read_file(blob_p, &blob_len);
+    uint8_t* blob = NULL;
+    if (have_blob_size) {
+        /* qurt off_t=32 位: fseek/ftell 对 >2GB 溢出 — blob 大小由 job 给 */
+        blob_len = (size_t)strtoull(blob_size_s, NULL, 10);
+        blob = read_file_size(blob_p, blob_len);
+    } else {
+        blob = read_file(blob_p, &blob_len);
+    }
     uint8_t* in = read_file(in_p, &in_len);
     if (!blob || !in) { ex_log("[FAIL] read blob/input"); free(blob); free(in); return ex_summary() || 1; }
     ex_log("M5 blob %zu in %zu", blob_len, in_len);
@@ -175,9 +198,40 @@ int main(void) {
     struct wt_blob* w = calloc(1, sizeof(*w));
     if (!w) { ex_log("[FAIL] wt_blob alloc"); free(blob); free(in); return ex_summary() || 1; }
     ex_log("M6 before wt_parse");
-    if (wt_parse(blob, blob_len, w) != WT_OK) {
-        ex_log("[FAIL] wt_parse"); free(blob); free(in); free(w);
-        return ex_summary() || 1;
+    {
+        /* 独立预检: 自己数 op 流 (与 wt_parse 同布局), 打印首个异常点字节 */
+        /* 与 wt_parse 同源的 arity 表 (oplist_parse.c arity_of; 设备 lib 若
+         * 过期与此不一致即 ARITY 根因) */
+        /* oplist_parse.h WT_ARITY_* 表 (opcode 0..30; 31+ arity_of 无 case) */
+        static const int16_t ar_tab[43] = {
+            0, 10, 4, 1, 3, 15, 13, 4, 4, 4, 6, 4, 5, 4, 16, 16,
+            16, 9, 7, 6, 5, 3, 4, 5, 7, 5, 12, 8, 12, 16, 3,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+        };
+        uint32_t pn_slots = *(uint32_t*)(blob + 8);
+        uint32_t pn_ops = *(uint32_t*)(blob + 12);
+        size_t pp = 16 + (size_t)pn_slots * 16;
+        for (uint32_t pi = 0; pi < pn_ops && pp + 4 <= blob_len; pi++) {
+            uint16_t opc = (uint16_t)(blob[pp] | (blob[pp + 1] << 8));
+            uint16_t na = (uint16_t)(blob[pp + 2] | (blob[pp + 3] << 8));
+            if (opc > 42 || na > 16 || opc > 30 ||
+                (int16_t)na != ar_tab[opc]) {
+                ex_log("[pre] op%u @%zu opc=%u na=%u (arity=%d) bytes=%02X%02X%02X%02X%02X%02X%02X%02X",
+                       (unsigned)pi, pp, (unsigned)opc, (unsigned)na,
+                       opc < 43 ? (int)ar_tab[opc] : -1,
+                       blob[pp], blob[pp+1], blob[pp+2], blob[pp+3],
+                       blob[pp+4], blob[pp+5], blob[pp+6], blob[pp+7]);
+                break;
+            }
+            pp += 4 + (size_t)na * 4;
+        }
+        int prc = wt_parse(blob, blob_len, w);
+        if (prc != WT_OK) {
+            ex_log("[FAIL] wt_parse rc=%d %s (blob0=%02X%02X%02X%02X)", prc,
+                   wt_err_str(prc), blob[0], blob[1], blob[2], blob[3]);
+            free(blob); free(in); free(w);
+            return ex_summary() || 1;
+        }
     }
     int64_t t_parse1 = HAP_perf_get_time_us();
     ex_log("M7 wt_parse ok");
@@ -231,8 +285,15 @@ int main(void) {
     if (op_ts) wt_exec_set_ts(op_ts, w->n_ops);
     else ex_log("[prof] op_ts alloc failed (%u ops), 无 ts 产物", (unsigned)w->n_ops);
     int64_t t0 = HAP_perf_get_time_us();
-    ex_log("M10 before wt_exec_run_io");
-    int rc = wt_exec_run_io(w, in, NULL, out_temp, NULL, op_us, err, sizeof(err));
+    ex_log("M10 before wt_exec_run_io (upto=%s)", have_upto ? upto_s : "all");
+    int rc;
+    if (have_upto) {
+        uint32_t n_upto = (uint32_t)strtoul(upto_s, NULL, 10);
+        if (n_upto > w->n_ops) n_upto = w->n_ops;
+        rc = wt_exec_run_range(w, 0, n_upto, NULL, op_us, err, sizeof(err));
+    } else {
+        rc = wt_exec_run_io(w, in, NULL, out_temp, NULL, op_us, err, sizeof(err));
+    }
     int64_t total_us = HAP_perf_get_time_us() - t0;
     if (rc) {
         ex_log("[FAIL] wt_exec_run_io rc=%d %s", rc, err);

@@ -21,7 +21,7 @@ import argparse
 import json
 import sys
 
-sys.path.insert(0, "/disk2/GEHTP/scripts")
+sys.path.insert(0, "/disk1/GEHTP/scripts")
 from golden_qwen35 import gguf_read_full, GGUF_Q4_0, GGUF_F32  # noqa: E402
 
 # GGUF 角色表(arch=qwen35; 由 golden_qwen35.py 的实测映射固化)
@@ -63,6 +63,10 @@ def parse_node_layer_role(node_name):
             return None, "model", "norm"
         if mi + 1 < len(parts) and parts[mi + 1] == "embed_tokens":
             return None, None, "embed_tokens"
+        if mi + 1 < len(parts) and parts[mi + 1] == "lm_head":
+            return None, "model", "lm_head"
+    if "model" not in parts and len(parts) >= 2 and parts[1] == "lm_head":
+        return None, "model", "lm_head"
     # 找 layers.N 段(2.48 实测: 可能带 'rms_norm_' 前缀)
     for i, p in enumerate(parts):
         if p.startswith("layers.") and p[7:].isdigit():
@@ -123,7 +127,7 @@ def main():
         if not wt_inputs:
             continue
         layer, block, role = loc if loc else (None, None, "")
-        valid_roles = set(ROLE_MAP) | {"A_log", "dt_bias", "embed_tokens", "norm"}
+        valid_roles = set(ROLE_MAP) | {"A_log", "dt_bias", "embed_tokens", "norm", "lm_head"}
         if role not in valid_roles:
             # 节点名路径无有效角色(如 .../linear_attn/Add)→ 权重张量名通道
             for t in wt_inputs:
@@ -135,6 +139,9 @@ def main():
             continue
         # 顶层(layer=None)特殊: embed_tokens / norm
         if role == "embed_tokens":
+            gguf_name = "token_embd.weight"
+        elif role == "lm_head":
+            # tie: lm_head 与嵌入共享 token_embd.weight (gguf 无独立 output.weight)
             gguf_name = "token_embd.weight"
         elif role == "norm" and block == "linear_attn":
             gguf_name = f"blk.{layer}.ssm_norm.weight"
@@ -154,6 +161,11 @@ def main():
             unmatched_net.append((name, gguf_name))
             continue
         gtype, dims, offset, nbytes = tensors[gguf_name]
+        if nbytes == 0 and gtype == 14:
+            nbytes = 1
+            for d in dims:
+                nbytes *= d
+            nbytes *= 2  # BF16
         # 形状交叉验证: net.json 权重张量 dims(HF 序)与 GGUF dims(ggml 序)互转
         wt_shape = None
         for t in wt_inputs:

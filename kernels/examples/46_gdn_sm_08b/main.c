@@ -1,5 +1,5 @@
 /*
- * 43_gdn_sm_08b — gdn_sm 递归状态机单元 0.8B 生产形状设备验证 (C1b)
+ * 46_gdn_sm_08b — gdn_sm 递归状态机单元 0.8B 生产形状设备验证 (C1b)
  * =====================================================================
  * 例19 的 0.8B 形状变体: DI=6144 (qkv concat 3×2048), D=128, H=16, CK=32。
  * 覆盖 gdn_sm.h 全部 4 个 kernel + oracle 对拍 + 状态 bit-exact 复跑 +
@@ -52,7 +52,7 @@ static int guard_ok(guard_t* g, uint8_t p) {
 }
 
 int main(void) {
-    ex_open_result("43_gdn_sm_08b");
+    ex_open_result("46_gdn_sm_08b");
     uint32_t lcg = 20260822u;
 
     /* f16 roundtrip spot (次正规路径, MODULE B 修过的坑):

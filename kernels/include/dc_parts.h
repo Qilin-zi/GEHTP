@@ -74,6 +74,13 @@ struct dc_w4 {
     uint8_t* extra;    /* 16 */
     const uint8_t* atbl_ddr;  /* 重写源 (每次 invoke 前 memcpy 进 atbl) */
     const uint8_t* otbl_ddr;
+    const uint8_t* scale_ddr; /* 列 scale f16 N*2 (host 参考/设备出面反量化用;
+                                 kernel 固定 ÷7 域不消费) */
+    /* 分块重绑激活: 同一 act 多块 GEMM (lm_head 61 块) 时, act 量化+crouton
+     * 面 + 输出域因子只算一次, 各块 invoke 复用。valid=面已备。 */
+    const uint8_t* act_ddr; /* 已绑定的 DDR act 源 (位地址判 repack) */
+    float    act_scale; /* 已量化的 a_scale = as·f */
+    int      act_valid;
 };
 /* 从 arena 一性 carve 全部面 (HMX 面 2KB 对齐) */
 int dc_w4_carve(struct dc_w4* e, struct dc_arena* a, uint32_t m, uint32_t k,
@@ -82,5 +89,33 @@ int dc_w4_carve(struct dc_w4* e, struct dc_arena* a, uint32_t m, uint32_t k,
 int dc_w4_invoke(struct dc_w4* e);
 /* out 面 CPU 读回 (HMX 写绕过 dcache → 先 INVALIDATE) */
 void dc_w4_read_out(const struct dc_w4* e, void* recv);
+/* 全链: f16 DDR act → 量化(a16 域)+M→256 pad+crouton → kernel →
+ * 出面反量化(A_s·S[n]) f16 DDR。carve 须按 pad 后 M (e->m == pad256(m))。
+ * out_row_bytes = 输出行跨度字节 (分块写全宽 N_full 时传 N_full*2)。
+ * wq_rms = 权重列 RMS 均值 (发射器 scale 槽尾 f16; 自适应输出域因子用)。
+ * f_fixed > 0 = 固定域因子 (测试/闭包对拍); 0 = 运行时自适应
+ *   f = pow2ceil(4·√k·RMS(a/max|a|)·wq_rms/7) — kernel ±1 输出域限制
+ *   (闭包金标自身 14.1% 饱和), f 内部抵消 (dequant 用 a_scale 含 f)。 */
+int dc_w4_run(struct dc_w4* e, const uint8_t* act_ddr, uint8_t* out_ddr,
+              uint32_t m, uint32_t k, uint32_t n, const uint8_t* scale_ddr,
+              uint32_t out_row_bytes, float wq_rms, float f_fixed);
+
+/* lm_head N 分块优化: 复用 act 量化+crouton 面.
+ * 调用序列:
+ *   1. dc_w4_run_prep(e, act_src, M, K, wq_rms, f_fixed) — 量化一次
+ *   2. for each chunk c0: dc_w4_run_invoke(e, scale+c0*2, nc,
+ *        out_ddr+c0*2, N*2, M, wq_rms, f_fixed) — 只 kernel+dequant
+ *   3. dc_w4_run_fini(e) — 释放重绑状态 (下次 prep 重新量化)
+ * m_out = 真实行数 M (e->m 是 pad256(M), 反量化只用前 M 行);
+ * out_ddr 由调用方给到本块列偏移。复用期内 e->n 须由 invoke 临时改回
+ * (dc_w4_invoke 按 e->n refill 表; carve 宽 n_eff ≥ 块宽 nc)。
+ * 数值契约与逐块 dc_w4_run 完全等价 (同 a_scale、同 32768 pad、同
+ * w4a16_dequant_crouton); 仅消除 61 次重复的 act 全面 pass。 */
+int dc_w4_run_prep(struct dc_w4* e, const uint8_t* act_src, uint32_t m,
+                     uint32_t k, float wq_rms, float f_fixed);
+int dc_w4_run_invoke(struct dc_w4* e, const uint8_t* scale, uint32_t n,
+                       uint8_t* out_ddr, uint32_t out_row_bytes,
+                       uint32_t m_out, float wq_rms, float f_fixed);
+void dc_w4_run_fini(struct dc_w4* e);
 
 #endif

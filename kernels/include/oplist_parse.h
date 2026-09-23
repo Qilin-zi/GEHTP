@@ -15,7 +15,8 @@
  *   temp 位置的 arg 可用 (0x8000|slot_id) 引用 slot —— 输入注入(首层
  *   transpose 读输入 slot 0, 引擎按位 0x8000 区分 temp/slot 空间)。
  *   OP_NOP          = 0  : []
- *   OP_MATMUL_W4A16 = 1  : [act_slot, w_slot, out_temp, M, K, N]
+ *   OP_MATMUL_W4A16 = 1  : [act_slot, w_slot, out_temp, M, K, N,
+ *                           bias_s, atbl_s, otbl_s, scale_s] (显式供给槽)
  *   OP_RMSNORM_F16  = 2  : [x_temp, w_slot, y_temp, n]
  *   OP_PIN          = 3  : [slot]
  *   OP_SILU_F16     = 4  : [x_temp, y_temp, n_elem]   (V2.3 U16)
@@ -122,15 +123,23 @@ enum {
     OP_TRANSPOSE_GEN_F16 = 27, /* [x_ref,y_t,rank,d0..d3,perm4B] 通用 N-D C 序转置
                                (rank 2/3/4; dims 为输入形状; opcode 10 保留
                                conv 管线 4-D NCHW 契约不动) */
-    OP_SCATTER_ND_F16 = 28, /* [data_ref,idx_s,upd_ref,out_t,n_out,rank,d0..d4,K,n_idx,block]
-                               arity 14 (A3② 真语义; 恒等拷贝=数值死刑, docs/A3 判决)
-                               data/upd f16, idx i32 (0x8000|slot 或 temp 引用);
-                               out=data 拷贝后按 n_idx 组 K 维坐标写 block 块 */
+    OP_SCATTER_ND_F16 = 28,   /* [data_t,idx_s,upd_t,out_t,n_idx,K,d0..d4] arity 12
+                               真 ScatterND (A3 暗雷收口): out=data 拷贝后,
+                               对 n_idx 个坐标 (每坐标 K 维, idx_s int32 槽)
+                               写 upd[e] 到 out[base]; block=1 (GDN attn_iter
+                               每步写单点; 恒等拷贝冒充在 0.8B 1154 处全错) */
+    OP_PAD_F16 = 29,          /* [x_ref,out_t,rk,in_d0..3,out_d0..3,pb0..3,padv_f16] arity 16
+                               真 Pad (CONSTANT scheme): out 先填 pad 值, 再按
+                               前 pad 偏移把 in 拷入 (C 序, rank≤4)。恒等冒充
+                               → 后半段读陈旧池字节 = 0.8B 全 -inf 根因 */
+    OP_CAST_I32_F16 = 30,     /* [x_ref,out_t,n_i32] int32 位模式 → f16 数值
+                               (参考实现同款: RoPE 位置链 Cast 才转数值;
+                               恒等冒充 → 位置值=次正规 → RoPE 全错) */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
 #define WT_ARITY_NOP 0
-#define WT_ARITY_MATMUL 6
+#define WT_ARITY_MATMUL 10  /* [a,w,out,M,K,N,bias_s,atbl_s,otbl_s,scale_s] 显式供给槽 */
 #define WT_ARITY_RMSNORM 4
 #define WT_ARITY_PIN 1
 #define WT_ARITY_SILU 3
@@ -157,7 +166,9 @@ enum {
 #define WT_ARITY_RMSNORM2_F16 5
 #define WT_ARITY_BROADCAST_F16 12
 #define WT_ARITY_TRANSPOSE_GEN_F16 8
-#define WT_ARITY_SCATTER_ND_F16 14
+#define WT_ARITY_SCATTER_ND_F16 12
+#define WT_ARITY_PAD_F16 16
+#define WT_ARITY_CAST_I32_F16 3
 
 struct wt_slot {
     uint32_t len;
