@@ -150,15 +150,19 @@ void dc_clean_ddr(const void* p, uint32_t bytes) {
 void dc_dma_clean_src(struct dc_dma* d) { dc_clean_ddr(d->src, d->bytes); }
 
 int dc_dma_once(struct dc_dma* d) {
+    return dc_dma_once_ex(d, d->src_bypass, d->dst_bypass);
+}
+
+int dc_dma_once_ex(struct dc_dma* d, int src_bypass, int dst_bypass) {
     const int64_t t_dma0 = HAP_perf_get_time_us();
     dma_desc_1d_params_t p;
     memset(&p, 0, sizeof(p));
-    /* src 已由 dc_dma_clean_src 一次性清过; bypass 来自 d->src_bypass/dst_bypass
-     * (dc_dma_init 默认 1/0 同 1-C 契约; OP_DMA 透传覆盖) */
+    /* src 已由 dc_dma_clean_src 一次性清过; bypass 由参数携带 (dc_dma_once
+     * 取 d->src_bypass/dst_bypass = dc_dma_init 默认 1/0, 同 1-C 契约) */
     p.src_address = (uint32_t)(uintptr_t)d->src;
     p.dst_address = (uint32_t)(uintptr_t)d->dst;
-    p.src_bypass = d->src_bypass;
-    p.dst_bypass = d->dst_bypass;
+    p.src_bypass = src_bypass;
+    p.dst_bypass = dst_bypass;
     p.length = d->bytes;
     p.order = 1;
     if (dma_desc_init(d->desc, &p, DMA_DESC_TYPE_1D) != DMA_SUCCESS) return 0xD201;

@@ -282,6 +282,70 @@ int main() {
         run_case("badneu", "ElementWiseNeuron", 99.0, 0, 0, true);
     }
 
+    /* 7. P5 OP_DMA 解析契约 (OP_DMA=33, arity 8, GAP_CLOSURE C):
+     * 手组最小 blob (1 slot + 1 op + weight 区), 断言:
+     *   正例: OP_DMA arity 8 通过; src/dst 带 0xC000|引擎面编码豁免槽界;
+     *   负例: 坏 arity -> ARITY; 0x8000|越界槽 -> BAD_REF;
+     *         非 DMA op 携带 0xC000 -> BAD_REF (豁免仅限 OP_DMA)。
+     * 另: --dma-runlist 作用于无溢出计划的 conv_add bin, 输出必须与默认
+     *     形态逐字节一致 (旗标不扰动默认发射路径)。 */
+    {
+        auto build_blob = [](uint16_t opcode, const std::vector<uint32_t>& args) {
+            std::vector<uint8_t> b;
+            auto w16 = [&b](uint16_t v) { b.push_back((uint8_t)(v & 0xff)); b.push_back((uint8_t)(v >> 8)); };
+            auto w32 = [&b](uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((uint8_t)(v >> (8 * i))); };
+            b.insert(b.end(), {'W', 'T', 'O', 'P'});
+            w16(WT_BLOB_VER); w16(WT_ENDIAN_CHK);
+            w32(1); w32(1);                       // 1 slot, 1 op
+            w32(128); w32(1); w32(0); w32(0);     // slot0: len=128 off=0 addr=0
+            w16(opcode); w16((uint16_t)args.size());
+            for (uint32_t a : args) w32(a);
+            while (b.size() % 128) b.push_back(0);
+            b.resize(b.size() + 128, 0);          // weight 区
+            return b;
+        };
+        wt_blob* w3 = new wt_blob{};
+        /* 正例: OP_DMA(0x8000|slot0 → 0x4000|temp9, 128B, fence CPU→DMA→HMX) */
+        std::vector<uint8_t> dma = build_blob(OP_DMA,
+            {0x8000u | 0u, WT_REF_VTCM_FLAG | 9u, 128u, 0u, 0u, 1u, 0u /*FC_CPU*/, 2u /*FC_HMX*/});
+        CHECK(wt_parse(dma.data(), dma.size(), w3) == WT_OK, "P5: OP_DMA arity 8 wt_parse OK");
+        CHECK(w3->ops[0].opcode == 33 && w3->ops[0].n_args == 8, "P5: OP_DMA=33 arity=8 契约");
+        /* 正例: src/dst 0xC000|引擎面 豁免槽界 */
+        std::vector<uint8_t> eng = build_blob(OP_DMA,
+            {WT_REF_ENG_FLAG | WT_ENG_OUT, WT_REF_ENG_FLAG | WT_ENG_ACT, 128u, 0u, 0u, 1u, 2u, 0u});
+        CHECK(wt_parse(eng.data(), eng.size(), w3) == WT_OK, "P5: OP_DMA 0xC000 引擎面豁免");
+        /* 负例: 坏 arity */
+        {
+            std::vector<uint8_t> bad = build_blob(OP_DMA,
+                {0x8000u | 0u, WT_REF_VTCM_FLAG | 9u, 128u, 0u, 0u, 1u, 0u});
+            CHECK(wt_parse(bad.data(), bad.size(), w3) == WT_ERR_ARITY, "P5 neg: OP_DMA arity 7 -> ARITY");
+        }
+        /* 负例: 0x8000|越界槽 */
+        {
+            std::vector<uint8_t> bad = build_blob(OP_DMA,
+                {0x8000u | 999u, WT_REF_VTCM_FLAG | 9u, 128u, 0u, 0u, 1u, 0u, 2u});
+            CHECK(wt_parse(bad.data(), bad.size(), w3) == WT_ERR_BAD_REF, "P5 neg: OP_DMA src 越界槽 -> BAD_REF");
+        }
+        /* 负例: 非 DMA op 携带 0xC000 (豁免仅限 OP_DMA) */
+        {
+            std::vector<uint8_t> bad = build_blob(OP_PIN, {WT_REF_ENG_FLAG | WT_ENG_OUT});
+            CHECK(wt_parse(bad.data(), bad.size(), w3) == WT_ERR_BAD_REF,
+                  "P5 neg: PIN 带 0xC000 -> BAD_REF (豁免仅 OP_DMA)");
+        }
+        delete w3;
+        /* --dma-runlist 不扰动默认形态: conv_add (无溢出计划) 两次发射逐字节一致 */
+        {
+            const std::string blob_dma = dir + "blob_dmaflag.wtop";
+            std::string c3 = std::string(WTOP_EMIT_PATH) + " --bin " + bin_path +
+                             " --input-f16 " + in_path + " --out " + blob_dma +
+                             " --dma-runlist 2>/dev/null";
+            CHECK(std::system(c3.c_str()) == 0, "P5: wtop_emit --dma-runlist exit 0");
+            std::vector<uint8_t> bdm;
+            CHECK(load_file(blob_dma, bdm), "P5: read --dma-runlist blob");
+            CHECK(bdm == blob, "P5: 无溢出计划下 --dma-runlist 输出 == 默认形态 (逐字节)");
+        }
+    }
+
     std::printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASS", failed);
     return failed ? 1 : 0;
 }

@@ -44,6 +44,7 @@
 | 1.3 | gehtp setup 适配新板 | 四件套已就位（09-18）；核对 skel 正典 md5（防 third_party 毒件）、`--device d0f1784` 全流程 | setup 读回校验绿 |
 | 1.4 | 设备队列协议升双板 | PORTAL §4 / TASKBOOK §2.3 登记表加板卡列；互斥检查命令按板参数化 | 文档+quickstart 检查同步 |
 | 1.5 | **C1/C4 设备门补跑** | 0.8B（A3②真 scatter 重编 blob，qwen35_08b_scatter.wtop 已上板）+ minicpm（5.15GB v2 blob）在新板跑设备门 | judge_logits / judge_minicpm 判据达标，战役日志更新 |
+| 1.2.1 | **eqfix 后 ScatterNd 数据污染定位** | 80 锚点 dump (8:0=Ctx0，35:15=Embedding，45:16=CumulativeSum，45:17=Pad输出…) 逐锚点对拍发现：op45 输出 temp17 ≈ host_id_179 结构错位；host 行0-15 有信号 dev 行0-15 全 -inf → **ScatterNd 在 1154 个 gated delta 写入窗口前数据已坏**；设备 v3 全 -inf 毒化问题**已彻底根除**，但 ScatterNd 首实跑时激活的 Gate 机制（Dtype int8 控制块）导致写入值异常；待复盘 exdiag 逐 op dump 比对确认。| cmp_l0.py 对拍 log (TASKBOOK §8) |
 | 1.6 | 域号参数化（降级，可选） | job.txt 加 `domain` 键；`--domain` 旗标默认 3；三处硬编码清除（gehtp:180、conv_add_pipeline.sh:77、device_run.sh:71）。目的=双板/未来多核，不再阻塞换板 | 双板 conv_add byte-exact |
 
 **换板战役总门**：quickstart `=== SAMPLE ALL GREEN ===` 在 d0f1784 复现 + C1/C4 设备输出达标。

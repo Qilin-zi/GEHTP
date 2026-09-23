@@ -160,6 +160,17 @@ int main(void) {
         wt_exec_set_trace(tr);
         ex_log("[prof] per-op optrace %s", tr ? "ON" : "OFF");
     }
+    /* 精度排查: hook 键 = 逐 op 张量 dump spec ("opidx:temp,..."), 产物
+     * /data/local/tmp/hrt/gehtp/hook_<idx>_<temp>.f16.raw (host gehtp run 拉回)。
+     * 缓冲按全模型锚点串规模给 (80 锚点 ≈ 762 字符, 1KB 够)。 */
+    {
+        static char hook_s[1024];
+        memset(hook_s, 0, sizeof(hook_s));
+        if (job_get((char*)job, "hook", hook_s, sizeof(hook_s)) == 0 && hook_s[0]) {
+            wt_exec_set_hook(hook_s);
+            ex_log("[hook] tensor dump spec: %s", hook_s);
+        }
+    }
     free(job);
     uint32_t out_temp = (uint32_t)strtoul(temp_s, NULL, 10);
     ex_log("M4 wgt_size=%s", have_wgt_size ? wgt_size_s : "(none)");

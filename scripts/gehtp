@@ -107,12 +107,13 @@ cmd_compile() {
 }
 
 cmd_run() {
-    local blob="" input="" output="" device="${ANDROID_SERIAL:-52f67807}" trace=0
+    local blob="" input="" output="" device="${ANDROID_SERIAL:-52f67807}" trace=0 hook_spec=""
     while [ $# -gt 0 ]; do case "$1" in
         --input) input="$2"; shift 2;;
         --output) output="$2"; shift 2;;
         --device) device="$2"; shift 2;;
         --trace) trace=1; shift;;   # PROF W-P2: per-op optrace 落盘行 (调试取证; 性能测量勿开)
+        --hook) hook_spec="$2"; shift 2;;  # 精度排查: 逐 op 张量 dump "opidx:temp,..."
         -*) die "unknown flag $1";;
         *) [ -z "$blob" ] && blob="$1" || die "unexpected arg $1"; shift;;
     esac; done
@@ -165,6 +166,8 @@ cmd_run() {
     fi
     # PROF W-P2: trace 旗标经 job.txt 下发 (runner 读到 =1 才开 per-op 落盘行)
     [ "$trace" = 1 ] && printf 'trace 1\n' >> /tmp/gehtp_job.txt
+    # 精度排查: hook spec 经 job.txt 下发 (opidx:temp,... 张量 dump)
+    [ -n "$hook_spec" ] && printf 'hook %s\n' "$hook_spec" >> /tmp/gehtp_job.txt
     adb -s "$device" push /tmp/gehtp_job.txt "$GDIR/job.txt" >/dev/null
 
     # PROF W-P2: prof 产物目录取 output 同侧 prof/, 键 = blob 名
@@ -174,6 +177,8 @@ cmd_run() {
     local run_log="$prof_dir/$pname.run.log"
     # trace 模式: optrace.txt 是 append 累积文件, 先清保证拉到的是本次
     [ "$trace" = 1 ] && adb -s "$device" shell "rm -f /data/local/tmp/hrt/gehtp/optrace.txt" >/dev/null
+    # hook 模式: 清上轮 dump 残留, 保证拉回的是本次
+    [ -n "$hook_spec" ] && adb -s "$device" shell "rm -f /data/local/tmp/hrt/gehtp/hook_*.f16.raw" >/dev/null
 
     echo "== run on $device =="
     adb -s "$device" shell "cd $DEVROOT && ADSP_LIBRARY_PATH=$DEVROOT CDSP_LIBRARY_PATH=$DEVROOT ./run_main_on_hexagon 3 gehtp_runner.so" 2>&1 | tee "$run_log" | tail -20
@@ -196,6 +201,15 @@ cmd_run() {
             "$prof_dir/$pname.optrace.txt" >/dev/null 2>&1 \
             && echo "prof: $prof_dir/$pname.optrace.txt" \
             || echo "prof: optrace.txt 拉取失败 (trace=1 但未产出?)"
+    fi
+    if [ -n "$hook_spec" ]; then
+        local hf hbase
+        for hf in $(adb -s "$device" shell "ls /data/local/tmp/hrt/gehtp/hook_*.f16.raw 2>/dev/null" | tr -d '\r'); do
+            hbase="$(basename "$hf")"
+            adb -s "$device" pull "$hf" "$prof_dir/$hbase" >/dev/null 2>&1 \
+                && echo "hook: $prof_dir/$hbase ($(wc -c < "$prof_dir/$hbase") bytes)" \
+                || echo "hook: $hbase 拉取失败 (非致命)"
+        done
     fi
     echo "prof 报表: scripts/gehtp_prof.py --wtop $blob --op-ts $prof_dir/$pname.op_ts.bin"
 }

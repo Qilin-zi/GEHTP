@@ -242,14 +242,25 @@
 - 构建环境登记: 宿主机 g++-9 无法编译(他方 __builtin_bit_cast, 已由 aae0e09 修 C++17), **编译器一律容器 `gehtp-toolchain:24.04` (GCC 13)**: `docker run --rm -u $(id -u):$(id -g) -v /disk1:/disk1 -v /disk1/toolchains:/opt/toolchains:ro -w /disk1/gehtp/compiler gehtp-toolchain:24.04 bash -lc "cmake -S . -B build_<tag> && cmake --build build_<tag> -j"`; scripts/gehtp 已修 source env.sh(五件套死路径收敛)。
 - v3 blob: v2 tagged.bin 直接重发射(免 2-4h hnnx_compile), f16 权重域(GGUF 不在本机), 2.04GB, EQ sub=4 ×1 + SOFTPLUS sub=13 ×18 + 烘焙 ids/mask=ones/pos=arange 逐项槽位校验。
 
-**设备门 (d0f1784, lib=本树构建含 eqfix+MAX_TEMPS 4096)**: 复跑 v3 ×4 prompts → judge 结果见下条(待补)。
+**设备门 (d0f1784, lib=本树构建含 eqfix+MAX_TEMPS 4096)**: 复跑 v3 ×4 prompts → judge 结果见下条。
 
 **2026-09-23 设备复跑日志（eqfix 会话）**:
 - v3 blob 已在 d0f1784，尺寸一致，设备侧未提供可选外置 `qwen35_08b_v3.weights.bin`；runner 正确回退到 blob 内嵌 f16 权重（不是失败原因）。
 - `qwen35_08b_v3.device.txt` 实锤：`wt_parse ok`、`wt_exec_run_io rc=0`、`ops=16297`、`out_temp=1401`；总耗时约 275.7 s，说明 MAX_TEMPS=4096 后已完整跑过全图。
 - 之前 P2/P3 复跑因多个 run 并发共享同一设备 `job.txt`/`output.f16.raw` 通道而互相覆盖，退出码不具判读性；后续改为串行，每次完成 pull 后立即 judge。
 
-**挂账**: ①全 -inf 若仍现, 下一嫌疑 = scatter_nd 首实跑/Pad 尾部垃圾/Cast, exdiag 二分工具链现成; ②C1 总门 cos≥0.9999+top1 4/4 未必一次达(host 链自身 0.9987/26~31), 门收口另行; ③oplist_exec.c 未提交 = eqfix(case 4/13+MAX_TEMPS)叠在 prof W-P3 在途(+395 行 HVX/HMX)之上, commit 需与 prof 会话错峰协商; ④v2 blob(EQ 错误语义+烘焙全零)及其设备输出全部作废, test_assets/qwen35_08b/qwen35_08b.wtop 同源需按 v3 流程重编替换。
+**2026-09-23 4-prompt 判定矩阵（串行完成，同 lib 同 blob）**:
+| prompt | nan/inf | cos | top1 | host 链同 prompt cos/top1 |
+|---|---|---|---|---|
+| P0 | 0/0 | 0.153144 | 1/32 | 0.9987 / 31/32 (p1_logits_0_fixed) |
+| P1 | 0/0 | -0.067401 | 0/32 | 0.9986 / 30/32 |
+| P2 | 0/0 | 0.220459 | 0/32 | 0.9995 / 32/32 |
+| P3 | 0/0 | 0.142622 | 4/32 | 0.9988 / 26/32 |
+- **eqfix 疗效确认**：修复前设备输出 7,946,240 元素全 -inf（死输出）；修复后四 prompt 全部有限值（nan=0/inf=0、logits 分布合理 ±17）——全 -inf 毒化已根除，剩下的是**语义级偏差**（cos 0.14~0.22，top1 近乎全错）。
+- 输出结构：设备各行 top1 偏向小 token id（16/314/88…），行间 cos 0.71（golden 0.39）= 部分塌缩；row0 cos 0.24 / row31 cos 0.41，信号存在但整体偏。
+- 分叉定位工具落地：**exec_hook_dump 双平台化**（原 hostsim 限定 GEHTP_HOOK → 加 `wt_exec_set_hook` + runner job.txt `hook` 键 + `gehtp run --hook "idx:temp,..."`，设备产物 /data/local/tmp/hrt/gehtp/hook_<idx>_<temp>.f16.raw 自动拉回 prof/）。锚点 = embedding(op8→temp0) + 全部 79 个 RmsNorm 输出（80 点 spec 762 字符），host 对照 = .scratch_a3/dump_fixed（P0 输入全图 host_id dump，实锤覆盖 80/80 锚点）。
+
+**挂账**: ①设备/host 分叉点定位中（hook dump 对拍链：hook_<idx> ↔ manifest.op_ids[idx] ↔ host_id_<oid>，M3c 机制复用）；首要嫌疑 scatter_nd×1154 首实跑/Pad 尾部垃圾/Cast; ②C1 总门 cos≥0.9999+top1 4/4 未达(host 链自身 0.9987/26~31 亦未达，门收口另行); ③oplist_exec.c 已被 58cc915 合并提交（eqfix+P5 OP_DMA 修订），ptr_in_vtcm 重复定义编译错误由对方会话 01:49 修复；dump 改动（exec_hook_dump 双平台化）未提交，commit 需与活跃会话错峰; ④v2 blob(EQ 错误语义+烘焙全零)及其设备输出全部作废, test_assets/qwen35_08b/qwen35_08b.wtop 同源需按 v3 流程重编替换。
 
 ### 2026-09-17 C1 线 (105 会话) — VL Gather 回归定罪 + A3 判决 + A3② 落地 + 设备楔死旁证
 

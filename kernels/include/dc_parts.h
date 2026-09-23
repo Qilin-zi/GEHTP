@@ -48,6 +48,9 @@ int dc_dma_init(struct dc_dma* d, uint8_t* src, uint8_t* dst, uint32_t bytes,
                 dc_mutex_t* mu);
 void dc_dma_destroy(struct dc_dma* d);
 int dc_dma_once(struct dc_dma* d);          /* 单次 DDR→VTCM (契约同 1-C) */
+/* P5: bypass 参数化变体 (OP_DMA 条目携带 src/dst_bypass 位)。
+ * dc_dma_once ≡ dc_dma_once_ex(d, d->src_bypass, d->dst_bypass) — 既有调用契约不动。 */
+int dc_dma_once_ex(struct dc_dma* d, int src_bypass, int dst_bypass);
 /* src 一次性清 cache (CPU 写过 DDR 后、首次 DMA 前调一次;
  * 每轮清会把 4MB×N 的 dcacheopma CPU 开销算进带宽 — P2 首跑教训) */
 void dc_dma_clean_src(struct dc_dma* d);

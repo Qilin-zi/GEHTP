@@ -12,8 +12,10 @@
  *   5 rms_w (f16×2560, 本工具确定性生成)
  *   6 q8_0 crouton (vendored weight_pack 打包, 随车运输证明)
  * op 表:
- *   w4: NOP; PIN(1); PIN(2); MATMUL(0,1,temp0,256,2560,2560)
- *   w5: 上者 + RMSNORM(temp0,5,temp1,2560)
+ *   w4:    NOP; PIN(1); PIN(2); MATMUL(0,1,temp0,256,2560,2560)
+ *   w5:    上者 + RMSNORM(temp0,5,temp1,2560)
+ *   w4dma: P5 合成显式 DMA runlist — NOP; PIN; PIN; OP_DMA(act→VTCM temp9);
+ *          MATMUL(0x4000|temp9,...); OP_DMA(ENG_OUT→temp0); RMSNORM
  */
 #include <cmath>
 #include <cstdint>
@@ -59,12 +61,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--tag") && i + 1 < argc) tag = argv[++i];
     }
-    if (t10.empty() || out.empty() || (tag != "w4" && tag != "w5")) {
-        fprintf(stderr, "usage: %s --t10 <dir> --out <dir> --tag w4|w5\n", argv[0]);
+    if (t10.empty() || out.empty() || (tag != "w4" && tag != "w5" && tag != "w4dma")) {
+        fprintf(stderr, "usage: %s --t10 <dir> --out <dir> --tag w4|w5|w4dma\n", argv[0]);
         return 1;
     }
 
-    struct SlotDef { std::string name; uint32_t len; std::string bytes; };
+    struct SlotDef { std::string name; uint32_t len; std::string bytes; uint32_t addr = 0; };
     std::vector<SlotDef> slots;
     const char* faces[5] = {"act_surface.raw", "packed_weight.raw", "folded_bias.raw",
                             "act_table.raw", "out_table.raw"};
@@ -104,15 +106,55 @@ int main(int argc, char** argv) {
 
     /* op 表 */
     struct OpDef { uint16_t opcode; std::vector<uint32_t> args; };
-    std::vector<OpDef> ops = {
-        {OP_NOP, {}},
-        {OP_PIN, {1}},
-        {OP_PIN, {2}},
-        {OP_MATMUL_W4A16, {0, 1, 0, 256, 2560, 2560}},
-    };
-    if (tag == "w5") {
-        ops.push_back({OP_RMSNORM_F16, {0, 5, 1, 2560}});
-        ops.push_back({OP_PIN, {1}}); /* 引擎已建立后的真 pin (幂等 restage) */
+    std::vector<OpDef> ops;
+    if (tag == "w4dma") {
+        /* P5 合成显式 DMA runlist blob (契约 oplist_parse.h OP_DMA=33;
+         * 与 w5 同数值链, matmul 的 act 就位/out 排空改由 runlist 承担):
+         *   NOP; PIN(1); PIN(2);
+         *   OP_DMA(0x8000|slot0 → 0x4000|temp9, act_b, fence CPU→DMA→HMX)
+         *   MATMUL(0x4000|temp9, 1, temp0, 256,2560,2560)  ← 就位检测形态
+         *   OP_DMA(0xC000|ENG_OUT → temp0, out_b, fence HMX→DMA→CPU)
+         *   RMSNORM(temp0, 5, temp1, 2560)                  ← CPU 消费者
+         * slot7 = TEMPOFF: temp0/temp1 DDR 静态偏移 + temp9 VTCM 驻留
+         * (1280KB 池, 2048 对齐 — exec_matmul 就位检测对齐硬门)。 */
+        const uint32_t ACT_B = 256u * 2560u * 2u, OUT_B = ACT_B;
+        const uint32_t ST_T = 9u;                 /* VTCM 驻留 staging temp id */
+        ops = {
+            {OP_NOP, {}},
+            {OP_PIN, {1}},
+            {OP_PIN, {2}},
+            {OP_DMA, {(0x8000u | 0u), (WT_REF_VTCM_FLAG | ST_T), ACT_B, 0, 0, 1,
+                      0 /*FC_CPU*/, 2 /*FC_HMX*/}},
+            {OP_MATMUL_W4A16, {(WT_REF_VTCM_FLAG | ST_T), 1, 0, 256, 2560, 2560}},
+            {OP_DMA, {(WT_REF_ENG_FLAG | WT_ENG_OUT), 0, OUT_B, 0, 0, 1,
+                      2 /*FC_HMX*/, 0 /*FC_CPU*/}},
+            {OP_RMSNORM_F16, {0, 5, 1, 2560}},
+        };
+        /* TEMPOFF 槽数据: [cap][reserve][n][n×{tid,off,sz}] (oplist_parse.h
+         * WT_SLOT_TEMPOFF 契约; reserve = vtcm_kb<<16 | bump_kb) */
+        std::string t;
+        auto put32 = [&t](uint32_t v) {
+            for (int i = 0; i < 4; i++) t.push_back((char)((v >> (8 * i)) & 0xff));
+        };
+        const uint32_t vtcm_kb = ACT_B / 1024u;   /* 1280 (2048 对齐 ✓) */
+        put32(2u * ACT_B);                        /* cap: temp0@0 + temp1@ACT_B */
+        put32((vtcm_kb << 16) | 128u);            /* VTCM 池 1280KB + bump 128KB */
+        put32(3);
+        put32(0); put32(0);      put32(ACT_B);    /* temp0 → DDR [0, ACT_B) */
+        put32(1); put32(ACT_B);  put32(ACT_B);    /* temp1 → DDR [ACT_B, 2·ACT_B) */
+        put32(WT_REF_VTCM_FLAG | ST_T); put32(0); put32(ACT_B);  /* temp9 → VTCM */
+        slots.push_back({"tempoff_tab", (uint32_t)t.size(), t, WT_SLOT_TEMPOFF});
+    } else {
+        ops = {
+            {OP_NOP, {}},
+            {OP_PIN, {1}},
+            {OP_PIN, {2}},
+            {OP_MATMUL_W4A16, {0, 1, 0, 256, 2560, 2560}},
+        };
+        if (tag == "w5") {
+            ops.push_back({OP_RMSNORM_F16, {0, 5, 1, 2560}});
+            ops.push_back({OP_PIN, {1}}); /* 引擎已建立后的真 pin (幂等 restage) */
+        }
     }
 
     /* 组 blob */
@@ -128,7 +170,7 @@ int main(int argc, char** argv) {
     for (auto& s : slots) { offs.push_back(cur); cur += s.len; cur = (cur + 127u) & ~127u; }
     for (size_t i = 0; i < slots.size(); i++) {
         wr_u32(blob, slots[i].len); wr_u32(blob, 1);
-        wr_u32(blob, offs[i]);      wr_u32(blob, 0);
+        wr_u32(blob, offs[i]);      wr_u32(blob, slots[i].addr);
     }
     for (auto& op : ops) {
         wr_u16(blob, op.opcode); wr_u16(blob, (uint16_t)op.args.size());
@@ -164,7 +206,7 @@ int main(int argc, char** argv) {
     man << " \"slots\": [\n";
     for (size_t i = 0; i < slots.size(); i++) {
         man << "  {\"i\":" << i << ",\"name\":\"" << slots[i].name << "\",\"len\":" << slots[i].len
-            << ",\"count\":1,\"offset\":" << offs[i] << ",\"addr\":0,\"sha256\":\""
+            << ",\"count\":1,\"offset\":" << offs[i] << ",\"addr\":" << slots[i].addr << ",\"sha256\":\""
             << wt_sha256_hex(slots[i].bytes.data(), slots[i].bytes.size(), sha_buf) << "\"}"
             << (i + 1 < slots.size() ? "," : "") << "\n";
     }

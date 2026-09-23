@@ -93,6 +93,13 @@ void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap);
  * 仍只有 g_rtrace 一个 FILE*, 开关只控 fopen 与否, 绝不新建路径。 */
 void wt_exec_set_trace(int on);
 
+/* 逐 op 张量 dump 钩子 (精度排查): spec = "opidx:temp,opidx:temp,...", 执行到
+ * op idx (run_range 局部序号, 与 optrace 行号一致) 且 rc==0 后, 把 temp 按
+ * g_last_bytes 落盘 hook_<idx>_<temp>.f16.raw (设备 /data/local/tmp/hrt/gehtp/,
+ * host /tmp/)。NULL/空串 = 关 (零开销)。host 未 set 时回退 GEHTP_HOOK env
+ * (旧 hostsim 行为保持); 设备经 runner job.txt "hook" 键下发。run_io 前调一次。 */
+void wt_exec_set_hook(const char* spec);
+
 /* W3 解析报告 (源: wt_w3.c)。emit 逐行收到 JSON 行; host wt_inspect 与
  * 设备输出共用此函数, 行逐字节一致。 */
 void wt_w3_report(const char* blob_name, const uint8_t* buf, size_t size,
