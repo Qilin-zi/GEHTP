@@ -1028,7 +1028,9 @@ static int exec_dma(const struct wt_blob* b, const struct wt_op* op,
         if (dc_dma_init(&d, src, dst, bytes, &mu) != 0) {
             snprintf(err, errn, "dma desc alloc"); return -1;
         }
-        int rc = dc_dma_once_ex(&d, src_bypass, dst_bypass);
+        d.src_bypass = src_bypass;
+        d.dst_bypass = dst_bypass;
+        int rc = dc_dma_once(&d);
         dc_dma_destroy(&d);
         if (rc) { snprintf(err, errn, "dma 0x%X", rc); return -1; }
     } else {
