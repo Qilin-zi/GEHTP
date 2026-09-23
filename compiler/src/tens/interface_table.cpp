@@ -5,11 +5,23 @@
 #include "hnnx/tens/interface.hpp"
 
 #include <cmath>
+#include <cstring>
 
 // ---------------------------------------------------------------------------
 // thunk 群 (全部 static —— .so 中为内部链接局部符号)
 // ---------------------------------------------------------------------------
 namespace {
+
+// C++17 兼容位级重解释 (GCC9 无内建 bit_cast 原语)。
+// 编译为单条 movd/movss, 与逐指令复刻的语义一致 (纯位搬运, 无数值转换)。
+template <typename To, typename From>
+To bit_cast(From const &from) noexcept
+{
+    static_assert(sizeof(To) == sizeof(From), "bit_cast: size mismatch");
+    To to;
+    memcpy(&to, &from, sizeof(To));
+    return to;
+}
 
 // 0xdcd040 — read_float(UNKNOWN): xorps xmm0,xmm0; ret
 float read_float_unknown(Interface const *, void const *) noexcept
@@ -122,19 +134,19 @@ float read_float_f16(Interface const *, void const *p) noexcept
     uint32_t const ecx0 = *static_cast<uint16_t const *>(p); // movzwl (%rsi)
     uint32_t eax = (ecx0 << 16) & 0x80000000u;               // 符号位
     uint32_t const mag = ecx0 & 0x7fffu;
-    if (mag == 0) return __builtin_bit_cast(float, eax); // je 0xdcd27e
+    if (mag == 0) return bit_cast<float>(eax); // je 0xdcd27e
     if (mag <= 0x3ffu) {                                 // 次正规 (cmp 0x3ff; ja)
         eax |= 0x33800000u;
-        return __builtin_bit_cast(float, eax) * float(mag); // mulss
+        return bit_cast<float>(eax) * float(mag); // mulss
     }
     // 规格化/inf/nan: 重偏置 +13; mag >= 0x7c00 时强置指教位
     uint32_t norm = (mag << 13) + 0x38000000u;
     uint32_t const sp = (mag < 0x7c00u) ? norm : (norm | 0x7f800000u); // cmovbl
-    return __builtin_bit_cast(float, eax | sp);
+    return bit_cast<float>(eax | sp);
 }
 void write_float_f16(Interface const *, void *p, float f) noexcept
 {
-    uint32_t const x = __builtin_bit_cast(uint32_t, f);       // movd xmm0→r8d
+    uint32_t const x = bit_cast<uint32_t>(f);       // movd xmm0→r8d
     uint32_t edi = x & 0x7fffffffu;                           // 幅值
     uint32_t const eax_sign = (x >> 16) & 0x8000u;            // 半精度符号位
     uint16_t out;
@@ -176,11 +188,11 @@ void write_float_f16(Interface const *, void *p, float f) noexcept
 float read_float_bf16(Interface const *, void const *p) noexcept
 {
     uint32_t const b = uint32_t(*static_cast<uint16_t const *>(p)) << 16;
-    return __builtin_bit_cast(float, b);
+    return bit_cast<float>(b);
 }
 void write_float_bf16(Interface const *, void *p, float f) noexcept
 {
-    uint32_t const x = __builtin_bit_cast(uint32_t, f);
+    uint32_t const x = bit_cast<uint32_t>(f);
     uint16_t out;
     if ((x & 0x7f80ffffu) > 0x7f800000u) {
         out = 0x7fa0; // canonical NaN
