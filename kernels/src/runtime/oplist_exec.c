@@ -31,7 +31,7 @@
 #include "hvxhmx_v2_matmul.h"
 #include "hmx_crouton.h"
 
-#define MAX_TEMPS 256
+#define MAX_TEMPS 4096  /* 0.8B 全模型 temp id 至 1403+ (输出 temp 1401); 256 实锤死 op2616, 与 WT_EXEC_MAX_TEMPS 同步 */
 
 struct wt_exec {
     struct wtcache_ctx* wc;
@@ -171,6 +171,27 @@ static void cpu_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
     memcpy(dst, src, bytes);
     qurt_mem_cache_clean((qurt_addr_t)dst, bytes,
                          QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+}
+
+/* VTCM 驻留池懒初始化: 从 VTCM 尾部倒划, 避开 MATMUL carve arena。 */
+static int vtcm_pool_ensure(void) {
+    if (g_exec.vtcm_pool) return 0;
+    if (!g_exec.engine_ready) {
+        if (wtcache_open(&g_exec.wc, 4096) != WTC_OK) return -1;
+        g_exec.engine_ready = 1;
+    }
+    void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+    wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+    if (!vb || vs < g_exec.vtcm_pool_size) return -1;
+    uint32_t carve_end = (pc + 2047u) & ~2047u;
+    if (carve_end + g_exec.vtcm_pool_size > vs) return -1;
+    g_exec.vtcm_pool = (uint8_t*)vb + (vs - g_exec.vtcm_pool_size);
+    return 0;
+}
+
+static int ptr_in_vtcm(const uint8_t* p) {
+    return g_exec.vtcm_pool && p >= g_exec.vtcm_pool &&
+           p < g_exec.vtcm_pool + g_exec.vtcm_pool_size;
 }
 
 static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
@@ -373,8 +394,12 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "supply slots missing (bias/atbl/otbl)");
         return -1;
     }
-    if (b->slots[act_s].len != act_b || b->slots[w_s].len != wt_b) {
-        snprintf(err, errn, "act/w slot size mismatch");
+    if (!(act_s & WT_REF_VTCM_FLAG) && b->slots[act_s].len != act_b) {
+        snprintf(err, errn, "act slot size mismatch");
+        return -1;
+    }
+    if (b->slots[w_s].len != wt_b) {
+        snprintf(err, errn, "w slot size mismatch");
         return -1;
     }
     if (!g_exec.matmul_carved) {
@@ -402,6 +427,20 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
 
     cpu_to_vtcm(g_exec.e.wt, b->weight_base + b->slots[w_s].offset, wt_b);
     cpu_to_vtcm(g_exec.e.bias, bias, bias_b);
+
+    if (act_s & WT_REF_VTCM_FLAG) {
+        uint8_t* act_vtcm = (uint8_t*)ref_ptr(b, act_s);
+        if (!act_vtcm || !ptr_in_vtcm(act_vtcm) || ((uintptr_t)act_vtcm & 2047u)) {
+            snprintf(err, errn, "dma-prestaged act bad");
+            return -1;
+        }
+        uint8_t* saved_act = g_exec.e.act;
+        g_exec.e.act = act_vtcm;
+        int bad = dc_w4_invoke(&g_exec.e);
+        g_exec.e.act = saved_act;
+        if (bad) { snprintf(err, errn, "invoke"); return -1; }
+        return 0;
+    }
 
     struct dc_dma d_act, d_out;
     dc_dma_init(&d_act, (uint8_t*)b->weight_base + b->slots[act_s].offset,
@@ -776,57 +815,99 @@ static int exec_fill(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
-/* GEHTP P5: 真 DMA runlist 算子 (独立 OP_DMA, 不动 matmul 内嵌 DMA)。
- * args: [src_ref, dst_ref, bytes, src_bypass, dst_bypass, fence_w, fence_r, fence_mem, slot_off]
- *   src_ref/dst_ref: temp id / 0x8000|slot / 0x4000|vtcm 引用 (同 spill/fill 族)
- *   src_bypass/dst_bypass: 0/1, 透传 dc_dma_once (真 UserDMA, 非标量 memcpy)
- *   fence_w/r/mem: FC_* / FM_* 三元组, DMA 写 dst 后调 fence_handoff(dst,...)
- *     (方向对偶 cache handoff; 与 exec_matmul out 侧 INVALIDATE 同语义, 见 fence.h)
- * 引擎走 dc_dma_once + fence_handoff, 而非 xop 内硬编码。 */
+/* P5 arity-8 DMA runlist: [src_ref,dst_ref,bytes,src_off,dst_off,flags,fence_src,fence_dst]. */
+static uint8_t* dma_ref_resolve(const struct wt_blob* b, uint32_t ref,
+                                uint32_t off, uint32_t bytes, int is_dst,
+                                int* mem) {
+    uint8_t* p = NULL;
+    if ((ref & 0xC000u) == 0xC000u) {
+        if (!g_exec.matmul_carved) return NULL;
+        uint32_t cap = 0;
+        switch (ref & 0xFFu) {
+        case WT_ENG_ACT:  p = g_exec.e.act;  cap = g_exec.e.m * g_exec.e.k * 2u; break;
+        case WT_ENG_OUT:  p = g_exec.e.out;  cap = g_exec.e.m * g_exec.e.n * 2u; break;
+        case WT_ENG_WT:   p = g_exec.e.wt;   cap = g_exec.e.k * g_exec.e.n / 2u; break;
+        case WT_ENG_BIAS: p = g_exec.e.bias; cap = (g_exec.e.n / 32u) * 512u; break;
+        default: return NULL;
+        }
+        if (!p || (uint64_t)off + bytes > cap) return NULL;
+        p += off;
+        *mem = FM_VTCM;
+        return p;
+    }
+    if (ref & 0x8000u) {
+        uint32_t s = ref & 0x7FFFu;
+        const uint8_t* sp = slot_ptr(b, s);
+        if (!sp || s >= b->n_slots) return NULL;
+        if ((uint64_t)off + bytes > b->slots[s].len) return NULL;
+        p = (uint8_t*)sp + off;
+    } else if (ref & 0x4000u) {
+        uint32_t t = ref & 0x3FFFu;
+        if (t >= MAX_TEMPS || g_exec.vtcm_off_arr[t] == 0xFFFFFFFFu) return NULL;
+        if (!g_exec.vtcm_pool && vtcm_pool_ensure() != 0) return NULL;
+        uint32_t base = g_exec.vtcm_off_arr[t];
+        if ((uint64_t)base + off + bytes > g_exec.vtcm_pool_size) return NULL;
+        p = g_exec.vtcm_pool + base + off;
+        *mem = FM_VTCM;
+        return p;
+    } else {
+        uint32_t t = ref;
+        if (t >= MAX_TEMPS) return NULL;
+        if (is_dst) {
+            p = temp_get(t, off + bytes);
+        } else {
+            if (!g_exec.temps[t] || (uint64_t)off + bytes > g_exec.temp_bytes[t])
+                return NULL;
+            p = g_exec.temps[t];
+        }
+        if (!p) return NULL;
+        p += off;
+    }
+    *mem = ptr_in_vtcm(p) ? FM_VTCM : FM_DDR;
+    return p;
+}
+
 static int exec_dma(const struct wt_blob* b, const struct wt_op* op,
                     char* err, size_t errn) {
     uint32_t bytes = op->args[2];
-    uint32_t src_bypass = op->args[3], dst_bypass = op->args[4];
-    uint32_t fw = op->args[5], fr = op->args[6], fm = op->args[7];
-    uint32_t slot_off = op->args[8];   /* 溢出池等 slot 内字节偏移(0x8000|slot 引用) */
+    uint32_t src_off = op->args[3], dst_off = op->args[4];
+    int src_bypass = (int)(op->args[5] & 1u), dst_bypass = (int)((op->args[5] >> 1) & 1u);
+    uint32_t f_src = op->args[6], f_dst = op->args[7];
     if (bytes == 0) return 0;
+    if ((f_src > 3u && f_src != WT_DMA_FENCE_NONE) ||
+        (f_dst > 3u && f_dst != WT_DMA_FENCE_NONE)) {
+        snprintf(err, errn, "dma fence arg bad"); return -1;
+    }
+    int src_mem = FM_DDR, dst_mem = FM_DDR;
+    uint8_t* src = dma_ref_resolve(b, op->args[0], src_off, bytes, 0, &src_mem);
+    uint8_t* dst = dma_ref_resolve(b, op->args[1], dst_off, bytes, 1, &dst_mem);
+    if (!src || !dst) { snprintf(err, errn, "dma ref fail"); return -1; }
 
-    const uint8_t* src = ref_ptr(b, op->args[0]);
-    if (!src) { snprintf(err, errn, "dma src empty"); return -1; }
-    if (op->args[0] & 0x8000u) src += slot_off;
-    uint8_t* dst = NULL;
-    if (op->args[1] & 0x8000u) {
-        const uint8_t* s = slot_ptr(b, op->args[1] & 0x7FFFu);
-        dst = s ? (uint8_t*)(s + slot_off) : NULL;
-    } else if (op->args[1] & 0x4000u) {
-        uint32_t t = op->args[1] & 0x3FFFu;
-        if (t < MAX_TEMPS && g_exec.vtcm_pool && g_exec.vtcm_off_arr[t] != 0xFFFFFFFFu)
-            dst = g_exec.vtcm_pool + g_exec.vtcm_off_arr[t];
+    int src_vtcm = (src_mem == FM_VTCM), dst_vtcm = (dst_mem == FM_VTCM);
+    int scalar = (src_vtcm && dst_vtcm) || ((bytes & 7u) != 0);
+    int fc_peer = scalar ? FC_CPU : FC_DMA;
+
+    if (f_src != WT_DMA_FENCE_NONE &&
+        fence_handoff(src, bytes, (int)f_src, fc_peer, src_mem) != FENCE_OK) {
+        snprintf(err, errn, "dma fence src combo"); return -1;
+    }
+    if (!scalar) {
+        static dc_mutex_t mu;
+        static int mu_ready;
+        if (!mu_ready) { dc_mutex_init(&mu); mu_ready = 1; }
+        struct dc_dma d;
+        if (dc_dma_init(&d, src, dst, bytes, &mu) != 0) {
+            snprintf(err, errn, "dma desc alloc"); return -1;
+        }
+        int rc = dc_dma_once_ex(&d, src_bypass, dst_bypass);
+        dc_dma_destroy(&d);
+        if (rc) { snprintf(err, errn, "dma 0x%X", rc); return -1; }
     } else {
-        dst = temp_get(op->args[1], bytes);
+        memcpy(dst, src, bytes);
     }
-    if (!dst) { snprintf(err, errn, "dma dst empty"); return -1; }
-
-    static dc_mutex_t mu;
-    static int mu_ready;
-    if (!mu_ready) { dc_mutex_init(&mu); mu_ready = 1; }
-
-    /* 铁律①: DDR src + DMA bypass 直读 → 写者(CPU)先 FLUSH_INVALIDATE (dma_copy_ddr 同款) */
-    if (!ptr_in_vtcm(src) && src_bypass) dc_clean_ddr(src, bytes);
-
-    struct dc_dma d;
-    if (dc_dma_init(&d, (uint8_t*)src, dst, bytes, &mu) != 0) {
-        snprintf(err, errn, "dma init"); return -1;
-    }
-    d.src_bypass = src_bypass;
-    d.dst_bypass = dst_bypass;
-    int rc = dc_dma_once(&d);
-    dc_dma_destroy(&d);
-    if (rc != 0) { snprintf(err, errn, "dma once 0x%X", rc); return -1; }
-
-    /* fence 三元组: DMA 写 dst 后按 (writer,reader,mem) 方向对偶 handoff */
-    if (fence_handoff(dst, bytes, (int)fw, (int)fr, (int)fm) != FENCE_OK) {
-        snprintf(err, errn, "dma fence combo"); return -1;
+    if (f_dst != WT_DMA_FENCE_NONE &&
+        fence_handoff(dst, bytes, fc_peer, (int)f_dst, dst_mem) != FENCE_OK) {
+        snprintf(err, errn, "dma fence dst combo"); return -1;
     }
     return 0;
 }

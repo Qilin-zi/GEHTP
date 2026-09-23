@@ -20,7 +20,9 @@
 extern "C" {
 #endif
 
-#define WT_EXEC_MAX_TEMPS 256
+/* 0.8B 全模型 blob temp id 实测至 1403+(输出 temp 1401), 256 会死在首个
+ * temp≥256 的 op (broadcast ref fail, 2026-09-22 v3 复跑实锤) → 4096 对齐 WT_MAX_SLOTS */
+#define WT_EXEC_MAX_TEMPS 4096
 
 /* 顺序执行 b->ops。engine_m 回填引擎形状 (0=无 MATMUL op)。
  * op_us (可 NULL) 回填每 op 耗时表数组 (长度必须 >= n_ops)。

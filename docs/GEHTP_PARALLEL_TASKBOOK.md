@@ -223,7 +223,36 @@
 
 ## 8. 战役日志（追加区，新进展置顶）
 
+### 2026-09-22 C1 线 (eqfix 会话) — 全模型设备 run 三重门连环爆破: emit 静默兜底 ×2 + MAX_TEMPS 物理上限
+
+**动机**: CONVERGE Phase 1.2("broadcast opcode 补齐")复盘。结论先行: ①broadcast 执行体本树 09-01 已具(de237a1), 09-18"停点"系板上陈旧 lib 假象; ②真实阻塞 = emit 两处静默兜底毒化数值; ③**本树 lib 的 MAX_TEMPS=256 物理上限使全模型从未在本树跑通过**——09-19 22:41 optrace 全过(/tmp 已清)是平行树 lib 的功劳, 非本树能力。
+
+**实锤链**:
+1. 0.8B 设备存量输出(output_08b/dev_out, /tmp/gehtp_110 遗迹)经判分: **7,946,240 元素全 -inf**——执行链 rc=0 但数值全死。
+2. blob 取证(.scratch_a3 v2): idx23 `BINARY [0x8001,7,5,32,sub=0]` = **EQUAL(operation=3) 被 qnn_binary_to_sub 静默兜底成 ADD**(全图唯一 Equal = pad 掩码 Equal(attention_mask, Const_17)); 另 **SOFTPLUS(Neuron 7) ×18 被发成 UNARY sub=0xFFFFFFFF**, exec_unary default 静默直通(GDN 门控全错)。optrace 实锤 `code=11 sub=4294967295`。
+3. v2 blob 三个烘焙输入槽**全零**(编译未给 --input-f16, PORTAL "不给则全零")——mask=0 + ADD 兜底恰好不点火(ADD(0,0)=0), 全 -inf 另有来源(SOFTPLUS 直通/scatter_nd/Pad 候选); **EQ 修复后烘焙必须给真值(mask=ones/pos=arange), 否则 EQ(0,0)=1=全掩码=必全 -inf**。
+4. **MAX_TEMPS=256 物理上限实锤**: v3 复跑死 op 2617(1-based), err=`broadcast ref fail`; blob temp id 至 1403+(输出 temp 1401), 而本树 lib `#define MAX_TEMPS 256`(09-01 起)——`ref_ptr/temp_get/wt_exec_temp_last_bytes` 对 id≥256 全返 NULL/0, **即使跑完全程也会写出 0 字节输出**。升 4096(对齐 WT_MAX_SLOTS)后同一 blob 顺利越过停点跑至 16297/16297。
+
+**修复**(全部已设备验证):
+- emit 映射: `qnn_binary_to_sub` case 3→4(EQ), `qnn_neuron_to_sub` case 7→13(SOFTPLUS); **静默兜底改硬错误**(op_eltwise_binary/op_unary 遇未知 operation 即报错退出, A5 预检精神最小落地)。
+- 设备执行体: exec_binary case 4(EQ, host ops.cpp 同款 0/1), exec_unary case 13(SOFTPLUS 稳定化公式与 host 逐字同款)。
+- 契约登记: oplist_parse.h subtype 注释(BINARY 4=EQ, UNARY 13=SOFTPLUS); subtype 扩展不动 opcode/arity, 旧 blob 行为不变(旧 blob 的 Equal 仍是错误 ADD 语义, 需重编)。
+- **MAX_TEMPS 256→4096**(oplist_exec.c + WT_EXEC_MAX_TEMPS 同步, 例 38-41 guard 语义不变)。
+- 测试: test_wtop_emit +6 断言(EQ/SOFTPLUS subtype 契约 + 未知 op 硬错误 ×2 + 建图 name_tag 坑), ctest 47/47 绿。
+- 构建环境登记: 宿主机 g++-9 无法编译(他方 __builtin_bit_cast, 已由 aae0e09 修 C++17), **编译器一律容器 `gehtp-toolchain:24.04` (GCC 13)**: `docker run --rm -u $(id -u):$(id -g) -v /disk1:/disk1 -v /disk1/toolchains:/opt/toolchains:ro -w /disk1/gehtp/compiler gehtp-toolchain:24.04 bash -lc "cmake -S . -B build_<tag> && cmake --build build_<tag> -j"`; scripts/gehtp 已修 source env.sh(五件套死路径收敛)。
+- v3 blob: v2 tagged.bin 直接重发射(免 2-4h hnnx_compile), f16 权重域(GGUF 不在本机), 2.04GB, EQ sub=4 ×1 + SOFTPLUS sub=13 ×18 + 烘焙 ids/mask=ones/pos=arange 逐项槽位校验。
+
+**设备门 (d0f1784, lib=本树构建含 eqfix+MAX_TEMPS 4096)**: 复跑 v3 ×4 prompts → judge 结果见下条(待补)。
+
+**2026-09-23 设备复跑日志（eqfix 会话）**:
+- v3 blob 已在 d0f1784，尺寸一致，设备侧未提供可选外置 `qwen35_08b_v3.weights.bin`；runner 正确回退到 blob 内嵌 f16 权重（不是失败原因）。
+- `qwen35_08b_v3.device.txt` 实锤：`wt_parse ok`、`wt_exec_run_io rc=0`、`ops=16297`、`out_temp=1401`；总耗时约 275.7 s，说明 MAX_TEMPS=4096 后已完整跑过全图。
+- 之前 P2/P3 复跑因多个 run 并发共享同一设备 `job.txt`/`output.f16.raw` 通道而互相覆盖，退出码不具判读性；后续改为串行，每次完成 pull 后立即 judge。
+
+**挂账**: ①全 -inf 若仍现, 下一嫌疑 = scatter_nd 首实跑/Pad 尾部垃圾/Cast, exdiag 二分工具链现成; ②C1 总门 cos≥0.9999+top1 4/4 未必一次达(host 链自身 0.9987/26~31), 门收口另行; ③oplist_exec.c 未提交 = eqfix(case 4/13+MAX_TEMPS)叠在 prof W-P3 在途(+395 行 HVX/HMX)之上, commit 需与 prof 会话错峰协商; ④v2 blob(EQ 错误语义+烘焙全零)及其设备输出全部作废, test_assets/qwen35_08b/qwen35_08b.wtop 同源需按 v3 流程重编替换。
+
 ### 2026-09-17 C1 线 (105 会话) — VL Gather 回归定罪 + A3 判决 + A3② 落地 + 设备楔死旁证
+
 
 1. **VL 在途 Gather 通用化重写 = host 链回归源（bisect 三组对照定案）**：compact 剥前导 size-1 维后 axis 未同步左移。L0 GDN tbl `[1,16,1,64,64]` axis=3（converter 按原始 rank 写）→ 压缩 `[16,1,64,64]` 后真轴=2，VL 用 axis=3 取末维 → 全层错位。现行链 L0 host vs HF 锚点 cos=**0.53**（pre-VL=1.0 / VL minus Gather=1.0 / 4090 VL 二进制=0.53，三方对照）。**修复 = `axis -= (原始rank - 压缩rank)`**（105 提交 ef5869e），修复链 cos=1.0、vs gold_ncf 0.999999。**104 基线树 host_run 对全模型 GDN 层输出当前不可信（66 gather/层 × 18 层同型），修复须回灌。**
 2. **A3 判决（数值实锤，docs/A3_COPY_SEM_AUDIT.md）**：ScatterNd 恒等拷贝 → L0 cos **0.102 死刑**（GEHTP_HOST_*_IDENTITY 仿真旗标已入 ops.cpp）；Pad 恒等 L0 无害（尾部垃圾挂账）；Cast 待全模型；**"L3 恒等安全"是伪命题——L3 含 0 个 ScatterNd/Pad/Cast**，从未考验该路径。0.8B 全部 1245 copy-sem 站点（除 Reshape）均可达 logits，无死端。

@@ -6,6 +6,7 @@
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
 #include "hnnx/ir/types.hpp"
+#include "hnnx/ir/scalar_params.hpp"
 #include "hnnx/ops/ops.hpp"
 
 #include <cstdio>
@@ -197,6 +198,88 @@ int main() {
             std::memcpy(bad.data() + op0 + 2, &wrong, 2);
         }
         CHECK(wt_parse(bad.data(), bad.size(), wb) == WT_ERR_ARITY, "neg: 坏 arity -> ARITY");
+    }
+
+    /* 6. operation 映射契约(2026-09-22 静默兜底治理):
+     * EQUAL(binary op=3) → OP_BINARY_F16 sub=4;
+     * SOFTPLUS(neuron op=7) → OP_UNARY_F16 sub=13;
+     * 未知 operation → emit 硬错误非零(不再静默 ADD/0xFFFFFFFF 进 blob)。
+     * 建图模式同 build_conv_add: Input → 单 op → Output。 */
+    {
+        auto scalar_op = [](double v) {
+            ScalarParam p; p.name = "operation"; p.is_numeric = true; p.value_num = v;
+            return pack_scalar_params(std::vector<ScalarParam>{p});
+        };
+        auto run_case = [&](const char* tag, const char* op_name, double oper,
+                            uint16_t expect_opcode, uint32_t expect_sub, bool expect_fail) {
+            GraphPrepare g;
+            auto od = make_od4(1, 1, 1, 32);
+            od.dtype = static_cast<uint32_t>(DType::Float16);
+            g.append_node("Input", 1, nullptr, 0, &od, 1, nullptr);
+            auto sp = scalar_op(oper);
+            InputDef oin[1] = {{3, 0}};
+            if (std::strcmp(op_name, "Eltwise_Binary") == 0) {
+                auto cw = make_od4(1, 1, 1, 32);  // const f32 权重域(同 conv_add 惯例)
+                std::vector<float> c0(32, 0.0f);
+                g.append_const_node(2, cw, reinterpret_cast<const uint8_t*>(c0.data()), c0.size() * 4);
+                g.get_op_at(2)->name_tag = string_tag_t::map_str("c0");
+                InputDef ein[2] = {{1, 0}, {2, 0}};
+                g.append_node(op_name, 3, ein, 2, &od, 1, sp.data(), sp.size());
+            } else {
+                InputDef uin[1] = {{1, 0}};
+                g.append_node(op_name, 3, uin, 1, &od, 1, sp.data(), sp.size());
+            }
+            g.append_node("Output", 4, oin, 1, nullptr, 0, nullptr);
+            std::string pre = std::string("  [") + tag + "] ";
+            if (g.prepare(env) != GraphStatus::Success) {
+                CHECK(false, (pre + "prepare").c_str());
+                return;
+            }
+            std::vector<uint8_t> b2(1u << 16, 0);
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) {
+                CHECK(false, (pre + "serialize").c_str());
+                return;
+            }
+            const std::string bp = dir + tag + ".bin";
+            const std::string ip = dir + tag + ".f16.raw";
+            const std::string op2 = dir + tag + ".wtop";
+            const std::string mp = dir + tag + ".manifest.json";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint8_t> in16(64, 0);
+            write_file(ip, in16.data(), in16.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 +
+                             " --manifest " + mp + " 2>/dev/null";
+            int rc2 = std::system(c2.c_str());
+            if (expect_fail) {
+                CHECK(rc2 != 0, (pre + "未知 operation -> emit 硬错误(非零)").c_str());
+                return;
+            }
+            if (rc2 != 0) {
+                // 诊断: 去重定向重跑一次, 让 emit 的报错直接可见
+                std::system((std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 +
+                             " --manifest " + mp).c_str());
+                CHECK(false, (pre + "emit exit 0").c_str());
+                return;
+            }
+            std::vector<uint8_t> bl2;
+            if (!load_file(op2, bl2)) { CHECK(false, (pre + "read blob").c_str()); return; }
+            wt_blob* w2 = new wt_blob{};
+            if (wt_parse(bl2.data(), bl2.size(), w2) != WT_OK) { CHECK(false, (pre + "wt_parse").c_str()); delete w2; return; }
+            CHECK(w2->n_ops == 1 && w2->ops[0].opcode == expect_opcode,
+                  (pre + "单 op opcode 契约").c_str());
+            if (expect_opcode == OP_BINARY_F16)
+                CHECK(w2->ops[0].args[4] == expect_sub, (pre + "BINARY subtype 契约").c_str());
+            else
+                CHECK(w2->ops[0].args[3] == expect_sub, (pre + "UNARY subtype 契约").c_str());
+            delete w2;
+        };
+        run_case("eq", "Eltwise_Binary", 3.0, OP_BINARY_F16, 4, false);
+        run_case("softplus", "ElementWiseNeuron", 7.0, OP_UNARY_F16, 13, false);
+        run_case("badbin", "Eltwise_Binary", 99.0, 0, 0, true);
+        run_case("badneu", "ElementWiseNeuron", 99.0, 0, 0, true);
     }
 
     std::printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASS", failed);

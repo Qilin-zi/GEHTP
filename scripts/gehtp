@@ -9,13 +9,15 @@
 # runner 读 job.txt(定值路径), 跑 wt_parse→wt_exec_run_io→写输出文件。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 110 布局: env.sh 收敛五件套路径 (存在即覆盖下列历史默认)
+[ -f "$ROOT/env.sh" ] && source "$ROOT/env.sh"
 CB="$ROOT/compiler/build_linux"
 KD="$ROOT/kernels"
-SDK=/4090disk2/QCtools/qairt_2.48.40.260702
-PY=/4090disk2/Qwen35dev/revlibHtpPrepare/venv310/bin/python3
-HEX=/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0
+SDK=${SDK:-/4090disk2/QCtools/qairt_2.48.40.260702}
+PY=${PY:-/4090disk2/Qwen35dev/revlibHtpPrepare/venv310/bin/python3}
+HEX=${HEX:-/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0}
 HT="$HEX/tools/HEXAGON_Tools/19.0.07"
-SWIV=/4090disk2/QCtools/swiv_build_utility.py
+SWIV=${SWIV:-/4090disk2/QCtools/swiv_build_utility.py}
 DEVROOT=/data/local/tmp/hvxhmx23
 GDIR="$DEVROOT/gehtp"
 

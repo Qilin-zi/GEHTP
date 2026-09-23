@@ -75,6 +75,15 @@ extern "C" {
  * TEMPOFF 槽 reserve 字段拆两段(u32): [低 16 位=表外 bump 预留 KB] |
  * [高 16 位=VTCM 池大小 KB](0=无 VTCM 驻留)。 */
 #define WT_REF_VTCM_FLAG 0x4000u
+/* P5: 引擎面引用编码(0xC000|surface_id), 仅 OP_DMA 的 src/dst 可用。
+ * 0=e.act, 1=e.out, 2=e.wt, 3=e.bias。 */
+#define WT_REF_ENG_FLAG 0xC000u
+#define WT_ENG_ACT 0u
+#define WT_ENG_OUT 1u
+#define WT_ENG_WT 2u
+#define WT_ENG_BIAS 3u
+/* 不做该侧 cache/fence 操作。合法通道值取 fence.h 的 FC_*。 */
+#define WT_DMA_FENCE_NONE 0xFFu
 
 enum {
     OP_NOP = 0,
@@ -126,10 +135,8 @@ enum {
                                arity 14 (A3② 真语义; 恒等拷贝=数值死刑, docs/A3 判决)
                                data/upd f16, idx i32 (0x8000|slot 或 temp 引用);
                                out=data 拷贝后按 n_idx 组 K 维坐标写 block 块 */
-    OP_DMA = 29,           /* [src_ref,dst_ref,bytes,src_bypass,dst_bypass,
-                               fence_w,fence_r,fence_mem,slot_off] arity 9
-                               (P5 真 DMA runlist 算子; 独立于 spill/fill,
-                                dc_dma_once 带 bypass + fence_handoff(dst)) */
+    /* P5: True DMA runlist operator (arity=8, args: [src,dst,bytes,src_off,dst_off,flags,fence_src,fence_dst]) */
+    OP_DMA = 33,
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -162,7 +169,7 @@ enum {
 #define WT_ARITY_BROADCAST_F16 12
 #define WT_ARITY_TRANSPOSE_GEN_F16 8
 #define WT_ARITY_SCATTER_ND_F16 14
-#define WT_ARITY_DMA 9
+#define WT_ARITY_DMA 8
 
 struct wt_slot {
     uint32_t len;

@@ -112,6 +112,7 @@ gehtp run m.wtop --input x0_new.f16.raw --output out.f16.raw   # x1 用编译时
 | 逐 op 轨迹 | 设备 `/data/local/tmp/hvxhmx23/optrace.txt` |
 | `no output on device` | 看 runner 日志 `[FAIL]` 行（如 `transpose_gen rank 5` = blob 含 rank>4 转置，用当前 build 重新 compile，16af35d 已修） |
 | 拉到陈旧输出 | 不可能（run 前自动 rm）；若见即 bug |
+| **设备输出全 -inf / 全同值** | **先查烘焙**：blob 未给 `--input-f16` 时其余图输入固化全零——mask 全零经 EQ 语义=全掩码全 -inf（EQ 修复前 ADD 兜底反而不点火，2026-09-22 实锤）。再查 emit 静默兜底：unknown operation 曾静默 ADD/直通（已改硬错误）；host 链正常但设备死 = host/emit 语义分叉，逐 op dump 对拍 |
 | 编译器覆盖 | 20 型 opcode 家谱（0.8B 全模型）；新 op 报 `opcode N unhandled` 是编译器缺口不是门户问题 |
 
 ## 6. 已验证矩阵（52f67807 实测）
