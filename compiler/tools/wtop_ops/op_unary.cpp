@@ -13,8 +13,18 @@ static int op_unary(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uin
     uint32_t out_t = em.fresh_temp(gp, od->op_id);
     uint32_t sub = (nm == "Eltwise_Unary") ? qnn_unary_to_sub(e.operation)
                                            : qnn_neuron_to_sub(e.operation);
-    em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od),
-                             sub == 0xFFFFFFFFu ? 0xFFFFFFFFu : sub});
+    if (sub == 0xFFFFFFFFu) {
+        /* 硬错误(P1 消除静默兜底): 未知 operation 不得进 blob —
+         * 此前 0xFFFFFFFF 原样入 blob, exec_unary default 静默直通,
+         * 0.8B GDN SOFTPLUS ×18 全被拷成恒等(战役日志 2026-09-22) */
+        std::fprintf(stderr,
+                     "error: %s op %llu (%s) operation=%u 无设备映射\n",
+                     nm.c_str(), (unsigned long long)od->op_id,
+                     od->name_tag && od->name_tag->name() ? od->name_tag->name() : "?",
+                     e.operation);
+        return 5;
+    }
+    em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od), sub});
     return 0;
 }
 

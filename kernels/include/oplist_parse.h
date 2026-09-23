@@ -76,6 +76,15 @@ extern "C" {
  * TEMPOFF 槽 reserve 字段拆两段(u32): [低 16 位=表外 bump 预留 KB] |
  * [高 16 位=VTCM 池大小 KB](0=无 VTCM 驻留)。 */
 #define WT_REF_VTCM_FLAG 0x4000u
+/* P5: 引擎面引用编码(0xC000|surface_id), 仅 OP_DMA 的 src/dst 可用。
+ * 0=e.act, 1=e.out, 2=e.wt, 3=e.bias。 */
+#define WT_REF_ENG_FLAG 0xC000u
+#define WT_ENG_ACT 0u
+#define WT_ENG_OUT 1u
+#define WT_ENG_WT 2u
+#define WT_ENG_BIAS 3u
+/* 不做该侧 cache/fence 操作。合法通道值取 fence.h 的 FC_*。 */
+#define WT_DMA_FENCE_NONE 0xFFu
 
 enum {
     OP_NOP = 0,
@@ -91,8 +100,8 @@ enum {
     OP_FILL = 9,
     OP_TRANSPOSE_F16 = 10,
     /* M2/M3 契约(D6 清单, QNN op 语义; 0-10 不动, 向后兼容) */
-    OP_UNARY_F16 = 11,      /* [x_t,y_t,n,subtype]   subtype: 0=NEG 1=EXP 2=SQRT 3=RSQRT 4=LOG 5=ABS 6=SIN 7=COS; (Neuron) 8=SIGMOID 9=TANH 10=GELU 11=RELU 12=SWISH */
-    OP_BINARY_F16 = 12,     /* [a_t,b_t,y_t,n,subtype] subtype: 0=ADD 1=SUB 2=MUL 3=DIV */
+    OP_UNARY_F16 = 11,      /* [x_t,y_t,n,subtype]   subtype: 0=NEG 1=EXP 2=SQRT 3=RSQRT 4=LOG 5=ABS 6=SIN 7=COS; (Neuron) 8=SIGMOID 9=TANH 10=GELU 11=RELU 12=SWISH 13=SOFTPLUS(稳定化, host ops.cpp 同款) */
+    OP_BINARY_F16 = 12,     /* [a_t,b_t,y_t,n,subtype] subtype: 0=ADD 1=SUB 2=MUL 3=DIV 4=EQ(bool 0/1); 8=SELECT 三元(另 4 参形态) */
     OP_SOFTMAX_F16 = 13,    /* [x_t,y_t,rows,n]       rows = 行数(每行 n 元素) */
     OP_CONCAT_F16 = 14,     /* [in_t0..7,out_t,axis,n_segments,n_elems,size0..3] arity 16
                                 (每段 axis 维尺寸显式; ≤4 段, 0.8B 实测 2-3 段) */
@@ -127,7 +136,9 @@ enum {
                                真 ScatterND (A3 暗雷收口): out=data 拷贝后,
                                对 n_idx 个坐标 (每坐标 K 维, idx_s int32 槽)
                                写 upd[e] 到 out[base]; block=1 (GDN attn_iter
-                               每步写单点; 恒等拷贝冒充在 0.8B 1154 处全错) */
+                               每步写单点; 恒等拷贝冒充在 0.8B 1154 处全错)。
+                               合并裁定: 采 12 参版 (与树内发射器 op_scatter_nd.cpp
+                               及存量 0.8B blob 一致), prof-wp 14 参版弃用 */
     OP_PAD_F16 = 29,          /* [x_ref,out_t,rk,in_d0..3,out_d0..3,pb0..3,padv_f16] arity 16
                                真 Pad (CONSTANT scheme): out 先填 pad 值, 再按
                                前 pad 偏移把 in 拷入 (C 序, rank≤4)。恒等冒充
@@ -135,6 +146,12 @@ enum {
     OP_CAST_I32_F16 = 30,     /* [x_ref,out_t,n_i32] int32 位模式 → f16 数值
                                (参考实现同款: RoPE 位置链 Cast 才转数值;
                                恒等冒充 → 位置值=次正规 → RoPE 全错) */
+    /* 31/32 空位: prof 线在途 opcode 预留 (58cc915 意图; 注意 29/30 已被
+     * 本线 PAD/CAST 冻结占用, 未来 prof opcode 若声称 29/30 须顺延 34+) */
+    OP_DMA = 33,              /* [src,dst,bytes,src_off,dst_off,flags,fence_src,fence_dst]
+                               arity 8 (P5 真 DMA runlist 算子, 独立于 spill/fill;
+                               dma_ref_resolve 三态引用 + VTCM 池懒初始化;
+                               编号 33 = 58cc915 终态, 编译器经本头取常量同步) */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -169,6 +186,7 @@ enum {
 #define WT_ARITY_SCATTER_ND_F16 12
 #define WT_ARITY_PAD_F16 16
 #define WT_ARITY_CAST_I32_F16 3
+#define WT_ARITY_DMA 8
 
 struct wt_slot {
     uint32_t len;

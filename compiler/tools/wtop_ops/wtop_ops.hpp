@@ -636,6 +636,7 @@ inline uint32_t qnn_binary_to_sub(uint32_t op) {
     case 18: return 1;   /* SUBTRACT */
     case 13: return 2;   /* MULTIPLY */
     case 2:  return 3;   /* DIVIDE */
+    case 3:  return 4;   /* EQUAL → bool 0/1 (0.8B pad 掩码; 静默 ADD 兜底=设备全 -inf 实锤) */
     default: return 0xFFFFFFFFu;
     }
 }
@@ -659,7 +660,8 @@ inline uint32_t qnn_neuron_to_sub(uint32_t op) {
     case 1:  return 10;  /* GELU */
     case 4:  return 11;  /* RELU */
     case 3:  return 12;  /* HARD_SWISH → SWISH 近似 */
-    case 7:  return 13;  /* SOFTPLUS (设备侧 case 13; 缺失=恒等→cumsum 爆炸) */
+    case 7:  return 13;  /* SOFTPLUS (GDN 门控 ×18; 设备侧 case 13, 稳定化公式
+                            见 exec_unary; 缺失=恒等→cumsum 爆炸) */
     default: return 0xFFFFFFFFu;
     }
 }

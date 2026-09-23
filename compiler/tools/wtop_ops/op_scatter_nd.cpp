@@ -1,9 +1,3 @@
-// A3-① 判决 (docs/A3_COPY_SEM_AUDIT.md): ScatterNd 恒等拷贝 = L0 cos 0.102 死刑,
-// 必须真语义上设备。发射 OP_SCATTER_ND_F16 (opcode 28, §7 预登记):
-//   args = [data_ref, idx_s, upd_ref, out_t, n_out, rank, d0..d4, K, n_idx, block]
-//   data/updates: f16 (ref 可 temp 或 0x8000|slot); idx: i32 (const → slot)
-//   K=indices 末维 (≤5), n_idx=前导维积, block=updates_elems/n_idx
-=======
 // op_scatter_nd.cpp — ScatterNd 真语义发射(算子三件套·host 发射侧; A3 暗雷收口)
 //
 // 背景: ScatterNd 此前走 op_copy_sem 恒等拷贝(OP_UNARY_F16 passthrough),

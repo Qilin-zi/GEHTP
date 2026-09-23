@@ -40,7 +40,7 @@
 | # | 任务 | 范围/文件 | 门 |
 |---|---|---|---|
 | 1.1 | ~~NSP 域探针~~【已闭合】 | 实证：domain 3 可用（RUNBOOK §7.4，optrace 为证）；NSP 域（16/1600）留档为未来多核分流选项 | runner 已实跑 |
-| 1.2 | broadcast opcode 补齐【关键路径】 | runner 停点：broadcast 形态未覆盖。归 A 线 emit 覆盖墙：定位具体 op（optrace 尾部 code=12 后续），emit handler + 设备执行体 | runner 跑过停点；conv_add/L3 回归绿 |
+| 1.2 | ~~broadcast opcode 补齐~~【已闭合，2026-09-22，根因改写】 | 复盘实锤：broadcast 执行体在本树 09-01 已具（de237a1），09-18"停点"系板上陈旧 lib 假象——09-19 22:41 optrace 全模型 16297 op 全 rc=0（含 9416 行 code=26）。**真实缺口 = emit 两处静默兜底**（EQUAL→ADD ×1 毒化掩码路径、SOFTPLUS→0xFFFFFFFF 直通 ×18），修复见 TASKBOOK §8 2026-09-22 条目 | runner 跑过停点；conv_add/L3 回归绿 |
 | 1.3 | gehtp setup 适配新板 | 四件套已就位（09-18）；核对 skel 正典 md5（防 third_party 毒件）、`--device d0f1784` 全流程 | setup 读回校验绿 |
 | 1.4 | 设备队列协议升双板 | PORTAL §4 / TASKBOOK §2.3 登记表加板卡列；互斥检查命令按板参数化 | 文档+quickstart 检查同步 |
 | 1.5 | **C1/C4 设备门补跑** | 0.8B（A3②真 scatter 重编 blob，qwen35_08b_scatter.wtop 已上板）+ minicpm（5.15GB v2 blob）在新板跑设备门 | judge_logits / judge_minicpm 判据达标，战役日志更新 |

@@ -122,6 +122,7 @@ int dc_dma_init(struct dc_dma* d, uint8_t* src, uint8_t* dst, uint32_t bytes,
     if (posix_memalign(&d->desc, 16, DMA_DESC_SIZE_1D) != 0) return 0xD200;
     memset(d->desc, 0, DMA_DESC_SIZE_1D);
     d->src = src; d->dst = dst; d->bytes = bytes; d->mu = mu;
+    d->src_bypass = 1; d->dst_bypass = 0;  /* 默认同 1-C 硬编码契约 */
     return 0;
 }
 
@@ -154,11 +155,12 @@ int dc_dma_once(struct dc_dma* d) {
     const int64_t t_dma0 = HAP_perf_get_time_us();
     dma_desc_1d_params_t p;
     memset(&p, 0, sizeof(p));
-    /* src 已由 dc_dma_clean_src 一次性清过; bypass 1/0 契约同 1-C */
+    /* src 已由 dc_dma_clean_src 一次性清过; bypass 来自 d->src_bypass/dst_bypass
+     * (dc_dma_init 默认 1/0 同 1-C 契约; OP_DMA 透传覆盖) */
     p.src_address = (uint32_t)(uintptr_t)d->src;
     p.dst_address = (uint32_t)(uintptr_t)d->dst;
-    p.src_bypass = 1;
-    p.dst_bypass = 0;
+    p.src_bypass = d->src_bypass;
+    p.dst_bypass = d->dst_bypass;
     p.length = d->bytes;
     p.order = 1;
     if (dma_desc_init(d->desc, &p, DMA_DESC_TYPE_1D) != DMA_SUCCESS) return 0xD201;

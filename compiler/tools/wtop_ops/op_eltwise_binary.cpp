@@ -82,8 +82,17 @@ static int op_eltwise_binary(Emitter& em, GraphPrepare& gp, const OpDef* od, std
     if (sub == 0) em.add_op(OP_ADD_F16, {a_t, b_t, out_t, (uint32_t)n});
     else if (sub != 0xFFFFFFFFu)
         em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, (uint32_t)n, sub});
-    else
-        em.add_op(OP_BINARY_F16, {a_t, b_t, out_t, (uint32_t)n, 0});
+    else {
+        /* 硬错误(P1 消除静默兜底): 未知 operation 不得进 blob —
+         * 静默 ADD 兜底曾把 0.8B 唯一 EQUAL(pad 掩码)算成 mask+0,
+         * 设备输出全 -inf(战役日志 2026-09-22) */
+        std::fprintf(stderr,
+                     "error: Eltwise_Binary op %llu (%s) operation=%u 无设备映射\n",
+                     (unsigned long long)od->op_id,
+                     od->name_tag && od->name_tag->name() ? od->name_tag->name() : "?",
+                     subtype);
+        return 5;
+    }
     return 0;
 }
 

@@ -40,6 +40,8 @@ enum class DmaOpType {
     MSyncPost,
     MSyncWait,
     HVXSpawn,       // fork/join
+    DmaCheckpointSet,   // 真类型 (M36 typeinfo 0x5ec2568); real .bin serializes OP_TYPE_DMA
+    DmaCheckpointWait,  // 真类型 (M36 typeinfo 0x5ec2488); real .bin serializes OP_TYPE_DMA
 };
 
 // DMA mode flags (Phase 4.2, from PortableDMA decompilation)

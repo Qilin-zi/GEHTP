@@ -39,6 +39,8 @@ struct dc_dma {
     uint8_t* src;            /* DDR (CPU 写后由本函数清 cache) */
     uint8_t* dst;            /* VTCM 2KB 对齐 */
     uint32_t bytes;
+    uint32_t src_bypass;       /* 1=直读内存(默认, 同 1-C); 0=过 cache */
+    uint32_t dst_bypass;       /* 1=不经 cache(须手动清); 0=经 dcache(默认) */
     void* desc;              /* 16B 1D desc (DDR, posix_memalign 16) */
     dc_mutex_t* mu;          /* 共享 submit 锁 */
 };

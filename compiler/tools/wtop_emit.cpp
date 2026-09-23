@@ -74,7 +74,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& out_path, const std::string& manifest_path,
          const std::string& gguf_path, const std::string& match_path,
          bool ext_weights = false, const std::string& ext_weights_path = "",
-         bool force_v2 = false) {
+         bool force_v2 = false, bool dma_runlist = false) {
     // 1. deserialize .bin
     std::vector<uint8_t> bin;
     if (!load_file(bin_path, bin)) { std::fprintf(stderr, "error: cannot open %s\n", bin_path.c_str()); return 2; }
@@ -416,8 +416,17 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 if (sit == em.ddr_spill_map.end()) continue;
                 auto tit = em.op_temp.find(Emitter::tkey(c.src_id, c.out_idx));
                 if (tit == em.op_temp.end()) continue;  // 未物化(如 const 引用)
-                em.add_op(OP_FILL, {em.spill_pool_slot, (uint32_t)sit->second.first,
-                                    tit->second, (uint32_t)(sit->second.second / 2)});
+                if (dma_runlist) {
+                    /* P5 OP_DMA: DDR→DDR 溢出搬移 (arity 8: src_ref, dst_ref, bytes,
+                     * src_off, dst_off, flags, fence_src, fence_dst). flags=1,
+                     * fence_src=CPU/DDR/INVALIDATE, fence_dst=INVALIDATE. */
+                    em.add_op(OP_DMA, {0x8000u | em.spill_pool_slot, tit->second,
+                                       (uint32_t)sit->second.second,
+                                       0u, 0u, 1u, 0xFFu, 0xFFu});
+                } else {
+                    em.add_op(OP_FILL, {em.spill_pool_slot, (uint32_t)sit->second.first,
+                                        tit->second, (uint32_t)(sit->second.second / 2)});
+                }
             }
         }
         auto hit = wtop::op_registry().find(nm);
@@ -434,9 +443,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (sit != em.ddr_spill_map.end()) {
                 auto tit = em.op_temp.find(Emitter::tkey(id, 0));
                 if (tit != em.op_temp.end()) {
-                    em.add_op(OP_SPILL, {tit->second, em.spill_pool_slot,
-                                         (uint32_t)sit->second.first,
-                                         (uint32_t)(sit->second.second / 2)});
+                    if (dma_runlist) {
+                        /* P5 OP_DMA: SPILL 显式化 (arity 8: src_ref=staging
+                         * temp, dst_ref=0x8000|slot, bytes, 0/0/flags/
+                         * fence_src/fence_dst). dst_bypass=1. */
+                        em.add_op(OP_DMA, {tit->second, 0x8000u | em.spill_pool_slot,
+                                           (uint32_t)sit->second.second,
+                                           0u, 0u, 1u, 0xFFu, 0xFFu});
+                    } else {
+                        em.add_op(OP_SPILL, {tit->second, em.spill_pool_slot,
+                                             (uint32_t)sit->second.first,
+                                             (uint32_t)(sit->second.second / 2)});
+                    }
                 }
             }
         }
@@ -641,6 +659,7 @@ int main(int argc, char** argv) {
     std::string bin_path, in_f16, out_path, manifest_path, gguf_path, match_path, ext_weights_path;
     bool ext_weights = false;  // --ext-weights: 路线B 权重外置(blob 描述符 + model.weights.bin)
     bool force_v2 = false;     // --force-v2: 小模型强制 v2 槽记录(设备回归 v2 通路用)
+    bool dma_runlist = false;  // --dma-runlist: 溢出搬移发射真 OP_DMA(非 SPILL/FILL)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -660,12 +679,13 @@ int main(int argc, char** argv) {
         else if (a == "--ext-weights") ext_weights = true;
         else if (a == "--weights-bin") ext_weights_path = next();
         else if (a == "--force-v2") force_v2 = true;
+        else if (a == "--dma-runlist") dma_runlist = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (bin_path.empty() || out_path.empty()) {
-        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ext-weights [--weights-bin <params.bin>]]\n");
+        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ext-weights [--weights-bin <params.bin>]] [--dma-runlist]\n");
         return 2;
     }
     return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path,
-                ext_weights, ext_weights_path, force_v2);
+                ext_weights, ext_weights_path, force_v2, dma_runlist);
 }
