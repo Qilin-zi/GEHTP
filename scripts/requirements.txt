@@ -1,0 +1,5 @@
+fastapi>=0.100,<1
+uvicorn[standard]>=0.22,<1
+tokenizers>=0.13,<1
+pytest>=7,<9
+httpx>=0.24,<1
