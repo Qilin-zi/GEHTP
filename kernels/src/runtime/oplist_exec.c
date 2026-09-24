@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <HAP_perf.h>
 #include <qurt.h>
@@ -93,13 +95,23 @@ static void rtrace(const char* msg, int v) {
     if (g_rtrace) { fprintf(g_rtrace, "[run_io] %s %d\n", msg, v); fflush(g_rtrace); }
 }
 
-/* hostsim 调试钩子: GEHTP_HOOK="opidx:temp,..." — 执行到 op idx 后把
- * temp 内容 dump 到 /tmp/hook_<idx>_<temp>.f16.raw (仅 host 构建,
- * 设备 qurt 无此调试需求) */
-#ifndef __hexagon__
+/* 逐 op 张量 dump 钩子 (精度排查): spec = "opidx:temp,opidx:temp,..." —
+ * 执行到 op idx (run_range 内局部序号, 与 optrace 行号一致) 且 rc==0 后,
+ * 把 temp 按 g_last_bytes 落盘 hook_<idx>_<temp>.f16.raw。
+ * 下发: host 未 set 时回退 GEHTP_HOOK env (旧 hostsim 行为保持);
+ * 设备由 runner 读 job.txt "hook" 键经 wt_exec_set_hook 下发 (qurt 无 env)。
+ * 落盘: 设备 /data/local/tmp/hrt/gehtp/, host /tmp/。
+ * 写用 POSIX open/write 16MB 分块 (qurt stdio 大件死循环教训, 同 runner 输出写法)。 */
+static const char* g_hook_spec = NULL;
+void wt_exec_set_hook(const char* spec) { g_hook_spec = spec; }
 static void exec_hook_dump(uint32_t ii) {
-    static const char* hook = NULL;
-    if (!hook) hook = getenv("GEHTP_HOOK");
+    static const char* env_hook = NULL;
+    static int env_tried = 0;
+    const char* hook = g_hook_spec;
+    if (!hook) {
+        if (!env_tried) { env_hook = getenv("GEHTP_HOOK"); env_tried = 1; }
+        hook = env_hook;
+    }
     if (!hook || !hook[0]) return;
     const char* tok = hook;
     while (*tok) {
@@ -112,21 +124,36 @@ static void exec_hook_dump(uint32_t ii) {
             size_t l1 = (size_t)(col - tok);
             if (l1 > 15) l1 = 15;
             memcpy(b1, tok, l1); b1[l1] = 0;
-            snprintf(b2, sizeof b2, "%s", col + 1);
+            size_t l2 = len - l1 - 1;
+            if (l2 > 15) l2 = 15;
+            memcpy(b2, col + 1, l2); b2[l2] = 0;
             uint32_t hi = (uint32_t)strtoul(b1, NULL, 0);
             uint32_t ht = (uint32_t)strtoul(b2, NULL, 0);
             if (hi == ii && ht < MAX_TEMPS && g_exec.temps[ht]) {
-                char fn[96];
+                char fn[128];
+#ifdef __hexagon__
+                snprintf(fn, sizeof fn, "/data/local/tmp/hrt/gehtp/hook_%u_%u.f16.raw", hi, ht);
+#else
                 snprintf(fn, sizeof fn, "/tmp/hook_%u_%u.f16.raw", hi, ht);
-                FILE* f = fopen(fn, "wb");
-                if (f) { fwrite(g_exec.temps[ht], 1, g_last_bytes[ht], f); fclose(f); }
+#endif
+                int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd >= 0) {
+                    const uint8_t* p = (const uint8_t*)g_exec.temps[ht];
+                    uint32_t left = g_last_bytes[ht], off = 0;
+                    while (left) {
+                        uint32_t want = left > (16u << 20) ? (16u << 20) : left;
+                        ssize_t n = write(fd, p + off, want);
+                        if (n <= 0) break;
+                        off += (uint32_t)n; left -= (uint32_t)n;
+                    }
+                    close(fd);
+                }
             }
         }
         if (!comma) break;
         tok = comma + 1;
     }
 }
-#endif
 
 /* Level 1 输入注入: 外部输入缓冲 (run_io 设置) */
 static const uint8_t* g_ext_in = NULL;
@@ -891,8 +918,11 @@ static int exec_add(const struct wt_blob* b, const struct wt_op* op,
  * 快路径: 两端均 DDR 走 dc_dma_once(硬件 DMA); 任一端 VTCM 驻留回退标量 memcpy
  *         —— VTCM↔DDR 描述符 + fence 收编为后续项(GEHTP_MEMPLAN_GAP_CLOSURE P1)。 */
 static int ptr_in_vtcm(const uint8_t* p) {
+    /* 差值式判定: VTCM 映射在 32 位地址空间顶端 (实测 [0xff800000,4GB)),
+     * pool+size 可恰为 2^32 → 端点相加回绕成 0, 区间上界比较恒假 (w4dma 上板实锤)。
+     * p-pool 对 p>=pool 在回绕下仍正确 (pool_size 远小于 2^32)。 */
     return g_exec.vtcm_pool && p >= g_exec.vtcm_pool &&
-           p < g_exec.vtcm_pool + g_exec.vtcm_pool_size;
+           (uintptr_t)(p - g_exec.vtcm_pool) < g_exec.vtcm_pool_size;
 }
 static int dma_copy_ddr(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
     if (bytes == 0) return 0;

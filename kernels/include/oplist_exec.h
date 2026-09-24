@@ -72,6 +72,12 @@ int  wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
 /* 路线B: 外部权重区注入(run/run_io 前调一次; 权重 slot addr==WT_SLOT_EXT_WGT
  * 时从此基址+slot.offset 读)。NULL=禁用。与 run_io 解耦(权重常驻)。 */
 void wt_exec_set_ext_weights(const void* wgt_ptr);
+/* 逐 op 张量 dump 钩子 (精度排查): spec = "opidx:temp,opidx:temp,..." —
+ * 执行到 op idx 且 rc==0 后, 把 temp 按 g_last_bytes 落盘 hook_<idx>_<temp>.f16.raw
+ * (设备 /data/local/tmp/hrt/gehtp/, host /tmp/)。NULL/空串 = 关 (零开销)。
+ * host 未 set 时回退 GEHTP_HOOK env (旧 hostsim 行为保持); 设备经 runner
+ * job.txt "hook" 键下发。run_io 前调一次。 */
+void wt_exec_set_hook(const char* spec);
 /* ---- PROF 战役 W-P2: 逐 op 时间戳对 + optrace 开关 ----
  * wt_op_ts: 每 op 的 {start_us, dur_us, dma_us, dma_bytes, engine}, start_us 相对
  * run_range 入口 (u32 us, 约 71min 回绕, 单 run 不会超)。注册后 run/run_range 自动
