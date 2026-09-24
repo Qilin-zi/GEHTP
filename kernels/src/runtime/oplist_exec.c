@@ -450,12 +450,13 @@ static void inv_crouton(const uint16_t* surf, int16_t* dst, uint32_t M, uint32_t
 
 static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                        char* err, size_t errn) {
-    uint32_t act_s = op->args[0] & 0x7FFFu, w_s = op->args[1] & 0x7FFFu, out_t = op->args[2];
+    uint32_t w_s = op->args[1] & 0x7FFFu, out_t = op->args[2];
     uint32_t M = op->args[3], K = op->args[4], N = op->args[5];
     uint32_t out_b = M * N * 2u;
-    /* act 支持 temp 引用 (transformer emit: src_ref 给 temp; t10 契约
-     * 是 slot — 两种形态 ref_ptr 统一解码) */
-    const uint8_t* act_src = ref_ptr(b, act_s);
+    /* act 引用解码: 保留 args[0] 的 0x8000(slot)/0x4000(VTCM 驻留) 标志,
+     * ref_ptr 统一解码三态 (slot / VTCM 驻留 / temp)。P5 真 DMA runlist:
+     * act 由显式 OP_DMA 预铺进 VTCM 后, 此处直接指 VTCM, 免 DDR 往返。 */
+    const uint8_t* act_src = ref_ptr(b, op->args[0]);
     /* wt 槽尺寸: kernel 格式 = K*N/2 (发射器 pack_w4a16_kernel) */
     uint32_t wt_b = b->slots[w_s].len;
     uint32_t bias_b = (N / 32u) * 512u, tbl_b = 8u * (K / 32u) * 4u;
@@ -487,15 +488,11 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                  (unsigned)b->slots[scale_s].len, (unsigned)(N * 2u + 2u));
         return -1;
     }
-    /* P5 DMA 预铺 act (0x4000|temp): 本线明确拒收 —— prof-wp 旧路径用
-     * dc_w4_invoke 直跑, 但 ① 预铺的是原始 f16 act, 而 e.act 面契约是
-     * 量化+crouton 后数据; ② dc_w4_invoke 不写回 out (结果滞留 VTCM e.out,
-     * out_t temp 恒为陈旧值 = 静默数值腐败)。正确的集成须走
-     * dc_w4_run_prep/invoke 链 + 出面写回, 待 P5 完成后开放。 */
-    if (op->args[0] & WT_REF_VTCM_FLAG) {
-        snprintf(err, errn, "exec_matmul: DMA 预铺 act (0x4000) 暂不支持 (P5 集成未完)");
-        return -1;
-    }
+    /* P5 真 DMA runlist: act 可为 VTCM 驻留 (0x4000|temp, 由上游 OP_DMA
+     * 预铺)。走 dc_w4_run_prep/invoke 链 (非 prof-wp 的 dc_w4_invoke 直跑):
+     * prep 从 act_src(可能指 VTCM) 读 raw f16 量化进 e.act, invoke 反量化
+     * 写回 out_ddr, 无静默腐败。ref_ptr 解析失败(驻留未建立)返回 NULL,
+     * 由下方 !act_src 兜底报错。 */
     if (!act_src || wt_b != K * N / 2u) {
         snprintf(err, errn, "act/w slot size mismatch (act_src=%p wt_b=%u exp=%u)",
                  (const void*)act_src, (unsigned)wt_b, (unsigned)(K * N / 2u));
