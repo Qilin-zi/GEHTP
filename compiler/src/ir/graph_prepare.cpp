@@ -1718,7 +1718,7 @@ const OpDef* find_param_const(const GraphPrepare& gp, const OpDef& opdef, const 
 std::vector<uint32_t> read_param_u32(const GraphPrepare& gp, const OpDef* p, size_t max_n) {
     std::vector<uint32_t> v;
     if (!p || p->const_data_size < 4) return v;
-    size_t n = std::min(max_n, p->const_data_size / 4);
+    size_t n = std::min(max_n, (size_t)(p->const_data_size / 4));
     const auto& pool = gp.const_pool();
     if (p->const_data_offset == 0 || p->const_data_offset + p->const_data_size > pool.size())
         return v;
@@ -1872,7 +1872,7 @@ std::string scalar_str(const OpDef& opdef, const char* key) {
 std::vector<double> read_param_f64(const GraphPrepare& gp, const OpDef* p, size_t max_n) {
     std::vector<double> v;
     if (!p || p->const_data_size < 8) return v;
-    size_t n = std::min(max_n, p->const_data_size / 8);
+    size_t n = std::min(max_n, (size_t)(p->const_data_size / 8));
     const auto& pool = gp.const_pool();
     if (p->const_data_offset == 0 || p->const_data_offset + p->const_data_size > pool.size())
         return v;

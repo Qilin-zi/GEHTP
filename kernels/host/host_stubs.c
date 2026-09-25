@@ -40,7 +40,6 @@ struct h_arena { uint8_t* base; uint32_t size; uint32_t used; };
 void dc_arena_init(struct dc_arena* a, uint8_t* base, uint32_t size) {
     struct h_arena* h = (struct h_arena*)a;
     h->base = base; h->size = size; h->used = 0;
-    return (base && size) ? 0 : -1;
 }
 uint8_t* dc_arena_alloc(struct dc_arena* a, uint32_t bytes, uint32_t align) {
     struct h_arena* h = (struct h_arena*)a;

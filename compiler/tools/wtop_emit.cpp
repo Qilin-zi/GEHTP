@@ -417,12 +417,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 auto tit = em.op_temp.find(Emitter::tkey(c.src_id, c.out_idx));
                 if (tit == em.op_temp.end()) continue;  // 未物化(如 const 引用)
                 if (dma_runlist) {
-                    /* P5 OP_DMA: DDR→DDR 溢出搬移 (arity 8: src_ref, dst_ref, bytes,
-                     * src_off, dst_off, flags, fence_src, fence_dst). flags=1,
-                     * fence_src=CPU/DDR/INVALIDATE, fence_dst=INVALIDATE. */
+                    /* P5 OP_DMA: FILL 溢出搬移 (pool slot → scratch temp),
+                     * arity 8: src_ref, dst_ref, bytes, src_off, dst_off,
+                     * flags, fence_src, fence_dst。
+                     * flags bit0=src_bypass: 池侧引擎直读 DDR, 免 L2 污染;
+                     * f_src=FC_CPU → (CPU,DMA,DDR)=FLUSH_INVALIDATE
+                     * (dc_clean_ddr 同式; 池经 bypass 写, 顺带逐出 dcache
+                     * 陈旧行); f_dst=FC_CPU → (DMA,CPU,DDR)=INVALIDATE
+                     * (铁律③, dma_copy_ddr 同式)。0xFF/0xFF(无 fence)在
+                     * 设备上读陈旧 dcache, 已废。 */
                     em.add_op(OP_DMA, {0x8000u | em.spill_pool_slot, tit->second,
                                        (uint32_t)sit->second.second,
-                                       0u, 0u, 1u, 0xFFu, 0xFFu});
+                                       0u, 0u, 1u, 0u, 0u});
                 } else {
                     em.add_op(OP_FILL, {em.spill_pool_slot, (uint32_t)sit->second.first,
                                         tit->second, (uint32_t)(sit->second.second / 2)});
@@ -444,12 +450,14 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 auto tit = em.op_temp.find(Emitter::tkey(id, 0));
                 if (tit != em.op_temp.end()) {
                     if (dma_runlist) {
-                        /* P5 OP_DMA: SPILL 显式化 (arity 8: src_ref=staging
-                         * temp, dst_ref=0x8000|slot, bytes, 0/0/flags/
-                         * fence_src/fence_dst). dst_bypass=1. */
+                        /* P5 OP_DMA: SPILL 显式化 (scratch temp → pool slot),
+                         * arity 8 同上。flags bit1=dst_bypass: 池侧引擎直写
+                         * DDR, 免 L2 污染; f_src=FC_CPU → FLUSH_INVALIDATE
+                         * (铁律① CPU写DDR→DMA 读); f_dst=FC_CPU →
+                         * INVALIDATE (逐出池区 dcache 陈旧行)。 */
                         em.add_op(OP_DMA, {tit->second, 0x8000u | em.spill_pool_slot,
                                            (uint32_t)sit->second.second,
-                                           0u, 0u, 1u, 0xFFu, 0xFFu});
+                                           0u, 0u, 2u, 0u, 0u});
                     } else {
                         em.add_op(OP_SPILL, {tit->second, em.spill_pool_slot,
                                              (uint32_t)sit->second.first,

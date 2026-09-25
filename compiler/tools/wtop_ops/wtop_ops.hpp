@@ -147,9 +147,22 @@ struct Emitter {
         dbg_released++;
     }
     uint32_t fresh_temp(GraphPrepare& gp, uint64_t op_id, uint32_t out_idx = 0) {
-        uint32_t t;
-        if (!free_temps.empty()) { t = free_temps.back(); free_temps.pop_back(); }
-        else { t = next_temp++; }
+        uint32_t t = 0;
+        int got = 0;
+        /* 表内 tid 永久退役(不复用): TEMPOFF/vtcm 表项 per-tid 一次解析
+         * 定终, 复用于新张量会命中旧 (off,size) —— 尺寸不足 → 设备
+         * temp_get 边界 NULL(ref fail); 尺寸够但 off 已另分配 → 与并活
+         * 张量静默重叠。probe: t2cut 混合尺寸图 tid1 {6144,2048} 被
+         * 6144B matmul 出复用 → op5 fill dst empty + producer 越界写
+         * bump 区(pool_used 被 bump 抬高掩盖边界, 静默重叠)。
+         * 表外 tid(bump 路径)尺寸无关, 自由复用。tid 总量 = 静态张量数
+         * + 活跃表外数, 0.8B 级图 < 2K ≪ 32768; 复用优化留 T5。 */
+        while (!free_temps.empty()) {
+            uint32_t c = free_temps.back();
+            free_temps.pop_back();
+            if (ddr_temp_tab.find(c) == ddr_temp_tab.end()) { t = c; got = 1; break; }
+        }
+        if (!got) t = next_temp++;
         op_temp[tkey(op_id, out_idx)] = t;
         if (ddr_static) {
             /* 静态模式: 表内(op_id 命中且 out_idx==0)登记编译期偏移;
