@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef __hexagon__
+#include <malloc.h>  /* memalign 原型: 缺则 64 位 host 按 int 隐式声明截断指针 → SIGSEGV */
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -438,6 +441,11 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     if (!g_exec.matmul_carved) {
         int rc = 0;
         if (!g_exec.engine_ready) {
+            /* VTCM 互斥回收: 前置 MATMUL_F16/CONV2D 的 HMX 快路径 hmx_runtime_setup
+             * 持全量 VTCM 且从不释放 → 同进程二次 acquire 返 0 (WTC_ERR_VTCM_ACQUIRE)。
+             * 先 teardown 让出再独占。反向已有守卫 (exec_matmul_f16_hmx/exec_conv2d_hmx
+             * 首行 engine_ready 判据 → 回落标量), 不会二次踩。 */
+            if (hmx_runtime_get_vtcm_base()) hmx_runtime_teardown();
             rc = wtcache_open(&g_exec.wc, 4096);
             if (rc != WTC_OK) { snprintf(err, errn, "wtcache 0x%X", rc); return -1; }
         }
@@ -1056,15 +1064,18 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
         uint32_t cn = ref_elem_count(b, a_t), an = ref_elem_count(b, b_t);
         uint32_t fn = ref_elem_count(b, y_t);
         /* 输出元素数 = 三者广播最大值; true 为标量(an=1)时不得只写 1 元素
-         * 余下读旧 temp 垃圾 (GDN 门控链全 nan 根因之一)。emit 已把部分广播
-         * (cond [1,1,64,64]→16 头)物化为全尺寸 temp, 这里仅需覆盖标量广播。 */
+         * 余下读旧 temp 垃圾 (GDN 门控链全 nan 根因之一)。numpy 广播语义:
+         * 各源按标量/平铺/全量三态取址 (i%cn 兜底 1<cn<n 部分广播越界读;
+         * emit 通常已把 [1,1,64,64]→16 头物化为全尺寸 temp, 此处为防御性兜底)。 */
         uint32_t n = cn > an ? cn : an;
         n = fn > n ? fn : n;
         uint16_t* y = (uint16_t*)temp_get(op->args[3], n * 2u);
         if (!c || !tv || !fv || !y || n == 0) { snprintf(err, errn, "select ref fail"); return -1; }
         for (uint32_t i = 0; i < n; i++) {
-            float cv = f16_to_f32(c[cn <= 1u ? 0 : i]);
-            float r = (cv != 0.0f) ? f16_to_f32(tv[an <= 1u ? 0 : i]) : f16_to_f32(fv[fn <= 1u ? 0 : i]);
+            float cv = f16_to_f32(c[cn <= 1u ? 0 : (cn < n ? i % cn : i)]);
+            float r = (cv != 0.0f)
+                ? f16_to_f32(tv[an <= 1u ? 0 : (an < n ? i % an : i)])
+                : f16_to_f32(fv[fn <= 1u ? 0 : (fn < n ? i % fn : i)]);
             y[i] = f32_to_f16(r);
         }
         return 0;

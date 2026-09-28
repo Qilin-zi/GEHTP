@@ -125,9 +125,13 @@ static int job_get(const char* job, const char* key, char* out, size_t n) {
 }
 
 int main(void) {
-    ex_open_result("42_gehtp_runner");
+    /* RESULT_NAME 身份制 (与 JOB_PATH 同律): 共享板上多 runner 变体并存时结果分家 */
+#if !defined(RESULT_NAME)
+#define RESULT_NAME "42_gehtp_runner"
+#endif
+    ex_open_result(RESULT_NAME);
     ex_log("M0 after ex_open");
-    ex_log("=== 42_gehtp_runner (generic WTOP runner) ===");
+    ex_log("=== %s (generic WTOP runner) ===", RESULT_NAME);
     ex_log("M1 before job read");
     int bad = 0;
 
