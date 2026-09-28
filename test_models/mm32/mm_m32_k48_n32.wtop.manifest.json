@@ -1,0 +1,11 @@
+{
+  "manifest_ver": 2,
+  "input_slot": 0,
+  "input_elems": 1536,
+  "output_temp": 0,
+  "n_slots": 2,
+  "n_ops": 1,
+  "op_ids": [6],
+  "opcodes": [24],
+  "op_names": ["FullyConnected"]
+}

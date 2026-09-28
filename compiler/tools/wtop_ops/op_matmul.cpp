@@ -54,6 +54,44 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             for (uint32_t i = 0; i + 2 < rk; i++) bn *= od->output_def.dims[i];
             flags |= ((uint32_t)bn & 0xFFFFu) << 16;
         }
+        /* 002 US1: 超 VTCM 界的 f16 matmul 编译期 N 分块 (OP_MATMUL_F16_SPLIT)。
+         * need 公式与 exec_matmul_f16_hmx 逐字节同口径; US2 前预算 = 运行时
+         * VTCM total (16MB = 16777216, 设备 A2 query_VTCM 实锤), US2 后换
+         * TAG_MEM_PLAN v2 的 scratch_size。
+         * 条件: M/K/N 全 32 对齐 + 非 batched; 不满足则维持整 op (运行时
+         * 超界回落标量, 现状行为零回归)。act/wgt/out 三引用跨 chunk 共享,
+         * 仅 n0/N_chunk 两标量不同; 逐字节恒等五纪律见 spec FR-013。 */
+        auto need_mm = [](uint32_t mm, uint32_t kk, uint32_t nn2) -> size_t {
+            size_t a = (size_t)mm * kk * 2u;
+            size_t w = (size_t)nn2 * kk * 2u;
+            size_t o = (size_t)mm * nn2 * 2u;
+            size_t off_w = (a + 2047u) & ~(size_t)2047u;
+            size_t off_o = (off_w + w + 2047u) & ~(size_t)2047u;
+            size_t off_s = (off_o + o + 2047u) & ~(size_t)2047u;
+            return off_s + 2048u;
+        };
+        const size_t kVTCMTotal = 16u * 1024u * 1024u;
+        if (!em2.batched && (m % 32u) == 0u && (k % 32u) == 0u && (nn % 32u) == 0u &&
+            need_mm(m, k, nn) > kVTCMTotal) {
+            /* 二分找最大 32 倍数 N_c 使 need(m,k,N_c) ≤ 预算 (need 随 N 单调) */
+            uint32_t N_chunk = 0, lo = 32u, hi = nn;
+            while (lo <= hi) {
+                uint32_t mid = lo + ((hi - lo) / 64u) * 32u;
+                if (need_mm(m, k, mid) <= kVTCMTotal) { N_chunk = mid; lo = mid + 32u; }
+                else { hi = mid - 32u; }
+            }
+            if (N_chunk == 0) {
+                /* 连最小 32 列 chunk 都超界 (act 自身超 VTCM 的极端形状) */
+                std::fprintf(stderr, "warn: matmul M=%u K=%u N=%u 最小 chunk 也超 VTCM, 维持整 op\n",
+                             m, k, nn);
+            } else {
+                for (uint32_t n0 = 0; n0 < nn; n0 += N_chunk) {
+                    uint32_t nc = (N_chunk < nn - n0) ? N_chunk : (nn - n0);
+                    em.add_op(OP_MATMUL_F16_SPLIT, {a_t, w_s, out_t, m, k, nn, n0, nc, flags});
+                }
+                return 0;
+            }
+        }
         em.add_op(OP_MATMUL_F16, {a_t, w_s, out_t, m, k, nn, flags});
     }
     return 0;

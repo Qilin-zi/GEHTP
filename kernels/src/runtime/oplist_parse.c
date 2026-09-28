@@ -39,6 +39,8 @@ static int arity_of(uint16_t opcode) {
     case OP_TRANSPOSE_GEN_F16: return WT_ARITY_TRANSPOSE_GEN_F16;
     case OP_SCATTER_ND_F16: return WT_ARITY_SCATTER_ND_F16;
     case OP_DMA: return WT_ARITY_DMA;
+    case OP_PAD_F16: return WT_ARITY_PAD_F16;
+    case OP_MATMUL_F16_SPLIT: return WT_ARITY_MATMUL_F16_SPLIT;
     default: return -1;
     }
 }
@@ -71,6 +73,8 @@ static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     case OP_TRANSPOSE_GEN_F16: return idx == 0;
     case OP_SCATTER_ND_F16: return idx == 0 || idx == 1 || idx == 2;
     case OP_DMA: return idx == 0 || idx == 1;
+    case OP_PAD_F16: return idx == 0;
+    case OP_MATMUL_F16_SPLIT: return idx == 0 || idx == 1;
     default: return 0;
     }
 }

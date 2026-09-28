@@ -94,6 +94,10 @@ struct Emitter {
     std::vector<wt_slot> slots;
     std::vector<wt_op> ops;
     std::map<uint64_t, uint32_t> op_temp;  // (op_id<<32 | out_idx) → temp id
+    std::map<uint64_t, uint32_t> i32_slots;  // int32 索引 const 独立缓存(键 op_id)
+                                             // 与 wslots(权重槽)分离: 同一 const 节点
+                                             // 既当索引又当权重时, 权重槽 f32→f16 洗白
+                                             // 与索引槽原样字节必须各占一槽, 不能撞键
     uint32_t next_temp = 0;
     std::vector<uint32_t> free_temps;      // 活性分析释放的 temp(M2)
     std::map<uint64_t, uint32_t> last_use; // 复合键 → 最后消费位置(plan_order 下标)
@@ -317,8 +321,10 @@ struct Emitter {
         size_t n = (size_t)w->const_data_size / 4;
         if (n == 0) {
             // 空 const(记录在但池数据被 DCE 删): 最小零槽占位(M4 数值门兜底)
-            std::fprintf(stderr, "warn: empty weight const (op %llu), 零槽占位\n",
-                         (unsigned long long)w->op_id);
+            std::fprintf(stderr, "warn: empty weight const (op %llu, name=%s, rank=%u), 零槽占位\n",
+                         (unsigned long long)w->op_id,
+                         (w->name_tag && w->name_tag->name()) ? w->name_tag->name() : "?",
+                         w->output_def.rank);
             std::vector<uint8_t> zeros(128, 0);
             uint32_t id = slot_for(128, 64, zeros.data());
             wslots[w->op_id] = id;
@@ -335,6 +341,25 @@ struct Emitter {
         std::memcpy(wbytes.data(), w16.data(), wbytes.size());
         uint32_t id = slot_for((uint32_t)wbytes.size(), (uint32_t)n, wbytes.data());
         wslots[w->op_id] = id;
+        return id;
+    }
+    /* int 索引 const 原样入槽 (ScatterNd/Gather 索引等; 设备按 int32 直读)。
+     * 走 ensure_weight_slot 会被 f32→f16 洗白: 小整数 int32 按位当 denormal
+     * f32 → 全零 (0.8B GDN state ScatterNd 索引槽全零实锤 — 16 个更新全写
+     * 同一坐标 (0,0,0,0,0), state 路径常数化, 层间彻底解耦)。 */
+    uint32_t ensure_i32_slot(GraphPrepare& gp, const OpDef* w) {
+        auto it = i32_slots.find(w->op_id);
+        if (it != i32_slots.end()) return it->second;
+        size_t nb = (size_t)w->const_data_size;
+        uint32_t id;
+        if (nb >= 4 && w->const_data_offset + nb <= gp.const_pool().size()) {
+            const uint8_t* src = gp.const_pool().data() + w->const_data_offset;
+            id = add_slot((uint32_t)nb, (uint32_t)(nb / 4), src);
+        } else {
+            std::vector<uint8_t> zeros(128, 0);
+            id = add_slot(128, 64, zeros.data());
+        }
+        i32_slots[w->op_id] = id;
         return id;
     }
     // 输入节点 = slot 0; const 生产者 = 权重槽(0x8000|slot 编码);

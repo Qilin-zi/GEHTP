@@ -374,10 +374,13 @@ static uint16_t f32_to_f16(float f) {
         if (exp < -10) return (uint16_t)sign;
         man |= 0x800000u;
         uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half = man >> (shift + 1);
-        uint32_t rest = man & ((1u << shift) - 1u);
-        if ((man >> shift) & 1u) half += (rest || (half & 1u)) ? 1u : 0u;
-        return (uint16_t)(sign | half);
+        /* subnormal RNE (与 gdn_ref.c gdn_f32_to_f16 逐字同款): 尾数右移 shift 位。
+         * 旧版误写 man >> (shift + 1), 把所有 f16 subnormal (<2^-14) 输出砍半 (0.5×),
+         * 0.8B GDN 门控态(rms~1e-4) 上产生非均匀损坏, 是 logits cos 0.988 的根因。 */
+        uint32_t sub = man >> shift;
+        uint32_t rem = man & ((1u << shift) - 1u);
+        sub += (rem > (1u << (shift - 1u)) || (rem == (1u << (shift - 1u)) && (sub & 1u))) ? 1u : 0u;
+        return (uint16_t)(sign | sub);
     }
     uint32_t half = sign | ((uint32_t)exp << 10) | (man >> 13);
     if ((man >> 12) & 1u) half += ((man & 0xfffu) || (half & 1u)) ? 1u : 0u;
@@ -990,6 +993,8 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
         case 8:  fn = hvhx_v2_sigmoid_f32; break;
         case 9:  fn = hvhx_v2_tanh_f32;    break;
         case 12: fn = hvhx_v2_silu_f32;    break;
+        case 14: /* COPY: 位级直通(整面 memcpy 比标量 f16→f32→f16 保真且快) */
+            break;
         default: break;
         }
         if (fn) {
@@ -1000,6 +1005,9 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
                 hvhx_v2_cvt_f32_to_f16(y, sc, n);
                 return 0;
             }
+        } else if (subtype == 14) {
+            memcpy(y, x, (size_t)n * 2u);
+            return 0;
         }
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -1021,7 +1029,12 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
         case 12: r = v / (1.0f + expf(-v)); break;
         case 13: /* SOFTPLUS: 稳定化 log(1+e^x), 与 host ops.cpp Neuron case 7 逐字同款 */
             r = (v > 30.0f) ? v : (v < -30.0f ? expf(v) : log1pf(expf(v))); break;
-        default: break;
+        case 14: r = v; break;  /* COPY */
+        default:
+            /* P1 消除静默兜底: 未知 subtype 不得静默直通(此前 0xFFFFFFFF
+             * 拷贝 = 0.8B 全 -inf 根因之一)。与 emit 侧硬错误同口径。 */
+            snprintf(err, errn, "unary unknown subtype %u", (unsigned)subtype);
+            return -1;
         }
         y[i] = f32_to_f16(r);
     }
@@ -1042,11 +1055,16 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
         const uint16_t* fv = (const uint16_t*)ref_ptr(b, y_t);
         uint32_t cn = ref_elem_count(b, a_t), an = ref_elem_count(b, b_t);
         uint32_t fn = ref_elem_count(b, y_t);
-        uint16_t* y = (uint16_t*)temp_get(op->args[3], an * 2u);
-        if (!c || !tv || !fv || !y || an == 0) { snprintf(err, errn, "select ref fail"); return -1; }
-        for (uint32_t i = 0; i < an; i++) {
+        /* 输出元素数 = 三者广播最大值; true 为标量(an=1)时不得只写 1 元素
+         * 余下读旧 temp 垃圾 (GDN 门控链全 nan 根因之一)。emit 已把部分广播
+         * (cond [1,1,64,64]→16 头)物化为全尺寸 temp, 这里仅需覆盖标量广播。 */
+        uint32_t n = cn > an ? cn : an;
+        n = fn > n ? fn : n;
+        uint16_t* y = (uint16_t*)temp_get(op->args[3], n * 2u);
+        if (!c || !tv || !fv || !y || n == 0) { snprintf(err, errn, "select ref fail"); return -1; }
+        for (uint32_t i = 0; i < n; i++) {
             float cv = f16_to_f32(c[cn <= 1u ? 0 : i]);
-            float r = (cv != 0.0f) ? f16_to_f32(tv[i]) : f16_to_f32(fv[fn <= 1u ? 0 : i]);
+            float r = (cv != 0.0f) ? f16_to_f32(tv[an <= 1u ? 0 : i]) : f16_to_f32(fv[fn <= 1u ? 0 : i]);
             y[i] = f32_to_f16(r);
         }
         return 0;
@@ -1203,17 +1221,57 @@ static int exec_reduce(const struct wt_blob* b, const struct wt_op* op,
     uint32_t d[4] = {op->args[5], op->args[6], op->args[7], op->args[8]};
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     if (!x) { snprintf(err, errn, "reduce in fail"); return -1; }
+    /* 哨兵/越界一律硬错误: 旧码 d[0xFFFFFFFF] 野读栈垃圾 (0.8B 全图 1170
+     * 个 Reduce 曾因此退化成恒等, l2norm 全灭 → 下游 matmul inf) */
+    if (axis >= 4 || subtype > 3) {
+        snprintf(err, errn, "reduce axis/subtype bad (axis=%u sub=%u)", axis, subtype);
+        return -1;
+    }
+    /* 泛化单轴: y[o*inner+i] = reduce_l x[(o*L+l)*inner+i]  (末轴时 inner=1
+     * 退化为原 contiguous 快路径; 中间轴单点归约也正确) */
     uint32_t L = d[axis];
     if (L == 0) L = 1;
-    uint32_t outer = n / L;
-    uint16_t* y = (uint16_t*)temp_get(y_t, outer * 2u);
+    uint32_t inner = 1;
+    for (uint32_t a = axis + 1; a < 4; a++) inner *= d[a];
+    if ((uint64_t)L * inner == 0 || n % (L * inner) != 0) {
+        snprintf(err, errn, "reduce geom (n=%u L=%u inner=%u)", n, L, inner);
+        return -1;
+    }
+    uint32_t outer = n / (L * inner);
+    uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)outer * inner * 2u);
     if (!y) { snprintf(err, errn, "reduce out fail"); return -1; }
     for (uint32_t o = 0; o < outer; o++) {
-        float acc = 0.0f;
-        for (uint32_t l = 0; l < L; l++)
-            acc += f16_to_f32(x[(size_t)o * L + l]);
-        if (subtype == 1) acc /= (float)L;
-        y[o] = f32_to_f16(acc);
+        for (uint32_t i = 0; i < inner; i++) {
+            const uint16_t* base = x + ((size_t)o * L) * inner + i;
+            float acc = (subtype == 2) ? -3.0e38f : (subtype == 3) ? 3.0e38f : 0.0f;
+            for (uint32_t l = 0; l < L; l++) {
+                float v = f16_to_f32(base[(size_t)l * inner]);
+                if (subtype == 2)      acc = v > acc ? v : acc;
+                else if (subtype == 3) acc = v < acc ? v : acc;
+                else                   acc += v;
+            }
+            if (subtype == 1) acc /= (float)L;
+            y[(size_t)o * inner + i] = f32_to_f16(acc);
+        }
+    }
+    return 0;
+}
+
+static int exec_pad(const struct wt_blob* b, const struct wt_op* op,
+                    char* err, size_t errn) {
+    uint32_t x_t = op->args[0], y_t = op->args[1];
+    uint32_t outer = op->args[2], in_inner = op->args[3], out_inner = op->args[4];
+    uint32_t pad_before = op->args[5];
+    uint16_t pv = (uint16_t)op->args[6];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
+    uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)outer * out_inner * 2u);
+    if (!x || !y) { snprintf(err, errn, "pad ref fail"); return -1; }
+    if (pad_before + in_inner > out_inner) { snprintf(err, errn, "pad geom"); return -1; }
+    for (uint32_t i = 0; i < outer; i++) {
+        uint16_t* dst = y + (size_t)i * out_inner;
+        for (uint32_t j = 0; j < pad_before; j++) dst[j] = pv;
+        memcpy(dst + pad_before, x + (size_t)i * in_inner, (size_t)in_inner * 2u);
+        for (uint32_t j = pad_before + in_inner; j < out_inner; j++) dst[j] = pv;
     }
     return 0;
 }
@@ -1255,35 +1313,79 @@ static int exec_conv1d_ssm(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* w = (const uint16_t*)slot_ptr(b, w_s);
     uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)seq * C * 2u);
     if (!x || !w || !y) { snprintf(err, errn, "ssm ref fail"); return -1; }
+    /* 窗序 (host 图语义 lstsq 实锤): y[t] = Σ_j w[j]·x[t-(k-1)+j] (纯卷积,
+     * 无激活 — 图有独立 Sigmoid/Mul 节点做 SiLU 分解, 这里再套 silu 会双倍
+     * 套用 → cos(dev, silu(host))=0.9999995 实锤), 内存 tap j=0 配最老样本;
+     * x 有效行 = seq-k+1 (QNN pad flush: 首 k-1 行隐式零历史, 末 k-1 行隐式
+     * 零冲刷), 越界按零。旧码 w[j] 配 x[t-j] (tap 反序) 且无尾窗界 — 0.8B
+     * GDN conv 全层错。 */
+    uint32_t in_rows = (seq >= k) ? (seq - k + 1) : 0;
     for (uint32_t t = 0; t < seq; t++)
         for (uint32_t c = 0; c < C; c++) {
             float acc = 0.0f;
-            for (uint32_t j = 0; j < k && (int32_t)(t - j) >= 0; j++)
-                acc += f16_to_f32(x[(size_t)(t - j) * C + c]) *
+            for (uint32_t j = 0; j < k; j++) {
+                int32_t src = (int32_t)t - (int32_t)(k - 1) + (int32_t)j;
+                if (src < 0 || src >= (int32_t)in_rows) continue;
+                acc += f16_to_f32(x[(size_t)src * C + c]) *
                        f16_to_f32(w[(size_t)j * C + c]);
-            float sv = acc / (1.0f + expf(-acc));
-            y[(size_t)t * C + c] = f32_to_f16(sv);
+            }
+            y[(size_t)t * C + c] = f32_to_f16(acc);
         }
     return 0;
 }
 
 static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
                        char* err, size_t errn) {
-    /* 槽引用兼容两种形态(emit 对输入槽用 0x8000|slot 编码, 权重槽裸 id;
-     * wt_parse 校验已按位解码, 执行侧同步) */
-    uint32_t tbl_s = op->args[0] & 0x7FFFu, idx_s = op->args[1] & 0x7FFFu;
+    /* host ops.cpp Gather 逐字移植: out 坐标按 od(=td 把 axis 换成 xd)分解,
+     * idx 块取 r=idx[il] 查 tbl[axis], 余维直通; 越界 r 出零。
+     * args: [tbl,idx,out,n, packed(axis|xrank<<8|irank<<16), td0..4, xd0..4]
+     * tbl/idx 双态: const → 0x8000|slot, 计算 op 输出 → 裸 temp id
+     * (GDN gather 的 tbl 是 ScatterNd/CumulativeSum 的 state/门控 temp) */
     uint32_t out_t = op->args[2];
-    uint32_t n = op->args[3], row_bytes = op->args[4];
-    const uint8_t* tbl = slot_ptr(b, tbl_s);
-    const int32_t* idx = (const int32_t*)slot_ptr(b, idx_s);
+    uint32_t n = op->args[3], packed = op->args[4];
+    uint32_t axis = packed & 0xFF, xrank = (packed >> 8) & 0xFF, irank = (packed >> 16) & 0xFF;
+    uint32_t td[5] = {op->args[5], op->args[6], op->args[7], op->args[8], op->args[9]};
+    uint32_t xd[5] = {op->args[10], op->args[11], op->args[12], op->args[13], op->args[14]};
+    const uint16_t* tbl = (const uint16_t*)ref_ptr(b, op->args[0]);
+    const int32_t* idx = (const int32_t*)ref_ptr(b, op->args[1]);
     uint16_t* y = (uint16_t*)temp_get(out_t, n * 2u);
     if (!tbl || !idx || !y) { snprintf(err, errn, "gather ref fail"); return -1; }
-    uint32_t row_n = row_bytes / 2;
-    if (row_n == 0) { snprintf(err, errn, "gather row_bytes"); return -1; }
-    for (uint32_t i = 0; i < n / row_n; i++) {
-        int32_t r = idx[i];
-        if (r < 0) r = 0;
-        memcpy(y + (size_t)i * row_n, tbl + (size_t)r * row_bytes, row_bytes);
+    if (axis >= irank || irank > 5 || xrank > 5 || xrank == 0) {
+        snprintf(err, errn, "gather axis/rank bad (a=%u x=%u i=%u)", axis, xrank, irank);
+        return -1;
+    }
+    /* od = td 把 axis 维换成 xd (out 紧凑形); 三套 stride 预计算 */
+    uint32_t od5[5] = {1, 1, 1, 1, 1};
+    for (uint32_t d = 0; d < axis && d < 5; d++) od5[d] = td[d];
+    for (uint32_t k = 0; k < xrank && axis + k < 5; k++) od5[axis + k] = xd[k];
+    for (uint32_t d = axis + 1; d < irank && d < 5; d++) {
+        uint32_t ocd = d + xrank - 1;
+        if (ocd < 5) od5[ocd] = td[d];
+    }
+    size_t os[5] = {1, 1, 1, 1, 1}, ts[5] = {1, 1, 1, 1, 1}, xs[5] = {1, 1, 1, 1, 1};
+    for (int d = 3; d >= 0; d--) {
+        os[d] = os[d + 1] * od5[d + 1];
+        ts[d] = ts[d + 1] * td[d + 1];
+        xs[d] = xs[d + 1] * xd[d + 1];
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        size_t rem = i;
+        uint32_t oc[5];
+        for (int d = 0; d < 5; d++) { oc[d] = (uint32_t)(rem / os[d]); rem %= os[d]; }
+        size_t il = 0;
+        for (uint32_t k = 0; k < xrank && k < 5; k++)
+            il += (oc[axis + k] % xd[k]) * xs[k];
+        int32_t r = idx[il];
+        if (r < 0) r += (int32_t)td[axis];
+        if (r < 0 || r >= (int32_t)td[axis]) { y[i] = 0; continue; }
+        size_t src = 0;
+        for (uint32_t d = 0; d < axis && d < 5; d++) src += (size_t)oc[d] * ts[d];
+        src += (size_t)r * ts[axis];
+        for (uint32_t d = axis + 1; d < irank && d < 5; d++) {
+            uint32_t ocd = d + xrank - 1;
+            src += (size_t)(ocd < 5 ? oc[ocd] : 0) * ts[d];
+        }
+        y[i] = tbl[src];
     }
     return 0;
 }
@@ -1336,6 +1438,7 @@ static int exec_scatter_nd(const struct wt_blob* b, const struct wt_op* op,
 #if defined(__HVX__) || defined(__hexagon__)
 static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y,
                                uint32_t M, uint32_t K, uint32_t N,
+                               uint32_t n0, uint32_t N_full,
                                int t0, int t1, char* err, size_t errn) {
     /* wtcache 已开 (W4A16/VTCM 驻留 temp 占用同一物理 VTCM) → 跳过,
      * 防 hmx_runtime_setup 的 HAP_compute_res_acquire/memset 踩对方。 */
@@ -1385,14 +1488,16 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                 }
         }
 
-    /* pack wgt: B[K,N] (或 t1 转置) → crouton[(c*n_dot+kt)*1024] (row=ic=k, col=oc=n) */
+    /* pack wgt: B[K,N] (或 t1 转置) → crouton[(c*n_dot+kt)*1024] (row=ic=k, col=oc=n)。
+     * 002 US1: 全局列号 = n0 + c*32 + n, 行主 [K,N_full] 布局 stride=N_full
+     * (n0=0/N_full=N 时与整 op 逐字节同公式) */
     for (uint32_t c = 0; c < n_col; ++c)
         for (uint32_t kt = 0; kt < n_dot; ++kt) {
             uint16_t* tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
             for (uint32_t k = 0; k < 32u; ++k)
                 for (uint32_t n = 0; n < 32u; ++n) {
-                    size_t src = t1 ? ((size_t)(c * 32u + n) * K + (kt * 32u + k))
-                                    : ((size_t)(kt * 32u + k) * N + (c * 32u + n));
+                    size_t src = t1 ? ((size_t)(n0 + c * 32u + n) * K + (kt * 32u + k))
+                                    : ((size_t)(kt * 32u + k) * N_full + (n0 + c * 32u + n));
                     tile[hmx_crouton_pos(k, n)] = w[src];
                 }
         }
@@ -1427,13 +1532,13 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
         }
     }
 
-    /* unpack out: crouton[(r*n_col+c)*1024] → row-major y[M,N] */
+    /* unpack out: crouton[(r*n_col+c)*1024] → row-major y[M,N_full] 列子区间 [n0, n0+N) */
     for (uint32_t r = 0; r < n_row; ++r)
         for (uint32_t c = 0; c < n_col; ++c) {
             uint16_t* tile = out_cr + ((size_t)r * n_col + c) * 1024u;
             for (uint32_t m = 0; m < 32u; ++m)
                 for (uint32_t n = 0; n < 32u; ++n)
-                    y[(size_t)(r * 32u + m) * N + (c * 32u + n)] = tile[hmx_crouton_pos(m, n)];
+                    y[(size_t)(r * 32u + m) * N_full + (n0 + c * 32u + n)] = tile[hmx_crouton_pos(m, n)];
         }
     g_last_engine = WT_ENG_HMX;  /* W-P3: f16 GEMM 走 HMX crouton 路径 */
     return 0;
@@ -1443,8 +1548,15 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
 static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
                            char* err, size_t errn) {
     uint32_t a_t = op->args[0], w_s = op->args[1], out_t = op->args[2];
-    uint32_t M = op->args[3], K = op->args[4], N = op->args[5];
-    uint32_t flags = op->args[6];
+    uint32_t M = op->args[3], K = op->args[4];
+    uint32_t N_full, n0, N, flags;
+    if (op->opcode == OP_MATMUL_F16_SPLIT) {
+        /* 002 US1: [a_ref,w_s,out_t,M,K,N_full,n0,N_chunk,flags]
+         * 本 chunk 只算列区间 [n0, n0+N), 写共享 out temp 的列子区间 */
+        N_full = op->args[5]; n0 = op->args[6]; N = op->args[7]; flags = op->args[8];
+    } else {
+        N_full = N = op->args[5]; n0 = 0; flags = op->args[6];
+    }
     int t0 = (int)(flags & 1u), t1 = (int)(flags & 2u);
     int batched = (int)(flags & 4u);
     uint32_t Bn = flags >> 16;
@@ -1452,16 +1564,37 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
     /* w 可为 slot(权重)或 temp(运行时 B, 如 attention q·kᵀ) */
     const uint16_t* w = (const uint16_t*)ref_ptr(b, op->args[1]);
-    uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N * Bn * 2u);
+    uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N_full * Bn * 2u);
     if (!a || !w || !y) { snprintf(err, errn, "matmul_f16 ref fail"); return -1; }
 #if defined(__HVX__) || defined(__hexagon__)
-    /* HMX 快路径: M/K/N 均 32 倍数 + 非 batched → crouton + HMX GEMM */
+    /* HMX 快路径: M/K/N 均 32 倍数 + 非 batched → crouton + HMX GEMM。
+     * SPLIT 回落全有或全无 (FR-013 ④): 同逻辑 matmul 的 chunk 间共享引擎
+     * 选择, 首 chunk 决定, 续 chunk (三引用一致) 沿用; 混合路径破逐字节
+     * 恒等, 违禁即硬错误。chunk 间必有别的 op 插入时 key 不匹配, 重新决定。 */
+    static struct { uint32_t a_t, w_s, out_t; int engine; } g_split_prev = {0, 0, 0, 0};
     if (!batched && (M % 32u) == 0u && (K % 32u) == 0u && (N % 32u) == 0u) {
-        if (exec_matmul_f16_hmx(a, w, y, M, K, N, t0, t1, err, errn) == 0)
-            return 0;
-        /* 失败(未 setup/超 VTCM/wtcache 已占)回落标量 */
+        int engine = 0;
+        if (op->opcode == OP_MATMUL_F16_SPLIT &&
+            g_split_prev.out_t == out_t && g_split_prev.a_t == a_t && g_split_prev.w_s == w_s)
+            engine = g_split_prev.engine;  /* 续 chunk: 沿用已定引擎 */
+        if (engine == 0) {
+            engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn) == 0)
+                         ? 1 : -1;
+        } else if (engine == 1) {
+            if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn) != 0) {
+                snprintf(err, errn, "matmul_f16 split 混合路径 (FR-013 ④ 违禁): 前 chunk HMX 本 chunk 失败");
+                return -1;
+            }
+        }
+        if (op->opcode == OP_MATMUL_F16_SPLIT) {
+            g_split_prev.a_t = a_t; g_split_prev.w_s = w_s;
+            g_split_prev.out_t = out_t; g_split_prev.engine = engine;
+        }
+        if (engine == 1) return 0;
+        /* engine == -1 (或非 SPLIT 失败): 回落标量 */
     }
 #endif
+    /* 标量路径: 列号 = n0 + n, 行主 stride = N_full (n0=0/N_full=N 即旧公式) */
     if (batched) {
         for (uint32_t bb = 0; bb < Bn; bb++)
             for (uint32_t m = 0; m < M; m++)
@@ -1469,11 +1602,11 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
                     float acc = 0.0f;
                     for (uint32_t k = 0; k < K; k++) {
                         float av = f16_to_f32(a[((size_t)bb * M + m) * K + k]);
-                        float wv = f16_to_f32(w[t1 ? ((size_t)bb * N + n) * K + k
-                                                  : ((size_t)bb * K + k) * N + n]);
+                        float wv = f16_to_f32(w[t1 ? ((size_t)bb * N_full + n0 + n) * K + k
+                                                  : ((size_t)bb * K + k) * N_full + (n0 + n)]);
                         acc += av * wv;
                     }
-                    y[((size_t)bb * M + m) * N + n] = f32_to_f16(acc);
+                    y[((size_t)bb * M + m) * N_full + (n0 + n)] = f32_to_f16(acc);
                 }
         return 0;
     }
@@ -1482,10 +1615,10 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
             float acc = 0.0f;
             for (uint32_t k = 0; k < K; k++) {
                 float av = f16_to_f32(a[t0 ? (size_t)k * M + m : (size_t)m * K + k]);
-                float wv = f16_to_f32(w[t1 ? (size_t)n * K + k : (size_t)k * N + n]);
+                float wv = f16_to_f32(w[t1 ? (size_t)(n0 + n) * K + k : (size_t)k * N_full + (n0 + n)]);
                 acc += av * wv;
             }
-            y[(size_t)m * N + n] = f32_to_f16(acc);
+            y[(size_t)m * N_full + (n0 + n)] = f32_to_f16(acc);
         }
     return 0;
 }
@@ -1507,8 +1640,20 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
     uint32_t m = n / rw;
     /* HVX 快路径(策略 B): 无 bias 时走 hvhx_v2_rms_norm_mul_f32_rows
      * (逐行 rmsnorm×weight, HVX/标量自适应)。有 bias 时回落标量
-     * (HVX 无 rmsnorm+weight+bias 融合内核)。rw%32==0 才触发 HVX 主体。 */
-    if (!bv && m >= 1u && (rw % 32u) == 0u) {
+     * (HVX 无 rmsnorm+weight+bias 融合内核)。rw%32==0 才触发 HVX 主体。
+     *
+     * [2026-09-28 精度根因] 该 HVX 路径用 Qf32 定点累加 + 快速 rsqrt
+     * (hvx_vec_rsqrt_f32 / Q6_Vqf32_vmpy), 在微小行(0.8B GDN 门控态 rms~1e-4,
+     * x² 低于 Qf32 分辨率 2^-31 被截断成 0)上产生 0.5× 量级偏差:
+     * 实测 op911(RMSNorm) 512 行中 49 行 cos<0.99, 最差 0.887; 标量 double 路径
+     * 同数据 0 行<0.99(最差 0.9967)。故默认关(标量), 仅 GEHTP_HVX_RMSNORM=1
+     * 显式开启(待定点 kernel 修好后再默认开)。 */
+    static int g_hvx_rmsnorm = -1;
+    if (g_hvx_rmsnorm < 0) {
+        const char* e = getenv("GEHTP_HVX_RMSNORM");
+        g_hvx_rmsnorm = (e && e[0] == '1') ? 1 : 0;  /* 默认关, 显式 1 才开 */
+    }
+    if (g_hvx_rmsnorm && !bv && m >= 1u && (rw % 32u) == 0u) {
         uint32_t st = 0;
         float* sc = f32_scratch(n, 2, &st);
         if (sc) {
@@ -1855,6 +2000,10 @@ static int xop_conv1d_ssm(const struct wt_op_ctx* cx) {
     return exec_conv1d_ssm(cx->b, cx->op, cx->err, cx->errn);
 }
 
+static int xop_pad(const struct wt_op_ctx* cx) {
+    return exec_pad(cx->b, cx->op, cx->err, cx->errn);
+}
+
 static int xop_gather(const struct wt_op_ctx* cx) {
     return exec_gather(cx->b, cx->op, cx->err, cx->errn);
 }
@@ -1901,6 +2050,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_SPILL] = xop_spill,
     [OP_FILL] = xop_fill,
     [OP_DMA] = xop_dma,
+    [OP_PAD_F16] = xop_pad,
     [OP_TRANSPOSE_F16] = xop_transpose,
     [OP_UNARY_F16] = xop_unary,
     [OP_BINARY_F16] = xop_binary,
@@ -1917,6 +2067,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_KV_APPEND_F16] = xop_kv_unimpl,
     [OP_KV_GATHER_F16] = xop_kv_unimpl,
     [OP_MATMUL_F16] = xop_matmul_f16,
+    [OP_MATMUL_F16_SPLIT] = xop_matmul_f16,
     [OP_RMSNORM2_F16] = xop_rmsnorm2,
     [OP_BROADCAST_F16] = xop_broadcast,
     [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,

@@ -138,7 +138,7 @@ static float hb_f16_to_f32(uint16_t h) {
         if (man == 0) bits = sign;
         else {
             uint32_t m = man; int e = -1;
-            while (!(m & 0x400)) { m <<= 1; e--; }
+            while (!(m & 0x400)) { m <<= 1; e++; }
             bits = sign | ((uint32_t)(127 - 15 + 1 - e - 1) << 23) | ((m & 0x3ff) << 13);
         }
     } else if (exp == 0x1f) {
@@ -159,10 +159,12 @@ static uint16_t hb_f32_to_f16(float f) {
         if (exp < -10) return (uint16_t)sign;
         man |= 0x800000u;
         uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half = man >> (shift + 1);
-        uint32_t rest = man & ((1u << shift) - 1u);
-        if ((man >> shift) & 1u) half += (rest || (half & 1u)) ? 1u : 0u;
-        return (uint16_t)(sign | half);
+        /* subnormal RNE (与 gdn_ref.c gdn_f32_to_f16 逐字同款): 旧版 man >> (shift+1)
+         * 把 f16 subnormal 输出砍半, 与 oplist_exec.c f32_to_f16 同根因一起修。 */
+        uint32_t sub = man >> shift;
+        uint32_t rem = man & ((1u << shift) - 1u);
+        sub += (rem > (1u << (shift - 1u)) || (rem == (1u << (shift - 1u)) && (sub & 1u))) ? 1u : 0u;
+        return (uint16_t)(sign | sub);
     }
     uint32_t half = sign | ((uint32_t)exp << 10) | (man >> 13);
     if ((man >> 12) & 1u) half += ((man & 0xfffu) || (half & 1u)) ? 1u : 0u;

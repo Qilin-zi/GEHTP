@@ -20,7 +20,15 @@ static int op_scatter_nd(Emitter& em, GraphPrepare& gp, const OpDef* od, std::ma
     const OpDef* updp = gp.get_op_at(od->inputs[2].src_id);
 
     uint32_t data_ref = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
-    uint32_t idx_s   = em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots);
+    /* 索引 const 必须 int32 原样入槽 (设备按 int32 直读); src_ref →
+     * ensure_weight_slot 会 f32→f16 洗成全零 (小整数当 denormal), 禁走 */
+    uint32_t idx_s;
+    if (idxp && idxp->const_data_size >= 4) {
+        idx_s = 0x8000u | em.ensure_i32_slot(gp, idxp);
+    } else {
+        std::fprintf(stderr, "[op_scatter_nd] %s: 索引非 const, 拒发\n", nm.c_str());
+        return -1;
+    }
     uint32_t upd_ref = em.src_ref(od->inputs[2], gp.get_input_node_id(), gp, wslots);
     uint32_t out_t   = em.fresh_temp(gp, od->op_id);
 

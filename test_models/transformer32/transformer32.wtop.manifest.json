@@ -1,0 +1,11 @@
+{
+  "manifest_ver": 2,
+  "input_slot": 0,
+  "input_elems": 1024,
+  "output_temp": 5,
+  "n_slots": 24,
+  "n_ops": 37,
+  "op_ids": [7,14,20,18,10,22,24,24,25,26,29,30,35,38,39,40,44,46,50,53,57,63,64,65,65,66,61,67,71,72,76,80,81,82,86,87,91],
+  "opcodes": [25,24,27,24,24,24,26,12,13,24,24,7,25,24,11,12,24,7,25,24,24,27,24,26,12,13,24,24,24,7,25,24,11,12,24,7,25],
+  "op_names": ["RmsNorm","FullyConnected","Transpose","FullyConnected","FullyConnected","MatMul","Eltwise_Binary","Eltwise_Binary","Softmax","MatMul","FullyConnected","Eltwise_Binary","RmsNorm","FullyConnected","ElementWiseNeuron","Eltwise_Binary","FullyConnected","Eltwise_Binary","RmsNorm","FullyConnected","FullyConnected","Transpose","MatMul","Eltwise_Binary","Eltwise_Binary","Softmax","FullyConnected","MatMul","FullyConnected","Eltwise_Binary","RmsNorm","FullyConnected","ElementWiseNeuron","Eltwise_Binary","FullyConnected","Eltwise_Binary","RmsNorm"]
+}

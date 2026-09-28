@@ -278,6 +278,9 @@ private:
     std::vector<TakenRange> taken_ranges_;
 
     void find_live_taken_ranges(int start_idx, int end_idx);
+    // 复用安全断言: 任意两个 lifetime 区间重叠的分配, offset 区间必须不相交。
+    // 违例 = 生命周期算错导致静默串数据前兆, 直接 abort (响亮失败)。
+    void validate_no_overlap(const std::vector<AllocRequest>& requests) const;
 
     // Lifetime-aware allocation state (populated by allocate_with_lifetime)
     std::unordered_map<hnnx::op_id_t, AllocResult> lifetime_allocs_;

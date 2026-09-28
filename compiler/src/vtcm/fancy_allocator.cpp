@@ -6,6 +6,8 @@
 #include <climits>
 #include <cstring>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace fa {
 
@@ -77,10 +79,11 @@ void FancyAllocator::deallocate(void* ptr) {
 //   5. 超预算 → spill 到 DDR
 //
 // 关键: 同 (life_begin, life_end) 的 tensor 必须共存, 不能共享 offset,
-// 只能顺序 bump。跨组复用在 .so 中由 RuntimeAllocator::make_allocator 负责,
-// 非本函数职责。P3 已恢复 RuntimeAllocator 中间层 (继承 + 字段搬移 +
-// make_allocator 槽位工厂), 跨组复用算法属 P5+ 升级; 本函数维持顺序 bump,
-// 行为与恢复前完全一致。
+// 只能顺序 bump。跨组复用在 .so 中由 RuntimeAllocator::make_allocator 负责;
+// 本函数 (host 重实现) 已升级为 first-fit 复用 (T5 第一阶段): 组按 life_begin
+// 升序到达, 已死 (life_end < 当前 life_begin) 的区间回收进 free_list, 新组
+// first-fit 复用; 无洞才 bump, 超预算整组 spill。复用安全由 validate_no_overlap
+// 断言兜底 (生命周期算错 → 响亮 abort, 而非静默串数据)。
 std::unordered_map<hnnx::op_id_t, FancyAllocator::AllocResult>
 FancyAllocator::allocate_with_lifetime(const std::vector<AllocRequest>& requests,
                                         size_t vtcm_budget, size_t alignment) {
@@ -91,13 +94,13 @@ FancyAllocator::allocate_with_lifetime(const std::vector<AllocRequest>& requests
 
     if (requests.empty()) return {};
 
-    // 1. 按 life_end 降序、life_begin 升序、op_id 升序排序
-    //    (反汇编 sort_blocks_by_reverse_lifetime_end @ 0x13b21b0)
+    // 1. 按 life_begin 升序排序 (区间复用需按起点顺序处理, 才能正确回收已死);
+    //    同起点: life_end 降序 (活得久先放), op_id 升序。
     std::vector<AllocRequest> sorted = requests;
     std::sort(sorted.begin(), sorted.end(),
               [](const AllocRequest& a, const AllocRequest& b) {
-                  if (a.life_end != b.life_end) return a.life_end > b.life_end;
                   if (a.life_begin != b.life_begin) return a.life_begin < b.life_begin;
+                  if (a.life_end != b.life_end) return a.life_end > b.life_end;
                   return a.op_id < b.op_id;
               });
 
@@ -136,38 +139,69 @@ FancyAllocator::allocate_with_lifetime(const std::vector<AllocRequest>& requests
         groups.push_back(std::move(g));
     }
 
-    // 3. 顺序 bump 分配: 各组依次放置,组内成员顺序 bump
-    //    (反汇编 allow_tensor_overlap @ 0x13a6af0 组内 bump)
-    uint64_t next_free = 0;
+    // 3. first-fit 复用分配: 组按 life_begin 升序到达, 已死张量的区间回收进
+    //    free_list, 新组优先 first-fit 复用; 无洞才 bump, 超预算整组 spill。
+    struct Range { uint64_t start, end; };
+    struct Live { uint64_t off, size; uint32_t life_end; };
+    std::vector<Range> free_list;
+    std::vector<Live> active;
+    uint64_t high_water = 0;
     uint32_t next_block_id = 0;
 
     for (const auto& g : groups) {
         uint64_t need = align_up(g.total_size);
 
-        if (next_free + need <= vtcm_budget) {
-            // 组内顺序 bump
-            uint64_t cur = next_free;
-            for (const auto* req : g.members) {
-                AllocResult result;
-                result.block_id = next_block_id++;
-                result.offset = cur;
-                result.spilled = false;
-                cur += align_up(req->size);
-                lifetime_allocs_[req->op_id] = result;
-            }
-            taken_ranges_.push_back({next_free, next_free + need,
-                                     -1, g.life_begin, g.life_end});
-            next_free += need;
-        } else {
-            // 超预算 → 全组 spill 到 DDR
-            for (const auto* req : g.members) {
-                AllocResult result;
-                result.block_id = next_block_id++;
-                result.offset = 0;
-                result.spilled = true;
-                lifetime_allocs_[req->op_id] = result;
+        // 回收已死: life_end < g.life_begin 的分配 → 区间进 free_list
+        for (auto it = active.begin(); it != active.end();) {
+            if (it->life_end < g.life_begin) {
+                free_list.push_back({it->off, it->off + it->size});
+                it = active.erase(it);
+            } else {
+                ++it;
             }
         }
+
+        // first-fit: 找最小能放下的 free range
+        int64_t off = -1;
+        for (size_t i = 0; i < free_list.size(); ++i) {
+            if (free_list[i].end - free_list[i].start >= need) {
+                off = (int64_t)free_list[i].start;
+                free_list[i].start += need;
+                if (free_list[i].start >= free_list[i].end)
+                    free_list.erase(free_list.begin() + i);
+                break;
+            }
+        }
+
+        // 无洞 → bump; 超预算 → 整组 spill
+        if (off < 0) {
+            off = (int64_t)high_water;
+            if ((uint64_t)off + need > vtcm_budget) {
+                for (const auto* req : g.members) {
+                    AllocResult result;
+                    result.block_id = next_block_id++;
+                    result.offset = 0;
+                    result.spilled = true;
+                    lifetime_allocs_[req->op_id] = result;
+                }
+                continue;
+            }
+            high_water = (uint64_t)off + need;
+        }
+
+        // 组内顺序分配 + 记 active
+        uint64_t cur = (uint64_t)off;
+        for (const auto* req : g.members) {
+            AllocResult result;
+            result.block_id = next_block_id++;
+            result.offset = cur;
+            result.spilled = false;
+            cur += align_up(req->size);
+            lifetime_allocs_[req->op_id] = result;
+        }
+        taken_ranges_.push_back({(uint64_t)off, (uint64_t)off + need,
+                                 -1, g.life_begin, g.life_end});
+        active.push_back({(uint64_t)off, need, g.life_end});
     }
 
     // size==0 的请求直接分配 block_id, offset=0
@@ -181,11 +215,52 @@ FancyAllocator::allocate_with_lifetime(const std::vector<AllocRequest>& requests
         }
     }
 
-    lifetime_used_ = next_free;
+    lifetime_used_ = high_water;
     lifetime_saved_ = (total_requested > lifetime_used_)
                       ? (total_requested - lifetime_used_) : 0;
 
+    validate_no_overlap(sorted);
+
     return lifetime_allocs_;
+}
+
+// validate_no_overlap: 复用安全断言。任意两个 lifetime 区间重叠的分配,
+// offset 区间必须不相交; 违例 = 生命周期算错导致静默串数据的前兆, abort。
+void FancyAllocator::validate_no_overlap(
+    const std::vector<AllocRequest>& requests) const {
+    struct Placed { uint64_t off, size; uint32_t lb, le; hnnx::op_id_t op; };
+    std::unordered_map<hnnx::op_id_t, AllocRequest> req_by_op;
+    for (const auto& r : requests) req_by_op[r.op_id] = r;
+
+    std::vector<Placed> placed;
+    for (const auto& [op, res] : lifetime_allocs_) {
+        if (res.spilled) continue;
+        auto it = req_by_op.find(op);
+        if (it == req_by_op.end() || it->second.size == 0) continue;
+        placed.push_back({res.offset, it->second.size,
+                          it->second.life_begin, it->second.life_end, op});
+    }
+
+    for (size_t i = 0; i < placed.size(); ++i) {
+        for (size_t j = i + 1; j < placed.size(); ++j) {
+            const Placed& a = placed[i];
+            const Placed& b = placed[j];
+            bool life_overlap = a.lb < b.le && b.lb < a.le;
+            bool off_overlap = a.off < b.off + b.size && b.off < a.off + a.size;
+            if (life_overlap && off_overlap) {
+                std::fprintf(stderr,
+                    "[alloc] OVERLAP: op%llu [%llu,%llu) life[%u,%u) vs "
+                    "op%llu [%llu,%llu) life[%u,%u)\n",
+                    (unsigned long long)a.op,
+                    (unsigned long long)a.off, (unsigned long long)(a.off + a.size),
+                    a.lb, a.le,
+                    (unsigned long long)b.op,
+                    (unsigned long long)b.off, (unsigned long long)(b.off + b.size),
+                    b.lb, b.le);
+                std::abort();
+            }
+        }
+    }
 }
 
 const FancyAllocator::AllocResult* FancyAllocator::get_allocation(hnnx::op_id_t op_id) const {

@@ -110,10 +110,20 @@ enum {
     OP_SPLIT_F16 = 16,      /* [x_t,out_t0..7,axis,n_segments,size0..3,split_index]
                                 arity 16 (副本 op 取第 split_index 段写 out_t0) */
     OP_REDUCE_F16 = 17,     /* [x_t,y_t,n,axis,subtype,dim0..3] arity 9
-                                n=输入元素数, dims=输入形状(rank≤4) */
+                                n=输入元素数, dims=输入形状(rank≤4; rank>4 时发射侧
+                                归一化为 axis=0 + 轴起后缀, leading 维由 outer 展平吸收)
+                                subtype: 0=SUM 1=AVG 2=MAX 3=MIN; 单轴 strided 归约,
+                                axis/subtype 越界硬错误 (禁 0xFFFFFFFF 哨兵野读) */
     OP_CUMSUM_F32 = 18,     /* [x_t,y_t,rows,n,axis,exclusive,reverse] f32 保持 */
-    OP_CONV1D_SSM_F16 = 19, /* [x_t,w_s,y_t,seq,C,k]    depthwise causal conv+SiLU(SSM) */
-    OP_GATHER_F16 = 20,     /* [table_s,idx_s,out_t,n,row_bytes] idx_s 为 int32 槽 */
+    OP_CONV1D_SSM_F16 = 19, /* [x_t,w_s,y_t,seq,C,k]    depthwise causal conv(SSM);
+                               y[t]=Σ_j w[j]·x[t-k+1+j] (纯卷积, 无激活 — SiLU 由图中
+                               独立 Sigmoid/Mul 节点分解, 别再套 silu); 内存 tap j=0 配
+                               最老样本; x 有效行 = seq-k+1, 窗外隐式零 (QNN pad flush) */
+    OP_GATHER_F16 = 20,     /* [tbl,idx,out,n,packed,td0..4,xd0..4] arity 15
+                                packed = axis | xrank<<8 | irank<<16 (均紧凑形口径);
+                                host ops.cpp Gather 坐标分解同款: od=td 把 axis 换成 xd,
+                                idx 块查 tbl[axis], 余维直通, r 越界出零;
+                                idx int32 (const 原样槽/输入槽), tbl 可 temp(GDN state 回读) */
     OP_ARGMAX_F16 = 21,     /* [x_t,out_t,n] */
     OP_KV_APPEND_F16 = 22,  /* [k_t,v_t,state_s,pos]    (M5 decode 用) */
     OP_KV_GATHER_F16 = 23,  /* [state_s,q_t,pos,n_kv,head_dim] */
@@ -137,6 +147,21 @@ enum {
                                out=data 拷贝后按 n_idx 组 K 维坐标写 block 块 */
     /* P5: True DMA runlist operator (arity=8, args: [src,dst,bytes,src_off,dst_off,flags,fence_src,fence_dst]) */
     OP_DMA = 33,
+    /* M4.5: Pad 真物化 (2026-09-24, 0.8B GDN 门控链修复).
+       恒等拷贝降级在 temp 复用下把 pad 区留成垃圾, CumSum 累加后全链毒化。
+       形态门: 单维增长 (前导维折 outer, 尾维折 inner), 常量填充。
+       [x_t,y_t,outer,in_inner,out_inner,pad_before_elems,pad_val_f16]
+       每 outer 块: 先填 pad_before_elems 个 pad_val, 拷 in_inner 个 f16,
+       再填 (out_inner-pad_before-in_inner) 个 pad_val。 */
+    OP_PAD_F16 = 34,
+    /* 002 VTCM 统一 arena (2026-09-28): matmul 编译期 N 分块。
+       [a_ref,w_s,out_t,M,K,N_full,n0,N_chunk,flags] arity 9
+       与 OP_MATMUL_F16 同源: f16×f16→f16 (f32 累加), flags 同 bit 布局;
+       N_full=整 op 列数, n0=本 chunk 列基址, N_chunk=本 chunk 列数(32×)。
+       act/wgt/out 三引用跨 chunk 共享, 仅 n0/N_chunk 两标量不同;
+       逐字节恒等五纪律见 spec FR-013 (每 tile clracc / 重装 bias 页 /
+       k 升序 / 回落全有或全无 / 同引擎)。 */
+    OP_MATMUL_F16_SPLIT = 35,
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -160,7 +185,7 @@ enum {
 #define WT_ARITY_REDUCE_F16 9
 #define WT_ARITY_CUMSUM_F32 7
 #define WT_ARITY_CONV1D_SSM_F16 6
-#define WT_ARITY_GATHER_F16 5
+#define WT_ARITY_GATHER_F16 15
 #define WT_ARITY_ARGMAX_F16 3
 #define WT_ARITY_KV_APPEND_F16 4
 #define WT_ARITY_KV_GATHER_F16 5
@@ -170,6 +195,8 @@ enum {
 #define WT_ARITY_TRANSPOSE_GEN_F16 8
 #define WT_ARITY_SCATTER_ND_F16 14
 #define WT_ARITY_DMA 8
+#define WT_ARITY_PAD_F16 7
+#define WT_ARITY_MATMUL_F16_SPLIT 9
 
 struct wt_slot {
     uint32_t len;

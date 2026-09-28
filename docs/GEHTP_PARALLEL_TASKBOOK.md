@@ -223,6 +223,39 @@
 
 ## 8. 战役日志（追加区，新进展置顶）
 
+### 2026-09-28 C1 线 (eqfix 会话) — 0.8B 设备语义偏差收敛: Gather axis 空 op_data + SELECT 三输入广播缺双根因, logits cos 0.15→0.988
+
+**动机**: 接上条 — v3 修复全 -inf 后设备 logits cos 仅 0.14~0.22 (top1 近乎全错), 语义级偏差二分。
+
+**根因 ① — Gather axis 读空 op_data (v4 修复)**:
+- tagged.bin deserialize **不填 `OpDef::op_data`**(`serialize_opdef` 只写 extra 尾随段 → `serialized_extra`), op_gather.cpp 直读 `od->op_data` 恒得空 → axis 默认 0 → GDN gather (真轴 3, compact 后 2) 全错位, op222 cos 0.0103。
+- 修复: 与 op_concat/op_softmax/op_cumsum 同源, 改读 `serialized_extra`(ExtraAxis, 20B)。v4 blob 校验: 1192 gathers 轴分布正确 (3×axis=0, 55×axis=2, 1134×axis=3)。
+- **坑表登记: tagged.bin 路径下所有标量参数必须走 serialized_extra + extra_info_registry 提取器; op_data 仅在 loader 编译期路径填充。**
+
+**根因 ② — SELECT(Eltwise_Ternary) 三输入广播缺 (v5 修复, 设备全 nan 的直接来源)**:
+- 设备 `exec_binary` SELECT(subtype=8) 原实现: loop 界 = true 分支元素数 `an`, 只支持 cond/假值的**标量**广播。GDN 门控链 (op id=219): cond `[1,1,64,64]` 4096 元素(16 头广播到 65536) + true 分支**标量** 1 元素 + false 65536 → 设备只写 1 个元素, 其余 65535 读旧 temp 垃圾 → op106 Unary 全 nan → Gather tbl 全 nan (op109 nan 根因)。
+- host ops.cpp 同款 op 是 `in_bc()` 三输入 numpy 广播 — emit 侧从未物化。
+- 修复双侧:
+  - emit `op_eltwise_ternary.cpp`: 与 op_eltwise_binary 同款, 任一输入元素数 < 输出即 OP_BROADCAST_F16 物化为全尺寸 temp (cond 4096→65536, true 1→65536), SELECT 保持纯元素语义。
+  - 设备 `exec_binary` SELECT: loop 界改 `max(cn,an,fn)` + true 分支标量广播 (`tv[an<=1?0:i]`) — 防御标量 true 直通路径。
+- v5 blob: n_ops 16297→16443 (+146 broadcast 物化), GDN gate SELECT 实锤带 cond/true 双物化。
+
+**设备验证 (d0f1784, v5, hook 阶梯对拍)**:
+| 锚点 | op | cos |
+|---|---|---|
+| op109 MatMul | id=215 | 1.000000 |
+| op110 Binary | id=216 | 1.000000 |
+| op113 SELECT | id=219 | 0.610667 (514/65536 元素错位, 下述) |
+| op114 Unary | id=221 | 0.999999 |
+| op117 **Gather** | id=222 | **1.000000** (修复前 nan) |
+| op125/137 ScatterNd | id=243/266 | 0.999999 |
+| op128 Gather | id=245 | 1.000000 |
+- **logits (P0): 修复前 cos 0.153 top1 1/32 → 修复后 cos 0.988039 top1 26/32, nan=0 inf=0** — 与 host 链同 prompt 水平 (cos 0.9987 / top1 31/32) 同量级, C1 设备链语义偏差收敛到 host 链残差口径内。
+
+**挂账**: ①op113 SELECT 残差 514/65536 元素 (512 处 host=0 而 dev=in2 直通, 2 处反之) — 模式 = cond 全 1 列(head 0 对角线)被当 false; 下游 op114 cos 0.9999 显示影响甚微, 疑似 host/device cond 在边界列的 dump 口径差, 未收口。②op122 Reduce(id=237) 16 元素 dev 全 0 vs host 非零 (cos=0) — 同族小锚点, 下游 op125 ScatterNd cos 0.9999 未传播, 挂账。③C1 总门 cos≥0.9999+top1 4/4 仍未达 (host 链自身亦然), 门收口另行。④build_linux 有 root 所有残留 (09-22 容器误 build) 致 4 个 test 目标目录陈旧 — 非本树代码问题, /tmp 干净副本全量构建 ctest 47/47 绿; build_linux 需 root 清理后重 cmake。
+
+**清理**: 全部临时调试代码已删 (op_gather.cpp GEHTP_DEBUG_GATHER×4 块, wtop_ops.hpp [wslot]/[i32slot]×4, op_eltwise_binary.cpp [bdiag]); ctest 47/47 绿 (/tmp 干净副本)。
+
 ### 2026-09-22 C1 线 (eqfix 会话) — 全模型设备 run 三重门连环爆破: emit 静默兜底 ×2 + MAX_TEMPS 物理上限
 
 **动机**: CONVERGE Phase 1.2("broadcast opcode 补齐")复盘。结论先行: ①broadcast 执行体本树 09-01 已具(de237a1), 09-18"停点"系板上陈旧 lib 假象; ②真实阻塞 = emit 两处静默兜底毒化数值; ③**本树 lib 的 MAX_TEMPS=256 物理上限使全模型从未在本树跑通过**——09-19 22:41 optrace 全过(/tmp 已清)是平行树 lib 的功劳, 非本树能力。
@@ -259,6 +292,9 @@
 - **eqfix 疗效确认**：修复前设备输出 7,946,240 元素全 -inf（死输出）；修复后四 prompt 全部有限值（nan=0/inf=0、logits 分布合理 ±17）——全 -inf 毒化已根除，剩下的是**语义级偏差**（cos 0.14~0.22，top1 近乎全错）。
 - 输出结构：设备各行 top1 偏向小 token id（16/314/88…），行间 cos 0.71（golden 0.39）= 部分塌缩；row0 cos 0.24 / row31 cos 0.41，信号存在但整体偏。
 - 分叉定位工具落地：**exec_hook_dump 双平台化**（原 hostsim 限定 GEHTP_HOOK → 加 `wt_exec_set_hook` + runner job.txt `hook` 键 + `gehtp run --hook "idx:temp,..."`，设备产物 /data/local/tmp/hrt/gehtp/hook_<idx>_<temp>.f16.raw 自动拉回 prof/）。锚点 = embedding(op8→temp0) + 全部 79 个 RmsNorm 输出（80 点 spec 762 字符），host 对照 = .scratch_a3/dump_fixed（P0 输入全图 host_id dump，实锤覆盖 80/80 锚点）。
+
+**2026-09-23 06:xx 复现性实锤（eqfix 会话，lib 全量重建后）**: 用正确 `HEXAGON_SDK_ROOT=/disk1/toolchains/...`（build_libs.sh 默认 /local/mnt 死路径，env.sh 的 TC 不被它读——坑表补登）全量重编+重签 libhvxhmx_v23 并 gehtp setup 重推 d0f1784，串行复跑 p0~p3 → judge 数值**逐位复现**上表凌晨矩阵（P0 0.153144/1·32, P1 -0.067401/0·32, P2 0.220459/0·32, P3 0.142622/4·32）。跨 lib 重建、跨 4.5h、cos/top1 完全一致 = **偏差是确定性语义错误，排除竞态/随机硬件噪声**，hook 对拍二分具有可重复判读基础。产物 .scratch_eqfix/out_v3_rerun_p{0..3}.f16.raw。
+- 行错位排除（新增判读）：设备 32 行 logits 与 golden 32 行两两 cos 最优匹配行号散乱（P0 最优行 ∈ {17,31,2,19,6}，P2 ∈ {0,2,20,19}），无 clean permutation，最优 cos 0.2~0.71 —— **不是 seq 维行移位/转置**，是逐行内部数值部分塌缩（行间自相关 0.71 vs golden 0.39），与 scatter_nd/GDN 门控污染假说相容。
 
 **挂账**: ①设备/host 分叉点定位中（hook dump 对拍链：hook_<idx> ↔ manifest.op_ids[idx] ↔ host_id_<oid>，M3c 机制复用）；首要嫌疑 scatter_nd×1154 首实跑/Pad 尾部垃圾/Cast; ②C1 总门 cos≥0.9999+top1 4/4 未达(host 链自身 0.9987/26~31 亦未达，门收口另行); ③oplist_exec.c 已被 58cc915 合并提交（eqfix+P5 OP_DMA 修订），ptr_in_vtcm 重复定义编译错误由对方会话 01:49 修复；dump 改动（exec_hook_dump 双平台化）未提交，commit 需与活跃会话错峰; ④v2 blob(EQ 错误语义+烘焙全零)及其设备输出全部作废, test_assets/qwen35_08b/qwen35_08b.wtop 同源需按 v3 流程重编替换。
 
@@ -308,3 +344,10 @@
 
 17. **PROF 战役 G-P2 登记**: d0f1784 经 110, 短槽 ~5min (conv_add 2s run + 拉回 op_ts.bin/device.txt)。身份制合规: gehtp_runner_prof.so + job_prof.txt 独立通道 (不碰 job.txt)。lib 换装窗口: 备份设备标准 lib (f35e06d6) → 我方 d8fc9502 (同 HEAD v2 ABI 超集: PROF+arity14; 对在册 runner/blob 兼容) → 跑完恢复。**勘误 #12**: 本线 runner 已 09-18 随 v2 ABI 重编 (两态 trace 版), 非 #12 所指 09-17 早旧件。排队序: C1 (在跑 qwen35_08b_scatter) → C4 (minicpm 30min) → PROF (本行)。
 18. **skel 层①字节级定案 (顺带, 见 §8 前文 09-17 事故)**: 好坏 skel 符号表/strings 全同, 唯一差=SWIV 签名段 (56B); 未签件补签 = 已知好件 380f3cbf 逐字节一致 (确定性签名)。治理已入 task/prof-wp scripts/gehtp cmd_setup [0/5] (ship 缺签→现场补签→推后读回校验; 缺件→源码重建) + device_run.sh 拷链门卫。新板 skel 已 380f3cbf ✓ 勿动。
+
+### 2026-09-24 EVAL 线 (本会话) — qwen35_08b_v3 精度+性能评估（复跑确认）
+
+1. **设备 lib 被覆盖事故 + 恢复**: d0f1784 标准 lib 被它会话换成异树构建 (fc79cfb4, arity-12 scatter ABI), v3 blob wt_parse 即拒 (opc=28 na=14 arity=12 rc=-11); `gehtp setup` 回本树签名 lib (325ec2d9) 后恢复正常。再次实锤 #9 ABI 分裂坑 + 身份制必要性。
+2. **复跑确认（第 3 次逐位复现）**: `gehtp run qwen35_08b_v3.wtop --input ids_p0.i32.raw` rc 0, 输出与 09-23 rerun **逐字节一致**; wall 279.31s (上次 279.64s, Δ0.1%), lm_head 224.03s (上次 224.13s)。精度/性能均为确定性结论, 非噪声。
+3. **精度判决 (vs HF fp32 golden, judge_logits.py)**: P0 cos=0.153144/top1=1/32, P1 cos=-0.067401/0, P2 cos=0.220459/0, P3 cos=0.142622/4 — **全 4 prompt CHECK (FAIL)**, 维持 eqfix 挂账① (语义级偏差, hook 对拍分叉定位在途, 首要嫌疑 scatter_nd/Pad 尾垃圾/Cast)。
+4. **性能拆解 (口径=gehtp runner per-op wall µs + graph wall, 对应 QNN per-op cycles/graph wall 字段; 场景=seq32 prefill 整网串行 runlist, 16297 ops; 非 num_dominant_path, 无 HMX/HVX 单元拆分)**: graph wall **279.3s** (read 3.6 + exec 275.1 + 写回 0.03)。真算-MAC 93.2% (MATMUL_F16 256.1s + CONV1D_SSM 0.4s), 装料-prep 6.8% (STRIDED_SLICE 6.7 + BROADCAST 6.1 + UNARY 3.7 + TRANSPOSE_GEN 1.3 + 杂 0.9s), spill/fill/DMA=0。**单一 lm_head (op#16296, [32,1024]×[1024,248320]) = 224.0s = 80% wall, 有效 0.073 GFLOPS** — 唯一数量级杠杆 (疑似走了朴素 HVX 路径); 其余 325 个 matmul 合计 32.0s (avg 98.5ms)。产物 .scratch_eqfix/out_v3_eval_p0.f16.raw。

@@ -14,7 +14,7 @@ import numpy as np
 
 VOCAB = 248320
 SEQ = 32
-GOLD = "/disk2/GEHTP/test_models/qwen35_08b/cpu_golden"
+GOLD = "/disk1/gehtp/test_models/qwen35_08b/cpu_golden"
 
 
 def load_dev(path):

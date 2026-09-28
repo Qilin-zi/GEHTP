@@ -85,6 +85,47 @@ static void build_conv_add(GraphPrepare& gp) {
     gp.append_node("Output", 10, oin, 1, nullptr, 0, nullptr);
 }
 
+/* 建 FullyConnected 图: Input[M,K](f16) @ W[N,K](const f32 池, 存 [N,K]) -> Output[M,N]。
+ * 用 FC 而非 MatMul: 真实 0.8B 的超界 matmul (lm_head N248320 等) 全是 FC (flags=2
+ * 非 batched), 而 prepare 会把 rank<4 张量补成 [1,1,..,..] → MatMul 被误判
+ * batched(Bn=1), 分块条件 (非 batched) 永不命中。FC 的 ExtraFc 无 batched 字段,
+ * 恒非 batched, 与真实发射一致。 */
+static void build_matmul(GraphPrepare& gp, uint32_t M, uint32_t K, uint32_t N) {
+    auto f32_od2 = [](uint64_t d0, uint64_t d1) {
+        OutputDef od{};
+        od.rank = 2; od.dims[0] = d0; od.dims[1] = d1;
+        od.element_size = 4;
+        od.dtype = static_cast<uint32_t>(DType::Float32);
+        return od;
+    };
+    OutputDef w_od = f32_od2(N, K);   /* FC 权重存 [N,K] */
+    std::vector<uint8_t> W(N * K * 4, 0);
+    /* 确定性非零整数取值 (f16 精确表示), 供 T016 数值对拍; T010/T011 只查
+     * opcode/形状不看值, 不受影响 */
+    for (size_t i = 0; i < N * K; i++) {
+        float v = (float)((int)(i % 37) - 18);
+        std::memcpy(W.data() + i * 4, &v, 4);
+    }
+    gp.append_const_node(1, w_od, W.data(), W.size());
+    gp.get_op_at(1)->name_tag = string_tag_t::map_str("W");
+
+    OutputDef in_od{};
+    in_od.rank = 2; in_od.dims[0] = M; in_od.dims[1] = K;
+    in_od.element_size = 2;
+    in_od.dtype = static_cast<uint32_t>(DType::Float16);
+    gp.append_node("Input", 10, nullptr, 0, &in_od, 1, nullptr);
+
+    InputDef mm_in[2] = {{10, 0}, {1, 0}};
+    OutputDef mm_od{};
+    mm_od.rank = 2; mm_od.dims[0] = M; mm_od.dims[1] = N;
+    mm_od.element_size = 2;
+    mm_od.dtype = static_cast<uint32_t>(DType::Float16);
+    gp.append_node("FullyConnected", 20, mm_in, 2, &mm_od, 1, nullptr);
+
+    InputDef oin[1] = {{20, 0}};
+    gp.append_node("Output", 40, oin, 1, nullptr, 0, nullptr);
+}
+
 static bool write_file(const std::string& path, const void* data, size_t len) {
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return false;
@@ -103,6 +144,67 @@ static bool load_file(const std::string& path, std::vector<uint8_t>& out) {
     if (sz > 0 && std::fread(out.data(), 1, (size_t)sz, f) != (size_t)sz) { std::fclose(f); return false; }
     std::fclose(f);
     return true;
+}
+
+/* —— T016 host 合成数值验证: f16 转换 + FC 标量参考 ——
+ * 直接复制 oplist_exec.c:341-385 的 f16↔f32 (IEEE 754 binary16, 与 exec
+ * 标量路径同算法) 及 exec_matmul_f16 标量回落 FC(t1=1, 非 batched) 循环
+ * (:1610-1619) 的 n0/N_full 版本。目的: 验证发射出的 (n0,N_chunk,N_full)
+ * 分块把同一乘积流按列拆开重放后逐字节等于整算。 */
+static float r_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t man = h & 0x3ffu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;
+        } else {
+            uint32_t m = man;
+            int e = -1;
+            while (!(m & 0x400u)) { m <<= 1; e++; }
+            bits = sign | ((uint32_t)(127 - 15 + 1 - e - 1) << 23) | ((m & 0x3ffu) << 13);
+        }
+    } else if (exp == 0x1fu) {
+        bits = sign | 0x7f800000u | (man << 13);
+    } else {
+        bits = sign | ((exp - 15u + 127u) << 23) | (man << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+static uint16_t r_f32_to_f16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t man = x & 0x7fffffu;
+    if (((x >> 23) & 0xffu) == 0xffu) return (uint16_t)(sign | 0x7c00u);
+    if (exp >= 0x1f) return (uint16_t)(sign | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        man |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half = man >> (shift + 1);
+        uint32_t rest = man & ((1u << shift) - 1u);
+        if ((man >> shift) & 1u) half += (rest || (half & 1u)) ? 1u : 0u;
+        return (uint16_t)(sign | half);
+    }
+    uint32_t half = sign | ((uint32_t)exp << 10) | (man >> 13);
+    if ((man >> 12) & 1u) half += ((man & 0xfffu) || (half & 1u)) ? 1u : 0u;
+    return (uint16_t)half;
+}
+/* FC(t1=1) 标量: y[m*N_full + n0+n] = Σ_k a[m*K+k]·w[(n0+n)*K+k] (f32 累加) */
+static void fc_ref(const uint16_t* a, const uint16_t* w, uint16_t* y,
+                   uint32_t M, uint32_t K, uint32_t N_full, uint32_t n0, uint32_t N) {
+    for (uint32_t m = 0; m < M; m++)
+        for (uint32_t n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (uint32_t k = 0; k < K; k++)
+                acc += r_f16_to_f32(a[(size_t)m * K + k]) * r_f16_to_f32(w[(size_t)(n0 + n) * K + k]);
+            y[(size_t)m * N_full + (n0 + n)] = r_f32_to_f16(acc);
+        }
 }
 
 int main() {
@@ -343,6 +445,157 @@ int main() {
             std::vector<uint8_t> bdm;
             CHECK(load_file(blob_dma, bdm), "P5: read --dma-runlist blob");
             CHECK(bdm == blob, "P5: 无溢出计划下 --dma-runlist 输出 == 默认形态 (逐字节)");
+        }
+    }
+
+    /* 8. US1 matmul 编译期 N 分块契约 (OP_MATMUL_F16_SPLIT=35, arity 9):
+     * 线格式 [a_ref, w_s, out_t, M, K, N_full, n0, N_chunk, flags]。
+     * 大 N 超 VTCM 界 → ceil(N/N_chunk) 个 SPLIT op, n0 递增覆盖 [0,N),
+     * act/wgt/out 三引用跨 chunk 共享; 小 N 不超界 → 旧 OP_MATMUL_F16 (24) arity 7。
+     * 预算口径(US1): 运行时 VTCM total = 16MB(设备 A2 query_VTCM 实锤 16777216),
+     * need 公式与 exec_matmul_f16_hmx 一致 =
+     * align2048(M*K*2) + align2048(N*K*2) + align2048(M*N*2) + 2048。 */
+    {
+        auto run_matmul_emit = [&](uint32_t M, uint32_t K, uint32_t N) {
+            GraphPrepare g;
+            build_matmul(g, M, K, N);
+            if (g.prepare(env) != GraphStatus::Success) {
+                CHECK(false, "matmul prepare");
+                return (wt_blob*)nullptr;
+            }
+            std::vector<uint8_t> b2(1u << 27, 0);  /* 128MB: 超界 N(8192×1024) 的 f32 权重池 ~32MB */
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) {
+                CHECK(false, "matmul serialize");
+                return (wt_blob*)nullptr;
+            }
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "mm_%u_%u_%u", M, K, N);
+            const std::string bp = dir + tag + ".bin";
+            const std::string ip = dir + tag + ".f16.raw";
+            const std::string op2 = dir + tag + ".wtop";
+            const std::string mp = dir + tag + ".manifest.json";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint8_t> in16((size_t)M * K * 2, 0);
+            write_file(ip, in16.data(), in16.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 +
+                             " --manifest " + mp + " 2>/dev/null";
+            if (std::system(c2.c_str()) != 0) {
+                std::system((std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 +
+                             " --manifest " + mp).c_str());
+                CHECK(false, "matmul emit exit 0");
+                return (wt_blob*)nullptr;
+            }
+            std::vector<uint8_t> bl2;
+            if (!load_file(op2, bl2)) { CHECK(false, "matmul read blob"); return (wt_blob*)nullptr; }
+            wt_blob* w2 = new wt_blob{};
+            if (wt_parse(bl2.data(), bl2.size(), w2) != WT_OK) {
+                CHECK(false, "matmul wt_parse"); delete w2; return (wt_blob*)nullptr;
+            }
+            return w2;
+        };
+
+        /* T010: 大 N (8192/K1024, need≈17MB) 超 16MB 界 → SPLIT 分块 */
+        {
+            wt_blob* w = run_matmul_emit(32, 1024, 8192);
+            CHECK(w && w->n_ops >= 2, "US1: N=8192 超界 → 分块 op 数 ≥2");
+            if (w && w->n_ops >= 2) {
+                bool all_split = true, arity9 = true, shared_ref = true, n0_cov = true;
+                for (uint32_t i = 0; i < w->n_ops; i++) {
+                    if (w->ops[i].opcode != 35) all_split = false;      /* OP_MATMUL_F16_SPLIT */
+                    if (w->ops[i].n_args != 9) arity9 = false;
+                }
+                const uint32_t a0 = w->ops[0].args[0], s1 = w->ops[0].args[1], t2 = w->ops[0].args[2];
+                for (uint32_t i = 0; i < w->n_ops; i++) {
+                    if (w->ops[i].args[0] != a0 || w->ops[i].args[1] != s1 || w->ops[i].args[2] != t2)
+                        shared_ref = false;
+                }
+                uint32_t expect_n0 = 0;
+                for (uint32_t i = 0; i < w->n_ops; i++) {
+                    if (w->ops[i].args[6] != expect_n0) n0_cov = false;
+                    if (w->ops[i].args[3] != 32 || w->ops[i].args[4] != 1024 || w->ops[i].args[5] != 8192) n0_cov = false;
+                    if (w->ops[i].args[7] == 0 || (w->ops[i].args[7] % 32) != 0) n0_cov = false;
+                    expect_n0 += w->ops[i].args[7];
+                }
+                if (expect_n0 != 8192) n0_cov = false;
+                CHECK(all_split, "US1: 全 op opcode=35 (SPLIT)");
+                CHECK(arity9, "US1: 全 op arity=9");
+                CHECK(shared_ref, "US1: act/wgt/out 三引用跨 chunk 共享");
+                CHECK(n0_cov, "US1: n0 递增覆盖 [0,N) 且 M/K/N_full/N_chunk(32×) 一致");
+            }
+            delete w;
+        }
+
+        /* T011: 小 N (256/K512) 不超界 → 旧 OP_MATMUL_F16 arity 7 行为不变 */
+        {
+            wt_blob* w = run_matmul_emit(32, 512, 256);
+            CHECK(w && w->n_ops == 1, "US1: N=256 不超界 → 单 op (旧兼容)");
+            if (w && w->n_ops == 1) {
+                CHECK(w->ops[0].opcode == OP_MATMUL_F16 && w->ops[0].n_args == 7,
+                      "US1: 小 N 走 OP_MATMUL_F16(24) arity=7 不变");
+                CHECK(w->ops[0].args[3] == 32 && w->ops[0].args[4] == 512 && w->ops[0].args[5] == 256,
+                      "US1: 小 N M/K/N 参数不变");
+            }
+            delete w;
+        }
+
+        /* T016: host 合成数值验证 —— 发射出的分块 (n0,N_chunk,N_full) 经 FC 标量
+         * 重放后逐字节等于整算标量 (五纪律之「k 升序不动」: N 只切列, 每元素
+         * 乘积流不变)。输入/权重取确定性非零整数 (f16 精确), 非零保证 n0 错位
+         * 会在零值下不可见。 */
+        {
+            auto pat_a = [](size_t i) -> uint16_t { return r_f32_to_f16((float)((int)(i % 29) - 14)); };
+            auto pat_w = [](size_t i) -> uint16_t { return r_f32_to_f16((float)((int)(i % 37) - 18)); };
+
+            /* (a) 大 N=8192/K1024 发射分块: 逐 chunk 标量 vs 整算标量 */
+            {
+                uint32_t M = 32, K = 1024, N_full = 8192;
+                wt_blob* w = run_matmul_emit(M, K, N_full);
+                CHECK(w && w->n_ops >= 2, "T016: N=8192 发射分块 op ≥2");
+                if (w && w->n_ops >= 2) {
+                    std::vector<uint16_t> a((size_t)M * K), wgt((size_t)N_full * K);
+                    for (size_t i = 0; i < a.size(); i++) a[i] = pat_a(i);
+                    for (size_t i = 0; i < wgt.size(); i++) wgt[i] = pat_w(i);
+                    std::vector<uint16_t> y((size_t)M * N_full, 0);
+                    for (uint32_t i = 0; i < w->n_ops; i++) {
+                        fc_ref(a.data(), wgt.data(), y.data(), M, K, N_full,
+                               w->ops[i].args[6], w->ops[i].args[7]);
+                    }
+                    std::vector<uint16_t> yref((size_t)M * N_full, 0);
+                    fc_ref(a.data(), wgt.data(), yref.data(), M, K, N_full, 0, N_full);
+                    CHECK(y == yref, "T016: 分块标量 vs 整算标量逐字节一致");
+                }
+                delete w;
+            }
+
+            /* (b) 边界形状: M=32 单行 tile / N=32 单列 tile / 部分尾 chunk / 退化单块 */
+            {
+                struct Case { uint32_t M, K, N_full, Nc; };
+                const Case cases[] = {
+                    {32, 64, 256, 32},     /* Nc=32 单列 chunk */
+                    {32, 32, 32, 32},      /* 单 tile */
+                    {32, 1024, 4096, 384}, /* 部分尾 chunk (4096 % 384 != 0) */
+                    {32, 128, 1024, 1024}, /* 退化: Nc == N_full 单块 */
+                };
+                for (const auto& c : cases) {
+                    std::vector<uint16_t> a((size_t)c.M * c.K), wgt((size_t)c.N_full * c.K);
+                    for (size_t i = 0; i < a.size(); i++) a[i] = pat_a(i);
+                    for (size_t i = 0; i < wgt.size(); i++) wgt[i] = pat_w(i);
+                    std::vector<uint16_t> y((size_t)c.M * c.N_full, 0);
+                    for (uint32_t n0 = 0; n0 < c.N_full; n0 += c.Nc) {
+                        uint32_t nc = (c.Nc < c.N_full - n0) ? c.Nc : (c.N_full - n0);
+                        fc_ref(a.data(), wgt.data(), y.data(), c.M, c.K, c.N_full, n0, nc);
+                    }
+                    std::vector<uint16_t> yref((size_t)c.M * c.N_full, 0);
+                    fc_ref(a.data(), wgt.data(), yref.data(), c.M, c.K, c.N_full, 0, c.N_full);
+                    char msg[96];
+                    std::snprintf(msg, sizeof(msg), "T016: 边界 M=%u K=%u N=%u Nc=%u 逐字节",
+                                  c.M, c.K, c.N_full, c.Nc);
+                    CHECK(y == yref, msg);
+                }
+            }
         }
     }
 

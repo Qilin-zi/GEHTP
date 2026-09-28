@@ -1933,9 +1933,20 @@ std::vector<uint8_t> extract_eltwise_extra(const GraphPrepare& gp, const OpDef& 
 
 std::vector<uint8_t> extract_axis_extra(const GraphPrepare& gp, const OpDef& opdef) {
     ExtraAxis e{};
-    e.axis = static_cast<int32_t>(scalar_num(opdef, "axis", -1));
+    /* Reduce 的轴在 axes tensor_param (QNN 无 scalar "axis") — 旧码读
+     * scalar 恒得 -1=0xFFFFFFFF, 设备 exec_reduce d[axis] 野读 (0.8B 全图
+     * 1170 个 Reduce 全灭)。与 extract_rmsnorm_extra 同源读 tensor const。 */
+    const OpDef* axes = find_param_const(gp, opdef, "axes");
+    auto ax = read_param_u32(gp, axes, 4);
+    e.axis = ax.empty() ? static_cast<int32_t>(scalar_num(opdef, "axis", -1))
+                        : static_cast<int32_t>(ax[0]);
+    /* reduce_type QNN 写 "ReduceSum/Mean/Max/Min" — 旧码比 "SUM"/"AVG"
+     * 恒落空得 0xFFFFFFFF (subtype 语义全错)。契约: 0=SUM 1=AVG 2=MAX 3=MIN。 */
     const std::string rt = scalar_str(opdef, "reduce_type");
-    e.reduce_type = (rt == "SUM" || rt.empty()) ? 0 : (rt == "AVG" ? 1 : 0xFFFFFFFFu);
+    e.reduce_type = (rt == "ReduceSum" || rt == "SUM" || rt.empty()) ? 0
+                  : (rt == "ReduceMean" || rt == "AVG") ? 1
+                  : (rt == "ReduceMax") ? 2
+                  : (rt == "ReduceMin") ? 3 : 0xFFFFFFFFu;
     e.keep_dims = static_cast<uint32_t>(scalar_num(opdef, "keep_dims", 0));
     e.exclusive = static_cast<uint32_t>(scalar_num(opdef, "exclusive", 0));
     e.reverse = static_cast<uint32_t>(scalar_num(opdef, "reverse", 0));
@@ -2066,11 +2077,17 @@ std::vector<uint8_t> extract_transpose_extra(const GraphPrepare& gp, const OpDef
 
 std::vector<uint8_t> extract_depthwise_conv_extra(const GraphPrepare& gp, const OpDef& opdef) {
     ExtraDepthwiseConv e{};
-    // 权重 const [1,1,K,C] 或 [Kh,Kw,C,1](depthwise); 这里按 [1,k,1,C] QNN 布局
+    // 权重 const QNN 布局 [1,k,1,C] (末维=通道 C)。kw = 总元素/C —— 对
+    // [1,4,1,6144] 得 4; 旧码取 dims[r-2] 命中 singleton 1 (0.8B GDN 实锤:
+    // 真核 k=4 被发成 k=1, 设备 conv 输出能量差 30 倍)。
     const OpDef* w = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
     if (w && w->output_def.rank >= 2) {
         uint32_t r = w->output_def.rank;
-        e.kw = w->output_def.dims[r - 2];
+        uint64_t elems = 1;
+        for (uint32_t i = 0; i < r && i < 5; i++) elems *= w->output_def.dims[i];
+        uint64_t ch = w->output_def.dims[r - 1];
+        uint32_t kw = ch ? (uint32_t)(elems / ch) : 1;
+        e.kw = kw ? kw : 1;
         e.kh = 1;
     }
     // stride/pad 在 tensor_param(stride/pad_amount), 名匹配

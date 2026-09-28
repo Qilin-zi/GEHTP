@@ -146,18 +146,41 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         }
         /* Input 节点按 op_id 升序(与 host_run 同约定) — in_ids 已在图级信息段收集 */
         em.main_input_id = in_ids[0];
+        if (getenv("GEHTP_DEBUG_INPUTS"))
+            std::fprintf(stderr, "[inputs] in_ids=%zu in_paths=%zu\n", in_ids.size(), in_paths.size());
         for (size_t k = 0; k < in_ids.size(); k++) {
             const OpDef* iop = gp.get_op_at(in_ids[k]);
             if (!iop) continue;
             size_t elems = 1;
             for (uint32_t i = 0; i < iop->output_def.rank && i < 5; ++i)
                 elems *= (size_t)iop->output_def.dims[i];
+            if (getenv("GEHTP_DEBUG_INPUTS"))
+                std::fprintf(stderr,
+                             "[inputs] k=%zu op=%llu name=%s rank=%u dims=[%llu,%llu,%llu,%llu] dtype=%u elems=%zu file=%s\n",
+                             k, (unsigned long long)in_ids[k],
+                             (iop->name_tag && iop->name_tag->name()) ? iop->name_tag->name() : "?",
+                             iop->output_def.rank,
+                             (unsigned long long)(iop->output_def.rank > 0 ? iop->output_def.dims[0] : 0),
+                             (unsigned long long)(iop->output_def.rank > 1 ? iop->output_def.dims[1] : 0),
+                             (unsigned long long)(iop->output_def.rank > 2 ? iop->output_def.dims[2] : 0),
+                             (unsigned long long)(iop->output_def.rank > 3 ? iop->output_def.dims[3] : 0),
+                             (unsigned)iop->output_def.dtype, elems,
+                             k < in_paths.size() ? in_paths[k].c_str() : "(zeros)");
             /* 设备槽面统一 f16: f32 文件(4B/元素)转 f16 后塞槽;
              * 已是 f16(2B/元素)直塞。 */
             std::vector<uint8_t> data;
             /* 主输入 dtype 跟随图输入节点: int32(ids/gather 索引)保持 4B/元素,
-             * 不参与槽面 f16 化; 其余 f16 直塞 / f32 转 f16。 */
-            bool is_i32_in = (k == 0 && iop->output_def.dtype == (uint32_t)DType::Int32);
+             * 不参与槽面 f16 化; 其余 f16 直塞 / f32 转 f16。
+             * 例外: .i32.raw 文件名显式声明 int32 原文 — tagged 输入节点
+             * dtype 全是 Float32(loader 口径), pos_arange.i32.raw 曾被
+             * f32→f16 洗成全零 (小整数当 denormal, RoPE/GDN 位置全灭)。 */
+            bool name_i32 = false;
+            if (k < in_paths.size()) {
+                const std::string& fp = in_paths[k];
+                name_i32 = fp.size() >= 8 &&
+                           fp.compare(fp.size() - 8, 8, ".i32.raw") == 0;
+            }
+            bool is_i32_in = (k == 0 && iop->output_def.dtype == (uint32_t)DType::Int32) || name_i32;
             if (is_i32_in) {
                 if (k < in_paths.size()) {
                     if (!load_file(in_paths[k], data)) {

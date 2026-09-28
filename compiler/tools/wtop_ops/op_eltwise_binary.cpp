@@ -22,28 +22,6 @@ static int op_eltwise_binary(Emitter& em, GraphPrepare& gp, const OpDef* od, std
     /* numpy 广播: b 元素 < 输出时先物化为全尺寸 temp(带形状的
      * 逐轴广播), 保持 ADD/BINARY 纯元素语义 */
     const OpDef* bb = gp.get_op_at(od->inputs[1].src_id);
-    uint64_t b_elems = bb ? elems_of(bb) : n;
-    if (getenv("GEHTP_BDIAG")) {
-        const OpDef* aa = gp.get_op_at(od->inputs[0].src_id);
-        std::fprintf(stderr, "[bdiag] op %llu %s: od.rank=%u od.dims=",
-                     (unsigned long long)od->op_id,
-                     od->name_tag && od->name_tag->name() ? od->name_tag->name() : "?",
-                     od->output_def.rank);
-        for (uint32_t i = 0; i < od->output_def.rank && i < 8; i++)
-            std::fprintf(stderr, "%u ", od->output_def.dims[i]);
-        std::fprintf(stderr, "| a(%s).rank=%u dims=",
-                     aa && aa->name_tag && aa->name_tag->name() ? aa->name_tag->name() : "?",
-                     aa ? aa->output_def.rank : 0);
-        if (aa) for (uint32_t i = 0; i < aa->output_def.rank && i < 8; i++)
-            std::fprintf(stderr, "%u ", aa->output_def.dims[i]);
-        std::fprintf(stderr, "| bb(%s).rank=%u dims=",
-                     bb && bb->name_tag && bb->name_tag->name() ? bb->name_tag->name() : "?",
-                     bb ? bb->output_def.rank : 0);
-        if (bb) for (uint32_t i = 0; i < bb->output_def.rank && i < 8; i++)
-            std::fprintf(stderr, "%u ", bb->output_def.dims[i]);
-        std::fprintf(stderr, "| n=%llu b_elems=%llu\n",
-                     (unsigned long long)n, (unsigned long long)b_elems);
-    }
     /* 广播物化: a/b 任一输入元素数 < 输出即物化为全尺寸 temp
      * (numpy 广播; Expand 的 a [1,2,1,32,256]→[1,2,4,32,256] 同款) */
     {

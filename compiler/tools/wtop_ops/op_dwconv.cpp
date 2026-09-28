@@ -12,6 +12,21 @@ static int op_dwconv(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
         std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
     uint32_t x_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
     const OpDef* w = od->inputs.size() > 1 ? gp.get_op_at(od->inputs[1].src_id) : nullptr;
+    /* kw 以权重实形重算 (QNN 布局 [1,k,1,C], 末维=ch): serialized_extra 是
+     * hnnx_compile 期冻结的, 重跑 wtop_emit 不会刷新 — 0.8B GDN 旧 tagged.bin
+     * 全 18 层 kw=1 (真核 4), 与 graph_prepare.cpp 提取器修复同式。 */
+    if (w && w->output_def.rank >= 2) {
+        uint32_t r = w->output_def.rank;
+        uint64_t we = 1;
+        for (uint32_t i = 0; i < r && i < 5; i++) we *= w->output_def.dims[i];
+        uint64_t wch = w->output_def.dims[r - 1];
+        uint32_t kw = wch ? (uint32_t)(we / wch) : 0;
+        if (kw && kw != e.kw) {
+            std::fprintf(stderr, "[op_dwconv] op %llu: kw %u→%u (权重实形重算)\n",
+                         (unsigned long long)od->op_id, e.kw, kw);
+            e.kw = kw;
+        }
+    }
     uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
     uint32_t out_t = em.fresh_temp(gp, od->op_id);
     uint64_t ne = elems_of(od);
