@@ -157,7 +157,7 @@ T5 (跨组复用 + bin packing)  独立后置
 |---|---|---|---|
 | T0 对比报告 | | pending | |
 | T1 SFCD 写侧 | 2026-09-26 会话 | ✅ done | 双门验证（见 §1 T1 实施记录）；无新 commit（实现存量已落地，仅 graph_prepare Mac 构建修复待提交） |
-| T2 真 DMA 编译侧 + act 预铺 | 2026-09-25/26 会话 | ✅ 编译侧+本地差分门（设备验证待错峰） | commit T2-<hash>（编译侧发射 + host 差分门） |
+| T2 真 DMA 编译侧 + act 预铺 | 2026-09-25/26 会话 | ✅ 编译侧+本地差分门（设备验证待错峰） | commit 919ae44（编译侧发射 + host 差分门） |
 | T3 VTCM↔DDR 端点 | | pending | |
 | T4 cp 默认化 | | pending | |
 | T5 跨组复用 + bin packing | | pending | |

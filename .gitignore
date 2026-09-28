@@ -54,3 +54,6 @@ scripts/venv_qpm/
 scripts/venv_qpm210/
 .scratch_d59/
 tmp/
+
+# e2e 测试夹具 (73MB 权重 + raw, 本地生成/105 scp, 不入库)
+compiler/test_models/qwen35_e2e/
