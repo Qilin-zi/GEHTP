@@ -1578,19 +1578,38 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
     uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N_full * Bn * 2u);
     if (!a || !w || !y) { snprintf(err, errn, "matmul_f16 ref fail"); return -1; }
 #if defined(__HVX__) || defined(__hexagon__)
-    /* HMX 快路径: M/K/N 均 32 倍数 + 非 batched → crouton + HMX GEMM。
+    /* HMX 快路径: M/K/N 均 32 倍数 → crouton + HMX GEMM。
+     * batched attention (q·kᵀ, Bn 头) 同走 HMX: 逐 batch 切片调 exec_matmul_f16_hmx,
+     * 批维在 A/W/Y 最外层连续 (与标量 batched 路径同布局, 见下方标量分支)。
      * SPLIT 回落全有或全无 (FR-013 ④): 同逻辑 matmul 的 chunk 间共享引擎
      * 选择, 首 chunk 决定, 续 chunk (三引用一致) 沿用; 混合路径破逐字节
      * 恒等, 违禁即硬错误。chunk 间必有别的 op 插入时 key 不匹配, 重新决定。 */
     static struct { uint32_t a_t, w_s, out_t; int engine; } g_split_prev = {0, 0, 0, 0};
-    if (!batched && (M % 32u) == 0u && (K % 32u) == 0u && (N % 32u) == 0u) {
+    if ((M % 32u) == 0u && (K % 32u) == 0u && (N % 32u) == 0u) {
         int engine = 0;
         if (op->opcode == OP_MATMUL_F16_SPLIT &&
             g_split_prev.out_t == out_t && g_split_prev.a_t == a_t && g_split_prev.w_s == w_s)
             engine = g_split_prev.engine;  /* 续 chunk: 沿用已定引擎 */
         if (engine == 0) {
-            engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn) == 0)
-                         ? 1 : -1;
+            if (batched) {
+                /* 全或全无 (与 SPLIT 同纪律): 任一 batch 失败 → 整体回落标量。
+                 * W 批跨步 = K*N_full (t1 不改跨步, 见标量 batched 分支下标)。
+                 * batched 恒非 SPLIT (SPLIT 仅超界整 op), 不碰 g_split_prev。 */
+                engine = 1;
+                for (uint32_t bb = 0; bb < Bn; ++bb) {
+                    const uint16_t* ab = a + (size_t)bb * M * K;
+                    const uint16_t* wb = w + (size_t)bb * K * N_full;
+                    uint16_t* yb = y + (size_t)bb * M * N_full;
+                    if (exec_matmul_f16_hmx(ab, wb, yb, M, K, N, 0, N_full, t0, t1,
+                                            err, errn) != 0) {
+                        engine = -1;
+                        break;
+                    }
+                }
+            } else {
+                engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn) == 0)
+                             ? 1 : -1;
+            }
         } else if (engine == 1) {
             if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn) != 0) {
                 snprintf(err, errn, "matmul_f16 split 混合路径 (FR-013 ④ 违禁): 前 chunk HMX 本 chunk 失败");
