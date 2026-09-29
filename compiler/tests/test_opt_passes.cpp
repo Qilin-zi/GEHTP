@@ -235,6 +235,43 @@ int main() {
         std::printf("      %s\n", s.c_str());
     }
 
+    std::printf("=== [11] fusion 注册制: 默认关 vs enable 后 run_optimize 触发 ===\n");
+    {
+        PassManager& pm = PassManager::instance();
+        // 图 A: 默认关, Relu 不被融合(契约: 融合非设备准入, 主路径不开启)
+        {
+            GraphPrepare gp;
+            auto in   = add_input(gp, 5, f32_def(1, 224, 224, 3));
+            auto w    = add_const_f32(gp, 1, f32_def(32, 3, 3, 3), std::vector<float>(864, 0.01f));
+            auto conv = add_unary_op(gp, 10, "Conv", {in, w}, f32_def(1, 222, 222, 32));
+            auto relu = add_unary_op(gp, 20, "Relu", {conv}, f32_def(1, 222, 222, 32));
+            add_output(gp, 30, relu);
+            pm.disable("fusion_conv_relu");
+            gp.run_optimize_passes(env);
+            OpDef* ro = gp.get_op_at(relu);
+            std::string nm = (ro && ro->name_tag) ? ro->name_tag->name() : "";
+            CHECK(nm == "Relu", "fusion: 默认关, Relu 保持不融合");
+        }
+        // 图 B: enable 后经注册制 run_phase(PHASE_3) 触发融合
+        {
+            GraphPrepare gp;
+            auto in   = add_input(gp, 5, f32_def(1, 224, 224, 3));
+            auto w    = add_const_f32(gp, 1, f32_def(32, 3, 3, 3), std::vector<float>(864, 0.01f));
+            auto conv = add_unary_op(gp, 10, "Conv", {in, w}, f32_def(1, 222, 222, 32));
+            auto relu = add_unary_op(gp, 20, "Relu", {conv}, f32_def(1, 222, 222, 32));
+            add_output(gp, 30, relu);
+            pm.enable("fusion_conv_relu");
+            gp.run_optimize_passes(env);
+            OpDef* ro = gp.get_op_at(relu);
+            OpDef* co = gp.get_op_at(conv);
+            std::string nm = (ro && ro->name_tag) ? ro->name_tag->name() : "";
+            bool conv_dead = (co == nullptr || co->is_dead());
+            CHECK(nm == "ConvActivations", "fusion: enable 后 Relu -> ConvActivations");
+            CHECK(conv_dead, "fusion: enable 后 Conv producer dead");
+            pm.disable("fusion_conv_relu");
+        }
+    }
+
     std::printf("\n%s: %d failures\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

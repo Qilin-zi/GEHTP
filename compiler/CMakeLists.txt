@@ -24,6 +24,7 @@ add_library(htp_core STATIC
     src/opt/pass_manager.cpp
     src/opt/pass_const_fold.cpp
     src/opt/pass_shape_fold.cpp
+    src/opt/pass_fusion.cpp
     src/cost/cost_model.cpp
     src/vtcm/fancy_allocator.cpp
     src/vtcm/runtime_alloc.cpp

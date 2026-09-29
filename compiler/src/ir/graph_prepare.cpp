@@ -1076,6 +1076,10 @@ void GraphPrepare::run_optimize_passes_single_registry(
     if (changed > 0) run_phase_fixpoint_internal();
     changed = pm.run_phase(this, PHASE_1);
     if (changed > 0) run_phase_fixpoint_internal();
+    // 激活融合槽(PHASE_3): 默认全关(非设备准入), run_phase 空转返回 0;
+    // --enable-pass fusion_* 打开后这里才生效。
+    changed = pm.run_phase(this, PHASE_3);
+    if (changed > 0) run_phase_fixpoint_internal();
 
     uint32_t after = 0;
     for (auto& [id, opdef] : opdef_map_) {

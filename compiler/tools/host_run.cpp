@@ -252,6 +252,7 @@ int main(int argc, char** argv) {
         else if (a == "--input-f32" && i + 1 < argc) in_path = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
         else if (a == "--no-pass" && i + 1 < argc) PassManager::instance().disable(argv[++i]);
+        else if (a == "--enable-pass" && i + 1 < argc) PassManager::instance().enable(argv[++i]);
         else { std::fprintf(stderr, "usage: host_run --net-json N [--weights-bin W] [--input-f32 I] --out O\n"); return 1; }
     }
     if (out_path.empty() || (net_json.empty() && bin_path.empty())) {

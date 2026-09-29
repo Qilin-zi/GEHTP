@@ -121,6 +121,11 @@ struct FusionRule {
 // 应用所有 fusion 规则，返回融合的 op 数。
 int apply_fusion_rules(GraphPrepare* gp, const std::vector<FusionRule>& rules);
 
+// 单对 (producer, consumer) 的结构匹配与融合 —— 拆出供 apply_fusion_rules
+// (遗留批量接口) 与注册制 fusion pass (pass_fusion) 共用。
+bool fusion_match(const FusionRule& rule, OpDef* consumer_od, GraphPrepare* gp);
+bool fuse_pair(GraphPrepare* gp, OpDef* consumer_od, const FusionRule& rule);
+
 // 遗留 8-rule 融合表(自造, 非设备准入: 产出的 ConvActivations/Add 激活
 // 变体 wtop_emit 无翻译, exec_conv2d/add/binary 无激活参数)。已移出主路径,
 // 保留为 test_e2e 与历史对拍的契约。

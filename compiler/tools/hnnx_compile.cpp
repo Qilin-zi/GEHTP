@@ -50,6 +50,7 @@ static void usage() {
         "  --output <path>     Output context binary path (default: output.bin)\n"
         "  --graph-name <name>  Graph name (default: from net.json or 'compiled_graph')\n"
         "  --no-pass <name>    关闭单个图优化 pass(可重复; 默认全开)\n"
+        "  --enable-pass <name> 打开单个图优化 pass(默认关的 fusion_* 用; 可重复)\n"
         "  --opt-stats         打印各 pass 匹配/折叠统计与前后条目数\n"
         "  --ddr-offsets <tsv> 第7步阶段一: 导出静态 DDR 偏移表 TSV(check_offsets 消费)\n"
         "  --ddr-budget <n>    DDR 池字节(0=不规划; M2 起喂 TAG_MEM_PLAN)\n"
@@ -308,6 +309,7 @@ int main(int argc, char** argv) {
         else if (arg == "--vtcm-budget" && i+1 < argc) vtcm_budget = strtoull(argv[++i], nullptr, 0);
         else if (arg == "--graph-name" && i+1 < argc) graph_name = argv[++i];
         else if (arg == "--no-pass" && i+1 < argc) PassManager::instance().disable(argv[++i]);
+        else if (arg == "--enable-pass" && i+1 < argc) PassManager::instance().enable(argv[++i]);
         else if (arg == "--opt-stats") opt_stats = true;
         else if (arg == "--ddr-offsets" && i+1 < argc) ddr_offsets_path = argv[++i];
         else if (arg == "--ddr-budget" && i+1 < argc) ddr_budget = strtoull(argv[++i], nullptr, 0);

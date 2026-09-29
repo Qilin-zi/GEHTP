@@ -2,12 +2,14 @@
 #include "hnnx/ir/graph_prepare.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <unordered_set>
 
 namespace hnnx {
 
 // 内置 pass 的注册函数(每个 pass 一个文件)
 void register_pass_const_fold();
 void register_pass_shape_fold();
+void register_pass_fusion_rules();
 
 PassManager& PassManager::instance() {
     static PassManager mgr;
@@ -59,28 +61,56 @@ bool PassManager::is_enabled(const std::string& name) const {
 
 uint32_t PassManager::run_phase(GraphPrepare* gp, uint32_t phase) {
     if (!gp) return 0;
-    uint32_t total = 0;
 
-    // op 快照: rewrite 会改 opdef_map_(replace_opdef_with_opconst 同键替换
-    // + 标 OP_DEAD), 遍历期间先收集 id 列表。
-    std::vector<op_id_t> ids;
+    // 收集本 phase 的 enabled pass; 无则零开销返回(融合默认全关走这里)。
+    std::vector<GraphPass*> active;
+    for (auto& p : passes_) {
+        if (p.phase == phase && p.enabled && p.matcher) active.push_back(&p);
+    }
+    if (active.empty()) return 0;
+
+    // worklist 驱动的 greedy 重写(对齐 MLIR GreedyPatternRewriteDriver):
+    // 种子 = 全部存活非 const op。命中改写后把 op 的输入 producer 与消费者
+    // 压回 worklist, 使 const_fold 前向级联、shape_fold/fusion 改线后下游
+    // 重访。与旧"一次快照 + 逐 op 单 pass + 单向 sweep"不同, 这里到 fixpoint,
+    // 且不依赖 for_each_op 的 unordered_map 桶序。
+    std::vector<op_id_t> worklist;
+    std::unordered_set<op_id_t> in_worklist;
+    auto push = [&](op_id_t id) {
+        if (in_worklist.insert(id).second) worklist.push_back(id);
+    };
     gp->for_each_op([&](OpDef* od) {
-        if (od && od->is_enabled() && !od->is_dead()) ids.push_back(od->op_id);
+        if (od && od->is_enabled() && !od->is_dead() && !od->is_const())
+            push(od->op_id);
     });
 
-    for (op_id_t id : ids) {
+    uint32_t total = 0;
+    while (!worklist.empty()) {
+        op_id_t id = worklist.back();
+        worklist.pop_back();
+        in_worklist.erase(id);
+
         OpDef* op = gp->get_op_at(id);
         if (!op || !op->is_enabled() || op->is_dead() || op->is_const()) continue;
-        for (auto& pass : passes_) {
-            if (pass.phase != phase || !pass.enabled) continue;
-            if (!pass.matcher) continue;
-            if (!pass.matcher(op, gp)) continue;
-            pass.matched++;
-            int changed = pass.rewrite ? pass.rewrite(op, gp) : 0;
+
+        for (auto* pass : active) {
+            if (!pass->matcher(op, gp)) continue;
+            pass->matched++;
+            // 快照邻居 id 后再 rewrite: fold_op_to_const 经 replace_opdef_with_opconst
+            // 同键替换会销毁旧 op(unique_ptr 重新赋值), 故 rewrite 之后不可再
+            // 解引用 op。这里只拷 op_id 值, 安全。
+            std::vector<op_id_t> src_ids;
+            std::vector<op_id_t> consumer_ids;
+            for (const auto& conn : op->inputs) src_ids.push_back(conn.src_id);
+            consumer_ids = op->consumers;
+
+            int changed = pass->rewrite ? pass->rewrite(op, gp) : 0;
             if (changed > 0) {
-                pass.rewritten++;
+                pass->rewritten++;
                 total += static_cast<uint32_t>(changed);
-                break;  // 一个 op 每轮最多被一个 pass 重写
+                for (op_id_t s : src_ids) push(s);
+                for (op_id_t c : consumer_ids) push(c);
+                break;  // 一次改写后让位; 邻居经 worklist 触发下一轮
             }
         }
     }
@@ -117,6 +147,7 @@ void PassManager::reset_stats() {
 void register_builtin_passes() {
     register_pass_const_fold();
     register_pass_shape_fold();
+    register_pass_fusion_rules();
 }
 
 } // namespace hnnx

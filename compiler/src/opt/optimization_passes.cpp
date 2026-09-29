@@ -110,6 +110,43 @@ std::unique_ptr<Op> GraphOptContext::build_new_op(const GraphOptInfo& rule, OpDe
 // 这里实现直接的结构级 pattern: 找 (producer, consumer) 对，把 consumer
 // 的唯一输入来自 producer 且 producer 只被 consumer 消费时，把 consumer
 // 改名为 fused 类型并断开 producer (后续 DCE 回收)。
+// fusion_match / fuse_pair 拆成单对 (producer, consumer) 的匹配与改写,
+// 供 apply_fusion_rules(遗留批量接口) 与注册制 fusion pass 共用。
+bool fusion_match(const FusionRule& rule, OpDef* consumer_od, GraphPrepare* gp) {
+    if (!consumer_od || !consumer_od->is_enabled() || consumer_od->is_const())
+        return false;
+    const char* cname = consumer_od->name_tag ? consumer_od->name_tag->name() : "";
+    if (std::string(cname) != rule.consumer) return false;
+    if (consumer_od->inputs.size() != 1) return false;
+    OpDef* prod = gp->get_op_at(consumer_od->inputs[0].src_id);
+    if (!prod || !prod->is_enabled() || prod->is_const()) return false;
+    const char* pname = prod->name_tag ? prod->name_tag->name() : "";
+    if (std::string(pname) != rule.producer) return false;
+    if (prod->consumers.size() != 1) return false;
+    return true;
+}
+
+bool fuse_pair(GraphPrepare* gp, OpDef* consumer_od, const FusionRule& rule) {
+    if (!gp || !consumer_od || consumer_od->inputs.size() != 1) return false;
+    OpDef* prod = gp->get_op_at(consumer_od->inputs[0].src_id);
+    if (!prod) return false;
+    // 融合: consumer 改名为 fused, 输入改指向 producer 的输入
+    consumer_od->name_tag = string_tag_t::map_str(rule.fused);
+    auto new_inputs = prod->inputs;
+    for (const auto& conn : prod->inputs) {
+        OpDef* src = gp->get_op_at(conn.src_id);
+        if (src) {
+            src->consumers.erase(
+                std::remove(src->consumers.begin(), src->consumers.end(), prod->op_id),
+                src->consumers.end());
+            src->consumers.push_back(consumer_od->op_id);
+        }
+    }
+    consumer_od->inputs = new_inputs;
+    prod->flags |= OP_DEAD;
+    return true;
+}
+
 int apply_fusion_rules(GraphPrepare* gp, const std::vector<FusionRule>& rules) {
     if (!gp || rules.empty()) return 0;
     int fused_count = 0;
@@ -119,31 +156,8 @@ int apply_fusion_rules(GraphPrepare* gp, const std::vector<FusionRule>& rules) {
         for (const auto& rule : rules) {
             std::vector<op_id_t> fused_consumers;
             gp->for_each_op([&](OpDef* consumer_od) {
-                if (!consumer_od || !consumer_od->is_enabled() || consumer_od->is_const())
-                    return;
-                const char* cname = consumer_od->name_tag ? consumer_od->name_tag->name() : "";
-                if (std::string(cname) != rule.consumer) return;
-                if (consumer_od->inputs.size() != 1) return;
-                op_id_t prod_id = consumer_od->inputs[0].src_id;
-                OpDef* prod = gp->get_op_at(prod_id);
-                if (!prod || !prod->is_enabled() || prod->is_const()) return;
-                const char* pname = prod->name_tag ? prod->name_tag->name() : "";
-                if (std::string(pname) != rule.producer) return;
-                if (prod->consumers.size() != 1) return;
-                // 融合: consumer 改名为 fused, 输入改指向 producer 的输入
-                consumer_od->name_tag = string_tag_t::map_str(rule.fused);
-                auto new_inputs = prod->inputs;
-                for (const auto& conn : prod->inputs) {
-                    OpDef* src = gp->get_op_at(conn.src_id);
-                    if (src) {
-                        src->consumers.erase(
-                            std::remove(src->consumers.begin(), src->consumers.end(), prod->op_id),
-                            src->consumers.end());
-                        src->consumers.push_back(consumer_od->op_id);
-                    }
-                }
-                consumer_od->inputs = new_inputs;
-                prod->flags |= OP_DEAD;
+                if (!fusion_match(rule, consumer_od, gp)) return;
+                fuse_pair(gp, consumer_od, rule);
                 fused_consumers.push_back(consumer_od->op_id);
             });
             if (!fused_consumers.empty()) {
