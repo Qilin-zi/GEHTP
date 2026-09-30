@@ -6,6 +6,7 @@
 #include "hnnx/api/hexagon_nn_env.hpp"
 #include "hnnx/opt/optimization_passes.hpp"
 #include "hnnx/opt/pass_manager.hpp"
+#include "hnnx/opt/pass_view_fold.hpp"  // 005: dump_view_census
 #include "hnnx/vtcm/fancy_allocator.hpp"
 #include "hnnx/serialize/serializer.hpp"
 #include "hnnx/dma/spill_fill.hpp"
@@ -1072,6 +1073,11 @@ void GraphPrepare::run_optimize_passes_single_registry(
         if (opdef && opdef->is_enabled() && !opdef->is_dead()) before++;
     }
 
+    if (getenv("GEHTP_DUMP_VIEWS")) {          /* 005 T004: prepare 后/pass 前基数 */
+        std::fprintf(stderr, "[view-census PRE ]\n");
+        dump_view_census(this, stderr);
+    }
+
     uint32_t changed = pm.run_phase(this, PHASE_0);
     if (changed > 0) run_phase_fixpoint_internal();
     changed = pm.run_phase(this, PHASE_1);
@@ -1086,6 +1092,11 @@ void GraphPrepare::run_optimize_passes_single_registry(
         if (opdef && opdef->is_enabled() && !opdef->is_dead()) after++;
     }
     pm.note_counts(before, after);
+
+    if (getenv("GEHTP_DUMP_VIEWS")) {          /* pass 后余量(对照 PRE 得消解数) */
+        std::fprintf(stderr, "[view-census POST]\n");
+        dump_view_census(this, stderr);
+    }
 
     // Build 8 phase descriptors with verified node-count thresholds
     struct PhaseInfo { uint32_t threshold; const char* name; };
@@ -2813,8 +2824,10 @@ op_id_t GraphPrepare::append_node(const std::string& name, uint32_t node_type,
 
 op_id_t GraphPrepare::append_const_node(uint32_t node_type, const OutputDef& od,
                                           const uint8_t* data, size_t data_len) {
-    // Validate construction state
-    if (construction_state_ != 1) return 0;
+    // Validate construction state。state==2(优化期)也放行: pass rewrite
+    // (view_fold 合成 ranges 等)需要建新 const —— 与 fold_op_to_const 在
+    // 优化期直接追加 const_pool_ 同一先例, 池追加约定(4 对齐+extents)不变。
+    if (construction_state_ != 1 && construction_state_ != 2) return 0;
 
     op_id_t new_id = (node_type != 0) ? static_cast<op_id_t>(node_type) : next_op_id_++;
     if (opdef_map_.count(new_id)) return 0;

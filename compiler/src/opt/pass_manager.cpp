@@ -11,6 +11,9 @@ void register_pass_const_fold();
 void register_pass_shape_fold();
 void register_pass_fusion_rules();
 void register_pass_fc_bias();
+void register_pass_view_fold();   // 005 P1
+void register_pass_eltwise_const();
+void register_pass_eltwise_div_to_mul();  // 005 P2(默认关)
 
 PassManager& PassManager::instance() {
     static PassManager mgr;
@@ -150,6 +153,9 @@ void register_builtin_passes() {
     register_pass_shape_fold();
     register_pass_fusion_rules();
     register_pass_fc_bias();
+    register_pass_view_fold();
+    register_pass_eltwise_const();
+    register_pass_eltwise_div_to_mul();
 }
 
 } // namespace hnnx

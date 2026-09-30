@@ -360,6 +360,390 @@ int main() {
         }
     }
 
+
+    // ============================================================
+    // [13] view_fold(005 P1): SS∘SS 合并 / Reshape 吸收 / T∘T 恒等
+    // ============================================================
+    {
+        // ranges const 造件: rank2 [R,3] Int32, 名含 "ranges"(find 口径)
+        auto add_ranges_const = [](GraphPrepare& gp, op_id_t id,
+                                   const std::vector<int32_t>& triples) -> op_id_t {
+            OutputDef od{};
+            od.rank = 2;
+            od.dtype = static_cast<uint32_t>(DType::Int32);
+            od.dims[0] = triples.size() / 3; od.dims[1] = 3;
+            od.element_size = 4;
+            std::vector<uint8_t> data(triples.size() * 4);
+            std::memcpy(data.data(), triples.data(), data.size());
+            op_id_t rid = gp.append_const_node(id, od, data.data(), data.size());
+            OpDef* c = gp.get_op_at(rid);
+            if (c) c->name_tag = string_tag_t::map_str("Slice_ranges");
+            return rid;
+        };
+        auto attach_ranges = [&](OpDef* ss, op_id_t rid) {
+            ss->tensor_param_ids.push_back(rid);
+        };
+        auto read_ranges_i32 = [&](GraphPrepare& gp, OpDef* ss) -> std::vector<int32_t> {
+            std::vector<int32_t> v;
+            for (op_id_t tpid : ss->tensor_param_ids) {
+                OpDef* pc = gp.get_op_at(tpid);
+                if (!pc || !pc->name_tag || !std::strstr(pc->name_tag->name(), "ranges")) continue;
+                if (pc->const_data_offset + pc->const_data_size > gp.const_pool().size()) break;
+                v.resize(pc->const_data_size / 4);
+                std::memcpy(v.data(), gp.const_pool().data() + pc->const_data_offset,
+                            pc->const_data_size);
+                break;
+            }
+            return v;
+        };
+
+        std::printf("=== [13a] view_fold R1 正例: SS∘SS 区间合成 ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 8, 1));            // [1,1,8,1] 8 元素
+            auto rg1 = add_ranges_const(gp, 1, {0,1,1, 0,1,1, 2,6,1, 0,1,1});
+            auto rg2 = add_ranges_const(gp, 2, {0,1,1, 0,1,1, 1,3,1, 0,1,1});
+            auto ss1 = add_unary_op(gp, 10, "StridedSlice", {in}, f32_def(1, 1, 4, 1));
+            auto ss2 = add_unary_op(gp, 11, "StridedSlice", {ss1}, f32_def(1, 1, 2, 1));
+            attach_ranges(gp.get_op_at(ss1), rg1);
+            attach_ranges(gp.get_op_at(ss2), rg2);
+            add_output(gp, 20, ss2);
+            gp.run_optimize_passes(env);
+
+            OpDef* o1 = gp.get_op_at(ss1);
+            OpDef* o2 = gp.get_op_at(ss2);
+            CHECK(!o1 || o1->is_dead(), "view_fold R1: 内层 SS 标 dead");
+            CHECK(o2 && !o2->is_dead(), "view_fold R1: 外层 SS 存活");
+            CHECK(o2 && o2->inputs.size() >= 1 && o2->inputs[0].src_id == in,
+                  "view_fold R1: 外层 SS 直连 Input");
+            auto rg = o2 ? read_ranges_i32(gp, o2) : std::vector<int32_t>{};
+            CHECK(rg == std::vector<int32_t>({0,1,1, 0,1,1, 3,5,1, 0,1,1}),
+                  "view_fold R1: 合成 ranges = [3,5) 步长 1(2+1*1 起, cnt=2)");
+        }
+
+        std::printf("=== [13b] view_fold R1 恒等: 双全区间 → 整体旁路 ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 8, 1));
+            auto rg1 = add_ranges_const(gp, 1, {0,1,1, 0,1,1, 0,8,1, 0,1,1});
+            auto rg2 = add_ranges_const(gp, 2, {0,1,1, 0,1,1, 0,8,1, 0,1,1});
+            auto ss1 = add_unary_op(gp, 10, "StridedSlice", {in}, f32_def(1, 1, 8, 1));
+            auto ss2 = add_unary_op(gp, 11, "StridedSlice", {ss1}, f32_def(1, 1, 8, 1));
+            attach_ranges(gp.get_op_at(ss1), rg1);
+            attach_ranges(gp.get_op_at(ss2), rg2);
+            auto out = add_output(gp, 20, ss2);
+            gp.run_optimize_passes(env);
+
+            CHECK(!gp.get_op_at(ss1) || gp.get_op_at(ss1)->is_dead(), "view_fold: 恒等链内层删");
+            CHECK(!gp.get_op_at(ss2) || gp.get_op_at(ss2)->is_dead(), "view_fold: 恒等链外层删");
+            OpDef* oo = gp.get_op_at(out);
+            CHECK(oo && oo->inputs.size() == 1 && oo->inputs[0].src_id == in,
+                  "view_fold: 恒等链 Output 直连 Input");
+        }
+
+        std::printf("=== [13c] view_fold R1 反例: 中间张量旁路不合并 ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 8, 1));
+            auto rg1 = add_ranges_const(gp, 1, {0,1,1, 0,1,1, 2,6,1, 0,1,1});
+            auto rg2 = add_ranges_const(gp, 2, {0,1,1, 0,1,1, 1,3,1, 0,1,1});
+            auto ss1 = add_unary_op(gp, 10, "StridedSlice", {in}, f32_def(1, 1, 4, 1));
+            auto ss2 = add_unary_op(gp, 11, "StridedSlice", {ss1}, f32_def(1, 1, 2, 1));
+            attach_ranges(gp.get_op_at(ss1), rg1);
+            attach_ranges(gp.get_op_at(ss2), rg2);
+            auto c = add_const_f32(gp, 3, f32_def(), {1.0f});
+            auto eb = add_unary_op(gp, 12, "Eltwise_Binary", {ss2, ss1, c},
+                                   f32_def(1, 1, 2, 1));              // ss1 旁路消费者
+            add_output(gp, 20, eb);
+            gp.run_optimize_passes(env);
+
+            OpDef* o1 = gp.get_op_at(ss1);
+            OpDef* o2 = gp.get_op_at(ss2);
+            CHECK(o1 && !o1->is_dead(), "view_fold 反例: 旁路时内层保留");
+            CHECK(o2 && o2->inputs.size() >= 1 && o2->inputs[0].src_id == ss1,
+                  "view_fold 反例: 外层仍接内层");
+        }
+
+        std::printf("=== [13d] view_fold R2: 纯 1 维增删 Reshape 吸收 ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 2, 4, 1));            // [1,2,4,1]
+            auto rs = add_unary_op(gp, 10, "Reshape", {in}, f32_def(1, 2, 1, 4)); // [1,2,1,4] 中插 1
+            auto rg1 = add_ranges_const(gp, 1, {0,1,1, 0,2,1, 0,1,1, 1,3,1});
+            auto ss = add_unary_op(gp, 11, "StridedSlice", {rs}, f32_def(1, 2, 1, 2));
+            attach_ranges(gp.get_op_at(ss), rg1);
+            add_output(gp, 20, ss);
+            gp.run_optimize_passes(env);
+
+            OpDef* rso = gp.get_op_at(rs);
+            OpDef* sso = gp.get_op_at(ss);
+            CHECK(!rso || rso->is_dead(), "view_fold R2: Reshape 被吸收(标 dead)");
+            CHECK(sso && !sso->is_dead(), "view_fold R2: SS 存活");
+            CHECK(sso && sso->inputs.size() >= 1 && sso->inputs[0].src_id == in,
+                  "view_fold R2: SS 直连底层 Input");
+            auto rg = sso ? read_ranges_i32(gp, sso) : std::vector<int32_t>{};
+            CHECK(rg == std::vector<int32_t>({0,1,1, 0,2,1, 1,3,1, 0,1,1}),
+                  "view_fold R2: 落底层帧 ranges(新增 1 轴消解, 尾 1 轴补全)");
+        }
+
+        std::printf("=== [13e] view_fold R2 反例: 跨维重排 Reshape 不吸收 ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 2, 4, 1));            // [1,2,4,1]
+            auto rs = add_unary_op(gp, 10, "Reshape", {in}, f32_def(1, 4, 2, 1)); // 跨维重排
+            auto rg1 = add_ranges_const(gp, 1, {0,1,1, 0,4,1, 0,2,1, 0,1,1});
+            auto ss = add_unary_op(gp, 11, "StridedSlice", {rs}, f32_def(1, 4, 2, 1));
+            attach_ranges(gp.get_op_at(ss), rg1);
+            add_output(gp, 20, ss);
+            gp.run_optimize_passes(env);
+
+            OpDef* rso = gp.get_op_at(rs);
+            CHECK(rso && !rso->is_dead(), "view_fold R2 反例: 跨维重排保留");
+        }
+
+        std::printf("=== [13f] view_fold R3: Transpose∘Transpose 恒等对 ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 2, 3, 1));            // [1,2,3,1]
+            auto p1 = add_ranges_const(gp, 1, {1,0,2,3});
+            auto p2 = add_ranges_const(gp, 2, {1,0,2,3});
+            auto t1 = add_unary_op(gp, 10, "Transpose", {in}, f32_def(1, 2, 3, 1));
+            // perm [1,0,2,3] 对 [1,2,3,1]: 轴 1/2 互换 → [1,3,2,1]
+            OpDef* t1o = gp.get_op_at(t1);
+            t1o->output_def = f32_def(1, 3, 2, 1);
+            auto t2 = add_unary_op(gp, 11, "Transpose", {t1}, f32_def(1, 2, 3, 1));
+            // 再换回来 → [1,2,3,1]
+            for (op_id_t pid : {p1, p2}) {
+                OpDef* pc = gp.get_op_at(pid);
+                if (pc) pc->name_tag = string_tag_t::map_str("Transpose_perm");
+            }
+            gp.get_op_at(t1)->tensor_param_ids.push_back(p1);
+            gp.get_op_at(t2)->tensor_param_ids.push_back(p2);
+            auto out = add_output(gp, 20, t2);
+            gp.run_optimize_passes(env);
+
+            CHECK(!gp.get_op_at(t1) || gp.get_op_at(t1)->is_dead(), "view_fold R3: 内层 T 删");
+            CHECK(!gp.get_op_at(t2) || gp.get_op_at(t2)->is_dead(), "view_fold R3: 外层 T 删");
+            OpDef* oo = gp.get_op_at(out);
+            CHECK(oo && oo->inputs.size() == 1 && oo->inputs[0].src_id == in,
+                  "view_fold R3: Output 直连 Input");
+        }
+
+        std::printf("=== [13g] view_fold 幂等: 二跑零改写 + 逃生门 ===\n");
+        {
+            PassManager& pm = PassManager::instance();
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 8, 1));
+            auto rg1 = add_ranges_const(gp, 1, {0,1,1, 0,1,1, 2,6,1, 0,1,1});
+            auto rg2 = add_ranges_const(gp, 2, {0,1,1, 0,1,1, 1,3,1, 0,1,1});
+            auto ss1 = add_unary_op(gp, 10, "StridedSlice", {in}, f32_def(1, 1, 4, 1));
+            auto ss2 = add_unary_op(gp, 11, "StridedSlice", {ss1}, f32_def(1, 1, 2, 1));
+            attach_ranges(gp.get_op_at(ss1), rg1);
+            attach_ranges(gp.get_op_at(ss2), rg2);
+            add_output(gp, 20, ss2);
+            gp.run_optimize_passes(env);
+            gp.run_optimize_passes(env);                               // 二跑
+            std::string st = pm.stats_line();
+            CHECK(st.find("view_fold=0/0") != std::string::npos,
+                  "view_fold 幂等: 二跑零改写");
+
+            // 逃生门: --no-pass view_fold 等价 disable 后链保持
+            pm.disable("view_fold");
+            GraphPrepare gp2;
+            auto in2 = add_input(gp2, 5, f32_def(1, 1, 8, 1));
+            auto r21 = add_ranges_const(gp2, 1, {0,1,1, 0,1,1, 2,6,1, 0,1,1});
+            auto r22 = add_ranges_const(gp2, 2, {0,1,1, 0,1,1, 1,3,1, 0,1,1});
+            auto s21 = add_unary_op(gp2, 10, "StridedSlice", {in2}, f32_def(1, 1, 4, 1));
+            auto s22 = add_unary_op(gp2, 11, "StridedSlice", {s21}, f32_def(1, 1, 2, 1));
+            attach_ranges(gp2.get_op_at(s21), r21);
+            attach_ranges(gp2.get_op_at(s22), r22);
+            add_output(gp2, 20, s22);
+            gp2.run_optimize_passes(env);
+            OpDef* o21 = gp2.get_op_at(s21);
+            CHECK(o21 && !o21->is_dead(), "view_fold 逃生: disable 后链保持");
+            pm.enable("view_fold");
+        }
+    }
+
+
+    // ============================================================
+    // [14] eltwise_const_fold(005 P2): 同型合并 + Div→Mul
+    // ============================================================
+    {
+        auto set_eb_oper = [](OpDef* od, int code) {
+            auto sp = unpack_scalar_params(od->op_data);
+            bool found = false;
+            for (auto& p : sp)
+                if (p.name == "operation") {
+                    p.is_numeric = true; p.value_num = (double)code; p.value_str.clear();
+                    found = true;
+                }
+            if (!found) {
+                ScalarParam p; p.name = "operation"; p.is_numeric = true;
+                p.value_num = (double)code;
+                sp.push_back(std::move(p));
+            }
+            od->op_data = pack_scalar_params(sp);
+        };
+        auto get_eb_oper = [](const OpDef* od) -> int {
+            auto sp = unpack_scalar_params(od->op_data);
+            const ScalarParam* p = scalar_get(sp, "operation");
+            return p && p->is_numeric ? (int)p->value_num : 0;
+        };
+        auto const_val_at = [](GraphPrepare& gp, op_id_t cid) -> float {
+            OpDef* c = gp.get_op_at(cid);
+            if (!c || c->const_data_size < 4) return -1e30f;
+            float v;
+            std::memcpy(&v, gp.const_pool().data() + c->const_data_offset, 4);
+            return v;
+        };
+
+        std::printf("=== [14a] 同型 ADD∘ADD 合并(c1+c2) ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 4, 1));
+            auto c1 = add_const_f32(gp, 1, f32_def(), {2.0f});
+            auto c2 = add_const_f32(gp, 2, f32_def(), {3.0f});
+            auto a1 = add_unary_op(gp, 10, "Eltwise_Binary", {in, c1}, f32_def(1, 1, 4, 1));
+            auto a2 = add_unary_op(gp, 11, "Eltwise_Binary", {a1, c2}, f32_def(1, 1, 4, 1));
+            set_eb_oper(gp.get_op_at(a1), 0);
+            set_eb_oper(gp.get_op_at(a2), 0);
+            add_output(gp, 20, a2);
+            gp.run_optimize_passes(env);
+
+            OpDef* o1 = gp.get_op_at(a1);
+            OpDef* o2 = gp.get_op_at(a2);
+            CHECK(!o1 || o1->is_dead(), "eltwise: 内层 ADD 标 dead");
+            CHECK(o2 && !o2->is_dead(), "eltwise: 外层 ADD 存活");
+            float merged = (o2 && o2->inputs.size() == 2) ? const_val_at(gp, o2->inputs[1].src_id) : -1e30f;
+            CHECK(std::fabs(merged - 5.0f) < 1e-6f, "eltwise: 合成 const = 2+3=5");
+            CHECK(o2 && o2->inputs.size() == 2 && o2->inputs[0].src_id == in,
+                  "eltwise: 外层数据输入直连 Input");
+        }
+
+        std::printf("=== [14b] Div→Mul(1/c, f32 口径; 默认关需显式开) ===\n");
+        {
+            PassManager::instance().enable("eltwise_div_to_mul");
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 4, 1));
+            auto c = add_const_f32(gp, 1, f32_def(), {4.0f});
+            auto dv = add_unary_op(gp, 10, "Eltwise_Binary", {in, c}, f32_def(1, 1, 4, 1));
+            set_eb_oper(gp.get_op_at(dv), 2);                    // DIVIDE
+            add_output(gp, 20, dv);
+            gp.run_optimize_passes(env);
+            PassManager::instance().disable("eltwise_div_to_mul");
+
+            OpDef* d = gp.get_op_at(dv);
+            CHECK(d && !d->is_dead() && get_eb_oper(d) == 13,
+                  "eltwise: DIVIDE → MULTIPLY(13)");
+            float inv = (d && d->inputs.size() == 2) ? const_val_at(gp, d->inputs[1].src_id) : -1e30f;
+            CHECK(std::fabs(inv - 0.25f) < 1e-6f, "eltwise: const 4 → 1/4=0.25");
+        }
+
+        std::printf("=== [14c] 反例: 除数零 / 旁路 / int32 / 默认关 ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 4, 1));
+            auto c0 = add_const_f32(gp, 1, f32_def(), {0.0f});
+            auto dv = add_unary_op(gp, 10, "Eltwise_Binary", {in, c0}, f32_def(1, 1, 4, 1));
+            set_eb_oper(gp.get_op_at(dv), 2);
+            add_output(gp, 20, dv);
+            gp.run_optimize_passes(env);
+            OpDef* d = gp.get_op_at(dv);
+            CHECK(d && get_eb_oper(d) == 2, "eltwise 反例: 除数 0 不转(显式开后)");
+
+            GraphPrepare gp0;
+            auto in0 = add_input(gp0, 5, f32_def(1, 1, 4, 1));
+            auto c40 = add_const_f32(gp0, 1, f32_def(), {4.0f});
+            auto dv0 = add_unary_op(gp0, 10, "Eltwise_Binary", {in0, c40}, f32_def(1, 1, 4, 1));
+            set_eb_oper(gp0.get_op_at(dv0), 2);
+            add_output(gp0, 20, dv0);
+            gp0.run_optimize_passes(env);
+            OpDef* d0 = gp0.get_op_at(dv0);
+            CHECK(d0 && get_eb_oper(d0) == 2, "eltwise 反例: 默认关时 Div 不转 Mul");
+            PassManager::instance().enable("eltwise_div_to_mul");
+
+            GraphPrepare gp2;
+            auto in2 = add_input(gp2, 5, f32_def(1, 1, 4, 1));
+            auto cb = add_const_f32(gp2, 1, f32_def(), {1.0f});
+            auto b1 = add_unary_op(gp2, 10, "Eltwise_Binary", {in2, cb}, f32_def(1, 1, 4, 1));
+            auto b2 = add_unary_op(gp2, 11, "Eltwise_Binary", {b1, cb}, f32_def(1, 1, 4, 1));
+            set_eb_oper(gp2.get_op_at(b1), 0);
+            set_eb_oper(gp2.get_op_at(b2), 0);
+            auto c3 = add_const_f32(gp2, 3, f32_def(), {7.0f});
+            auto b3 = add_unary_op(gp2, 12, "Eltwise_Binary", {b1, c3}, f32_def(1, 1, 4, 1));
+            set_eb_oper(gp2.get_op_at(b3), 0);
+            add_output(gp2, 21, b2);
+            add_output(gp2, 22, b3);
+            gp2.run_optimize_passes(env);
+            OpDef* o1 = gp2.get_op_at(b1);
+            CHECK(o1 && !o1->is_dead(), "eltwise 反例: 旁路消费者时内层保留");
+        }
+
+        std::printf("=== [14e] const 解包: Reshape 包装(前导 1) ===\n");
+        {
+            // 外层 const 经 [1]→[1,1] Reshape 包装(0.8B 实图形态): 解包后合并
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 4, 1));
+            auto c1 = add_const_f32(gp, 1, f32_def(), {2.0f});
+            auto c2 = add_const_f32(gp, 2, f32_def(), {3.0f});
+            auto r = add_unary_op(gp, 3, "Reshape", {c2}, f32_def(1, 1, 1, 1));
+            auto a1 = add_unary_op(gp, 10, "Eltwise_Binary", {in, c1}, f32_def(1, 1, 4, 1));
+            auto a2 = add_unary_op(gp, 11, "Eltwise_Binary", {a1, r}, f32_def(1, 1, 4, 1));
+            set_eb_oper(gp.get_op_at(a1), 0);
+            set_eb_oper(gp.get_op_at(a2), 0);
+            add_output(gp, 20, a2);
+            gp.run_optimize_passes(env);
+
+            OpDef* o1 = gp.get_op_at(a1);
+            OpDef* o2 = gp.get_op_at(a2);
+            OpDef* rr = gp.get_op_at(r);
+            CHECK(o1 && o1->is_dead(), "unwrap: 内层 ADD 标 dead");
+            CHECK(o2 && !o2->is_dead(), "unwrap: 外层 ADD 存活");
+            float merged = (o2 && o2->inputs.size() == 2) ? const_val_at(gp, o2->inputs[1].src_id) : -1e30f;
+            CHECK(std::fabs(merged - 5.0f) < 1e-6f, "unwrap: 合成 const = 5(透过 Reshape)");
+            {
+                OpDef* cin = gp.get_op_at(o2->inputs[1].src_id);
+                std::string cn = (cin && cin->name_tag) ? cin->name_tag->name() : "";
+                CHECK(cn != "Reshape" || !cin->name_tag, "unwrap: 外层 const 输入不再指向 Reshape");
+            }
+            (void)rr;
+
+            // 反例: [4]→[4,1] 改变右对齐广播语义, 不解包不合并
+            GraphPrepare gp2;
+            auto in2 = add_input(gp2, 5, f32_def(1, 1, 4, 1));
+            auto d1 = add_const_f32(gp2, 1, f32_def(), {2.0f});
+            auto d2 = add_const_f32(gp2, 2, f32_def(4), {3.0f, 3.0f, 3.0f, 3.0f});
+            auto r2 = add_unary_op(gp2, 3, "Reshape", {d2}, f32_def(4, 1));
+            auto e1 = add_unary_op(gp2, 10, "Eltwise_Binary", {in2, d1}, f32_def(1, 1, 4, 1));
+            auto e2 = add_unary_op(gp2, 11, "Eltwise_Binary", {e1, r2}, f32_def(4, 1));
+            set_eb_oper(gp2.get_op_at(e1), 0);
+            set_eb_oper(gp2.get_op_at(e2), 0);
+            add_output(gp2, 21, e2);
+            gp2.run_optimize_passes(env);
+            OpDef* i1 = gp2.get_op_at(e1);
+            CHECK(i1 && !i1->is_dead(), "unwrap 反例: [4]→[4,1] 不解包不合并");
+        }
+
+        std::printf("=== [14d] 幂等: 二跑零改写 ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, f32_def(1, 1, 4, 1));
+            auto c1 = add_const_f32(gp, 1, f32_def(), {2.0f});
+            auto c2 = add_const_f32(gp, 2, f32_def(), {3.0f});
+            auto a1 = add_unary_op(gp, 10, "Eltwise_Binary", {in, c1}, f32_def(1, 1, 4, 1));
+            auto a2 = add_unary_op(gp, 11, "Eltwise_Binary", {a1, c2}, f32_def(1, 1, 4, 1));
+            set_eb_oper(gp.get_op_at(a1), 0);
+            set_eb_oper(gp.get_op_at(a2), 0);
+            add_output(gp, 20, a2);
+            gp.run_optimize_passes(env);
+            gp.run_optimize_passes(env);
+            std::string st = PassManager::instance().stats_line();
+            CHECK(st.find("eltwise_const_fold=0/0") != std::string::npos,
+                  "eltwise 幂等: 二跑零改写");
+        }
+    }
+
     std::printf("\n%s: %d failures\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }
