@@ -314,13 +314,7 @@ int main(int argc, char** argv) {
     std::vector<std::vector<float>> ins;
     std::vector<size_t> in_elems;
     {
-        std::vector<op_id_t> in_ids;
-        gp.for_each_op([&](OpDef* od) {
-            if (od && od->name_tag && od->name_tag->name() &&
-                std::string(od->name_tag->name()) == "Input" && !od->is_dead())
-                in_ids.push_back(od->op_id);
-        });
-        std::sort(in_ids.begin(), in_ids.end());
+        std::vector<op_id_t> in_ids = gp.host_input_order();
         for (op_id_t iid : in_ids) {
             const OpDef* iop = gp.get_op_at(iid);
             size_t nn = 1;

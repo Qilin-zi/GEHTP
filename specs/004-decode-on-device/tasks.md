@@ -38,7 +38,8 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 - [ ] T001 抓基线：0.8B prefill v17 上板 d0f1784 一轮，落 `.scratch_004_baseline/`（勿入 git），记录 **cos=0.998643/top1=29/32 + wall** 与 sha——这是 decode==prefill 门 + 双门的对照锚。取证链 `.scratch_004_baseline/prof/`（op_ts.bin/device.txt）
 - [X] T002 git settle：实测主树=`task/prof-wp`@a5bdc70（dad4b48+afb56c7 已为祖先，ff-merge 不需要）且留有 003 会话未提交 WIP（blob v3 引擎注解，其 T007 与本特性 T004/T005 同改 `exec_matmul_f16` 段）→ **004 开独立 worktree** `/disk1/gehtp-wt/004-decode`（分支 `004-decode-on-device` off a5bdc70）隔离，spec 三件套随分支首 commit 落位；回合主线时与 003 reconcile（[[gehtp-cross-session-coordination]]）
-- [ ] T003 [P] seq=1 编译入口排查：`scripts/export_qwen35_onnx.py` 现状 seq 参数化路径（能否产出 `[1,248320]`）；persistent socket 协议 host/C 两侧 key 对齐现状（host 发 `handle_id`/C 找 `model_id` 的当前不符点，`42_gehtp_persistent/main.c`）
+- [X] T003 [P] seq=1 编译入口排查：`scripts/export_qwen35_onnx.py` 现状 seq 参数化路径（能否产出 `[1,248320]`）；persistent socket 协议 host/C 两侧 key 对齐现状（host 发 `handle_id`/C 找 `model_id` 的当前不符点，`42_gehtp_persistent/main.c`）
+  - **排查结论（2026-09-29）**：① `--seq` 已存在（`export_qwen35_onnx.py:97`），seq=1 零改动可出图，logits 实形 `[1,1,248320]`（元素数等价）；② mask/pos raw 文件不在脚本产出内，需手工备 seq=1 `.i32.raw`（各 4B，命名铁律 `wtop_emit.cpp:174-183`）；③ seq=1 **禁 `--net-json` 直通**（seq=32 dims 不可复用），须走 converter 全链（`scripts/gehtp:66-73`）；④ mask/pos 编译期固化进 blob（换 position=重编译，T018 范围）；⑤ persistent 6 bug 全部仍在且**另有 4 阻塞项**：响应缺 4B BE 长度前缀（host 必解析失败）、input_ids NULL 指针写（必 segfault）、double close、PING/PONG 未实现；⑥ `gehtp_server.py::_run_generation` 当前用 `DeviceRuntime` 占位（persistent 是死代码，`gehtp_server.py:255/:400`）；⑦ 协议 key 对照：`handle_id`↔`model_id` 错位 + host 从不发 `wtop_path`（C 永不加载 blob）
 
 **Checkpoint**: 基线数据在手，git 干净，seq=1 入口已知
 
@@ -50,10 +51,18 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 **⚠️ CRITICAL**: 无 seq=1 blob 就无 decode 可测；无 GEMV 则 US3 性能目标为空
 
-- [ ] T004 [P] GEMV kernel：`kernels/src/runtime/oplist_exec.c` 新增 `exec_matmul_f16_gemv`（:1450 附近）——HVX f32-accumulate、M<32、stream W 行主序**不 crouton repack**、支持 `batched`/`Bn`/`t0`/`t1`/SPLIT `n0`/`N_full`（FR-001/002）
-- [ ] T005 dispatch：`oplist_exec.c:1580-1588` HMX 门**之前**插 `if (M<32) { if (gemv==0) return 0; }`——gemv 失败回落原标量（**全有或全无**，禁止混合路径，FR-001）
-- [ ] T006 host GEMV 验证：M=1/16/32 GEMV vs 标量参考 cos≥0.99999；batched/Bn=1、t0/t1、SPLIT n0 合成矩阵各一（compiler/tests 或独立 host 合成）
-- [ ] T007 seq=1 编译冒烟：`scripts/export_qwen35_onnx.py --seq 1` → `hnnx_compile` → `wtop_emit` → blob 产出 `[1,248320]` logits（FR-003）
+- [X] T004 [P] GEMV kernel：`kernels/src/runtime/oplist_exec.c` 新增 `exec_matmul_f16_gemv`（:1450 附近）——HVX f32-accumulate、M<32、stream W 行主序**不 crouton repack**、支持 `batched`/`Bn`/`t0`/`t1`/SPLIT `n0`/`N_full`（FR-001/002）
+  - **实现（2026-09-29，:1453-1523）**：HVX 体内 `HVX_VectorPair` f32 累加，64 f16 列/向量，尾列走标量；`t0`/`t1` 置位时不做向量化（转置布局 W 的 N 维不连续，向量读会越界）而落标量；标量回落体索引与 `exec_matmul_f16` 原标量路径逐字段同构（batched `a[((bb*M)+m)*K+k]`、SPLIT `n0` 偏移、`N_full` 行距）
+- [X] T005 dispatch：`oplist_exec.c:1580-1588` HMX 门**之前**插 `if (M<32) { if (gemv==0) return 0; }`——gemv 失败回落原标量（**全有或全无**，禁止混合路径，FR-001）
+  - **实现（:1663-1672）**：分支在 ref/tmp 解析后、`M%32&&K%32&&N%32` HMX 门之前；`M>=32` 逐字节走原路径（SC-005）；`g_last_engine` 由 gemv 设置（HVX/SCALAR），optrace 可读
+- [X] T006 host GEMV 验证：M=1/16/32 GEMV vs 标量参考 cos≥0.99999；batched/Bn=1、t0/t1、SPLIT n0 合成矩阵各一（compiler/tests 或独立 host 合成）
+  - **落法（2026-09-29）**：独立 host 合成 `kernels/host/test_gemv_f16.c`——被测体按 `exec_matmul_f16_gemv` 标量回落的 base-pointer 写法逐字移植，参考体用绝对索引独立书写，两者对照 + `memcmp` 逐字节；14 例（M1/16/32、t0/t1 组合、batched Bn=1/2/3/4、SPLIT n0=128/256 + N_full=512、lm_head K=1024/N_full=4096 形状）全绿 cos=1.0 bit-exact
+  - `gcc -O2 -std=gnu11 kernels/host/test_gemv_f16.c -o /tmp/test_gemv -lm && /tmp/test_gemv`
+  - **覆盖边界**：本测试不链接 DSP runtime（`oplist_exec.c` 需 `HAP_perf.h` + `dc_*`/`wtcache_*`/`hvhx_v2_*` 桩，本树无 `host/shims/`），且 `#if __HVX__` 令主机永不走向量体——**HVX 向量体的数值验证归 T013（设备 optrace）**，本任务只钉住索引不变量
+- [X] T007 seq=1 编译冒烟：`scripts/export_qwen35_onnx.py --seq 1` → converter 全链（**禁 `--net-json` 直通**，T003③）→ `hnnx_compile` → `wtop_emit` → blob 产出 `[1,1,248320]` logits（FR-003）
+  - **绕道落法（2026-09-29/30）**：export 环境阻塞未解（见下），幸存 seq=1 ONNX（`/disk1/qwen35_0.8b/model_seq1_fixed.onnx` + 外置权重 + `model_net.json`/`model.params.bin` converter 产物）直通 `wtop_emit` 冒烟：**slots=1888 / ops=16212 / blob 12,372,736 B + ext weights 2,028,604,672 B**（`/tmp/seq1_copy/seq1.wtop`）
+  - **host 数值门（2026-09-30）**：`host_run --net-json` 对 ORT golden（`model_seq1_fixed.onnx`, ids=178/pos=0/mask=1, top1=90637）**cos=0.999999 / top1=90637** 达门（≥0.9986/top1 一致）。过程中修 4 个 seq=1 形状角 bug（Gather 前导 1 剥除错位 / DepthWiseConv2d 居中 pad 自猜 vs 参数驱动 / **输入槽位序**: net.json tensor id 序≠JSON 键序致 pos/mask 槽对调（`host_input_order()` 声明序修复）/ **Softmax 显式 axis** 前导压缩后右对齐钳末维——layer3 首发散 cos 0.485 根因）；seq=32 老链（`--bin fcbias`）逐位一致回归通过
+  - **遗留阻塞（export 环境仍缺）**：① 挂载 Qwen35dev 或准备 conda venv 跑 `export_qwen35_onnx.py`；② seq=1 mask/pos `.i32.raw` 手工生成已具备（`/tmp/s1_{ids,pos,mask}.i64.raw` 声明序喂法）；③ 上板喂 blob 输入时注意**槽位序 = id 序 ≠ 声明序**（input_ids=1, attention_mask=2, position_ids=3），喂前对 `[mdiag] in_ids` 核对
 
 **Checkpoint**: M=1 有 GEMV 快路径 + seq=1 blob 可产出
 
@@ -114,7 +123,7 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 ### decode 图发射 + persistent
 
 - [ ] T018 [US1] decode 图发射：`scripts/export_qwen35_onnx.py` decode 变体（use_cache、KV append/gather + SSM step op 图）+ `compiler/src/ir/graph_prepare.cpp`/`compiler/tools/wtop_emit.cpp` state tensor 分类 + 状态尺寸下发（R3/R5 绿地，先做 host 执行验证）
-- [ ] T019 [US1] persistent runtime（FR-007）：`kernels/examples/42_gehtp_persistent/main.c` 修 6 处硬 bug——`load_blob_from_path` 补 `wt_parse`（现只读不进 :118-143）、`parse_and_exec` 去自覆盖（:145-160）、input_ids 单数字解析、`MAX_LOGITS 32768→248320`+`MAX_OPS 1024→16384`、协议 key 对齐、token-id→host 侧 embedding 注入（FR-008，G7）
+- [ ] T019 [US1] persistent runtime（FR-007）：`kernels/examples/42_gehtp_persistent/main.c` 修 6 处硬 bug——`load_blob_from_path` 补 `wt_parse`+buf 挂载（现只读不进还泄漏 :118-143）、`parse_and_exec` 去自覆盖接 `wt_exec_run_io`（:145-160）、input_ids 栈数组+`strtol` 多数字解析（:185/:214-227）、`MAX_LOGITS 32768→248320`（栈数组改静态/堆）+`MAX_OPS 1024→16384`、协议 key 对齐（host 发 `handle_id`/C 找 `model_id`；host 补发 `wtop_path`）、token-id→host 侧 embedding 注入（FR-008，G7）；**T003 补充 4 阻塞项并入**：响应补 4B BE 长度前缀（:88-106）、double close（:104/:275）、PING/PONG、socket 路径统一（main.c:34 vs scripts/gehtp:21-22）
 - [ ] T020 [US1] host 循环接线：`scripts/persistent_runtime.py`/`device_runtime.py`/`gehtp_server.py::_run_generation` 端到端生成连贯 token；socket 冒烟 prefill→N decode 不 reload、状态存活
 
 ### 精度 + 性能收口

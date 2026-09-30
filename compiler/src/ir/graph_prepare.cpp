@@ -628,6 +628,25 @@ std::vector<const OpDef*> GraphPrepare::get_sorted_opdefs() const {
 }
 
 // Host-side reference execute: float buffers, topo order, tensor map.
+/* 多输入绑定的槽位序: 声明序(loader 记录的 net.json 张量字典插入序)优先,
+ * 无记录(旧 bin 反序列化)时回退 op_id 升序(=基线行为)。声明序条目须
+ * 与当前图 Input 节点集合一致(DCE 可能裁输入), 不一致同样回退。 */
+std::vector<op_id_t> GraphPrepare::host_input_order() {
+    std::vector<op_id_t> in_ids;
+    for (auto& [id, opdef] : opdef_map_)
+        if (opdef && opdef->name_tag && opdef->name_tag->name() &&
+            std::string(opdef->name_tag->name()) == "Input")
+            in_ids.push_back(id);
+    std::sort(in_ids.begin(), in_ids.end());
+    if (input_decl_order_.size() == in_ids.size() && !in_ids.empty()) {
+        bool ok = true;
+        for (op_id_t d : input_decl_order_)
+            if (!std::binary_search(in_ids.begin(), in_ids.end(), d)) { ok = false; break; }
+        if (ok) return input_decl_order_;
+    }
+    return in_ids;
+}
+
 GraphPrepare::ExecResult GraphPrepare::execute_host(
         const std::vector<float>& input,
         const std::vector<std::vector<float>>* multi_inputs) {
@@ -684,14 +703,9 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
 
     // tensor_map: op_id -> float buffer
     std::unordered_map<op_id_t, std::vector<float>> tensor_map;
-    /* 多输入: 所有 Input 节点按 op_id 升序 = net.json 图输入声明序;
+    /* 多输入: Input 槽位序 = host_input_order()(声明序优先, id 序回退);
      * multi 为空时单 input 喂第一个 Input(向后兼容)。 */
-    std::vector<op_id_t> in_ids;
-    for (auto& [id, opdef] : opdef_map_)
-        if (opdef && opdef->name_tag && opdef->name_tag->name() &&
-            std::string(opdef->name_tag->name()) == "Input")
-            in_ids.push_back(id);
-    std::sort(in_ids.begin(), in_ids.end());
+    std::vector<op_id_t> in_ids = host_input_order();
     if (in_ids.empty()) in_ids.push_back(input_id);
     if (getenv("GEHTP_EXDIAG")) {
         std::fprintf(stderr, "[mdiag] in_ids:");
