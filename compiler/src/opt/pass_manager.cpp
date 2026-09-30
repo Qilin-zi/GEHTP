@@ -10,6 +10,7 @@ namespace hnnx {
 void register_pass_const_fold();
 void register_pass_shape_fold();
 void register_pass_fusion_rules();
+void register_pass_fc_bias();
 
 PassManager& PassManager::instance() {
     static PassManager mgr;
@@ -148,6 +149,7 @@ void register_builtin_passes() {
     register_pass_const_fold();
     register_pass_shape_fold();
     register_pass_fusion_rules();
+    register_pass_fc_bias();
 }
 
 } // namespace hnnx

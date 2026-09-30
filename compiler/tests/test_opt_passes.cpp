@@ -8,6 +8,7 @@
 //               恒等 Transpose 删除(C)
 //   stats: 匹配/重写计数
 #include "hnnx/ir/graph_prepare.hpp"
+#include "hnnx/ir/scalar_params.hpp"
 #include "hnnx/opt/pass_manager.hpp"
 #include "hnnx/opt/optimization_passes.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
@@ -269,6 +270,93 @@ int main() {
             CHECK(nm == "ConvActivations", "fusion: enable 后 Relu -> ConvActivations");
             CHECK(conv_dead, "fusion: enable 后 Conv producer dead");
             pm.disable("fusion_conv_relu");
+        }
+    }
+
+    std::printf("=== [12] fc_bias_fold: FC→Reshape→Add(const bias) 折叠 ===\n");
+    {
+        PassManager& pm = PassManager::instance();
+        // 图 A: 正例 (M=32,K=1024,N=16 — N%32!=0 非 HMX 形, 应折叠)
+        {
+            GraphPrepare gp;
+            auto in   = add_input(gp, 5, f32_def(1, 32, 1024, 1));
+            auto w    = add_const_f32(gp, 1, f32_def(16, 1024, 1, 1), std::vector<float>(16384, 0.01f));
+            auto bias = add_const_f32(gp, 2, f32_def(16, 1, 1, 1), std::vector<float>(16, 0.5f));
+            auto fc   = add_unary_op(gp, 10, "FullyConnected", {in, w}, f32_def(1, 1, 32, 16));
+            auto rs   = add_unary_op(gp, 11, "Reshape", {fc}, f32_def(1, 32, 16, 1));
+            auto add  = add_unary_op(gp, 12, "Eltwise_Binary", {rs, bias}, f32_def(1, 32, 16, 1));
+            add_output(gp, 30, add);
+            gp.run_optimize_passes(env);
+            OpDef* fo = gp.get_op_at(fc);
+            OpDef* ao = gp.get_op_at(add);
+            OpDef* oo = gp.get_op_at(30);
+            CHECK(fo && fo->inputs.size() == 3, "fc_bias: FC 收到 inputs[2]=bias");
+            CHECK(fo && fo->inputs.size() == 3 && fo->inputs[2].src_id == bias,
+                  "fc_bias: inputs[2] 指向 bias const");
+            {
+                bool mark = false;
+                if (fo) {
+                    auto sp = unpack_scalar_params(fo->op_data);
+                    const ScalarParam* p = scalar_get(sp, "has_bias");
+                    mark = p && p->is_numeric && p->value_num != 0;
+                }
+                CHECK(mark, "fc_bias: op_data 写入 has_bias=1 可信标记");
+            }
+            CHECK(!ao || ao->is_dead(), "fc_bias: Add 标 dead");
+            CHECK(oo && oo->inputs.size() == 1 && oo->inputs[0].src_id == rs,
+                  "fc_bias: Output 改线到 Reshape");
+        }
+        // 图 D: 注入形态 — FC 已带 [wscale($Const id≥0x10000), quant_marker],
+        //        折叠 = 替换 inputs[2] 为 bias(真实管线 do_prepare1 注入后形状)
+        {
+            GraphPrepare gp;
+            auto in   = add_input(gp, 5, f32_def(1, 32, 1024, 1));
+            auto w    = add_const_f32(gp, 1, f32_def(16, 1024, 1, 1), std::vector<float>(16384, 0.01f));
+            auto bias = add_const_f32(gp, 2, f32_def(16, 1, 1, 1), std::vector<float>(16, 0.5f));
+            auto wsc  = add_const_f32(gp, 0x10000, f32_def(1, 1, 1, 16), std::vector<float>(16, 0.0f));
+            auto qm   = add_const_f32(gp, 0x10001, f32_def(1, 1, 1, 1), std::vector<float>(1, 0.0f));
+            auto fc   = add_unary_op(gp, 10, "FullyConnected", {in, w, wsc, qm}, f32_def(1, 32, 16, 1));
+            auto add  = add_unary_op(gp, 12, "Eltwise_Binary", {fc, bias}, f32_def(1, 32, 16, 1));
+            add_output(gp, 30, add);
+            gp.run_optimize_passes(env);
+            OpDef* fo = gp.get_op_at(fc);
+            OpDef* ao = gp.get_op_at(add);
+            CHECK(fo && fo->inputs.size() == 4 && fo->inputs[2].src_id == bias,
+                  "fc_bias: 注入形态 inputs[2] 由 wscale 替换为 bias");
+            CHECK(fo && fo->inputs[3].src_id == qm, "fc_bias: quant_marker 不动");
+            CHECK(!ao || ao->is_dead(), "fc_bias: 注入形态 Add 标 dead");
+        }
+        // 图 B: HMX 门 — M/K/N 全 32 倍数 (N=64) 不折(内核 v1 仅标量路径应用 bias)
+        {
+            GraphPrepare gp;
+            auto in   = add_input(gp, 5, f32_def(1, 32, 1024, 1));
+            auto w    = add_const_f32(gp, 1, f32_def(64, 1024, 1, 1), std::vector<float>(65536, 0.01f));
+            auto bias = add_const_f32(gp, 2, f32_def(64, 1, 1, 1), std::vector<float>(64, 0.5f));
+            auto fc   = add_unary_op(gp, 10, "FullyConnected", {in, w}, f32_def(1, 32, 64, 1));
+            auto add  = add_unary_op(gp, 12, "Eltwise_Binary", {fc, bias}, f32_def(1, 32, 64, 1));
+            add_output(gp, 30, add);
+            gp.run_optimize_passes(env);
+            OpDef* fo = gp.get_op_at(fc);
+            OpDef* ao = gp.get_op_at(add);
+            CHECK(fo && fo->inputs.size() == 2, "fc_bias: HMX 形不折, FC 保持 2 输入");
+            CHECK(ao && !ao->is_dead(), "fc_bias: HMX 形不折, Add 保留");
+        }
+        // 图 C: disable 后不折
+        {
+            pm.disable("fc_bias_fold");
+            GraphPrepare gp;
+            auto in   = add_input(gp, 5, f32_def(1, 32, 1024, 1));
+            auto w    = add_const_f32(gp, 1, f32_def(16, 1024, 1, 1), std::vector<float>(16384, 0.01f));
+            auto bias = add_const_f32(gp, 2, f32_def(16, 1, 1, 1), std::vector<float>(16, 0.5f));
+            auto fc   = add_unary_op(gp, 10, "FullyConnected", {in, w}, f32_def(1, 32, 16, 1));
+            auto add  = add_unary_op(gp, 12, "Eltwise_Binary", {fc, bias}, f32_def(1, 32, 16, 1));
+            add_output(gp, 30, add);
+            gp.run_optimize_passes(env);
+            OpDef* fo = gp.get_op_at(fc);
+            OpDef* ao = gp.get_op_at(add);
+            CHECK(fo && fo->inputs.size() == 2, "fc_bias: disable 后 FC 保持 2 输入");
+            CHECK(ao && !ao->is_dead(), "fc_bias: disable 后 Add 保留");
+            pm.enable("fc_bias_fold");
         }
     }
 

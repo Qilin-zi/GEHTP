@@ -1094,6 +1094,22 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                         out[(b * M2 + i) * N2 + j] = acc;
                     }
         } else {
+        /* FC bias 折叠(pass_fc_bias)配套: op_data scalar "has_bias"==1 且
+         * inputs[2] 元素数 == nn 时按列加 bias, 与设备 exec_matmul_f16 标量
+         * 路径(f32 累加器加 bias)同口径 —— host/device 数值一致。
+         * 只认 scalar 标记: 注入形态下 inputs[2] 常是 N 元素 wscale const,
+         * 形状启发会误加(test_wtop_emit US1 实锤)。host_run --bin 路径
+         * op_data 不落盘, 标记丢失则按无 bias 跑(与折叠前行为一致)。 */
+        const float* mm_bias = nullptr;
+        {
+            const ScalarParam* hb = scalar_get(sp, "has_bias");
+            if (hb && hb->is_numeric && hb->value_num != 0 &&
+                inputs.size() > 2 && inputs[2] && in_defs.size() > 2) {
+                size_t bn = 1;
+                for (uint32_t i = 0; i < in_defs[2].rank && i < 5; ++i) bn *= in_defs[2].dims[i];
+                if (bn == nn) mm_bias = reinterpret_cast<const float*>(inputs[2]);
+            }
+        }
         for (size_t i = 0; i < m; ++i) {
             for (size_t j = 0; j < nn; ++j) {
                 float acc = 0.0f;
@@ -1102,6 +1118,7 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                     float bv = t1 ? B[j * k + p] : B[p * nn + j];
                     acc += av * bv;
                 }
+                if (mm_bias) acc += mm_bias[j];
                 out[i * nn + j] = acc;
             }
         }
