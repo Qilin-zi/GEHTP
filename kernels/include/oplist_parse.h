@@ -49,6 +49,16 @@ extern "C" {
  * (存量 byte-exact 回归门零影响)。内存侧 wt_slot.offset 恒 u64 字节。 */
 #define WT_BLOB_VER_2 2u
 #define WT_SLOT_SIZE_V2 24u
+/* v3 (003 compiler-driven scheduling, 2026-09-29): 逐算子引擎注解 footer。
+ * 编译器给每个 op 指派计算单元 + 回落策略, 运行期照做 (FR-001..004)。
+ * footer = op 表之后、weight 区 128B 对齐之前, n_ops 条 4B (u32 打包):
+ *   bit 0-1  engine           0=scalar 1=HVX 2=HMX 3=reserved (对齐 wt_engine)
+ *   bit 2    fallback_allowed 0=禁止回落(硬报错) 1=允许回落
+ *   bit 3-4  fallback_engine  允许回落时回落到的单元 (0/1/2)
+ *   bit 5-31 保留 (0)
+ * ver<=2 无此 footer → 运行期走 legacy 自决 (FR-009)。v3 恒 24B slot 记录
+ * (ver>=2 单规则), 与 v2 大权重路径共享 slot 线格式; 小模型多付 12B/slot。 */
+#define WT_BLOB_VER_3 3u
 #define WT_ENDIAN_CHK 0x1234u
 #define WT_SLOT_SIZE 16u
 #define WT_WEIGHT_ALIGN 128u
@@ -78,12 +88,21 @@ extern "C" {
 /* P5: 引擎面引用编码(0xC000|surface_id), 仅 OP_DMA 的 src/dst 可用。
  * 0=e.act, 1=e.out, 2=e.wt, 3=e.bias。 */
 #define WT_REF_ENG_FLAG 0xC000u
+/* v3 VTCM carve footer: [magic u32][count u32][count × 20B record].
+ * The header makes the optional region distinguishable from alignment padding. */
+#define WT_CARVE_MAGIC 0x43524156u /* "VARC" little-endian */
+#define WT_CARVE_REC_SIZE 20u
 #define WT_ENG_ACT 0u
 #define WT_ENG_OUT 1u
 #define WT_ENG_WT 2u
 #define WT_ENG_BIAS 3u
 /* 不做该侧 cache/fence 操作。合法通道值取 fence.h 的 FC_*。 */
 #define WT_DMA_FENCE_NONE 0xFFu
+/* 003 T015: OP_DMA 的 src/dst 另可用 0x4000|temp (VTCM 驻留, 含编译期
+ * staging) 与 0x8000|slot (含 EXT_IN 注入) —— DDR↔VTCM 预置搬移的发射
+ * 形态 (exec_dma 的 dma_ref_resolve 解析两侧)。W4A16 act 预置 = 主发射面:
+ * OP_DMA {src=act 源, dst=0x4000|stg, M*K*2, 0,0, flags=1, FF, FF} 紧邻
+ * OP_MATMUL_W4A16 {0x4000|stg, w_裸slot, out, M,K,N}。 */
 
 enum {
     OP_NOP = 0,
@@ -227,6 +246,9 @@ struct wt_blob {
     struct wt_op ops[WT_MAX_OPS];
     const uint8_t* weight_base; /* 指向输入缓冲内 weight 区 */
     size_t weight_bytes;        /* weight 区可用字节数 */
+    const uint8_t* annot_base;  /* v3: 引擎注解表 (n_ops 条 u32); ver<3 = NULL */
+    const uint8_t* carve_base;  /* v3: optional VTCM carve footer records */
+    uint32_t n_carve;           /* number of entries in carve_base */
 };
 
 enum {
@@ -259,6 +281,16 @@ static inline uint32_t wt_rd_u32(const uint8_t* p) {
 static inline uint16_t wt_rd_u16(const uint8_t* p) {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
+
+/* v3 引擎注解 footer 打包/解包 (host emit 打包 / 设备 exec 解包共用) */
+static inline uint32_t wt_annot_pack(uint32_t engine, uint32_t fallback_allowed,
+                                     uint32_t fallback_engine) {
+    return (engine & 0x3u) | ((fallback_allowed & 1u) << 2) |
+           ((fallback_engine & 0x3u) << 3);
+}
+static inline uint32_t wt_annot_engine(uint32_t a) { return a & 0x3u; }
+static inline uint32_t wt_annot_fb_allowed(uint32_t a) { return (a >> 2) & 1u; }
+static inline uint32_t wt_annot_fb_engine(uint32_t a) { return (a >> 3) & 0x3u; }
 
 #ifdef __cplusplus
 }

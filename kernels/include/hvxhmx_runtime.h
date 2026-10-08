@@ -66,6 +66,12 @@ extern int  hmx_runtime_setup(unsigned int vtcm_size);
 /** @brief 释放运行时资源 (VTCM 归还 + HMX 下电). 与 hmx_runtime_setup 配对. */
 extern void hmx_runtime_teardown(void);
 
+/* 003 T014: attach 模式 — wtcache 已持有 VTCM (W4A16 驻留池) 时, f16/conv HMX
+ * 快路径把 base 挂到共享 scratch 区而非二次 acquire (二次 acquire 必失败)。
+ * teardown 对 attach 只清指针不 release ctx (ctx 归 wtcache 所有)。 */
+extern int  hmx_runtime_attach(void *base, unsigned int size);
+extern int  hmx_runtime_is_attached(void);
+
 /** @return 当前 runtime 持有的 VTCM 基地址 (setup 后有效; 未 setup 返回 NULL). */
 extern void        *hmx_runtime_get_vtcm_base(void);
 

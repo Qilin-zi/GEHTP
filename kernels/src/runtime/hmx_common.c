@@ -26,6 +26,7 @@
 static unsigned int  g_vtcm_ctx_id = 0;
 static void         *g_vtcm_base   = NULL;
 static unsigned int  g_vtcm_size   = 0;
+static int           g_vtcm_attached = 0;  /* 003 T014: base 借自 wtcache, 无自有 ctx */
 static int           g_power_on    = 0;
 
 unsigned int hmx_runtime_get_ctx_id(void) { return g_vtcm_ctx_id; }
@@ -190,9 +191,29 @@ void hmx_runtime_teardown(void)
         HAP_compute_res_release(g_vtcm_ctx_id);
     }
 #endif
-    g_vtcm_ctx_id = 0;
-    g_vtcm_base   = NULL;
-    g_vtcm_size   = 0;
+    g_vtcm_ctx_id   = 0;
+    g_vtcm_base     = NULL;
+    g_vtcm_size     = 0;
+    g_vtcm_attached = 0;
+}
+
+/* 003 T014 attach 模式: wtcache 已持有 VTCM (W4A16 驻留池场景) 时, f16/conv
+ * HMX 快路径不再自己 acquire 全量 (二次 acquire 必失败 → 整图静默回落标量),
+ * 而是把 g_vtcm_base 挂到共享 VTCM 的 scratch 区。teardown 对 attach 只清
+ * 指针不 release (ctx 归 wtcache 所有)。 */
+int hmx_runtime_attach(void *base, unsigned int size)
+{
+    if (!base || size == 0) return -1;
+    if (g_vtcm_base) return 0;  /* 已有(ctx 自有或已 attach), 幂等 */
+    g_vtcm_base     = base;
+    g_vtcm_size     = size;
+    g_vtcm_attached = 1;
+    return 0;
+}
+
+int hmx_runtime_is_attached(void)
+{
+    return g_vtcm_attached;
 }
 
 /* ============================================================

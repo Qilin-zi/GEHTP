@@ -52,7 +52,7 @@ ENGINE_NAMES = {0: "scalar", 1: "HVX", 2: "HMX"}
 class OpRec:
     __slots__ = ("idx", "opcode", "args", "name", "in_b", "w_b", "out_b",
                  "pool_b", "flops", "vtcm", "note", "start_us", "dur_us",
-                 "dma_us", "dma_bytes", "engine")
+                 "dma_us", "dma_bytes", "engine", "planned_engine", "deviation")
 
     def __init__(self, idx, opcode, args):
         self.idx = idx
@@ -66,6 +66,8 @@ class OpRec:
         self.start_us = self.dur_us = None
         self.dma_us = self.dma_bytes = None
         self.engine = 0
+        self.planned_engine = 0
+        self.deviation = 0
 
     @property
     def total_b(self):
@@ -88,8 +90,11 @@ def parse_wtop(path):
         ver, endian = struct.unpack_from("<HH", hdr, 4)
         if endian != 0x1234:
             raise SystemExit(f"bad endian chk: {path}")
-        if ver not in (1, 2):
-            raise SystemExit(f"unsupported blob ver {ver} (v1/v2 已知)")
+        if ver not in (1, 2, 3):
+            raise SystemExit(f"unsupported blob ver {ver} (v1/v2/v3 已知)")
+        # v3 = v2 槽格式(24B) + op 流后可选引擎注解 footer(n_ops×u32) +
+        # carve footer([magic][count][count×20B]); 本工具只按 n_ops/arity 读
+        # op 流, footer 不影响逐 op 读取。
         n_slots, n_ops = struct.unpack_from("<II", hdr, 8)
         slot_rec = 24 if ver >= 2 else 16
         slots = []
@@ -118,14 +123,16 @@ def parse_wtop(path):
 
 
 def parse_op_ts(path):
-    """op_ts.bin (WTS1): magic|ver|n_ops|pad|wall_us u64|n×(start,dur[,dma_us,dma_bytes,engine]).
-    ver=1: 每 op 8B {start,dur}; ver=2: 每 op 20B 加 dma_us/dma_bytes/engine。
-    统一返回 5 元组 (start,dur,dma_us,dma_bytes,engine), ver=1 后三项补 0。"""
+    """op_ts.bin (WTS1): magic|ver|n_ops|pad|wall_us u64|n×记录。
+    ver=1: 每 op 8B {start,dur}; ver=2: 20B 加 dma_us/dma_bytes/engine;
+    ver=3: 28B 再加 planned_engine/deviation (003 T019 US3 报告契约)。
+    统一返回 7 元组 (start,dur,dma_us,dma_bytes,engine,planned,deviation),
+    低版本缺项补 0 (ver<3 planned=engine 口径: 无计划语义, 偏差恒 0)。"""
     data = open(path, "rb").read()
     if data[:4] != b"WTS1":
         raise SystemExit(f"bad op_ts magic: {path}")
     ver, n_ops = struct.unpack_from("<II", data, 4)
-    if ver not in (1, 2):
+    if ver not in (1, 2, 3):
         raise SystemExit(f"unsupported op_ts ver {ver}")
     (wall_us,) = struct.unpack_from("<Q", data, 16)
     ts = []
@@ -133,10 +140,13 @@ def parse_op_ts(path):
     for _ in range(n_ops):
         if ver == 1:
             s, d = struct.unpack_from("<II", data, off); off += 8
-            ts.append((s, d, 0, 0, 0))
-        else:
+            ts.append((s, d, 0, 0, 0, 0, 0))
+        elif ver == 2:
             s, d, dus, db, eng = struct.unpack_from("<IIIII", data, off); off += 20
-            ts.append((s, d, dus, db, eng))
+            ts.append((s, d, dus, db, eng, 0, 0))
+        else:
+            s, d, dus, db, eng, pl, dv = struct.unpack_from("<IIIIIII", data, off); off += 28
+            ts.append((s, d, dus, db, eng, pl, dv))
     return wall_us, ts
 
 
@@ -151,7 +161,7 @@ def parse_optrace(path):
                 continue
             try:
                 us = int(line.rsplit(" us=", 1)[1])
-                ts.append((None, us if us >= 0 else None))
+                ts.append((None, us if us >= 0 else None, 0, 0, 0, 0, 0))
             except ValueError:
                 continue
     return None, ts
@@ -354,9 +364,10 @@ def main():
                 raise SystemExit(f"strict: {msg}  (跑前 gehtp run 已清设备侧 op_ts.bin; "
                                  f"若仍不齐 = 该 blob 未在本轮重跑)")
             print(f"warn: {msg}", file=sys.stderr)
-        for rec, (s, d, dus, db, eng) in zip(ops, ts):
+        for rec, (s, d, dus, db, eng, pl, dv) in zip(ops, ts):
             rec.start_us, rec.dur_us = s, d
             rec.dma_us, rec.dma_bytes, rec.engine = dus, db, eng
+            rec.planned_engine, rec.deviation = pl, dv
 
     # ---- [run] 分段 (可选)
     if args.device_txt:
@@ -403,6 +414,36 @@ def main():
     else:
         print("DMA 搬运实测: Σdma_us=0 (本 blob 无 W4A16 matmul 的 UserDMA 搬运)")
     print()
+
+    # ---- 003 T019/T020: 偏差报告 (US3 报告契约: 0=按计划 1=允许回落 2=已中止)
+    have_ts = [r for r in ops if getattr(r, "deviation", None) is not None
+               and r.dur_us is not None]
+    if have_ts:
+        n0 = sum(1 for r in have_ts if r.deviation == 0)
+        n1 = sum(1 for r in have_ts if r.deviation == 1)
+        n2 = sum(1 for r in have_ts if r.deviation == 2)
+        print(f"== 偏差报告 (planned vs actual) ==")
+        print(f"按计划 {n0} | 允许回落 {n1} | 已中止 {n2}")
+        # 契约不变量 (T020): dev==0 ⟺ planned==actual; dev==1 ⟹ actual==fallback
+        # (emit 恒 fb=scalar); dev==2 ⟹ run 在该 op 中止
+        bad = [r for r in have_ts
+               if (r.deviation == 0) != (r.planned_engine == r.engine)]
+        print(f"不变量: {'PASS' if not bad else 'FAIL (%d 违例)' % len(bad)}")
+        pairs = {}
+        for r in have_ts:
+            if r.deviation:
+                k = (ENGINE_NAMES.get(r.planned_engine, f"e{r.planned_engine}"),
+                     ENGINE_NAMES.get(r.engine, f"e{r.engine}"), r.deviation)
+                pairs[k] = pairs.get(k, 0) + 1
+        for (pl, ac, dv), c in sorted(pairs.items(), key=lambda kv: -kv[1]):
+            print(f"  {pl}→{ac} dev={dv}: {c}")
+        hot = sorted((r for r in have_ts if r.deviation == 1),
+                     key=lambda r: -(r.dur_us or 0))[:5]
+        for r in hot:
+            nm = r.name or "?"
+            print(f"  [回落热点] idx={r.idx} {nm} dur={r.dur_us}us "
+                  f"opcode={r.opcode} planned={ENGINE_NAMES.get(r.planned_engine)}")
+        print()
 
     # ---- top N
     ranked = sorted((r for r in ops if r.dur_us is not None),
@@ -471,13 +512,16 @@ def main():
         with open(args.csv, "w", newline="") as f:
             wcsv = csvmod.writer(f)
             wcsv.writerow(["idx", "name", "opcode", "opcode_name", "start_us",
-                           "dur_us", "dma_us", "dma_bytes", "engine", "in_b",
+                           "dur_us", "dma_us", "dma_bytes", "engine",
+                           "planned_engine", "deviation", "in_b",
                            "w_b", "out_b", "pool_b", "flops", "vtcm", "note"])
             for r in ops:
                 wcsv.writerow([r.idx, r.name, r.opcode,
                                OP_NAMES.get(r.opcode, "?"), r.start_us, r.dur_us,
                                r.dma_us, r.dma_bytes,
                                ENGINE_NAMES.get(r.engine, r.engine),
+                               ENGINE_NAMES.get(r.planned_engine, r.planned_engine),
+                               r.deviation,
                                r.in_b, r.w_b, r.out_b, r.pool_b, r.flops,
                                int(r.vtcm), r.note])
         print(f"csv: {args.csv}")

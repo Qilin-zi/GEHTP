@@ -41,6 +41,7 @@ static int arity_of(uint16_t opcode) {
     case OP_DMA: return WT_ARITY_DMA;
     case OP_PAD_F16: return WT_ARITY_PAD_F16;
     case OP_MATMUL_F16_SPLIT: return WT_ARITY_MATMUL_F16_SPLIT;
+    case OP_MATMUL_F16_BIAS: return WT_ARITY_MATMUL_F16_BIAS;
     default: return -1;
     }
 }
@@ -75,6 +76,7 @@ static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     case OP_DMA: return idx == 0 || idx == 1;
     case OP_PAD_F16: return idx == 0;
     case OP_MATMUL_F16_SPLIT: return idx == 0 || idx == 1;
+    case OP_MATMUL_F16_BIAS: return idx == 0 || idx == 1 || idx == 7;
     default: return 0;
     }
 }
@@ -84,12 +86,16 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
     if (buf[0] != 'W' || buf[1] != 'T' || buf[2] != 'O' || buf[3] != 'P')
         return WT_ERR_MAGIC;
     out->ver = wt_rd_u16(buf + 4);
-    if (out->ver != WT_BLOB_VER && out->ver != WT_BLOB_VER_2) return WT_ERR_VER;
+    if (out->ver != WT_BLOB_VER && out->ver != WT_BLOB_VER_2 &&
+        out->ver != WT_BLOB_VER_3) return WT_ERR_VER;
     if (wt_rd_u16(buf + 6) != WT_ENDIAN_CHK) return WT_ERR_ENDIAN;
     out->n_slots = wt_rd_u32(buf + 8);
     out->n_ops = wt_rd_u32(buf + 12);
     if (out->n_slots == 0 || out->n_slots > WT_MAX_SLOTS) return WT_ERR_NSLOTS;
     if (out->n_ops == 0 || out->n_ops > WT_MAX_OPS) return WT_ERR_NOPS;
+    out->annot_base = NULL;
+    out->carve_base = NULL;
+    out->n_carve = 0;
 
     /* v1: 16B 槽记录 {len,count,offset32,addr}; v2: 24B {len,count,off64,addr,rsv} */
     const uint32_t slot_rec = (out->ver >= WT_BLOB_VER_2) ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE;
@@ -130,6 +136,32 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
         for (uint16_t a = 0; a < n_args; a++)
             out->ops[i].args[a] = wt_rd_u32(buf + p + 4u + (size_t)a * 4u);
         p += 4u + (size_t)n_args * 4u;
+    }
+
+    /* v3: 引擎注解 footer (op 表后, weight 对齐前): n_ops 条 u32 */
+    if (out->ver == WT_BLOB_VER_3) {
+        if (size < p + (size_t)out->n_ops * 4u) return WT_ERR_OP_TRUNC;
+        out->annot_base = buf + p;
+        p += (size_t)out->n_ops * 4u;
+
+        /* v3: 可选 VTCM carve footer: [magic u32][count u32][count × 20B].
+         * 无 carve 的 v3 blob 在此处直接进入 weight 128B 对齐 —— 对齐填充
+         * 的字节不可能是 magic, 故按 magic 探测是确定性的(0x43524156 全
+         * 0 对齐填充下永不误判; magic 字节序由发射器小端写)。 */
+        if (size >= p + 8u && wt_rd_u32(buf + p) == WT_CARVE_MAGIC) {
+            uint32_t nc = wt_rd_u32(buf + p + 4u);
+            if (nc > 0u) {
+                if (size < p + 8u + (size_t)nc * WT_CARVE_REC_SIZE)
+                    return WT_ERR_OP_TRUNC;
+                out->carve_base = buf + p + 8u;
+                out->n_carve = nc;
+                p += 8u + (size_t)nc * WT_CARVE_REC_SIZE;
+            } else {
+                out->carve_base = buf + p + 8u;
+                out->n_carve = 0;
+                p += 8u;
+            }
+        }
     }
 
     out->weight_off = align_up((uint32_t)p, WT_WEIGHT_ALIGN);
