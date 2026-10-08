@@ -74,8 +74,15 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 **Independent Test**: seq=1 blob 上板 d0f1784，`[1,248320]` logits vs prefill 首行 cos≥0.9986/top1 一致（decode==prefill 首位置不变式）
 
-- [ ] T008 [US1] seq=1 上板 d0f1784：单 token 前向 logits `[1,248320]` vs `cpu_golden/hf/logits_{i}[0]`（prefill 首行）cos≥0.998643/top1 一致
-- [ ] T009 [US1] deploy loop 验证：`build_libs.sh`（full，勿 `one`）+ `gehtp setup --device d0f1784`（勿信 `[ -f signed.so ] || build` 短路 → stale arity），复现 prefill cos 0.998643/top1 29/32（G10）
+- [X] T008 [US1] seq=1 上板 d0f1784：单 token 前向 logits `[1,248320]` vs `cpu_golden/hf/logits_{i}[0]`（prefill 首行）cos≥0.998643/top1 一致
+  - **绿（2026-10-08，d0f1784，库指纹 a42720a5）**：`seq1.dev4.wtop`（直通 emit，`/tmp/seq1_copy/`）设备单发 → vs HF `logits_0[0]` **cos=0.999960 / top1=90637 精确一致**（top5 全同）；decode==prefill-首位置不变式 cos=0.999981。远超 0.998643 门
+  - **根因双 bug（修复后达标）**：
+    ① **emit Bn 剪尾**（`op_matmul.cpp`）：attn q·kᵀ 输出 `[1,8,1,1]`（M=N=1）被 `while(dims[rk-1]==1) rk--` 剪掉真实批维 8 → Bn=1 → 执行器只写 1/8 元素，其余 7 头读陈旧 temp（首发散 gid 4560/idx 2711，顺流污染全部 6 个 full-attn 层 + GDN scan 回路）。修法：批维 = 除末两维外全部前导维之积，不裁剪
+    ② **GEMV HVX 向量体数值错**（`oplist_exec.c`）：K=1/N=256/Bn=8 实锤输出 = W 偶元素 stride-2 抽样（`hvx_vec_mpyacc_f32_f16` pair-interleave × `hvx_vec_f32_to_f16` 的 vdeal 组合不匹配；对照 `hvx-mm-kernels-flat.h` vec_dot 收尾是 lo+hi 归约无逐元素回写先例）。`#if __HVX__` 体 host 编译不参与 → host 单测覆盖不到。**禁用（`if (0 && ...)`）全走标量**（标量公式已 numpy 逐位证实），设备侧单测补齐前不回开
+  - **取证链**：host netjson dump（`/tmp/s1diag5` 14697 张量）+ 设备 hook（`wt_exec_set_hook` 分段下发，1023B 截断上限）+ last-of-gid 对拍（code-26 分解中间步非检查点）+ 层哨兵阶梯（L0/L1/L2 exact → L3 起 BAD 定位窗口）
+- [X] T009 [US1] deploy loop 验证：`build_libs.sh`（full，勿 `one`）+ `gehtp setup --device d0f1784`（勿信 `[ -f signed.so ] || build` 短路 → stale arity），复现 prefill cos 0.998643/top1 29/32（G10）
+  - **绿（2026-10-08，d0f1784，新库 a42720a5 = full build + setup 重推）**：prefill v17 blob（`qwen35_08b_v17.wtop`，i32 ids=prompt0）→ **cos=0.998642 / top1=30/32 / exec 34.1s / wall 37.6s**；历史基线（9/28 旧库产物 `output_v17bhmx_0.f16.raw`）cos=0.998646/29/32。Δcos=4e-6（f16 噪声级）、top1 反升、wall 持平（基线 33.9s）——**无回归**
+  - **Δ来源（已知且良性）**：v17 全部 175 个 matmul_f16 均 M<32 → 旧库部分走 GEMV HVX 向量体（N≥64 的 !t0/!t1 分支），新库禁用后走标量 → row0-4 逐字节同、position 5 起微差（HVX 向量体与标量 f32 累加的舍入差）；这正是 T008 ② 修复的副作用，设备侧 GEMV 单测补齐后回开可收回 +0.2s
 
 **Checkpoint**: US1 独立交付——decode 单 token 前向上板正确，deploy loop 无 stale arity。**0.8B 双门（decode 门 + wall 对照 T001）过**。可 commit。
 

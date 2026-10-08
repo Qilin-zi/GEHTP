@@ -35,6 +35,9 @@
 #include "hvxhmx_runtime.h"
 #include "hvxhmx_v2_matmul.h"
 #include "hmx_crouton.h"
+#if defined(__HVX__) || defined(__hexagon__)
+#include "internal/hvx-base.h"  /* GEMV 向量体: hvx_vmemu / hvx_vec_mpyacc_f32_f16 / hvx_vec_f32_to_f16 */
+#endif
 
 #define MAX_TEMPS 4096  /* 0.8B 全模型 temp id 至 1403+ (输出 temp 1401); 256 实锤死 op2616, 与 WT_EXEC_MAX_TEMPS 同步 */
 
@@ -1038,6 +1041,8 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
         case 13: /* SOFTPLUS: 稳定化 log(1+e^x), 与 host ops.cpp Neuron case 7 逐字同款 */
             r = (v > 30.0f) ? v : (v < -30.0f ? expf(v) : log1pf(expf(v))); break;
         case 14: r = v; break;  /* COPY */
+        case 15: r = (v != v) ? 1.0f : 0.0f; break;         /* ISNAN: bool 0/1 (v!=v 即 NaN 判据) */
+        case 16: r = (v == v && (v > 3.4e38f || v < -3.4e38f)) ? 1.0f : 0.0f; break;  /* ISINF */
         default:
             /* P1 消除静默兜底: 未知 subtype 不得静默直通(此前 0xFFFFFFFF
              * 拷贝 = 0.8B 全 -inf 根因之一)。与 emit 侧硬错误同口径。 */
@@ -1123,6 +1128,7 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
         case 2: r = x0 * x1; break;
         case 3: r = (x1 != 0) ? x0 / x1 : 0.0f; break;
         case 4: r = (x0 == x1) ? 1.0f : 0.0f; break;  /* EQ: bool 语义, 与 host ops.cpp oper==3 同款 */
+        case 5: r = ((uint32_t)x0 & (uint32_t)x1) ? 1.0f : 0.0f; break;  /* AND: bool 位与 */
         default: break;
         }
         y[i] = f32_to_f16(r);
@@ -1446,6 +1452,94 @@ static int exec_scatter_nd(const struct wt_blob* b, const struct wt_op* op,
  * act/wgt/out/scales 放 hmx_runtime VTCM (mxmem 只能访问 VTCM), 2KB 对齐。
  * 失败(未 setup/超 VTCM/wtcache 已占同一物理 VTCM)返回 -1, 回落标量。
  * 仅 DSP (__HVX__/__hexagon__) 编译; host 无 HMX, 走标量。 */
+/* M<32 GEMV 快路径 (HVX f32-accumulate)。FR-001: 插入 HMX 门之前。
+ * FR-002: stream W 行主序，无 crouton repack (memory-bound)。
+ * 支持 t0/t1 转置、batched(Bn)、SPLIT(n0/N_full)。失败回落标量。
+ * 注意: 函数体在 #if __HVX__ 后, host 走标量回落。 */
+static int exec_matmul_f16_gemv(const uint16_t* a, const uint16_t* w, uint16_t* y,
+                                uint32_t M, uint32_t K, uint32_t N,
+                                uint32_t n0, uint32_t N_full,
+                                int t0, int t1,
+                                uint32_t batched, uint32_t Bn,
+                                char* err, size_t errn) {
+#if defined(__HVX__) || defined(__hexagon__)
+    uint32_t bb_max = batched ? Bn : 1u;
+    /* 仅对常见的 A[M,K] × W[K,N] 行主序布局向量化：
+     * 固定 k，W 的 N 维连续，正好符合 GEMV 的 stream-W 访问模式。
+     * 转置布局仍由下面的通用标量实现，避免对非连续维度做越界向量读。
+     * !!! seq=1 上板实锤该向量体数值错 (Bn=8,K=1,N=256 输出 = W 的偶元素
+     * 抽样): mpyacc pair-interleave 与 f32_to_f16 的 vdeal 组合不匹配
+     * (对照 hvx-mm-kernels-flat.h 的 vec_dot: 其收尾是 lo+hi 归约, 无逐元
+     * 素回写先例)。host 单测覆盖不到 (#if 体不参与 host 编译)。在设备侧
+     * 单测补齐前禁用, 全部走下方已对拍 bit 级一致的标量路径。 */
+    if (0 && !t0 && !t1) {
+        for (uint32_t bb = 0; bb < bb_max; ++bb) {
+            const uint16_t* ab = a + (size_t)bb * M * K;
+            const uint16_t* wb = w + (size_t)bb * K * N_full;
+            uint16_t* yb = y + (size_t)bb * M * N_full;
+            for (uint32_t m = 0; m < M; ++m) {
+                uint32_t n = 0;
+                for (; n + 64u <= N; n += 64u) {
+                    HVX_VectorPair acc = Q6_W_vzero();
+                    for (uint32_t k = 0; k < K; ++k) {
+                        HVX_Vector av = Q6_Vh_vsplat_R(ab[(size_t)m * K + k]);
+                        HVX_Vector wv = hvx_vmemu(wb + (size_t)k * N_full + n0 + n);
+                        acc = hvx_vec_mpyacc_f32_f16(acc, av, wv);
+                    }
+                    HVX_Vector out = hvx_vec_f32_to_f16(Q6_V_lo_W(acc), Q6_V_hi_W(acc));
+                    hvx_vmemu(yb + (size_t)m * N_full + n0 + n) = out;
+                }
+                /* 只有完整 HVX 向量才走快路径；尾列走精确标量。 */
+                for (; n < N; ++n) {
+                    float acc = 0.0f;
+                    for (uint32_t k = 0; k < K; ++k)
+                        acc += f16_to_f32(ab[(size_t)m * K + k]) *
+                               f16_to_f32(wb[(size_t)k * N_full + n0 + n]);
+                    yb[(size_t)m * N_full + n0 + n] = f32_to_f16(acc);
+                }
+            }
+        }
+        g_last_engine = WT_ENG_HVX;
+        return 0;
+    }
+#endif
+    /* Host: 直接走标量回落 */
+    if (batched) {
+        for (uint32_t bb = 0; bb < Bn; bb++)
+            for (uint32_t m = 0; m < M; m++)
+                for (uint32_t n = 0; n < N; n++) {
+                    float acc = 0.0f;
+                    for (uint32_t k = 0; k < K; k++) {
+                        float av = f16_to_f32(a[((size_t)bb * M + m) * K + k]);
+                        float wv = f16_to_f32(w[t1 ? ((size_t)bb * N_full + n0 + n) * K + k
+                                                  : ((size_t)bb * K + k) * N_full + (n0 + n)]);
+                        acc += av * wv;
+                    }
+                    y[((size_t)bb * M + m) * N_full + (n0 + n)] = f32_to_f16(acc);
+                }
+    } else {
+        for (uint32_t m = 0; m < M; m++)
+            for (uint32_t n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (uint32_t k = 0; k < K; k++) {
+                    float av = f16_to_f32(a[t0 ? (size_t)k * M + m : (size_t)m * K + k]);
+                    float wv = f16_to_f32(w[t1 ? (size_t)(n0 + n) * K + k : (size_t)k * N_full + (n0 + n)]);
+                    acc += av * wv;
+                }
+                y[(size_t)m * N_full + (n0 + n)] = f32_to_f16(acc);
+            }
+    }
+    g_last_engine = WT_ENG_SCALAR;
+    return 0;
+}
+
+/* f16×f16 GEMM (float 图; f32 累加 f16 存储）。M3c 正确性版 —— 性能版
+ * 走 HMX (M7)。flags bit0 = a 转置(存 [K,M]), bit1 = w 转置(存 [N,K]),
+ * bit2 = batched BMM(attention q·kᵀ/probs·v; 批数在高 16 位) */
+/* HMX GEMM 快路径 (策略 B 同款): M/K/N 均 32 倍数 → crouton repack + HMX 点积。
+ * act/wgt/out/scales 放 hmx_runtime VTCM (mxmem 只能访问 VTCM), 2KB 对齐。
+ * 失败(未 setup/超 VTCM/wtcache 已占同一物理 VTCM)返回 -1, 回落标量。
+ * 仅 DSP (__HVX__/__hexagon__) 编译; host 无 HMX, 走标量。 */
 #if defined(__HVX__) || defined(__hexagon__)
 static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y,
                                uint32_t M, uint32_t K, uint32_t N,
@@ -1578,6 +1672,15 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
     uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N_full * Bn * 2u);
     if (!a || !w || !y) { snprintf(err, errn, "matmul_f16 ref fail"); return -1; }
 #if defined(__HVX__) || defined(__hexagon__)
+    /* FR-001: M<32 GEMV 快路径 (HVX f32-accumulate)，插在 HMX 门之前。
+     * FR-002: stream W 行主序，无 crouton repack (memory-bound)。
+     * 成功返回 0，失败回落标量。 */
+    if (M < 32u) {
+        if (exec_matmul_f16_gemv(a, w, y, M, K, N, n0, N_full, t0, t1,
+                                batched, Bn, err, errn) == 0) {
+            return 0;  /* GEMV 成功：已设置 g_last_engine */
+        }
+    }
     /* HMX 快路径: M/K/N 均 32 倍数 → crouton + HMX GEMM。
      * batched attention (q·kᵀ, Bn 头) 同走 HMX: 逐 batch 切片调 exec_matmul_f16_hmx,
      * 批维在 A/W/Y 最外层连续 (与标量 batched 路径同布局, 见下方标量分支)。

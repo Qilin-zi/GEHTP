@@ -45,11 +45,13 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             flags = (em2.transpose_in0 & 1u) | ((em2.transpose_in1 & 1u) << 1);
         else
             flags = 2u;  /* FC: 权重存 [N,K] */
-        /* batched BMM: bit2 置位, 批数入高 16 位 */
+        /* batched BMM: bit2 置位, 批数入高 16 位。批维 = 除末两维(M,N)外的
+         * 全部前导维 —— 不得裁剪尾部 1 维: [1,8,1,1](attn q·kᵀ, M=N=1)会被
+         * 剪掉真实批维 8 → Bn=1 → 执行器只写 1 元素, 其余 7 头读陈旧 temp
+         * (seq=1 实锤: gid 4560 首发, 顺流污染全部 full-attn 层)。 */
         if (em2.batched) {
             flags |= 4u;
             uint32_t rk = od->output_def.rank;
-            while (rk > 0 && od->output_def.dims[rk - 1] == 1) rk--;
             uint64_t bn = 1;
             for (uint32_t i = 0; i + 2 < rk; i++) bn *= od->output_def.dims[i];
             flags |= ((uint32_t)bn & 0xFFFFu) << 16;

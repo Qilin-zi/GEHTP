@@ -2299,6 +2299,68 @@ struct BinReader {
     void read(void* dst, size_t n) { if (dst) std::memcpy(dst, p, n); p += n; }
 };
 
+/* M2d: --bin 反序列化路径重建 op_data(execute_host 的 ops.cpp 算子读
+ * scalar params; serialize_opdef 只写 serialized_extra 尾随段不写 op_data
+ * → Eltwise operation 退化 ADD(0)、Gather/Softmax/Concat axis 退化 0 —
+ * 0.8B seq=1 --bin cos 0.076 实锤: Expand(Mul) 变 Add、And 变 Add(1+1=2.0f))。
+ * 从 serialized_extra 反向 pack, 键域与 ops.cpp scalar_get 一一对应;
+ * extra 缺失/长度不足的 op 不动(保持 loader 语义: 无参数走各算子启发)。 */
+static void rebuild_op_data_from_extra(OpDef* od) {
+    if (!od || od->serialized_extra.empty()) return;
+    const char* nm = od->name_tag ? od->name_tag->name() : nullptr;
+    if (!nm) return;
+    const auto& ex = od->serialized_extra;
+    std::vector<ScalarParam> sp;
+    auto num = [&](const char* k, double v) {
+        ScalarParam q; q.name = k; q.is_numeric = true; q.value_num = v;
+        sp.push_back(q);
+    };
+    auto str = [&](const char* k, const char* v) {
+        ScalarParam q; q.name = k; q.is_numeric = false; q.value_str = v;
+        sp.push_back(q);
+    };
+    const bool eltwise = !std::strcmp(nm, "Eltwise_Binary") ||
+                         !std::strcmp(nm, "Eltwise_Unary") ||
+                         !std::strcmp(nm, "ElementWiseNeuron") ||
+                         !std::strcmp(nm, "Eltwise_Ternary");
+    if (eltwise) {
+        if (ex.size() < sizeof(ExtraEltwise)) return;
+        ExtraEltwise e; std::memcpy(&e, ex.data(), sizeof e);
+        num("operation", (double)e.operation);
+        if (e.eltwise_type == 0) str("eltwise_type", "SELECT");
+    } else if (!std::strcmp(nm, "Softmax") || !std::strcmp(nm, "Gather") ||
+               !std::strcmp(nm, "Concat") || !std::strcmp(nm, "CumulativeSum")) {
+        if (ex.size() < sizeof(ExtraAxis)) return;
+        ExtraAxis e; std::memcpy(&e, ex.data(), sizeof e);
+        num("axis", (double)e.axis);
+    } else if (!std::strcmp(nm, "Reduce")) {
+        if (ex.size() < sizeof(ExtraAxis)) return;
+        ExtraAxis e; std::memcpy(&e, ex.data(), sizeof e);
+        switch (e.reduce_type) {
+        case 1: str("reduce_type", "ReduceMean"); break;
+        case 2: str("reduce_type", "ReduceMax"); break;
+        case 3: str("reduce_type", "ReduceMin"); break;
+        default: break;  // 0(Sum)/未知: ops.cpp 缺省 ReduceSum
+        }
+    } else if (!std::strcmp(nm, "Split")) {
+        if (ex.size() < sizeof(ExtraSplit)) return;
+        ExtraSplit e; std::memcpy(&e, ex.data(), sizeof e);
+        num("split_index", (double)e.split_index);
+    } else if (!std::strcmp(nm, "Pad")) {
+        if (ex.size() < sizeof(ExtraPad)) return;
+        ExtraPad e; std::memcpy(&e, ex.data(), sizeof e);
+        num("scheme", (double)e.scheme);
+        num("pad_constant_value", e.constant_value);
+    } else if (!std::strcmp(nm, "MatMul")) {
+        if (ex.size() < sizeof(ExtraMatMul)) return;
+        ExtraMatMul e; std::memcpy(&e, ex.data(), sizeof e);
+        num("transpose_in1", (double)e.transpose_in1);
+    } else {
+        return;
+    }
+    if (!sp.empty()) od->op_data = pack_scalar_params(sp);
+}
+
 // deserialize: rebuild the graph from a buffer produced by serialize().
 // Round-trips the structural records written by do_serialize/serialize_opdef.
 bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
@@ -2546,6 +2608,7 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
                     rr.read(opdef->serialized_extra.data(), elen);
                 }
             }
+            rebuild_op_data_from_extra(opdef.get());
 
             if (name == "Input") input_node_id_ = op_id;
             else if (name == "Output") output_node_id_ = op_id;

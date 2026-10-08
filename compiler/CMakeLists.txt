@@ -254,6 +254,7 @@ add_executable(wtop_emit tools/wtop_emit.cpp
                tools/wtop_ops/op_split.cpp
                tools/wtop_ops/op_reduce.cpp
                tools/wtop_ops/op_cumsum.cpp
+               tools/wtop_ops/op_isnan.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
 target_link_libraries(wtop_emit htp_core)
 target_include_directories(wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
