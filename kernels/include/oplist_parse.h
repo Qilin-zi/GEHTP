@@ -75,6 +75,18 @@ extern "C" {
  * TEMPOFF 槽 reserve 字段拆两段(u32): [低 16 位=表外 bump 预留 KB] |
  * [高 16 位=VTCM 池大小 KB](0=无 VTCM 驻留)。 */
 #define WT_REF_VTCM_FLAG 0x4000u
+/* 004 decode P2 (FR-004): 命名持久状态表槽。slot.addr == STATE →
+ * 槽数据 = [n u32][n × {bytes u32}] (n ≤ WT_MAX_STATES), 每项一块
+ * DDR 缓冲 (memalign 128, 零初始化)。状态生命期 = 进程级持久:
+ * 跨 wt_exec_run_io 存活, wt_exec_shutdown 不回收 (persistent decode
+ * 语义), 新序列用 wt_exec_state_reset 清零。名称留在 emit 侧
+ * manifest json (wtop.manifest.json), blob 内是紧凑 idx。
+ * op 引用编码 0x6000|state_idx (平行 0x8000|slot / 0x4000|temp;
+ * idx ≤ 0x1FFF)。KV 状态 = kvc ring 布局 (K面|V面 per slot);
+ * SSM 状态 = f32 面 (conv win / delta S), 解释权在 op。 */
+#define WT_SLOT_STATE 0xFFFFFFFBu
+#define WT_REF_STATE_FLAG 0x6000u
+#define WT_MAX_STATES 64u
 /* P5: 引擎面引用编码(0xC000|surface_id), 仅 OP_DMA 的 src/dst 可用。
  * 0=e.act, 1=e.out, 2=e.wt, 3=e.bias。 */
 #define WT_REF_ENG_FLAG 0xC000u
@@ -125,8 +137,17 @@ enum {
                                 idx 块查 tbl[axis], 余维直通, r 越界出零;
                                 idx int32 (const 原样槽/输入槽), tbl 可 temp(GDN state 回读) */
     OP_ARGMAX_F16 = 21,     /* [x_t,out_t,n] */
-    OP_KV_APPEND_F16 = 22,  /* [k_t,v_t,state_s,pos]    (M5 decode 用) */
-    OP_KV_GATHER_F16 = 23,  /* [state_s,q_t,pos,n_kv,head_dim] */
+    OP_KV_APPEND_F16 = 22,  /* [k_t,v_t,state_ref,pos] (004 P2 实义化)
+                               k/v 各 [kv_heads*head_dim] f16 (ref: temp/
+                               0x8000|slot); state_ref=0x6000|idx; pos 为
+                               绝对位置 —— 写 ring 槽 pos%nslots (kvcache.h) */
+    OP_KV_GATHER_F16 = 23,  /* [state_ref,kT_out,v_out,n_kv,n_heads,kv_heads,
+                               head_dim] arity 7 (004 P2 实义化)。读位置
+                               [0,n_kv) 出 GQA repeat_interleave 展开的双面:
+                               kT_out [n_heads, head_dim, n_kv] (per-head Kᵀ,
+                               供 batched scores matmul 的 W=[K,N]),
+                               v_out [n_heads, n_kv, head_dim] (供 probs·V)。
+                               槽 miss (posmap 不符) = 硬错误, 状态 bug 必炸 */
     OP_MATMUL_F16 = 24,     /* [a_ref,w_s,out_t,M,K,N,flags] f16×f16→f16 (f32 累加)
                                flags bit0=转置 a(存[K,M]) bit1=转置 w(存[N,K]);
                                W4A16 留给 Q4_0 打包权重 (float 图 GEMM) */
@@ -162,6 +183,24 @@ enum {
        逐字节恒等五纪律见 spec FR-013 (每 tile clracc / 重装 bias 页 /
        k 升序 / 回落全有或全无 / 同引擎)。 */
     OP_MATMUL_F16_SPLIT = 35,
+    /* 004 decode P2 (2026-10-08): 状态化步进 op。占用 29/30 (两树均空闲;
+       主线 003/005 已占 33-36, 勿撞)。 */
+    OP_CONV1D_SSM_STEP_F16 = 29, /* [x_ref, w_s, y_t, state_ref, C, d_conv]
+                               arity 6。单 token 步进 conv (状态机 B1):
+                               y = silu(Σ_j w[j]·win[j] + w[dc-1]·x),
+                               win = state 内 [(d_conv-1)*C] f32 滑窗
+                               (win[0] 最老); 步进后窗口推入 x。
+                               !!! 含 SiLU —— 与 op 19 (纯卷积, SiLU 图内
+                               分解) 不同, decode 图发射端不再接 Sigmoid/Mul。
+                               w 槽 [d_conv, C] f16 同 op 19 布局。 */
+    OP_DELTA_CHUNK_F16 = 30,     /* [k_ref,v_ref,q_ref,beta_ref,g_ref,y_t,
+                               state_ref,c,ntok,H,D] arity 11。
+                               状态机 B2 gated delta rule chunk 更新:
+                               k/v/q/beta/g 输入, y 输出; 缓冲布局
+                               [H][ntok][D] (k/v/q/y) 与 [H][ntok] (beta/g);
+                               状态 S = [H*D*D] f32 外置原地更新;
+                               c = 本 chunk token 数 (decode 步 c=1);
+                               q 的 1/√D 缩放在 kernel 内。 */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -188,7 +227,7 @@ enum {
 #define WT_ARITY_GATHER_F16 15
 #define WT_ARITY_ARGMAX_F16 3
 #define WT_ARITY_KV_APPEND_F16 4
-#define WT_ARITY_KV_GATHER_F16 5
+#define WT_ARITY_KV_GATHER_F16 7
 #define WT_ARITY_MATMUL_F16 7
 #define WT_ARITY_RMSNORM2_F16 5
 #define WT_ARITY_BROADCAST_F16 12
@@ -197,6 +236,8 @@ enum {
 #define WT_ARITY_DMA 8
 #define WT_ARITY_PAD_F16 7
 #define WT_ARITY_MATMUL_F16_SPLIT 9
+#define WT_ARITY_CONV1D_SSM_STEP_F16 6
+#define WT_ARITY_DELTA_CHUNK_F16 11
 
 struct wt_slot {
     uint32_t len;

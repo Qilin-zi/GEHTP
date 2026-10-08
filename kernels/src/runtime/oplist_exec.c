@@ -25,6 +25,8 @@
 
 #include "dc_parts.h"
 #include "fence.h"
+#include "kvcache.h"
+#include "gdn_sm.h"
 #include "oplist_parse.h"
 #include "oplist_exec.h"
 #include "wtcache.h"
@@ -66,6 +68,17 @@ struct wt_exec {
     uint8_t* vtcm_pool;
     uint32_t vtcm_pool_size;
     uint32_t vtcm_off_arr[MAX_TEMPS];
+    /* 004 P2 (FR-004): 命名持久状态表。bufs 按首 run 解析 WT_SLOT_STATE
+     * 槽一次性分配 (DDR, 零初始化), 生命期 = 进程级 —— shutdown 不回收,
+     * reset 显式清零。KV 状态复用 kvc ring (槽几何首用时从 op 形状推导);
+     * SSM 状态是裸 f32 面 (conv win / delta S), 解释权在 op。 */
+    uint32_t n_states;
+    uint8_t* st_buf[WT_MAX_STATES];
+    uint32_t st_bytes[WT_MAX_STATES];
+    struct kvc st_kvc[WT_MAX_STATES];   /* KV 状态的 ring 描述 (惰性 init) */
+    uint32_t* st_posmap[WT_MAX_STATES]; /* ring posmap (首用时 malloc) */
+    int st_kvc_ready[WT_MAX_STATES];
+    int states_loaded;
 };
 
 static struct wt_exec g_exec;
@@ -170,10 +183,15 @@ static const uint8_t* slot_ptr(const struct wt_blob* b, uint32_t s) {
     return b->weight_base + b->slots[s].offset;
 }
 
-/* temp/slot 引用解码: 0x8000|slot_id → slot; 0x4000|temp_id → VTCM 驻留;
- * 否则 temp */
+/* temp/slot 引用解码: 0x8000|slot_id → slot; 0x6000|state_idx → 持久状态
+ * (只读视图, 写回走状态 op); 0x4000|temp_id → VTCM 驻留; 否则 temp */
 static const uint8_t* ref_ptr(const struct wt_blob* b, uint32_t arg) {
     if (arg & 0x8000u) return slot_ptr(b, arg & 0x7FFFu);
+    if ((arg & 0xE000u) == WT_REF_STATE_FLAG) {  /* 0x6000|idx (idx<0x2000);
+        VTCM 编码 0x4000|temp 上限 0x4FFF(temp<0x1000) 不与此重叠 */
+        uint32_t s = arg & 0x1FFFu;
+        return (s < g_exec.n_states) ? g_exec.st_buf[s] : NULL;
+    }
     if (arg & 0x4000u) {
         uint32_t t = arg & 0x3FFFu;
         if (t < MAX_TEMPS && g_exec.vtcm_pool && g_exec.vtcm_off_arr[t] != 0xFFFFFFFFu)
@@ -2043,6 +2061,196 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
     return 0;
 }
 
+/* ---- 004 P2: 命名持久状态表 (FR-004/005/006) ----
+ * WT_SLOT_STATE 槽解析: [n u32][n × {bytes u32}] → n_states 块 DDR 缓冲。
+ * init-once (states_loaded), 生命期 = 进程级: shutdown 不回收, reset 清零。 */
+static int wt_exec_load_states(const struct wt_blob* b, char* err, size_t errn) {
+    if (g_exec.states_loaded) return 0;
+    for (uint32_t s = 0; s < b->n_slots; s++) {
+        if (b->slots[s].addr != WT_SLOT_STATE) continue;
+        const uint8_t* p = b->weight_base + b->slots[s].offset;
+        uint32_t len = b->slots[s].len;
+        if (len < 4u) { snprintf(err, errn, "state slot short"); return -1; }
+        uint32_t n;
+        memcpy(&n, p, 4);
+        if (n == 0 || n > WT_MAX_STATES || len < 4u + n * 4u) {
+            snprintf(err, errn, "state slot table bad (n=%u len=%u)", n, len);
+            return -1;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t bytes;
+            memcpy(&bytes, p + 4 + i * 4, 4);
+            if (bytes == 0 || bytes > (1u << 30)) {
+                snprintf(err, errn, "state %u bytes bad %u", i, bytes);
+                return -1;
+            }
+            g_exec.st_buf[i] = memalign(128, bytes);
+            if (!g_exec.st_buf[i]) { snprintf(err, errn, "state %u alloc %u", i, bytes); return -1; }
+            memset(g_exec.st_buf[i], 0, bytes);
+            g_exec.st_bytes[i] = bytes;
+        }
+        g_exec.n_states = n;
+        g_exec.states_loaded = 1;
+        break;
+    }
+    g_exec.states_loaded = 1;  /* 无 state 槽的 blob: 也置位, 不再重扫 */
+    return 0;
+}
+
+void wt_exec_state_reset(void) {
+    for (uint32_t i = 0; i < g_exec.n_states; i++) {
+        memset(g_exec.st_buf[i], 0, g_exec.st_bytes[i]);
+        if (g_exec.st_kvc_ready[i]) {
+            kvc_init(&g_exec.st_kvc[i], g_exec.st_buf[i],
+                     g_exec.st_kvc[i].slot_bytes, g_exec.st_kvc[i].nslots,
+                     g_exec.st_posmap[i]);  /* posmap 全 NONE */
+        }
+    }
+}
+
+/* KV 状态的 ring 几何惰性推导: kv_elems = kv_heads*head_dim (来自 op 形状),
+ * slot_bytes = K|V 两面; nslots = 状态字节 / slot_bytes (必须整除)。
+ * append/gather 双侧同式推导, 不一致即硬错误 (状态表发射 bug)。 */
+static struct kvc* state_kvc(uint32_t state_ref, uint32_t kv_elems,
+                             char* err, size_t errn) {
+    if ((state_ref & 0xE000u) != WT_REF_STATE_FLAG) {
+        snprintf(err, errn, "kv state_ref not 0x6000|idx (0x%X)", state_ref);
+        return NULL;
+    }
+    uint32_t i = state_ref & 0x1FFFu;
+    if (i >= g_exec.n_states) { snprintf(err, errn, "kv state idx %u oob", i); return NULL; }
+    uint32_t slot_bytes = kv_elems * 2u * 2u;   /* K 面 + V 面 */
+    if (!g_exec.st_kvc_ready[i]) {
+        if (slot_bytes < 256u || (slot_bytes & 127u) ||
+            g_exec.st_bytes[i] % slot_bytes != 0u) {
+            snprintf(err, errn, "kv state %u geometry bad (slot=%u total=%u)",
+                     i, slot_bytes, g_exec.st_bytes[i]);
+            return NULL;
+        }
+        uint32_t nslots = g_exec.st_bytes[i] / slot_bytes;
+        g_exec.st_posmap[i] = malloc((size_t)nslots * 4u);
+        if (!g_exec.st_posmap[i]) { snprintf(err, errn, "kv posmap alloc"); return NULL; }
+        if (kvc_init(&g_exec.st_kvc[i], g_exec.st_buf[i], slot_bytes, nslots,
+                     g_exec.st_posmap[i]) != 0) {
+            snprintf(err, errn, "kvc_init state %u", i);
+            return NULL;
+        }
+        kvc_set_consumer(&g_exec.st_kvc[i], FC_CPU, FM_DDR);  /* CPU memcpy 读, 无 fence 需求 */
+        g_exec.st_kvc_ready[i] = 1;
+    } else if (g_exec.st_kvc[i].slot_bytes != slot_bytes) {
+        snprintf(err, errn, "kv state %u slot_bytes mismatch (%u vs %u)",
+                 i, g_exec.st_kvc[i].slot_bytes, slot_bytes);
+        return NULL;
+    }
+    return &g_exec.st_kvc[i];
+}
+
+/* OP_KV_APPEND_F16: [k_t, v_t, state_ref, pos] —— 写 pos 槽的 K|V 面 */
+static int exec_kv_append(const struct wt_blob* b, const struct wt_op* op,
+                          char* err, size_t errn) {
+    const uint16_t* k = (const uint16_t*)ref_ptr(b, op->args[0]);
+    const uint16_t* v = (const uint16_t*)ref_ptr(b, op->args[1]);
+    uint32_t kn = ref_elem_count(b, op->args[0]);
+    uint32_t vn = ref_elem_count(b, op->args[1]);
+    if (!k || !v || !kn || kn != vn) { snprintf(err, errn, "kv append ref fail"); return -1; }
+    struct kvc* c = state_kvc(op->args[2], kn, err, errn);
+    if (!c) return -1;
+    if (kvc_append(c, k, v, op->args[3]) < 0) { snprintf(err, errn, "kvc_append"); return -1; }
+    return 0;
+}
+
+/* OP_KV_GATHER_F16: [state_ref, kT_out, v_out, n_kv, n_heads, kv_heads, head_dim]
+ * 读 [0,n_kv) 出 GQA repeat_interleave 展开双面:
+ *   kT_out [n_heads, head_dim, n_kv] (per-head Kᵀ, 供 batched scores 的 W)
+ *   v_out  [n_heads, n_kv, head_dim] (供 probs·V 的 W)
+ * 槽 miss = 硬错误 (状态 bug 必炸, 不静默零)。 */
+static int exec_kv_gather(const struct wt_blob* b, const struct wt_op* op,
+                          char* err, size_t errn) {
+    uint32_t n_kv = op->args[3], n_heads = op->args[4];
+    uint32_t kv_heads = op->args[5], hd = op->args[6];
+    if (!n_heads || !kv_heads || !hd || n_heads % kv_heads != 0u) {
+        snprintf(err, errn, "kv gather gqa bad (h=%u kvh=%u hd=%u)", n_heads, kv_heads, hd);
+        return -1;
+    }
+    struct kvc* c = state_kvc(op->args[0], kv_heads * hd, err, errn);
+    if (!c) return -1;
+    uint16_t* kT = (uint16_t*)temp_get(op->args[1], (size_t)n_heads * hd * n_kv * 2u);
+    uint16_t* vo = (uint16_t*)temp_get(op->args[2], (size_t)n_heads * n_kv * hd * 2u);
+    if (!kT || !vo) { snprintf(err, errn, "kv gather out alloc"); return -1; }
+    uint32_t rep = n_heads / kv_heads;
+    for (uint32_t p = 0; p < n_kv; p++) {
+        int slot = kvc_lookup(c, p);
+        if (slot < 0) { snprintf(err, errn, "kv gather miss pos %u (state bug)", p); return -1; }
+        const uint16_t* kf = (const uint16_t*)kvc_k_face(c, (uint32_t)slot);
+        const uint16_t* vf = (const uint16_t*)kvc_v_face(c, (uint32_t)slot);
+        for (uint32_t h = 0; h < n_heads; h++) {
+            const uint16_t* ksrc = kf + (h / rep) * hd;
+            const uint16_t* vsrc = vf + (h / rep) * hd;
+            uint16_t* kdst = kT + ((size_t)h * hd) * n_kv;
+            uint16_t* vdst = vo + (size_t)h * n_kv * hd;
+            for (uint32_t d = 0; d < hd; d++) kdst[(size_t)d * n_kv + p] = ksrc[d];
+            memcpy(vdst + (size_t)p * hd, vsrc, hd * 2u);
+        }
+    }
+    return 0;
+}
+
+/* OP_CONV1D_SSM_STEP_F16: [x_ref, w_s, y_t, state_ref, C, d_conv]
+ * 状态 win = [(d_conv-1)*C] f32 (win[0] 最老); kernel 含 SiLU (≠op19)。 */
+static int exec_conv1d_ssm_step(const struct wt_blob* b, const struct wt_op* op,
+                                char* err, size_t errn) {
+    uint32_t C = op->args[4], dc = op->args[5];
+    const uint16_t* x = (const uint16_t*)ref_ptr(b, op->args[0]);
+    const uint16_t* w = (const uint16_t*)ref_ptr(b, op->args[1]);
+    uint16_t* y = (uint16_t*)temp_get(op->args[2], (size_t)C * 2u);
+    if (!x || !y || !w) { snprintf(err, errn, "ssm step ref fail"); return -1; }
+    if (b->slots[op->args[1] & 0x7FFFu].len != dc * C * 2u) {
+        snprintf(err, errn, "ssm step w slot len mismatch");
+        return -1;
+    }
+    if (dc < 2 || C == 0) { snprintf(err, errn, "ssm step shape C=%u dc=%u", C, dc); return -1; }
+    if ((op->args[3] & 0xE000u) != WT_REF_STATE_FLAG) {
+        snprintf(err, errn, "ssm step state_ref bad"); return -1;
+    }
+    uint32_t si = op->args[3] & 0x1FFFu;
+    if (si >= g_exec.n_states || g_exec.st_bytes[si] < (size_t)(dc - 1u) * C * 4u) {
+        snprintf(err, errn, "ssm step state %u too small", si); return -1;
+    }
+    conv_state_t st = { (int)C, (int)dc, (float*)g_exec.st_buf[si] };
+    if (conv1d_step_f16(&st, w, x, y) != 0) { snprintf(err, errn, "conv1d_step_f16"); return -1; }
+    return 0;
+}
+
+/* OP_DELTA_CHUNK_F16: [k,v,q,beta,g,y_t,state_ref,c,ntok,H,D]
+ * 缓冲 [H][ntok][D] / [H][ntok]; 状态 S=[H*D*D] f32 原地; q/√D 在 kernel。 */
+static int exec_delta_chunk(const struct wt_blob* b, const struct wt_op* op,
+                            char* err, size_t errn) {
+    uint32_t c = op->args[7], ntok = op->args[8], H = op->args[9], D = op->args[10];
+    const uint16_t* k = (const uint16_t*)ref_ptr(b, op->args[0]);
+    const uint16_t* v = (const uint16_t*)ref_ptr(b, op->args[1]);
+    const uint16_t* q = (const uint16_t*)ref_ptr(b, op->args[2]);
+    const uint16_t* beta = (const uint16_t*)ref_ptr(b, op->args[3]);
+    const uint16_t* g = (const uint16_t*)ref_ptr(b, op->args[4]);
+    uint16_t* y = (uint16_t*)temp_get(op->args[5], (size_t)H * ntok * D * 2u);
+    if (!k || !v || !q || !beta || !g || !y) { snprintf(err, errn, "delta ref fail"); return -1; }
+    if (!H || !D || !ntok || !c || c > ntok || c > GDN_C_MAX) {
+        snprintf(err, errn, "delta shape (c=%u ntok=%u H=%u D=%u)", c, ntok, H, D);
+        return -1;
+    }
+    if ((op->args[6] & 0xE000u) != WT_REF_STATE_FLAG) {
+        snprintf(err, errn, "delta state_ref bad"); return -1;
+    }
+    uint32_t si = op->args[6] & 0x1FFFu;
+    if (si >= g_exec.n_states || g_exec.st_bytes[si] < (size_t)H * D * D * 4u) {
+        snprintf(err, errn, "delta state %u too small", si); return -1;
+    }
+    rec_state_t st = { (int)H, (int)D, (float*)g_exec.st_buf[si] };
+    if (delta_chunk_f16(&st, k, v, q, beta, g, y, (int)c, (int)ntok) != 0) {
+        snprintf(err, errn, "delta_chunk_f16"); return -1;
+    }
+    return 0;
+}
+
 /* ---- 算子执行注册表(算子三件套·设备侧) ----
  * 每 opcode 一个 xop_* 入口(签名统一 wt_op_exec_fn), 注册进 g_op_exec_table[]。
  * 加新算子 = 写一个 exec_* 实现 + 一个 xop_* 薄壳 + 表加一项,
@@ -2183,10 +2391,20 @@ static int xop_argmax(const struct wt_op_ctx* cx) {
     return exec_argmax(cx->b, cx->op, cx->err, cx->errn);
 }
 
-static int xop_kv_unimpl(const struct wt_op_ctx* cx) {
-    (void)cx;
-    snprintf(cx->err, cx->errn, "kv op 未实现 (M5)");
-    return -1;
+static int xop_kv_append(const struct wt_op_ctx* cx) {
+    return exec_kv_append(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_kv_gather(const struct wt_op_ctx* cx) {
+    return exec_kv_gather(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_conv1d_ssm_step(const struct wt_op_ctx* cx) {
+    return exec_conv1d_ssm_step(cx->b, cx->op, cx->err, cx->errn);
+}
+
+static int xop_delta_chunk(const struct wt_op_ctx* cx) {
+    return exec_delta_chunk(cx->b, cx->op, cx->err, cx->errn);
 }
 
 static int xop_matmul_f16(const struct wt_op_ctx* cx) {
@@ -2231,13 +2449,15 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_GATHER_F16] = xop_gather,
     [OP_SCATTER_ND_F16] = xop_scatter_nd,
     [OP_ARGMAX_F16] = xop_argmax,
-    [OP_KV_APPEND_F16] = xop_kv_unimpl,
-    [OP_KV_GATHER_F16] = xop_kv_unimpl,
+    [OP_KV_APPEND_F16] = xop_kv_append,
+    [OP_KV_GATHER_F16] = xop_kv_gather,
     [OP_MATMUL_F16] = xop_matmul_f16,
     [OP_MATMUL_F16_SPLIT] = xop_matmul_f16,
     [OP_RMSNORM2_F16] = xop_rmsnorm2,
     [OP_BROADCAST_F16] = xop_broadcast,
     [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,
+    [OP_CONV1D_SSM_STEP_F16] = xop_conv1d_ssm_step,
+    [OP_DELTA_CHUNK_F16] = xop_delta_chunk,
 };
 
 int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
@@ -2247,6 +2467,7 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
     *engine_m = g_exec.engine_ready ? g_exec.e.m : 0;
     if (first + count > b->n_ops) { snprintf(err, errn, "range oob"); return -1; }
     if (wt_exec_load_tempoff(b, err, errn) != 0) return -1;
+    if (wt_exec_load_states(b, err, errn) != 0) return -1;
     const int64_t t_run0 = HAP_perf_get_time_us();  /* PROF W-P2: ts 时间轴零点 */
     for (uint32_t ii = 0; ii < count; ii++) {
         uint32_t i = first + ii;
