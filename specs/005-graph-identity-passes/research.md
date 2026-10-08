@@ -28,6 +28,7 @@ Phase 0 结论。每项给 Decision / Rationale / Alternatives。证据均为 20
 - **Rationale**: exec_matmul_f16_impl（oplist_exec.c:1805 起）`if (bias) want_hmx = 0`——v1 bias 仅标量路径；折叠 32 对齐形 = 踢下 HMX，倒退 30×（US1 实测 HMX 4.24s vs 标量 219s）。发射门 op_matmul.cpp:40 硬编码 FullyConnected，但 OP_MATMUL_F16_BIAS(36) 通路通用（含 W4A16 硬错保护）——放行是 1 行。
 - **Alternatives**: 一步到位撤 HMX 门——无设备验证的内核改动违反"恒等+零设备语义"纪律，拆 3b。
 - **3b 技术口径**: GEMM 出 crouton 后、unpack 写回前，VTCM 内 f32 累加器逐列加 bias（与标量路径同口径，oplist_exec.c:1094 起 host 参考已按列加）；合成 blob 对拍标量路径（cos ≥ 0.9999、逐列 ≤ 2 ULP f16）后撤 `want_hmx=0`。
+- **事后订正（2026-10-08, US3a/US3b 实测）**: ① 42 候选经 net.json 复核全为 activity-activity linear_attn 加法（MatMul→EB 对的另侧全非 const），**MatMul 折 0 次是正确结果**；② 3b 实际落地为 **scale 区奇位 out_bias**（cvt 一步单次舍入，优于 unpack 前逐列加，零额外 pass）；③ "逐列 ≤ 2 ULP"验收细化为**三判据**（同号位距 ≤2 或 |d|≤2·ulp(ref) 或 |d|≤2^-14 取消地板）——f16 次正规区对消输出按 2^-24 步长计成数百"ULP"，纯位距门必假阳性。
 
 ## R5: 视图链真实基数口径（P1 目标校准）
 

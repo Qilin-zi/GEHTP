@@ -119,9 +119,12 @@ description: "Task list for 005-graph-identity-passes implementation"
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T021 [P] 文档收尾：更新 `specs/005-graph-identity-passes/` 各文档状态与实测数字；跨会话协调表（memory/gehtp-cross-session-coordination）登记本线改动面
-- [ ] T022 按 `specs/005-graph-identity-passes/quickstart.md` 五门全跑一遍（ctest → opt-stats → host 恒等对拍 → 设备门 → 逃生门），记录最终证据链
-- [ ] T023 三 pass 叠加终验 + 提交：0.8B 全开编译对拍；`git status` 精确暂存（不吸收 003 在途改动，e4d1dbb 先例）；确认"前 16 行全零"共享设备问题时按 SC-006 口径记录（host 对拍 + op 数/wall 为准）
+- [x] T021 [P] 文档收尾：更新 `specs/005-graph-identity-passes/` 各文档状态与实测数字；跨会话协调表（memory/gehtp-cross-session-coordination）登记本线改动面
+  - 结果(2026-10-08): plan/spec/research(R4 订正)/data-model/contracts(门约束改 US3b 现状)/quickstart(期望值对齐实测) 六文档 + 协调表 69893e4 条目
+- [x] T022 按 `specs/005-graph-identity-passes/quickstart.md` 五门全跑一遍（ctest → opt-stats → host 恒等对拍 → 设备门 → 逃生门），记录最终证据链
+  - 结果(2026-10-08, .work/prof/005-final-gates-20261008.md): ①ctest 47/47 ②终态 opt-stats 同 US3b(view_fold=2286/2286, eltwise=54/0, fc_bias=18/18, before=26399 after=21121) ③host A/B(全关 vs 全开, 终态二进制重造双 .bin) **md5 逐字节一致 6153d61f…/n_diff=0/7946240/NaN 0** ④设备门=T017 同字节(md5 a322d06a…)沿用: ops 14152(-13.9%)/exec 31.43s(-20.3%)/指纹[0-15,18]无新 NaN ⑤逃生门全关编译成功三 pass 0/0(after=25711)
+- [x] T023 三 pass 叠加终验 + 提交：0.8B 全开编译对拍；`git status` 精确暂存（不吸收 003 在途改动，e4d1dbb 先例）；确认"前 16 行全零"共享设备问题时按 SC-006 口径记录（host 对拍 + op 数/wall 为准）
+  - 结果(2026-10-08): 叠加全开发射 md5 与基线逐字节恒等; 提交面纯 specs/005（八文件: 六文档+tasks+终局证据），无 003 在途共享文件; SC-006 口径已录终局证据门④段; US1+US2 951cef7 / US3a 1e131fb / US3b 69893e4
 
 ---
 

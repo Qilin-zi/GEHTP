@@ -32,8 +32,8 @@ hnnx_compile ... [--no-pass <name>] [--enable-pass <name>] [--opt-stats]
 |---|---|---|---|
 | `has_bias` (numeric=1) | pass_fc_bias（FC **与** MatMul 链头） | extract_fc_extra / extract_matmul_extra、op_matmul.cpp 发射门、host execute | inputs[2] 是 dense bias；发射 OP_MATMUL_F16_BIAS(36) |
 
-**硬约束**: 32 对齐形状（M%32==0 ∧ K%32==0 ∧ N%32==0）的 MatMul **不得**带标记发射 36 号（3b 前会被强制标量路径）——pass 侧 HMX 门保证，发射侧遇到违禁组合必须硬报错（对齐既有 "W4A16+bias" 硬错风格）。
+**门约束（US3b 后现状）**: 32 对齐形状（M%32==0 ∧ K%32==0 ∧ N%32==0）的 MatMul 带 has_bias 标记发射 36 号**合法**——pass 侧 HMX 门与发射侧硬报错均已随 US3b（69893e4）撤销，单测 [15b] 改正例。仍保留的排除: **batched**（flags&4）不折（设备硬错防御）；SPLIT N 分块维持 `!has_bias` 条件（SPLIT+bias 的 HMX 通道已接线但 SC-005 未覆盖，超 VTCM 极端形保持整 op）。
 
-## 设备契约（仅 3b，P3b 前不生效）
+## 设备契约（3b 已落地，2026-10-08）
 
-OP_MATMUL_F16_BIAS(36) 的 HMX 路径：bias 在 VTCM 内逐列加（f32 累加器），与标量路径数值等价（cos ≥ 0.9999、逐列 ≤ 2 ULP f16）。3b 验证通过前，设备端 `if (bias) want_hmx = 0` 保持不变。
+OP_MATMUL_F16_BIAS(36) 的 HMX 路径 bias 应用 = **scale 区奇位 out_bias 技法**: 每 (r,c) tile 循环内 `sca[2n]=0x3C00(1.0), sca[2n+1]=bias[col]` → `mxmem2(sca)` → cvt 一步 `f16(acc·1.0+bias)`（单次舍入，与 exec_conv2d_hmx 同源；较原设想的"unpack 前逐列加"零额外 pass）。SC-005 已过（46 号例 6/6: 引擎双到位 / cos=1.000000 / 逐元素三判据 0 违例 / NaN 0；"≤2 ULP"任务书口径细化为三判据——f16 次正规区对消输出的位距膨胀，详见 US3b 证据）。运行时 `if (bias) want_hmx = 0` 已撤销，生产默认 bias+32 对齐走 HMX；`wt_exec_force_bias_scalar(int)` 为测试专用钩子（默认 0=生产 HMX；qurt 无 env，显式 API）。

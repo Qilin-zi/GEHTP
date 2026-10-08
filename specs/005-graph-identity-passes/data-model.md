@@ -52,6 +52,6 @@ net.json → loader → GraphPrepare(含 inject_htp_prepare_inputs)
 |---|---|---|
 | FR-001/002 | SliceSpec 合成位级恒等 | test_opt_passes 图 + host md5 |
 | FR-003 | ConstScalar ≤1 ULP | host 对拍 max\|d\| |
-| FR-004 | BiasMark + HMX 门 | 单测 32 对齐反例 |
+| FR-004 | BiasMark（FC+MatMul 链头同标记） | 单测 [15a] 非对齐折 / [15b] 32 对齐折（US3b 撤门后正例）/ [15c] batched 反例 |
 | FR-006/007 | 幂等 + stats | 二跑零改写 + stats_line |
 | FR-008 | 序列化不感知 | ctest 序列化往返（既有） |

@@ -16,8 +16,10 @@ cd $W
 /disk1/gehtp/compiler/build_linux/hnnx_compile --net-json qwen35_08b_v2_net.json \
   --weights-bin model.params.bin --format tagged --opt-stats \
   --output /tmp/005_probe.bin 2>&1 | grep opt-stats
-# 期望: view_fold=m/r eltwise_const_fold=m/r fc_bias_fold=18/18(FC)+k/r(MatMul)
-# 幂等复跑同命令(改 --output): 第二次 rewritten 应为 0 可从 after 数不再下降佐证
+# 期望(2026-10-08 实测): view_fold=2286/2286 eltwise_const_fold=54/0(真图无可合并同型对)
+#   fc_bias_fold=18/18(全 FC; MatMul 0 折=正确, 42 候选实为 activity-activity 加法)
+#   before=26399 after=21121
+# 幂等佐证: US3a/US3b 两次独立全编译 .wtop md5 逐字节一致(a322d06a…)+单测 13g/14d 二跑零改写
 ```
 
 ## 3. 恒等性对拍（数值门）
@@ -56,7 +58,7 @@ python3 /disk1/gehtp/test_assets/qwen35_08b/judge_logits.py $W/out_005_p0.f16.ra
 grep '\[run\]' $W/prof/005.device.txt          # wall 与 ops 对比基线 39.5s/16438
 ```
 
-**SC-001**: op 数降 ≥6%、wall 降 ≥4%。**SC-006 口径**: 若全链路"前 16 行全零"设备侧问题仍在（cos ~0.2 且行 0-15 全零），以 op 数/wall/host 恒等对拍为准，精度门挂起并记录——这是共享设备状态问题，不是本特性回归。
+**SC-001**: op 数降 ≥6%、wall 降 ≥4%。实测（2026-09-30/10-08, d0f1784）: ops 16438→**14152**（-13.9%）、wall 39.5s→**31.49s**（-20.3%），双门超标通过。**SC-006 口径**: 若全链路"前 16 行全零"设备侧问题仍在（cos ~0.2 且行 0-15 全零），以 op 数/wall/host 恒等对拍为准，精度门挂起并记录——这是共享设备状态问题，不是本特性回归。
 
 ## 5. 逃生门验证
 

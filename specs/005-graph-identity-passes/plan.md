@@ -2,6 +2,8 @@
 
 **Branch**: `005-graph-identity-passes`（工作树 task/prof-wp，多会话共享——不切分支，见 Constitution Check） | **Date**: 2026-09-30 | **Spec**: [spec.md](spec.md)
 
+> **状态（2026-10-08 完成）**: US1+US2 `951cef7` / US3a `1e131fb` / US3b `69893e4`；kernels 侧 T018/T019 代码留主树在途（HEAD 无 opcode36 exec 基座，随 kernels 统一提交落库，见跨会话协调表）。性能门**超标兑现**: op 16438→14152（-13.9%，门 -6%）、wall 39.5s→31.49s（-20.3%，门 -4%）。Div→Mul 拆 `eltwise_div_to_mul` 默认关（设备 NaN 实证）。终局五门: `.work/prof/005-final-gates-20261008.md`。
+
 **Input**: Feature specification from `/specs/005-graph-identity-passes/spec.md`
 
 ## Summary

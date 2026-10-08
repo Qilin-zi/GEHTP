@@ -2,6 +2,8 @@
 
 对齐真库 libQnnHtp.so 同级能力（`Reshape_to_fold` / `stridedslice_opts` / `transpose_opts` / `QNN_FullyConnected_Add_fuse` 家族），在 PassManager 注册制下新增三个图级恒等 pass。全部遵守与 `fc_bias_fold`(e4d1dbb) 相同的纪律：**数学恒等、幂等、零设备语义改动**（P3 除外，见分阶段）。
 
+> **状态（2026-10-08 收尾）**: US1+US2 `951cef7` / US3a `1e131fb` / US3b `69893e4`，全部验收门通过。实测：**SC-001** ops 16438→14152（-13.9%，门 -6%）、wall 39.5s→31.49s（-20.3%，门 -4%）；**SC-002** host 位级一致（P1 md5 相同、P2 n_diff=0）；**SC-003** ctest 47/47；**SC-004** 发射 md5 与基线逐字节一致（a322d06a…）；**SC-005** cos=1.000000 + 三判据 0 违例（"≤2 ULP"细化为三判据口径，f16 次正规对消输出位距膨胀，见 US3b 证据）；**SC-006** 挂起口径沿用。0.8B 真图 **0 次 MatMul 折叠为正确结果**（42 候选实为 activity-activity 加法，另侧全非 const）。Div→Mul 拆独立 pass `eltwise_div_to_mul` **默认关**（设备 EB DIVIDE/MULTIPLY 溢出口径不同，开之致行 28-31 NaN——host 位级一致不保证设备一致）。终局五门证据链：`.work/prof/005-final-gates-20261008.md`。
+
 ## Background *(量化依据，2026-09-30 于 0.8B v2 实测)*
 
 设备 exec 35.58s 的耗时分布（fcbias 二进制，16438 ops）：
