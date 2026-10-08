@@ -4,6 +4,8 @@ description: "Task list for VTCM 统一内存规划（N 分块 + 单 acquire 四
 
 # Tasks: VTCM 统一内存规划
 
+> ⚠️ **2026-09-29 裁决**：**Phase 3（US2 四区 arena）退役，不再实施** —— VTCM 编译期归属/carve 由 003 P2（`specs/003-compiler-driven-scheduling/tasks.md` T012–T016，逐 op 生命周期 carve 表）唯一承担，其数学上包含四区语义且能处理工作集重叠。实施坑（DDR 门控 / golden 字节 / 基址双源 / acquire 闭环 / 锁相干性 / 3MB 陈旧源）已移交 memory `gehtp-003-us2-carve-gotchas`。**Phase 4（US3 supertile 驻留）保留**，改为待 003 P2 落地后嫁接（resident = carve 表 `in_vtcm` 项）；其 T041 成本修数 / G2 预算扣减 / FR-012 防静默剥除仍然有效。Phase 2（US1 N 分块）已完成，不受影响。
+
 **Input**: Design documents from `/specs/002-vtcm-unified-arena/`
 
 **Prerequisites**: plan.md (required), spec.md (required)
@@ -71,7 +73,7 @@ description: "Task list for VTCM 统一内存规划（N 分块 + 单 acquire 四
 
 ---
 
-## Phase 3: User Story 2 - VTCM 单 acquire 四区共存（Priority: P1）
+## Phase 3: User Story 2 - VTCM 单 acquire 四区共存（Priority: P1）❌ 已退役（2026-09-29，归 003 P2，见顶部裁决）
 
 **Goal**: 一次 acquire + 编译期四区照抄；f16 HMX 与 W4A16/驻留池共存，互斥回落消除
 
@@ -114,7 +116,7 @@ description: "Task list for VTCM 统一内存规划（N 分块 + 单 acquire 四
 
 ---
 
-## Phase 4: User Story 3 - supertile 账本接线（Priority: P2）
+## Phase 4: User Story 3 - supertile 账本接线（Priority: P2）⏸ 保留 — 待 003 P2 落地后嫁接（resident = carve 表 in_vtcm 项，见顶部裁决）
 
 **Goal**: supertile-interior temp 编译期驻留 VTCM 尾区，省 DDR round-trip
 

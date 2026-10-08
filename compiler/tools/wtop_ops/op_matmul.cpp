@@ -63,7 +63,45 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
                          m, k, nn);
             return 4;
         }
-        em.add_op(OP_MATMUL_W4A16, {a_t, w_s, out_t, m, k, nn});
+        /* 003 T015: W4A16 引用规范化。运行期 exec_matmul 的 act/w 均按裸
+         * slot 索引取数 (b->slots[act_s]), act 另认 0x4000|temp 驻留形态;
+         * 旧发射把 0x8000|slot / 裸 temp 原样传入 = slots 表越界读, 真实图
+         * W4A16 从未走通 (仅合成 blob 用裸 slot 验证过)。act 三态:
+         *   const 槽 → 裸 slot (烘焙字节, 零新 op)
+         *   VTCM 驻留 temp → 0x4000|temp (生产者已直写池, 零新 op)
+         *   DDR temp / 主输入(EXT_IN 注入) → OP_DMA 预置到池内 staging (--dma-runlist) */
+        uint32_t w_raw = w_s & 0x7FFFu;
+        uint32_t a_slot = (a_t & 0x8000u) ? (a_t & 0x7FFFu) : 0xFFFFFFFFu;
+        bool act_is_const_slot = (a_slot != 0xFFFFFFFFu) && a_slot != 0u &&
+                                 a_slot != em.dummy_slot_id;
+        uint32_t act_arg;
+        if (act_is_const_slot) {
+            act_arg = a_slot;
+        } else if (!(a_t & 0x8000u) && em.ddr_static &&
+                   em.ddr_temp_vtcm.count(a_t) && em.ddr_temp_vtcm.at(a_t)) {
+            act_arg = 0x4000u | a_t;
+        } else {
+            uint32_t act_bytes = m * k * 2u;
+            uint32_t off = 0;
+            int stg = em.alloc_vtcm_stage(act_bytes, &off);
+            if (stg < 0 || !em.dma_runlist) {
+                std::fprintf(stderr,
+                    "error: W4A16 act 引用不可表达 (a_t=0x%X M=%u K=%u): 运行期仅认"
+                    " 裸 slot / 0x4000|temp; DDR 源需 --dma-runlist + VTCM 池余量"
+                    " (staging rc=%d dma_runlist=%d)\n",
+                    a_t, m, k, stg, (int)em.dma_runlist);
+                return 4;
+            }
+            uint32_t prev_eng = em.cur_engine;
+            em.cur_engine = wt_annot_pack(0u, 1u, 0u);  /* 预置 DMA = 内存 op */
+            em.add_op(OP_DMA, {a_t, 0x4000u | (uint32_t)stg, act_bytes,
+                               0u, 0u, 1u, WT_DMA_FENCE_NONE, WT_DMA_FENCE_NONE});
+            em.cur_engine = prev_eng;
+            em.pending_stages.push_back({(uint32_t)(em.ops.size() - 1u), 0u,
+                                         off, act_bytes});
+            act_arg = 0x4000u | (uint32_t)stg;
+        }
+        em.add_op(OP_MATMUL_W4A16, {act_arg, w_raw, out_t, m, k, nn});
     } else {
         uint32_t flags = 0;
         if (nm == "MatMul")
@@ -110,6 +148,10 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
                 std::fprintf(stderr, "warn: matmul M=%u K=%u N=%u 最小 chunk 也超 VTCM, 维持整 op\n",
                              m, k, nn);
             } else {
+                /* 分块后每个 chunk 都满足 need_mm <= 16MB，必须保留
+                 * HMX 计划；assign_engine 只看整 op 的形状，看不见这里的
+                 * emit-side N 分块，否则 v3 会把所有 chunk 错标为 scalar。 */
+                em.cur_engine = wt_annot_pack(2u, 1u, 0u);  /* HMX, 可回落 */
                 for (uint32_t n0 = 0; n0 < nn; n0 += N_chunk) {
                     uint32_t nc = (N_chunk < nn - n0) ? N_chunk : (nn - n0);
                     em.add_op(OP_MATMUL_F16_SPLIT, {a_t, w_s, out_t, m, k, nn, n0, nc, flags});

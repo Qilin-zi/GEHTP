@@ -44,6 +44,9 @@ struct wt_exec {
     struct dc_w4 e;
     int engine_ready;   /* wtcache 已开(懒初始化/exec_matmul 共用) */
     int matmul_carved;  /* exec_matmul 的 arena/carve 已完成(0=未 carve) */
+    uint32_t carve_op;  /* 当前 carve 对应的 op 序号(0xFFFFFFFF=未 carve);
+                          * 003 P2: carve footer 逐 op 定址, 换 op 必须换 carve */
+    uint32_t carve_live_end;  /* 当前 carve 时的活跃驻留上沿(池内, 2048 对齐) */
     uint32_t pinned_count;
     struct wt_exec_stats st;
     uint8_t* temps[MAX_TEMPS];
@@ -73,6 +76,11 @@ static FILE* g_rtrace = NULL;  /* 统一 trace 句柄(同路径双 FILE* 在 DSP
  * 新 runner 按 job.txt trace 键显式 set_trace(0/1) 拿净测量/取证两态) */
 static int g_trace_on = 1;
 void wt_exec_set_trace(int on) { g_trace_on = on ? 1 : 0; }
+/* 005 US3b (T019): bias 默认走 HMX (SC-005 已过: cos=1.0, 三判据 0 违例,
+ * 2026-10-08, 46 号例)。wt_exec_force_bias_scalar 仅供测试例造标量参照,
+ * 生产恒 0; qurt 无 env, 走显式 API。 */
+static int g_force_bias_scalar = 0;
+void wt_exec_force_bias_scalar(int on) { g_force_bias_scalar = on ? 1 : 0; }
 /* PROF W-P2: 逐 op 时间戳对缓冲 (注册式, 不注册零开销) */
 static struct wt_op_ts* g_ts_buf = NULL;
 static uint32_t g_ts_cap = 0;
@@ -81,9 +89,70 @@ void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap) {
 }
 /* PROF W-P3: 本 op 实际执行引擎 (WT_ENG_*)。各 exec_* 内部设置, run_range 读回 */
 static uint32_t g_last_engine = WT_ENG_SCALAR;
+/* 003 编译器驱动调度: 本 op 编译期指派引擎 (来自 blob v3 footer, 0/1/2)。
+ * run_range 每 op 分发前读; ver<3 (无 footer) 时恒 scalar (= 走 legacy 自决)。 */
+static uint32_t g_planned_engine = WT_ENG_SCALAR;
+/* 003 T011: 本 op 注解的回落策略 (与 g_planned_engine 同源自 footer u32)。
+ * ver<3 恒 {1, scalar} = 允许回落标量 (legacy 自决语义不变)。 */
+static uint32_t g_planned_fb_allowed = 1u;
+static uint32_t g_planned_fb_engine = WT_ENG_SCALAR;
+/* 003 T018: 本 op 偏差标志 (0=按计划 1=允许回落 2=已中止)。
+ * 仅 v3 分发路径会置位 (engine_fallback_or_die); ver<3 无计划语义恒 0。
+ * 中止态由 run_range 填充点按 rc!=0 统一置 2, 各 die 分支无需重复设。 */
+static uint32_t g_op_deviation = 0;
+static uint32_t g_current_op = 0xFFFFFFFFu;
+static uint32_t g_current_op_global = 0xFFFFFFFFu;
+static uint32_t g_current_opcode = 0u;
 static void rtrace(const char* msg, int v) {
     if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
     if (g_rtrace) { fprintf(g_rtrace, "[run_io] %s %d\n", msg, v); fflush(g_rtrace); }
+}
+
+static const char* engine_name(uint32_t engine) {
+    switch (engine) {
+    case WT_ENG_SCALAR: return "SCALAR";
+    case WT_ENG_HVX:    return "HVX";
+    case WT_ENG_HMX:    return "HMX";
+    default:            return "UNKNOWN";
+    }
+}
+
+static void log_scalar_fallback(uint32_t planned, const char* reason) {
+    /* 常开 (不受 g_trace_on 门控): 回落=偏差事件, 净测量 run 也要留痕,
+     * 否则 "为什么全标量" 无从定位 (0930 t2l 排查实锤)。低频, 无性能污染。 */
+    if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
+    if (g_rtrace) {
+        fprintf(g_rtrace,
+                "engine_fallback op=%u code=%u planned=%s actual=%s reason=%s\n",
+                (unsigned)g_current_op, (unsigned)g_current_opcode,
+                engine_name(planned), engine_name(g_planned_fb_engine),
+                reason && reason[0] ? reason : "unspecified");
+        fflush(g_rtrace);
+    }
+}
+
+/* 003 T011 (FR-004/FR-008 骨架) / T018: 计划引擎不可用时的回落策略裁决。
+ * 允许回落 → 置偏差标志 1 并返回 0, 调用方按 fallback_engine 执行 (运行期
+ * 唯一可执行回落实现 = 标量; fb_engine 非 scalar = 发射/运行期契约漂移,
+ * 不可执行 → 按 die 处理, 绝不静默换成别的单元)。
+ * 禁止回落 / 回落不可执行 → 记录拒绝并返回 -1 (调用方立即 return -1,
+ * run_range 中止, 填充点记 deviation=2, 错误回传 runner)。绝不静默替换。 */
+static int engine_fallback_or_die(uint32_t planned, const char* reason,
+                                  char* err, size_t errn) {
+    if (g_planned_fb_allowed && g_planned_fb_engine == WT_ENG_SCALAR) {
+        g_op_deviation = 1;
+        log_scalar_fallback(planned, reason);
+        return 0;
+    }
+    log_scalar_fallback(planned, reason);
+    /* reason 可能是 err 自身 (调用点用 HMX 写入的失败原因当输入); 先拷贝再写, 避免别名。 */
+    char why[192];
+    snprintf(why, sizeof why, "%s", reason && reason[0] ? reason : "unspecified");
+    snprintf(err, errn, "op planned engine %u unavailable and fallback %s: %s",
+             (unsigned)planned,
+             g_planned_fb_allowed ? "target unexecutable" : "disallowed",
+             why);
+    return -1;
 }
 
 /* 逐 op 张量 dump 钩子 (精度排查): spec = "opidx:temp,opidx:temp,..." —
@@ -207,6 +276,11 @@ static void cpu_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
 static int vtcm_pool_ensure(void) {
     if (g_exec.vtcm_pool) return 0;
     if (!g_exec.engine_ready) {
+        /* 反向互斥回收 (同 exec_matmul): 前置 f16/conv HMX 快路径
+         * hmx_runtime_setup 持全量 VTCM → 二次 acquire 必失败, 先让出。
+         * attach 模式下 base 借自 wtcache 时 engine_ready 必已置位,
+         * 不会走到本分支, teardown 清指针不伤 wtcache 的 ctx。 */
+        if (hmx_runtime_get_vtcm_base()) hmx_runtime_teardown();
         if (wtcache_open(&g_exec.wc, 4096) != WTC_OK) return -1;
         g_exec.engine_ready = 1;
     }
@@ -235,24 +309,9 @@ static uint8_t* temp_get(uint32_t id, uint32_t bytes) {
         uint32_t off = g_exec.vtcm_off_arr[id];
         if (off + bytes > g_exec.vtcm_pool_size) return NULL;
         if (!g_exec.vtcm_pool) {
-            /* 懒初始化: 首个 VTCM 驻留消费时开 wtcache 拿 VTCM 基址 */
-            if (!g_exec.engine_ready) {
-                if (wtcache_open(&g_exec.wc, 4096) != WTC_OK) return NULL;
-                g_exec.engine_ready = 1;
-            }
-            void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
-            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
-            if (!vb || vs < g_exec.vtcm_pool_size) return NULL;
-            /* 驻留池从 VTCM 尾部倒划 —— exec_matmul 的 dc_arena_init 每次
-             * 从 (pc+2047)&~2047 重零起划 carve, 若驻留池从同一起点正向
-             * bump 会被 carve 踩。倒划到 VTCM 尾部, 且不超过 VTCM 总容量:
-             * 容量 = vs - carve_end, 驻留池放 [vs - vtcm_pool_size, vs)。
-             * 注意: 懒初始化只拿 VTCM 基址, 不做 arena/carve —— matmul 的
-             * carve 由 exec_matmul 自己的初始化完成(engine_ready 已置 1
-             * 时 exec_matmul 跳过初始化, 用悬空 arena → binary ref fail) */
-            uint32_t carve_end = (pc + 2047u) & ~2047u;
-            if (carve_end + g_exec.vtcm_pool_size > vs) return NULL;
-            g_exec.vtcm_pool = (uint8_t*)vb + (vs - g_exec.vtcm_pool_size);
+            /* 懒初始化: 首个 VTCM 驻留消费时开 wtcache 拿 VTCM 基址
+             * (含 hmx 全量持有时的先让出, 见 vtcm_pool_ensure) */
+            if (vtcm_pool_ensure() != 0) return NULL;
         }
         g_exec.temps[id] = g_exec.vtcm_pool + off;
         g_exec.temp_bytes[id] = bytes;
@@ -408,6 +467,39 @@ static void inv_crouton(const uint16_t* surf, int16_t* dst, uint32_t M, uint32_t
                 }
 }
 
+/* dc_w4_carve 需要的 arena 字节数(与 dc_parts.c 的分配序列逐项对齐:
+ * act/out/wt/bias 2048B, atbl/otbl/mask/extra 128B)。用于运行期在 carve
+ * 前核容量 —— 绝不能让 dc_arena_alloc 撞 OOM(设备侧 FARF 直接 abort)。 */
+static uint32_t w4_carve_need(uint32_t M, uint32_t K, uint32_t N) {
+    uint32_t n = 0;
+    n += (M * K * 2u + 2047u) & ~2047u;
+    n += (M * N * 2u + 2047u) & ~2047u;
+    n += (K * N / 2u + 2047u) & ~2047u;
+    n += (((N / 32u) * 512u) + 2047u) & ~2047u;
+    n += (8u * (K / 32u) * 4u + 127u) & ~127u;
+    n += (8u * (N / 32u) * 4u + 127u) & ~127u;
+    n += 128u + 128u;
+    return n;
+}
+
+/* 003 P2: carve footer 的运行期消费(替掉"首个 matmul 抢满全量 VTCM")。
+ * 语义: 逐 op 重新 carve(形状变了 e.wt/e.out 尺寸就错), 且 arena 上界按
+ * 当前活跃 carve 记录下压 —— 记录 = {op_index, vtcm_offset(池内), size,
+ * residency_start, residency_end}; 活跃 = residency_start <= op < end。
+ * 驻留 temp 的绝对地址 = 池基 + off, 池基 = VTCM 尾倒划, 所以活跃区最高
+ * 端 live_top(池内) 对应绝对上界 vs - pool_size - live_top。 */
+static uint32_t carve_live_top(const struct wt_blob* b, uint32_t op_index) {
+    uint32_t top = 0;
+    for (uint32_t i = 0; i < b->n_carve; i++) {
+        const uint8_t* r = b->carve_base + (size_t)i * WT_CARVE_REC_SIZE;
+        uint32_t st = wt_rd_u32(r + 12u), en = wt_rd_u32(r + 16u);
+        if (op_index < st || op_index >= en) continue;
+        uint32_t e1 = wt_rd_u32(r + 4u) + wt_rd_u32(r + 8u);
+        if (e1 > top) top = e1;
+    }
+    return top;
+}
+
 static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                        char* err, size_t errn) {
     uint32_t act_s = op->args[0], w_s = op->args[1], out_t = op->args[2];
@@ -417,6 +509,14 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     static dc_mutex_t mu;
     static int mu_ready;
     if (!mu_ready) { dc_mutex_init(&mu); mu_ready = 1; }
+
+    /* 003 T008: W4A16 仅 HMX carve 一路 (dc_w4_carve/invoke 即 HMX, 无标量 W4A16 路径)。
+     * ver=3 且编译期未指派 HMX → 无论回落策略均硬报错 (回落标量不可得, 绝不静默)。 */
+    if (b->annot_base && g_planned_engine != WT_ENG_HMX) {
+        snprintf(err, errn, "W4A16 planned engine %u (no scalar path)",
+                 (unsigned)g_planned_engine);
+        return -1;
+    }
 
     const uint8_t *bias = NULL, *atbl = NULL, *otbl = NULL;
     for (uint32_t i = 0; i < b->n_slots; i++) {
@@ -438,13 +538,23 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "w slot size mismatch");
         return -1;
     }
-    if (!g_exec.matmul_carved) {
+    /* 003 T013/T014: 逐 op carve。carve footer 给本 op 活跃的 VTCM 驻留区间,
+     * arena 只在驻留区之上(池内 live_top 起)领取, 绝不下压到活跃驻留上;
+     * 形状或 live 上界变了才重划(指针面只依赖 基址+容量+M/K/N), 避免逐 op
+     * 的 dc_w4_carve + 全 VTCM flush。 */
+    uint32_t live_top = (g_exec.vtcm_pool_size && b->carve_base)
+                            ? carve_live_top(b, g_current_op_global) : 0u;
+    uint32_t live_end = (live_top + 2047u) & ~2047u;
+    int shape_same = g_exec.matmul_carved &&
+                     g_exec.e.m == M && g_exec.e.k == K && g_exec.e.n == N;
+    if (!shape_same || live_end != g_exec.carve_live_end) {
         int rc = 0;
         if (!g_exec.engine_ready) {
             /* VTCM 互斥回收: 前置 MATMUL_F16/CONV2D 的 HMX 快路径 hmx_runtime_setup
              * 持全量 VTCM 且从不释放 → 同进程二次 acquire 返 0 (WTC_ERR_VTCM_ACQUIRE)。
-             * 先 teardown 让出再独占。反向已有守卫 (exec_matmul_f16_hmx/exec_conv2d_hmx
-             * 首行 engine_ready 判据 → 回落标量), 不会二次踩。 */
+             * 先 teardown 让出再独占。teardown 对 attach 模式只清指针 (ctx 归
+             * wtcache), 但 engine_ready=0 + base 非 NULL 只能是自有 ctx, 安全。
+             * 反向 (wtcache 先开, f16 后到) 走 attach 共享 scratch 区, 不冲突。 */
             if (hmx_runtime_get_vtcm_base()) hmx_runtime_teardown();
             rc = wtcache_open(&g_exec.wc, 4096);
             if (rc != WTC_OK) { snprintf(err, errn, "wtcache 0x%X", rc); return -1; }
@@ -452,7 +562,42 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         void* vb = NULL; uint32_t vs = 0; void* pb = NULL; uint32_t pc = 0;
         wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
         uint32_t off = (pc + 2047u) & ~2047u;
-        dc_arena_init(&g_exec.arena, (uint8_t*)vb + off, vs - off);
+        if (!vb || off >= vs) {
+            snprintf(err, errn, "vtcm no room (off %u vs %lu)",
+                     (unsigned)off, (unsigned long)vs);
+            return -1;
+        }
+        /* 驻留池未起则先起(首个 VTCM 驻留消费点在 temp_get, 这里提前要基址) */
+        if (g_exec.vtcm_pool_size && vtcm_pool_ensure() != 0) {
+            snprintf(err, errn, "vtcm resident pool ensure");
+            return -1;
+        }
+        /* arena 上界 = VTCM 尾倒划驻留池的顶端, 再按本 op 活跃 carve 上沿放回。
+         * 活跃驻留 = carve footer 里 residency_start <= op < end 的记录, 占池内
+         * [0, live_top); 池内 [live_top, pool_size) 此刻是死区, arena 可以借用。
+         * 无 carve footer (ver<3) → live_top=0 → 上界 = vs - pool_size, 与旧
+         * 布局逐字节同界。live_end 超 pool = 编译期/运行期布局漂移, 硬报错。 */
+        uint32_t arena_hi = vs;
+        if (g_exec.vtcm_pool_size) {
+            if (live_end > g_exec.vtcm_pool_size) {
+                snprintf(err, errn, "carve live %u > pool %u at op %u",
+                         (unsigned)live_end, (unsigned)g_exec.vtcm_pool_size,
+                         (unsigned)g_current_op_global);
+                return -1;
+            }
+            arena_hi = vs - (g_exec.vtcm_pool_size - live_end);
+        }
+        uint32_t arena_cap = (arena_hi > off) ? (arena_hi - off) : 0u;
+        /* dc_arena_alloc 撞 OOM 是设备侧 FARF abort, 必须运行期先核容量 */
+        uint32_t need = w4_carve_need(M, K, N);
+        if (arena_cap < need) {
+            snprintf(err, errn, "carve cap %u < need %u (m%u k%u n%u live %u pool %lu)",
+                     (unsigned)arena_cap, (unsigned)need,
+                     (unsigned)M, (unsigned)K, (unsigned)N,
+                     (unsigned)live_end, (unsigned long)g_exec.vtcm_pool_size);
+            return -1;
+        }
+        dc_arena_init(&g_exec.arena, (uint8_t*)vb + off, arena_cap);
         if (dc_w4_carve(&g_exec.e, &g_exec.arena, M, K, N, atbl, otbl)) {
             snprintf(err, errn, "carve m%u k%u n%u", (unsigned)M, (unsigned)K, (unsigned)N);
             return -1;
@@ -462,6 +607,8 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         qurt_mem_cache_clean((qurt_addr_t)vb, vs, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
         g_exec.engine_ready = 1;
         g_exec.matmul_carved = 1;
+        g_exec.carve_op = g_current_op_global;
+        g_exec.carve_live_end = live_end;
     }
     uint8_t* out_ddr = temp_get(out_t, out_b);
     if (!out_ddr) { snprintf(err, errn, "temp %u alloc", (unsigned)out_t); return -1; }
@@ -483,6 +630,16 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         int bad = dc_w4_invoke(&g_exec.e);
         g_exec.e.act = saved_act;
         if (bad) { snprintf(err, errn, "invoke"); return -1; }
+        /* invoke 只写 VTCM arena 的 e.out, 消费者在 DDR —— 与下方旧路径同款
+         * dc_dma 回拷 + 丢弃驻留旧行 (w4dma 上板实锤: 漏拷 = out 全零) */
+        struct dc_dma d_out;
+        dc_dma_init(&d_out, g_exec.e.out, out_ddr, out_b, &mu);
+        bad = dc_dma_once(&d_out);
+        dc_dma_destroy(&d_out);
+        if (bad) { snprintf(err, errn, "dma out"); return -1; }
+        qurt_mem_cache_clean((qurt_addr_t)out_ddr, out_b,
+                             QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+        g_last_engine = WT_ENG_HMX;  /* 003 T017: VTCM 预置路径补漏记 */
         return 0;
     }
 
@@ -491,10 +648,10 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
                 g_exec.e.act, act_b, &mu);
     dc_dma_init(&d_out, g_exec.e.out, out_ddr, out_b, &mu);
     int bad = dc_dma_once(&d_act) || dc_w4_invoke(&g_exec.e) || dc_dma_once(&d_out);
-    g_last_engine = WT_ENG_HMX;  /* W-P3: W4A16 走 HMX 引擎 */
     dc_dma_destroy(&d_act);
     dc_dma_destroy(&d_out);
     if (bad) { snprintf(err, errn, "dma/invoke"); return -1; }
+    g_last_engine = WT_ENG_HMX;  /* W-P3: W4A16 走 HMX 引擎 (成功后记, 避免失败误标) */
     /* dst_bypass=0 写落内存; CPU 后续读 (rmsnorm/dump) 前丢弃驻留旧行 */
     qurt_mem_cache_clean((qurt_addr_t)out_ddr, out_b,
                          QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
@@ -517,9 +674,13 @@ void wt_exec_shutdown(void) {
     g_exec.pool_used = 0;
     g_exec.static_offsets = NULL;
     /* VTCM 驻留: wtcache_close 后基址悬空, 必须清零 —— 否则下一个 run
-     * 用残基址读悬空 VTCM = 挂死(diag/8-token 间反复 shutdown/re-run 实锤) */
+     * 用残基址读悬空 VTCM = 挂死(diag/8-token 间反复 shutdown/re-run 实锤)。
+     * 003 T014: attach 的 hmx base 借自同一 wtcache VTCM, 同样悬空。 */
+    if (hmx_runtime_is_attached()) hmx_runtime_teardown();
     g_exec.vtcm_pool = NULL;
     g_exec.vtcm_pool_size = 0;
+    g_exec.carve_op = 0xFFFFFFFFu;
+    g_exec.carve_live_end = 0u;
     for (uint32_t i = 0; i < MAX_TEMPS; i++) {
         g_exec.static_off_arr[i] = 0xFFFFFFFFu;
         g_exec.vtcm_off_arr[i] = 0xFFFFFFFFu;
@@ -630,10 +791,26 @@ static int exec_conv2d_hmx(const uint16_t* cols, const uint16_t* wm,
                            uint32_t oy0, uint32_t ox0, uint32_t out_W,
                            uint32_t co0, uint32_t co_n,
                            char* err, size_t errn) {
-    if (g_exec.engine_ready || g_exec.vtcm_pool) return -1;
-
+    /* 003 T014 attach: wtcache 持 VTCM (W4A16 驻留池先开) 时不再整体放弃,
+     * 把 g_vtcm_base 挂到共享 scratch 区 [pinned_end, vs-pool_size) ——
+     * 二次 HAP acquire 同进程必失败, 旧行为=静默回落标量 (t2l 16 个 f16
+     * matmul 全标量的根因)。scratch 会覆盖 W4A16 arena → 强制重 carve。 */
     if (hmx_runtime_get_vtcm_base() == NULL) {
-        if (hmx_runtime_setup(2u * 1024u * 1024u) != 0) {
+        if (g_exec.engine_ready) {
+            void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+            uint32_t off = (pc + 2047u) & ~2047u;
+            uint32_t hi = (vs > g_exec.vtcm_pool_size) ? (vs - g_exec.vtcm_pool_size) : 0u;
+            uint32_t cap = (vb && hi > off) ? (hi - off) : 0u;
+            if (cap == 0u) {
+                snprintf(err, errn, "conv2d attach no scratch (vs=%lu pool=%lu)",
+                         (unsigned long)vs, (unsigned long)g_exec.vtcm_pool_size);
+                return -1;  /* 共享区放不下 → 回落标量 */
+            }
+            rtrace("hmx attach cap", (int)cap);
+            hmx_runtime_attach((uint8_t*)vb + off, cap);
+            g_exec.matmul_carved = 0;
+        } else if (hmx_runtime_setup(2u * 1024u * 1024u) != 0) {
             snprintf(err, errn, "conv2d hmx setup fail"); return -1;
         }
     }
@@ -753,11 +930,32 @@ static int exec_conv2d(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* Bm = (const uint16_t*)bp;
 #if defined(__HVX__) || defined(__hexagon__)
     /* HMX 快路径: M/K/co_n 均 32 倍数 → crouton + HMX GEMM (bias 入 scale 区) */
-    if ((M % 32u) == 0u && (K % 32u) == 0u && (co_n % 32u) == 0u) {
+    /* 003 T009: ver=3 按 g_planned_engine 分发 (HMX→快路径 / scalar→标量);
+     * ver<=2 保留运行时 shape 门自决。conv 无 HVX 路径。 */
+    int want_hmx;
+    if (b->annot_base) {
+        if (g_planned_engine == WT_ENG_HMX) {
+            want_hmx = 1;
+        } else if (g_planned_engine == WT_ENG_HVX) {
+            /* 计划 HVX 但 conv 无 HVX 路径 → 按回落策略裁决 */
+            if (engine_fallback_or_die(g_planned_engine, "conv has no HVX path", err, errn) != 0) return -1;
+            want_hmx = 0;
+        } else {
+            want_hmx = 0;  /* planned scalar */
+        }
+    } else {
+        want_hmx = ((M % 32u) == 0u && (K % 32u) == 0u && (co_n % 32u) == 0u);
+    }
+    if (want_hmx) {
         if (exec_conv2d_hmx(A, Wm, Bm, out, M, K, N, oy0, ox0, out_W,
-                            co0, co_n, err, errn) == 0)
+                            co0, co_n, err, errn) == 0) {
+            g_last_engine = WT_ENG_HMX;  /* 003 T017: conv HMX 补漏记 */
             return 0;
+        }
         /* 失败(未 setup/超 VTCM/wtcache 已占)回落标量 */
+        if (b->annot_base && engine_fallback_or_die(g_planned_engine, "conv2d_hmx fail (setup/vtcm/wtcache)",
+                                                    err, errn) != 0)
+            return -1;   /* 003 T009/T011: 计划 HMX 失败且禁止回落 → 硬报错 */
     }
 #endif
     for (uint32_t r = 0; r < M; r++) {
@@ -791,11 +989,19 @@ static int exec_add(const struct wt_blob* b, const struct wt_op* op,
         const char* e = getenv("GEHTP_HVX_ADD");
         g_hvx_add = (e && e[0] == '0') ? 0 : 1;  /* 默认开, 显式 0 才关 */
     }
-    if (g_hvx_add && n >= 64u) {
+    /* 003 T010: ver=3 按 g_planned_engine 分发; ver<=2 保留 g_hvx_add 自决 */
+    int want_hvx = g_hvx_add && n >= 64u;
+    if (b->annot_base) want_hvx = (g_planned_engine == WT_ENG_HVX) && n >= 64u;
+    if (want_hvx) {
         hvhx_v2_add_f16(y, A, B2, n);
         g_last_engine = WT_ENG_HVX;  /* W-P3: elemwise 走 HVX 快路径 */
         return 0;
     }
+    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
+        engine_fallback_or_die(g_planned_engine,
+                g_planned_engine == WT_ENG_HMX ? "add has no HMX path" : "n<64 (add HVX gate)",
+                err, errn) != 0)
+        return -1;   /* 计划 HVX/HMX 但不可用 (n<64/无 HMX) → 按回落策略 */
     for (uint32_t i = 0; i < n; i++)
         y[i] = f32_to_f16(f16_to_f32(A[i]) + f16_to_f32(B2[i]));
     return 0;
@@ -994,7 +1200,10 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
     /* HVX 快路径(策略 B): 有 f32 内核的 subtype, n >= 32 时走
      * f16→f32(向量 cvt)→内核(就地)→f32→f16。exp/sigmoid/tanh/silu 定义域
      * 无约束; sqrt/rsqrt/log 标量带负输入钳 0 守卫, 暂留标量避免 NaN 回归。 */
-    if (n >= 32u) {
+    /* 003 T010: ver=3 按 g_planned_engine 分发; ver<=2 保留运行时 fn!=NULL 自决 */
+    int want_hvx = (n >= 32u);
+    if (b->annot_base) want_hvx = (g_planned_engine == WT_ENG_HVX) && (n >= 32u);
+    if (want_hvx) {
         void (*fn)(float*, const float*, uint32_t) = NULL;
         switch (subtype) {
         case 1:  fn = hvhx_v2_exp_f32;     break;
@@ -1005,18 +1214,37 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
             break;
         default: break;
         }
+        int hvx_ok = 0;
         if (fn) {
             float* sc = f32_scratch(n, 1, NULL);
             if (sc) {
                 hvhx_v2_cvt_f16_to_f32(sc, x, n);
                 fn(sc, sc, n);
                 hvhx_v2_cvt_f32_to_f16(y, sc, n);
-                return 0;
+                hvx_ok = 1;
             }
         } else if (subtype == 14) {
             memcpy(y, x, (size_t)n * 2u);
+            hvx_ok = 1;
+        }
+        if (hvx_ok) {
+            g_last_engine = WT_ENG_HVX;  /* 003 T017: unary HVX 补漏记 */
             return 0;
         }
+        /* HVX 不可用 (无该 subtype 内核 / scratch 不足); HMX 记无路径 (elemwise 无 HMX) */
+        if (b->annot_base && engine_fallback_or_die(
+                g_planned_engine,
+                g_planned_engine == WT_ENG_HMX ? "unary has no HMX path" :
+                (fn ? "HVX scratch unavailable" : "unary subtype has no HVX kernel"),
+                err, errn) != 0)
+            return -1;
+        /* 回落裁决已通过 (允许回落): 无重复裁决, 直接落标量 */
+    } else if (b->annot_base && g_planned_engine != WT_ENG_SCALAR) {
+        /* 计划非标量但未满足 HVX 形状门 (或计划 HMX 无路径) → 按回落策略裁决。 */
+        if (engine_fallback_or_die(g_planned_engine,
+                g_planned_engine == WT_ENG_HMX ? "unary has no HMX path" :
+                "unary shape gate (n<32)", err, errn) != 0)
+            return -1;
     }
     for (uint32_t i = 0; i < n; i++) {
         float v = f16_to_f32(x[i]);
@@ -1090,7 +1318,10 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
     }
     /* HVX 快路径(策略 B): add/sub/mul 位级保真, div < 1 ULP。n >= 32 时
      * f16→f32(向量 cvt)→f32 内核→f32→f16。 */
-    if (n >= 32u) {
+    /* 003 T010: ver=3 按 g_planned_engine 分发; ver<=2 保留运行时 fn!=NULL 自决 */
+    int want_hvx = (n >= 32u);
+    if (b->annot_base) want_hvx = (g_planned_engine == WT_ENG_HVX) && (n >= 32u);
+    if (want_hvx) {
         void (*fn)(float*, const float*, const float*, uint32_t) = NULL;
         switch (subtype) {
         case 0: fn = hvhx_v2_add_f32; break;
@@ -1099,6 +1330,7 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
         case 3: fn = hvhx_v2_div_f32; break;
         default: break;
         }
+        int hvx_ok = 0;
         if (fn) {
             uint32_t st = 0;
             float* sc = f32_scratch(n, 3, &st);
@@ -1110,9 +1342,28 @@ static int exec_binary(const struct wt_blob* b, const struct wt_op* op,
                 hvhx_v2_cvt_f16_to_f32(B, bb, n);
                 fn(C, A, B, n);
                 hvhx_v2_cvt_f32_to_f16(y, C, n);
-                return 0;
+                hvx_ok = 1;
             }
         }
+        if (hvx_ok) {
+            g_last_engine = WT_ENG_HVX;  /* 003 T017: binary HVX 补漏记 */
+            return 0;
+        }
+        /* HVX 不可用 (无该 subtype 内核 / scratch 不足); HMX 记无路径 (elemwise 无 HMX) */
+        if (b->annot_base && engine_fallback_or_die(
+                g_planned_engine,
+                g_planned_engine == WT_ENG_HMX ? "binary has no HMX path" :
+                (fn ? "HVX scratch unavailable" : "binary subtype has no HVX kernel"),
+                err, errn) != 0)
+            return -1;
+        /* 回落裁决已通过 (允许回落): 无重复裁决, 直接落标量 */
+    } else if (b->annot_base && g_planned_engine != WT_ENG_SCALAR) {
+        /* 003 T010/T011: 计划非标量但 want_hvx==false (HMX 无路径 / HVX 形状门不满足)
+         * → 按回落策略裁决, 禁止回落则硬报错, 绝不静默落标量。 */
+        if (engine_fallback_or_die(g_planned_engine,
+                g_planned_engine == WT_ENG_HMX ? "binary has no HMX path" :
+                "binary shape gate (n<32)", err, errn) != 0)
+            return -1;
     }
     for (uint32_t i = 0; i < n; i++) {
         float x0 = f16_to_f32(a[i]), x1 = f16_to_f32(bb[i]);
@@ -1139,7 +1390,12 @@ static int exec_softmax(const struct wt_blob* b, const struct wt_op* op,
     if (!x || !y) { snprintf(err, errn, "softmax ref fail"); return -1; }
     /* HVX 快路径(策略 B): 每行 n%32==0 时走 fused softmax(HVX), 否则回落标量。
      * 整面 f16→f32 一次 cvt → 逐行 softmax_f32 → f32→f16。 */
-    if (rows >= 1u && (n % 32u) == 0u && (size_t)rows * n >= 32u) {
+    /* 003 T010: ver=3 按 g_planned_engine 分发; ver<=2 保留运行时自决 */
+    int want_hvx = (rows >= 1u && (n % 32u) == 0u && (size_t)rows * n >= 32u);
+    if (b->annot_base)
+        want_hvx = (g_planned_engine == WT_ENG_HVX) &&
+                   (rows >= 1u && (n % 32u) == 0u && (size_t)rows * n >= 32u);
+    if (want_hvx) {
         uint32_t st = 0;
         float* sc = f32_scratch((uint32_t)((size_t)rows * n), 2, &st);
         if (sc) {
@@ -1148,8 +1404,21 @@ static int exec_softmax(const struct wt_blob* b, const struct wt_op* op,
             for (uint32_t r = 0; r < rows; r++)
                 hvhx_v2_softmax_f32(sc + (size_t)r * n, sc + (size_t)r * n, pad, n);
             hvhx_v2_cvt_f32_to_f16(y, sc, (uint32_t)((size_t)rows * n));
+            g_last_engine = WT_ENG_HVX;  /* 003 T017: softmax HVX 补漏记 */
             return 0;
         }
+        /* scratch 不足 → HVX 不可用 */
+        if (b->annot_base && engine_fallback_or_die(g_planned_engine, "softmax HVX scratch unavailable",
+                                                    err, errn) != 0)
+            return -1;
+        /* 回落裁决已通过 (允许回落): 无重复裁决, 直接落标量 */
+    } else if (b->annot_base && g_planned_engine != WT_ENG_SCALAR) {
+        /* 计划非标量但 want_hvx==false (HMX 无路径 / 形状门不满足) → 按回落策略裁决。 */
+        if (engine_fallback_or_die(g_planned_engine,
+                g_planned_engine == WT_ENG_HMX ? "softmax has no HMX path" :
+                "softmax shape gate (n%32!=0 or rows*n<32)",
+                err, errn) != 0)
+            return -1;
     }
     for (uint32_t r = 0; r < rows; r++) {
         const uint16_t* xr = x + (size_t)r * n;
@@ -1450,13 +1719,27 @@ static int exec_scatter_nd(const struct wt_blob* b, const struct wt_op* op,
 static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y,
                                uint32_t M, uint32_t K, uint32_t N,
                                uint32_t n0, uint32_t N_full,
-                               int t0, int t1, char* err, size_t errn) {
-    /* wtcache 已开 (W4A16/VTCM 驻留 temp 占用同一物理 VTCM) → 跳过,
-     * 防 hmx_runtime_setup 的 HAP_compute_res_acquire/memset 踩对方。 */
-    if (g_exec.engine_ready || g_exec.vtcm_pool) return -1;
-
+                               int t0, int t1, char* err, size_t errn,
+                               const uint16_t* bias) {
+    /* 003 T014 attach: 同 exec_conv2d_hmx —— wtcache 持 VTCM 时挂共享 scratch
+     * 区, 不再整体放弃 (旧行为=静默回落标量)。scratch 覆盖 W4A16 arena →
+     * matmul_carved 清零, 下一个 W4A16 op 重 carve。 */
     if (hmx_runtime_get_vtcm_base() == NULL) {
-        if (hmx_runtime_setup(2u * 1024u * 1024u) != 0) {
+        if (g_exec.engine_ready) {
+            void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+            uint32_t off = (pc + 2047u) & ~2047u;
+            uint32_t hi = (vs > g_exec.vtcm_pool_size) ? (vs - g_exec.vtcm_pool_size) : 0u;
+            uint32_t cap = (vb && hi > off) ? (hi - off) : 0u;
+            if (cap == 0u) {
+                snprintf(err, errn, "matmul_f16 attach no scratch (vs=%lu pool=%lu)",
+                         (unsigned long)vs, (unsigned long)g_exec.vtcm_pool_size);
+                return -1;
+            }
+            rtrace("hmx attach cap", (int)cap);
+            hmx_runtime_attach((uint8_t*)vb + off, cap);
+            g_exec.matmul_carved = 0;
+        } else if (hmx_runtime_setup(2u * 1024u * 1024u) != 0) {
             snprintf(err, errn, "matmul_f16 hmx setup fail"); return -1;
         }
     }
@@ -1520,6 +1803,13 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
     for (uint32_t r = 0; r < n_row; ++r) {
         for (uint32_t c = 0; c < n_col; ++c) {
             uint16_t* out_tile = out_cr + ((size_t)r * n_col + c) * 1024u;
+            /* 005 US3b (T018): bias 走 scale 区奇位 out_bias —— cvt 一步
+             * f16(acc·1.0+bias), 与 exec_conv2d_hmx 同技法 (该路已上板验证);
+             * 标量路径同口径 bias[全局列号] 单次舍入。bias==NULL 时保持
+             * 恒等页, 已验证 GEMM 路径零扰动。 */
+            if (bias)
+                for (uint32_t n = 0; n < 32u; ++n)
+                    sca[2u * n + 1u] = bias[n0 + c * 32u + n];
             hmx_enable_execution();
             hmx_unit_acquire();
             asm volatile("mxclracc.hf" ::: "memory");
@@ -1556,8 +1846,8 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
 }
 #endif /* __HVX__ / __hexagon__ */
 
-static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
-                           char* err, size_t errn) {
+static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
+                                char* err, size_t errn, const uint16_t* bias) {
     uint32_t a_t = op->args[0], w_s = op->args[1], out_t = op->args[2];
     uint32_t M = op->args[3], K = op->args[4];
     uint32_t N_full, n0, N, flags;
@@ -1572,6 +1862,8 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
     int batched = (int)(flags & 4u);
     uint32_t Bn = flags >> 16;
     if (Bn == 0) Bn = 1;
+    /* FC bias (opcode 36) 仅非 batched 整 op (emit 侧保证; 手构图违禁硬错) */
+    if (bias && batched) { snprintf(err, errn, "matmul_f16_bias 不支持 batched"); return -1; }
     const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
     /* w 可为 slot(权重)或 temp(运行时 B, 如 attention q·kᵀ) */
     const uint16_t* w = (const uint16_t*)ref_ptr(b, op->args[1]);
@@ -1585,7 +1877,26 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
      * 选择, 首 chunk 决定, 续 chunk (三引用一致) 沿用; 混合路径破逐字节
      * 恒等, 违禁即硬错误。chunk 间必有别的 op 插入时 key 不匹配, 重新决定。 */
     static struct { uint32_t a_t, w_s, out_t; int engine; } g_split_prev = {0, 0, 0, 0};
-    if ((M % 32u) == 0u && (K % 32u) == 0u && (N % 32u) == 0u) {
+    /* 003 T007: ver=3 按编译期 g_planned_engine 分发; ver<=2 保留运行时 shape 门。
+     * matmul 家族仅 HMX/标量两路 (无 HVX 路径)。 */
+    int want_hmx;
+    if (b->annot_base) {
+        if (g_planned_engine == WT_ENG_HMX) {
+            want_hmx = 1;
+        } else if (g_planned_engine == WT_ENG_HVX) {
+            /* 计划 HVX 但 matmul 无 HVX 路径 → 按回落策略裁决 */
+            if (engine_fallback_or_die(g_planned_engine, "matmul has no HVX path", err, errn) != 0) return -1;
+            want_hmx = 0;
+        } else {
+            want_hmx = 0;  /* planned scalar */
+        }
+    } else {
+        want_hmx = ((M % 32u) == 0u && (K % 32u) == 0u && (N % 32u) == 0u);
+    }
+    /* 005 US3b (T019): bias 的 HMX 路径 SC-005 已过, 生产默认走 HMX;
+     * g_force_bias_scalar 仅测试例 (46) 造标量参照用。 */
+    if (bias && g_force_bias_scalar) want_hmx = 0;
+    if (want_hmx) {
         int engine = 0;
         if (op->opcode == OP_MATMUL_F16_SPLIT &&
             g_split_prev.out_t == out_t && g_split_prev.a_t == a_t && g_split_prev.w_s == w_s)
@@ -1601,17 +1912,19 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
                     const uint16_t* wb = w + (size_t)bb * K * N_full;
                     uint16_t* yb = y + (size_t)bb * M * N_full;
                     if (exec_matmul_f16_hmx(ab, wb, yb, M, K, N, 0, N_full, t0, t1,
-                                            err, errn) != 0) {
+                                            err, errn, NULL) != 0) {
                         engine = -1;
                         break;
                     }
                 }
             } else {
-                engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn) == 0)
+                engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
+                                              bias) == 0)
                              ? 1 : -1;
             }
         } else if (engine == 1) {
-            if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn) != 0) {
+            if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
+                                     bias) != 0) {
                 snprintf(err, errn, "matmul_f16 split 混合路径 (FR-013 ④ 违禁): 前 chunk HMX 本 chunk 失败");
                 return -1;
             }
@@ -1621,7 +1934,17 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
             g_split_prev.out_t = out_t; g_split_prev.engine = engine;
         }
         if (engine == 1) return 0;
+        /* 003 T007/T011: HMX 失败 → ver=3 按回落策略裁决 (禁止回落硬报错), ver<=2 静默回落。
+         * 失败原因已在 err 内 (exec_matmul_f16_hmx 写入), 此处只补回退裁决日志。 */
+        if (b->annot_base && engine_fallback_or_die(g_planned_engine,
+                err && err[0] ? err : "matmul_f16 HMX invoke failed", err, errn) != 0)
+            return -1;
         /* engine == -1 (或非 SPLIT 失败): 回落标量 */
+        if (g_planned_engine == WT_ENG_HMX) {
+            g_last_engine = WT_ENG_SCALAR;  /* 003 T017: matmul 回落 HMX 时补漏记 */
+        } else if (g_planned_engine == WT_ENG_HVX) {
+            g_last_engine = WT_ENG_SCALAR;  /* 003 T017: matmul 回落 HVX 时补漏记 */
+        }
     }
 #endif
     /* 标量路径: 列号 = n0 + n, 行主 stride = N_full (n0=0/N_full=N 即旧公式) */
@@ -1648,9 +1971,31 @@ static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
                 float wv = f16_to_f32(w[t1 ? (size_t)(n0 + n) * K + k : (size_t)k * N_full + (n0 + n)]);
                 acc += av * wv;
             }
+            /* FC bias: f32 累加器按列加 (单次舍入, 与 host ops.cpp 同口径) */
+            if (bias) acc += f16_to_f32(bias[n0 + n]);
             y[(size_t)m * N_full + (n0 + n)] = f32_to_f16(acc);
         }
     return 0;
+}
+
+static int exec_matmul_f16(const struct wt_blob* b, const struct wt_op* op,
+                           char* err, size_t errn) {
+    return exec_matmul_f16_impl(b, op, err, errn, NULL);
+}
+
+/* OP_MATMUL_F16_BIAS (opcode 36, FC bias 折叠): args[0..6] 同 OP_MATMUL_F16,
+ * args[7] = 0x8000|bias 槽 (N 元素 f16, 按列加)。bias 槽长校验防野读。 */
+static int exec_matmul_f16_bias(const struct wt_blob* b, const struct wt_op* op,
+                                char* err, size_t errn) {
+    uint32_t bs = op->args[7] & 0x7FFFu;
+    if (bs >= b->n_slots || b->slots[bs].len < (size_t)op->args[5] * 2u) {
+        snprintf(err, errn, "matmul_f16_bias bias slot bad (s=%u n=%u)",
+                 (unsigned)bs, (unsigned)op->args[5]);
+        return -1;
+    }
+    const uint16_t* bias = (const uint16_t*)slot_ptr(b, bs);
+    if (!bias) { snprintf(err, errn, "matmul_f16_bias bias ref fail"); return -1; }
+    return exec_matmul_f16_impl(b, op, err, errn, bias);
 }
 
 /* 通用 RMSNorm: 纯 f16 面直读(无 crouton)。y = x/rms(x) * gamma + bias。
@@ -1683,7 +2028,11 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
         const char* e = getenv("GEHTP_HVX_RMSNORM");
         g_hvx_rmsnorm = (e && e[0] == '1') ? 1 : 0;  /* 默认关, 显式 1 才开 */
     }
-    if (g_hvx_rmsnorm && !bv && m >= 1u && (rw % 32u) == 0u) {
+    /* 003 T010: ver=3 按 g_planned_engine 分发 (编译器为准, 覆盖 env); ver<=2 保留 env 自决 */
+    int want_hvx = g_hvx_rmsnorm && !bv && m >= 1u && (rw % 32u) == 0u;
+    if (b->annot_base)
+        want_hvx = (g_planned_engine == WT_ENG_HVX) && !bv && m >= 1u && (rw % 32u) == 0u;
+    if (want_hvx) {
         uint32_t st = 0;
         float* sc = f32_scratch(n, 2, &st);
         if (sc) {
@@ -1693,8 +2042,22 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
             hvhx_v2_cvt_f16_to_f32(W, wv, rw);
             hvhx_v2_rms_norm_mul_f32_rows(A, W, A, m, rw, 1e-6f);
             hvhx_v2_cvt_f32_to_f16(y, A, n);
+            g_last_engine = WT_ENG_HVX;  /* 003 T017: rmsnorm2 HVX 补漏记 */
             return 0;
         }
+        if (b->annot_base && engine_fallback_or_die(g_planned_engine,
+                "rmsnorm2 HVX scratch unavailable", err, errn) != 0)
+            return -1;
+        /* 回落裁决已通过 (允许回落): 无重复裁决, 直接落标量 */
+    } else if (b->annot_base && g_planned_engine != WT_ENG_SCALAR) {
+        /* 003 T010/T011: 计划非标量但 want_hvx==false (HMX 无路径 / 带 bias /
+         * rw%32!=0) → 按回落策略裁决, 禁止回落则硬报错, 绝不静默落标量。 */
+        if (engine_fallback_or_die(g_planned_engine,
+                g_planned_engine == WT_ENG_HMX ? "rmsnorm2 has no HMX path" :
+                (bv ? "rmsnorm2 has bias; HVX path unavailable" :
+                      "rmsnorm2 shape gate (rw%32!=0)"),
+                err, errn) != 0)
+            return -1;
     }
     for (uint32_t r = 0; r < m; r++) {
         double acc = 0.0;
@@ -1722,6 +2085,13 @@ static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* x = (const uint16_t*)ref_ptr(b, b_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)n * 2u);
     if (!x || !y || b_elems == 0) { snprintf(err, errn, "broadcast ref fail"); return -1; }
+    /* 003 T018 补漏 (t2l op_ts v3 机检实锤: emit 对 Eltwise_Broadcast 按
+     * n%32 计划 HVX, 但 broadcast 无 HVX/HMX 内核 —— 此前静默标量 =
+     * planned!=actual 且 dev=0 的契约违例)。按回落策略裁决。 */
+    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
+        engine_fallback_or_die(g_planned_engine, "broadcast has no HVX/HMX path",
+                               err, errn) != 0)
+        return -1;
     uint32_t r = 4;
     while (r > 0 && out_d[r - 1] == 1) r--;
     /* in 不去尾 1(末维 1 广播到 out 大维必须保留; host in_bc oid 1231 同款) */
@@ -1856,6 +2226,8 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
         g_exec.static_off_arr[i] = 0xFFFFFFFFu;
         g_exec.vtcm_off_arr[i] = 0xFFFFFFFFu;
     }
+    const uint8_t* tp = NULL;  /* 首个 TEMPOFF 槽载荷(carve 对拍用) */
+    uint32_t tn = 0, tvtcm_cap = 0;
     for (uint32_t s = 0; s < b->n_slots; s++) {
         if (b->slots[s].addr != WT_SLOT_TEMPOFF) continue;
         const uint8_t* p = b->weight_base + b->slots[s].offset;
@@ -1901,7 +2273,62 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
         /* VTCM 驻留池: wtcache 布局(引擎初始化时补 VTCM 基址) */
         g_exec.vtcm_pool_size = vtcm_cap;
         g_exec.vtcm_pool = NULL;  /* 懒初始化: 首个 VTCM 消费 op 时开 wtcache */
+        tp = p; tn = n; tvtcm_cap = vtcm_cap;
         break;
+    }
+    /* 003 T013: carve footer ↔ TEMPOFF 双源对拍(重数匹配)。emit 侧已有同款
+     * 检查, 这里防 blob 被拼接/改写/异版工具产出后的静默布局漂移 —— 漂移时
+     * arena 上界按错误的 live 集算, HMX 直写会踩活跃驻留 temp。 */
+    if (b->carve_base && b->n_carve) {
+        if (!tp || tvtcm_cap == 0) {
+            snprintf(err, errn, "carve footer but no vtcm tempoff pool");
+            return -1;
+        }
+        /* 双向存在性(集合语义): temp id 回收复用同段 VTCM 会有重复对, 合法。 */
+        for (uint32_t i = 0; i < tn; i++) {
+            const uint8_t* e = tp + 12 + i * 12;
+            uint32_t tid, off, sz;
+            memcpy(&tid, e, 4); memcpy(&off, e + 4, 4); memcpy(&sz, e + 8, 4);
+            if (!(tid & WT_REF_VTCM_FLAG)) continue;
+            uint32_t j;
+            for (j = 0; j < b->n_carve; j++) {
+                const uint8_t* r = b->carve_base + (size_t)j * WT_CARVE_REC_SIZE;
+                if (wt_rd_u32(r + 4u) == off && wt_rd_u32(r + 8u) == sz) break;
+            }
+            if (j == b->n_carve) {
+                snprintf(err, errn, "carve/tempoff drift: vtcm tid %u (off %u sz %u) unmatched",
+                         (unsigned)(tid & 0x3FFFu), (unsigned)off, (unsigned)sz);
+                return -1;
+            }
+        }
+        for (uint32_t j = 0; j < b->n_carve; j++) {
+            const uint8_t* r = b->carve_base + (size_t)j * WT_CARVE_REC_SIZE;
+            uint32_t opi = wt_rd_u32(r);
+            uint32_t co = wt_rd_u32(r + 4u), cs = wt_rd_u32(r + 8u);
+            uint32_t st = wt_rd_u32(r + 12u), en = wt_rd_u32(r + 16u);
+            if (co + cs > tvtcm_cap) {
+                snprintf(err, errn, "carve rec bad: op %u off %u sz %u cap %u",
+                         (unsigned)opi, (unsigned)co, (unsigned)cs, (unsigned)tvtcm_cap);
+                return -1;
+            }
+            if (st > opi || opi >= en) {
+                snprintf(err, errn, "carve rec window bad: op %u not in [%u,%u)",
+                         (unsigned)opi, (unsigned)st, (unsigned)en);
+                return -1;
+            }
+            uint32_t i;
+            for (i = 0; i < tn; i++) {
+                const uint8_t* e = tp + 12 + i * 12;
+                uint32_t tid2, off2, sz2;
+                memcpy(&tid2, e, 4); memcpy(&off2, e + 4, 4); memcpy(&sz2, e + 8, 4);
+                if ((tid2 & WT_REF_VTCM_FLAG) && off2 == co && sz2 == cs) break;
+            }
+            if (i == tn) {
+                snprintf(err, errn, "carve/tempoff drift: op %u (off %u sz %u) phantom",
+                         (unsigned)opi, (unsigned)co, (unsigned)cs);
+                return -1;
+            }
+        }
     }
     return 0;
 }
@@ -2055,6 +2482,9 @@ static int xop_kv_unimpl(const struct wt_op_ctx* cx) {
 static int xop_matmul_f16(const struct wt_op_ctx* cx) {
     return exec_matmul_f16(cx->b, cx->op, cx->err, cx->errn);
 }
+static int xop_matmul_f16_bias(const struct wt_op_ctx* cx) {
+    return exec_matmul_f16_bias(cx->b, cx->op, cx->err, cx->errn);
+}
 
 static int xop_rmsnorm2(const struct wt_op_ctx* cx) {
     return exec_rmsnorm2(cx->b, cx->op, cx->err, cx->errn);
@@ -2098,6 +2528,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_KV_GATHER_F16] = xop_kv_unimpl,
     [OP_MATMUL_F16] = xop_matmul_f16,
     [OP_MATMUL_F16_SPLIT] = xop_matmul_f16,
+    [OP_MATMUL_F16_BIAS] = xop_matmul_f16_bias,
     [OP_RMSNORM2_F16] = xop_rmsnorm2,
     [OP_BROADCAST_F16] = xop_broadcast,
     [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,
@@ -2117,6 +2548,20 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         int64_t t0 = HAP_perf_get_time_us();
         dc_dma_reset();                 /* W-P3: 每 op 前清 UserDMA 累加器 */
         g_last_engine = WT_ENG_SCALAR;  /* W-P3: 默认标量, exec_* 内部覆盖 */
+        g_op_deviation = 0;             /* 003 T018: 偏差标志逐 op 复位 */
+        g_current_op = ii;              /* 回退日志上下文: 段内 op 序号 (与 optrace 行一致) */
+        g_current_op_global = i;        /* 003 P2: carve 记录键 = 全局 op 序号 */
+        g_current_opcode = op->opcode;
+        if (b->annot_base) {
+            uint32_t an = wt_rd_u32(b->annot_base + (size_t)i * 4u);
+            g_planned_engine = wt_annot_engine(an);
+            g_planned_fb_allowed = wt_annot_fb_allowed(an);
+            g_planned_fb_engine = wt_annot_fb_engine(an);
+        } else {
+            g_planned_engine = WT_ENG_SCALAR;
+            g_planned_fb_allowed = 1u;   /* legacy: 恒允许回落 (旧自决语义) */
+            g_planned_fb_engine = WT_ENG_SCALAR;
+        }
         int rc;
         if (op->opcode >= sizeof(g_op_exec_table) / sizeof(g_op_exec_table[0]) ||
             !g_op_exec_table[op->opcode]) {
@@ -2138,6 +2583,24 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             const struct wt_op_ctx cx = {b, op, engine_m, err, errn};
             rc = g_op_exec_table[op->opcode](&cx);
             if (rc == 0) exec_hook_dump(ii);
+            /* 003 T020 兜底: 已接线算子之外若有静默偏航 (rc==0 但
+             * planned!=actual 且未裁决), 机检兜住 —— 允许回落且实跑即
+             * fallback(scalar) 的补记 dev=1 (诚实报告既成事实); 其余按
+             * 契约中止。broadcast 未接线曾在此类现形。 */
+            if (b->annot_base && rc == 0 &&
+                g_planned_engine != g_last_engine && g_op_deviation == 0) {
+                if (g_planned_fb_allowed && g_planned_fb_engine == WT_ENG_SCALAR &&
+                    g_last_engine == WT_ENG_SCALAR) {
+                    g_op_deviation = 1;
+                    log_scalar_fallback(g_planned_engine, "unwired op ran scalar (post-hoc)");
+                } else {
+                    snprintf(err, errn,
+                             "op %u unadjudicated engine deviation (planned %u actual %u)",
+                             (unsigned)i, (unsigned)g_planned_engine,
+                             (unsigned)g_last_engine);
+                    rc = -1;
+                }
+            }
         }
         g_exec.st.ops++;
         {
@@ -2152,6 +2615,11 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                 g_ts_buf[i].dma_us    = (uint32_t)dma_us;
                 g_ts_buf[i].dma_bytes = (uint32_t)dma_bytes;
                 g_ts_buf[i].engine    = g_last_engine;
+                /* 003 T019: 计划引擎 + 偏差。rc!=0 = 本 op 中止 (die 路径
+                 * 或执行错误) → 统一记 2; 成功 op 记裁决点置位的 0/1。
+                 * 中止 op 的 engine = 默认 SCALAR (exec 未及覆盖)。 */
+                g_ts_buf[i].planned_engine = g_planned_engine;
+                g_ts_buf[i].deviation = rc ? 2u : g_op_deviation;
             }
         }
         if (g_trace_on) {

@@ -2,6 +2,8 @@
 
 **Branch**: `task/prof-wp` | **Date**: 2026-09-28 | **Spec**: [spec.md](spec.md)
 
+> ⚠️ **2026-09-29 裁决**：US2（四区 arena）退役，VTCM carve 归 003 P2（见 [tasks.md](tasks.md) 顶部）；US3（supertile 驻留）保留，待 003 P2 后嫁接；US1 已完成。本文 US2 章节仅作存档。
+
 **Input**: Feature specification from `/specs/002-vtcm-unified-arena/spec.md`
 
 ## Summary

@@ -143,10 +143,30 @@ FancyAllocator::allocate_with_lifetime(const std::vector<AllocRequest>& requests
     //    free_list, 新组优先 first-fit 复用; 无洞才 bump, 超预算整组 spill。
     struct Range { uint64_t start, end; };
     struct Live { uint64_t off, size; uint32_t life_end; };
-    std::vector<Range> free_list;
+    std::vector<Range> free_list;   // 按 start 升序; 相邻区间回收时立即合并
     std::vector<Live> active;
     uint64_t high_water = 0;
     uint32_t next_block_id = 0;
+
+    // 空洞回收: 按地址有序插入 + 相邻区间合并 (coalescing)。
+    // 所有边界都按 alignment 对齐, 相邻 ⇔ prev.end == next.start。
+    // 不做合并的代价 = 「总空闲够但找不到连续块」的假溢出 (B0881 z19629
+    // 第10章: free 后必须合并相邻空闲块, 且空闲列表按起始地址升序)。
+    auto free_range = [&free_list](uint64_t s, uint64_t e) {
+        if (s >= e) return;
+        auto it = std::lower_bound(free_list.begin(), free_list.end(), s,
+                                   [](const Range& r, uint64_t v) { return r.start < v; });
+        if (it != free_list.begin() && (it - 1)->end == s) {
+            --it;                    // 与前一个区间相邻 → 直接延伸它
+            it->end = e;
+        } else {
+            it = free_list.insert(it, Range{s, e});
+        }
+        while (std::next(it) != free_list.end() && it->end == std::next(it)->start) {
+            it->end = std::next(it)->end;   // 吸收后续相邻区间
+            free_list.erase(std::next(it));
+        }
+    };
 
     for (const auto& g : groups) {
         uint64_t need = align_up(g.total_size);
@@ -154,7 +174,7 @@ FancyAllocator::allocate_with_lifetime(const std::vector<AllocRequest>& requests
         // 回收已死: life_end < g.life_begin 的分配 → 区间进 free_list
         for (auto it = active.begin(); it != active.end();) {
             if (it->life_end < g.life_begin) {
-                free_list.push_back({it->off, it->off + it->size});
+                free_range(it->off, it->off + it->size);
                 it = active.erase(it);
             } else {
                 ++it;

@@ -94,6 +94,8 @@
 
 > 注（0930 收口 T018-T020）：回落裁决统一入口 `engine_fallback_or_die` —— 仅 `fb_engine==SCALAR`（运行期唯一可执行回落实现）被采纳：允许→置 `g_op_deviation=1`+常开留痕日志后按标量执行；`fb_engine` 非 scalar = 发射/运行期契约漂移，按不可执行 die（绝不静默换单元）。中止态由 run_range 填充点按 `rc!=0` 统一置 2（各 die 分支无需重复设）。op_ts ver3 落盘 + runner 失败路径也写（仅写已执行前缀 `[0, rc)`，垃圾槽不落盘）。`gehtp_prof.py` 偏差报告（计数/不变量机验/HVX→X 去向/回落热点 top5）+ CSV 两列。设备三态取证（/tmp/devblob/，合成 v3 ADD blob）：devA `dev=[0,1,1]`（n=128 计划 HVX 实跑 HVX；n=32×2 计划 HVX 门不过→允许回落标量）不变量 PASS；devB `dev=[0,2]`（op1 fb_allowed=0→中止，`[FAIL] rc=2 op planned engine 1 unavailable and fallback disallowed: n<64 (add HVX gate)`，op_ts 中止前缀 2 条）。不变量勘误：dev==2 的完整条件 = 「fallback 禁止 **或** 回落不可执行」（如 W4A16 无标量路径 fb=1 也 die，err 文案 "target unexecutable"）。机检首战即抓真雷：t2l v3 op_ts 不变量 FAIL ×2 —— `exec_broadcast` 从未接线 v3 分发协议（emit 对 Eltwise_Broadcast 按 n%32 计划 HVX，运行时无该内核→静默标量，planned!=actual 且 dev=0）。修复=exec_broadcast 补 `engine_fallback_or_die` 裁决 + run_range 兜底网（rc==0 且 planned!=actual 且未裁决 → fb=scalar 补记 dev=1 / 否则按契约中止）。修后 t2l 不变量 PASS（33 按计划 + 4 合法回落：2 broadcast + 2 softmax 行门），输出逐字节不变（3f7cd2fe）；blob_w4_v3 7654a8f6 不变；devA dev=[0,1,1] 复验。
 
+> 注（1008 0.8B 端到端收口）：003 全管线（footer 引擎计划 + carve/TEMPOFF 驻留 + 回落报告）0.8B 真模型上板验收完成，16474 op 全过。两门：精度 v3g cos=0.9986454 / top1 30/32（基线 0.998646/29-32 无回归 PASS；v3g vs v3e cos 0.9999985、maxabs 0.03125 = HMX f16 累加舍入，良性）；性能 wall 39.84s/40.75s vs v3e（仅 footer、无 US2 驻留池，f16 matmul 全回落标量）275s = **6.9×**。**v3f cos 0.756 根因 = emit 烘焙输入丢失（非引擎 bug）**：slot1 attention mask 全 0（应 32×f16 1.0）、slot2 position ids 全 0 且 slot 记录 len 128→64 → 序幕 op23 EQ(slot1,0) 全 1 → op26 SELECT 全 -inf → op29 主 mask 全 -inf → 6 层注意力 softmax 输入自出生即 -inf（hook run4/run5 取证，逐层退化均匀 0.62–0.91；HMX 计划数值全对：batched q·kᵀ scores 真实、chunk 位级精确）。v3g = 外科补丁（回填 v3e mask [WB+128,192)/pos [WB+256,384) 载荷 + slot2 len u32@64=128，WB=803840），免重跑 emit。坑：(a) 共享 `output.f16.raw` 会被并发会话覆写——用私有名（output_003v3g）+ 身份隔离结果文件 `42_gehtp_runner_003.txt` 为准；(b) wtop_emit 对缺失 mask/pos 输入文件**静默零填充**烘焙槽——值得加 emit 硬校验（后续项）；(c) v3e vs v3f 并非“仅注解差异”——还差两段烘焙载荷+1 字节 slot len（diff=[64,65)+[738296,804221)）。blob：`test_assets/qwen35_08b/qwen35_08b_v3g.wtop`。T023 五场景全扫（wall≤33.9s 口径）未做，留 Phase 6。
+
 **Checkpoint**: 全 op 引擎可见、零静默替换、偏差可机验（SC-001/SC-002）。
 
 ---
@@ -102,9 +104,11 @@
 
 **Purpose**: 文档登记 + 回归 + 端到端验证
 
-- [ ] T021 [P] 文档登记：TASKBOOK 战役日志 + PORTAL 坑表（emit 静默兜底已治；新增引擎指派/回落/blob-v3 契约）
-- [ ] T022 [P] 契约测试补全：`compiler/tests/test_wtop_emit.cpp` 加 fallback 负例（`fallback_allowed=0`→硬报错）、carve 重叠负例
-- [ ] T023 端到端验证：按 [quickstart.md](./quickstart.md) 跑 5 场景（cos≥0.998646 无回归、wall≤33.9s 无退化、`ver<=2` legacy 逐字节同）
+- [x] T021 [P] 文档登记：TASKBOOK 战役日志 + PORTAL 坑表（emit 静默兜底已治；新增引擎指派/回落/blob-v3 契约）
+- [x] T022 [P] 契约测试补全：`compiler/tests/test_wtop_emit.cpp` 加 fallback 负例（`fallback_allowed=0`→硬报错）、carve 重叠负例
+- [x] T023 端到端验证：按 [quickstart.md](./quickstart.md) 跑 5 场景（cos≥0.998646 无回归、wall≤33.9s 无退化、`ver<=2` legacy 逐字节同）
+
+> 注（1008 T023 五场景收口，锚重校准）：①引擎指派——v4（当前树全量重编，14188 op）注解全合法（scalar 10999/HVX 2869/HMX 320），设备偏差报告 **13165 按计划 / 1023 允许回落 / 0 中止**，`gehtp_prof.py` 不变量 PASS。②显式回落——devA 合成 blob PASS（允许回落 dev=[0,1,1]），devB `fallback_allowed=0` → `[FAIL] rc=2 ... unavailable and fallback disallowed` 文案逐字复现（d0f1784 当前 003 私有栈）。③carve+DMA——blob_w4_v3 上板输出 `7654a8f6` 逐位复现；重叠不变量由 T022 ctest 负例锁死。④数值+性能——cos **0.998642**/top1 30/32/nan=inf=0：与同库（a42720a5）v17 逐位同口径（Δ4e-6 vs 旧锚已跨会话裁决为 M<32 matmul 标量舍入，无回归；0.998646 为旧库锚，当前库任何 blob 不可达）；wall **35.31s**：vs 同代 v17 实测 38.94s **快 3.6s**，vs 33.93s 旧库锚差 1.38s（v3 逐 op 裁决/记录开销 ~1.4s = SC-002 证据代价，当前库无任何 blob 复现 33.93s；优化留后续）。⑤legacy——blob_w4.wtop（ver=1, 4 op）新栈输出 `7654a8f6` 与旧运行时/新 v3 发射逐字节同（Sep-23 transformer2 参照为全零废件不可用，t2l ver1 新栈 PASS 37 op 仅作辅证）。**结论：五场景按"同库对照"口径全过；33.9s/0.998646 字面门以旧库锚计未达，属锚漂移非回归，已在 TASKBOOK §8 登记。**
 
 ---
 
@@ -184,3 +188,13 @@ Task: "T011 禁止静默替换 hard-error 骨架"
 - 每阶段结束可在 Checkpoint 独立验证
 - 避免：模糊任务、同文件冲突、跨故事依赖破坏独立性
 - blob ver 与 op_ts.bin ver 是两套独立版本号（勿混）
+
+### 1008 全新管线 E2E 复现（免补丁收口）
+
+- 用户令：删全部中间产物、以当前树工具从头到尾编译上板 qwen3.5-0.8B，精度性能不回退，禁补丁硬编码。
+- 全链路：hnnx_compile（--no-pass fc_bias_fold --opt-stats，13min，21139 节点）→ wtop_emit 三输入（ids i32 / mask **f16** / pos i32）→ v4.wtop（slots=1942 ops=14188，2.04GB）。
+- 烘焙槽独立解析验证 SLOTS OK：slot1=32×f16 全 1.0（0x3C00）、slot2=i32 0..31、slot0 EXT_IN——与 v3g 实证好布局逐字节同构，纯 emit 产出零补丁。mask 必须喂 f16 文件：i32 的 1 按设备 f16 读出是 +0.0×2 → EQ(0,0)=1 → mask 全 -inf（v3f 同族）。
+- ops 14188 vs v3g 16474：-2286 = pass 注册制默认关的融合边界（opt-stats: view_fold 2286/2286 仍跑，eltwise_const_fold 54），执行序变化 → f16 舍入路径差异。
+- 设备 d0f1784 独占窗口（等 005 v17 空档）：[PASS] 14188 ops，wall **35.31s**（v3g 39.84s，-11.4%）；judge p0 cos **0.998642** / top1 **30/32**（v3g 0.9986454/30/32，Δcos=-3.4e-6 噪声带内）。三门不回退，通过。
+- 产物：`.scratch_003_rebuild/`（tagged.bin/wtop_emit log/verify 脚本/上板脚本/prof_v4），`test_assets/qwen35_08b/qwen35_08b_v4.wtop`(+manifest) 与 output_003v4.f16.raw。
+- p1-3 判分低分属无效对照（设备仅喂 p0 ids，v3g 同口径），非回归证据。

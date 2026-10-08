@@ -223,6 +223,19 @@
 
 ## 8. 战役日志（追加区，新进展置顶）
 
+### 2026-10-08 003 线 — blob-v3 契约收口(引擎指派/显式回落/carve+TEMPOFF) + 0.8B 全新管线无补丁复现
+
+**blob ver=3 契约落定** (`oplist_parse.h` / `wtop_emit.cpp`):
+- 24B slot 记录恒定; 引擎注解 footer = n_ops×u32 (`engine` bit0-1 ∈{0,1,2} | `fb_allowed` bit2 | `fb_engine` bit3-4); 可选 VTCM carve footer `[magic 0x43524156][count][count×20B {op_index, vtcm_offset, size, residency_start, residency_end}]`, 生命期窗口按发射边界解析。
+- emit 组装段三重不变量**硬错误**: ①carve 生命期重叠⇒空间必不交 ("carve alias" 退出) ②footprint>vtcm_cap 退出 ③carve/TEMPOFF 双源 VTCM 布局集合不一致退出。ctest 负例锁定: `test_wtop_emit.cpp` §10 conv 图预算化后腐蚀 TAG_MEM_PLAN 全 entries 同偏移→wtop_emit 退出≠0 且错误指向 carve 不变量。
+- 运行期回落裁决统一入口 `engine_fallback_or_die`: fb_engine=scalar 且允许→dev=1 留痕按标量执行; fb 非 scalar 或禁回落=die (dev=2), 绝不静默换单元; op_ts ver3 三态落盘, `gehtp_prof.py` 不变量机验。
+
+**0.8B v4 全新管线验收** (当前树 hnnx_compile `--no-pass fc_bias_fold` + wtop_emit 三输入, 无补丁无硬编码, d0f1784):
+- 14188 op 注解全合法 (scalar 10999 / HVX 2869 / HMX 320; fb 恒允许→scalar — 数值敏感禁回落留 US3 细化)。
+- 设备偏差报告: **13165 按计划 / 1023 允许回落 / 0 中止**, 不变量 PASS (回落全为 broadcast HVX→scalar, 该 op 无 HVX 内核, 留痕非静默)。
+- 精度 cos 0.998642 / top1 30/32 = **同库 (a42720a5) v17 口径逐位一致** (Δ4e-6 已由 004 裁决为 175 个 M<32 matmul 标量舍入, 无回归); wall 35.31s — 同代 v17 实测 38.94s 快 3.6s; 33.93s 为 09-28 旧库锚, 当前库任何 blob 未复现 (v3 逐 op 裁决/记录开销 ~1.4s 为 SC-002 证据的代价, 优化留后续)。
+- **坑 (PORTAL 已登记)**: 烘焙 mask 必须走 **f16 槽面文件** (`mask_ones.f16.raw`) — 图输入节点 loader 口径全 Float32, `.i32.raw` 后缀强保 i32 原文→设备 f16 视图把 i32 1 读成两个 +0.0→`EQ(0,0)=1`→mask 全 -inf (v3f 同症状异根因); pos (i32 arange) 则必须 `.i32.raw`, 否则被 f32→f16 当 denormal 洗成 0。
+
 ### 2026-09-28 C1 线 (eqfix 会话) — 0.8B 设备语义偏差收敛: Gather axis 空 op_data + SELECT 三输入广播缺双根因, logits cos 0.15→0.988
 
 **动机**: 接上条 — v3 修复全 -inf 后设备 logits cos 仅 0.14~0.22 (top1 近乎全错), 语义级偏差二分。

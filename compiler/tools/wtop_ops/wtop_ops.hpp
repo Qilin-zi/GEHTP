@@ -93,6 +93,24 @@ struct Emitter {
     std::vector<uint8_t> weight_area;   // 128B 对齐起点相对 blob 尾部
     std::vector<wt_slot> slots;
     std::vector<wt_op> ops;
+    std::vector<uint32_t> op_annot;     // 每 op 一条引擎注解 (v3 footer, 平行于 ops)
+    struct CarveEntry {
+        uint32_t op_index;
+        uint32_t vtcm_offset;
+        uint32_t size_bytes;
+        uint32_t residency_start;
+        uint32_t residency_end;
+    };
+    struct PendingCarve {
+        uint32_t op_index;
+        uint32_t producer_pos;
+        uint32_t lifetime_end_pos;
+        uint32_t vtcm_offset;
+        uint32_t size_bytes;
+    };
+    std::vector<PendingCarve> pending_carves; // graph-order lifetimes, resolved after emit
+    std::vector<CarveEntry> carve_entries; // v3 optional VTCM carve footer
+    uint32_t cur_engine = 0;            // add_op 时写入 op_annot 的打包注解 u32
     std::map<uint64_t, uint32_t> op_temp;  // (op_id<<32 | out_idx) → temp id
     std::map<uint64_t, uint32_t> i32_slots;  // int32 索引 const 独立缓存(键 op_id)
                                              // 与 wslots(权重槽)分离: 同一 const 节点
@@ -114,6 +132,45 @@ struct Emitter {
     // 阶段二: 溢出张量 → SPILL/FILL 插桩
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> ddr_spill_map;  // op_id → {溢出区偏移, size}
     uint32_t spill_pool_slot = 0;
+
+    /* 003 T015: DDR→VTCM 预置 staging。W4A16 act 源在 DDR (计算 temp / EXT_IN
+     * 注入) 而运行期 exec_matmul 只认裸 slot / 0x4000|temp 两种形态 → 编译期
+     * 在 VTCM 池内 planner 驻留区之上 bump 一块 2048 对齐 staging 区, 发
+     * OP_DMA 预置 + matmul act 引用 0x4000|stg。TEMPOFF/ carve 双登记复用
+     * 既有表结构 (ddr_temp_tab/ddr_temp_vtcm + pending_stages→carve_entries)。 */
+    bool dma_runlist = false;
+    struct StageRec {
+        uint32_t op_index;   /* 预置 DMA op 的发射下标 (carve 记录锚点+窗口起点) */
+        uint32_t end_pos;    /* 消费 op 的图序位+1 (主循环回填, 合并时映射边界) */
+        uint32_t vtcm_offset;
+        uint32_t size_bytes;
+    };
+    std::vector<StageRec> pending_stages;
+    size_t stage_mark = 0;                 /* 主循环已回填 end_pos 的水位 */
+    uint32_t vtcm_stage_top = 0xFFFFFFFFu; /* 惰性: staging 起点 (planner 驻留区上沿对齐 2048) */
+    // 池内 bump 一块 staging 区, 登记为静态 VTCM temp, 返回 temp id (失败 -1:
+    // 无 mem plan / 无 VTCM 池 / 池放不下 / temp id 耗尽)。基线取 ddr_op_map
+    // 全量计划态上沿 (非物化态: 首个 W4A16 到达时高偏移驻留 temp 可能尚未物化)。
+    int alloc_vtcm_stage(uint32_t bytes, uint32_t* off_out) {
+        if (!ddr_static || ddr_vtcm_cap == 0) return -1;
+        if (next_temp > 32768u) return -1;
+        if (vtcm_stage_top == 0xFFFFFFFFu) {
+            uint64_t mx = 0;
+            for (const auto& [oid, offsz] : ddr_op_map) {
+                auto vit = ddr_op_vtcm.find(oid);
+                if (vit != ddr_op_vtcm.end() && vit->second)
+                    mx = std::max<uint64_t>(mx, (uint64_t)offsz.first + offsz.second);
+            }
+            vtcm_stage_top = (uint32_t)((mx + 2047u) & ~2047u);
+        }
+        if ((uint64_t)vtcm_stage_top + bytes > ddr_vtcm_cap) return -1;
+        uint32_t t = next_temp++;
+        ddr_temp_tab[t] = {vtcm_stage_top, bytes};
+        ddr_temp_vtcm[t] = true;
+        *off_out = vtcm_stage_top;
+        vtcm_stage_top += (bytes + 2047u) & ~2047u;
+        return (int)t;
+    }
 
     static uint64_t tkey(uint64_t op_id, uint32_t out_idx) {
         return (op_id << 32) | out_idx;
@@ -139,9 +196,42 @@ struct Emitter {
         dbg_released++;
     }
     uint32_t fresh_temp(GraphPrepare& gp, uint64_t op_id, uint32_t out_idx = 0) {
+        const OpDef* od = gp.get_op_at(op_id);
+        uint64_t elems = 1;
+        for (uint32_t i = 0; od && i < od->output_def.rank && i < 5; ++i)
+            elems *= (uint64_t)od->output_def.dims[i];
+        if (elems == 0) elems = 1;
+        uint64_t es = od && od->output_def.element_size ? od->output_def.element_size : 4;
+        uint64_t need = elems * es;
+        /* 静态模式 temp id 回收规则: TEMPOFF/carve 按 temp id 一对一定址,
+         * 已静态登记(ddr_temp_tab)的 id 只能复用给"计划区完全一致 + 同域
+         * (VTCM/DDR) + 放得下"的后继张量 —— 否则两个同时存活张量叠同一段
+         * 静态区 = 编译期踩踏 (t2l 实锤: temp1 gid14 区 [512,1024) 回收给
+         * gid18, 与 gid10 同区, 生命期 [43,49)∩[44,46) 重叠)。
+         * 非静态 id 任意复用; 无可回收 id 时发新号(0.8B 16k op 靠同区
+         * 复用把 id 压回并发水位, 不能一刀切禁回收)。 */
+        auto recyclable = [&](uint32_t c) {
+            if (!ddr_static || !ddr_temp_tab.count(c)) return true;
+            auto dit0 = ddr_op_map.find(op_id);
+            if (out_idx != 0 || dit0 == ddr_op_map.end()) return false;
+            if (!(dit0->second == ddr_temp_tab.at(c))) return false;
+            if (dit0->second.second < need) return false;
+            bool cv = ddr_temp_vtcm.count(c) && ddr_temp_vtcm.at(c);
+            bool ov = ddr_op_vtcm.count(op_id) && ddr_op_vtcm.at(op_id);
+            return cv == ov;
+        };
         uint32_t t;
-        if (!free_temps.empty()) { t = free_temps.back(); free_temps.pop_back(); }
-        else { t = next_temp++; }
+        size_t pick = free_temps.size();
+        for (size_t k = free_temps.size(); k-- > 0;) {
+            if (recyclable(free_temps[k])) { pick = k; break; }
+        }
+        if (pick < free_temps.size()) {
+            t = free_temps[pick];
+            free_temps[pick] = free_temps.back();
+            free_temps.pop_back();
+        } else {
+            t = next_temp++;
+        }
         op_temp[tkey(op_id, out_idx)] = t;
         if (ddr_static) {
             /* 静态模式: 表内(op_id 命中且 out_idx==0)登记编译期偏移;
@@ -150,13 +240,6 @@ struct Emitter {
              * off+bytes > cap → NULL → ref fail; probe op_id=146 实锤:
              * output_def 4096B 但广播物化后输出 8192 元素 = 16384B) */
             auto dit = ddr_op_map.find(op_id);
-            const OpDef* od = gp.get_op_at(op_id);
-            uint64_t elems = 1;
-            for (uint32_t i = 0; od && i < od->output_def.rank && i < 5; ++i)
-                elems *= (uint64_t)od->output_def.dims[i];
-            if (elems == 0) elems = 1;
-            uint64_t es = od && od->output_def.element_size ? od->output_def.element_size : 4;
-            uint64_t need = elems * es;
             if (dit != ddr_op_map.end() && out_idx == 0 &&
                 ddr_temp_tab.find(t) == ddr_temp_tab.end() &&
                 dit->second.second >= need) {
@@ -451,6 +534,7 @@ struct Emitter {
         uint32_t i = 0;
         for (uint32_t a : args) o.args[i++] = a;
         ops.push_back(o);
+        op_annot.push_back(cur_engine);
     }
     void add_op(uint16_t opcode, const std::vector<uint32_t>& args) {
         emitted_ids.push_back(cur_op);
@@ -460,8 +544,92 @@ struct Emitter {
         uint32_t i = 0;
         for (uint32_t a : args) o.args[i++] = a;
         ops.push_back(o);
+        op_annot.push_back(cur_engine);
     }
 };
+
+/* T003 成本模型 (R4): 编译期给 op 指派计算单元 + 回落策略, 打包 v3 注解 u32。
+ * OpDef 不携带 store type (RESOURCE_HVX/HMX 在 mid-level IR Op 上, 序列化时
+ * 被丢弃), 故从 serialized_extra (matmul 的 M/K/N) + output_def (elemwise
+ * 形状) 重推, 口径镜像运行期 exec_matmul_f16 / exec_unary 的 gate:
+ *   matmul 家族: 非 batched 且 M/K/N 全 %32 且 need_mm ≤ 16MB → HMX; 否则 scalar
+ *   conv: HMX (exec_conv2d_hmx tile 几何)
+ *   elemwise 家族: 输出元素数 %32 → HVX; 否则 scalar
+ *   其余/控制/内存 op: scalar (无加速单元)
+ * 回落: 恒允许 (fallback_allowed=1) 回落 scalar (数值敏感禁止回落由 US3 细化)。
+ */
+inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
+    uint32_t engine = 0u;          /* WT_ENG_SCALAR */
+    uint32_t fb_allowed = 1u, fb_engine = 0u;
+    /* 决策留痕: GEHTP_DEBUG_ENGINE=1 时逐 op 打印引擎+原因 —— 运行期"为什么
+     * 全标量"的定位入口(例: t2l matmul M=8 不 32 对齐→scalar, 一行即判)。 */
+    char why[160];
+    auto need_mm = [](uint32_t m, uint32_t k, uint32_t n) -> size_t {
+        size_t a = (size_t)m * k * 2u, w = (size_t)n * k * 2u, o = (size_t)m * n * 2u;
+        size_t off_w = (a + 2047u) & ~(size_t)2047u;
+        size_t off_o = (off_w + w + 2047u) & ~(size_t)2047u;
+        return ((off_o + o + 2047u) & ~(size_t)2047u) + 2048u;
+    };
+    const size_t kVTCM = 16u * 1024u * 1024u;
+    if (nm == "MatMul" || nm == "FullyConnected") {
+        uint32_t m = 0, k = 0, n = 0;
+        bool has_bias = false;
+        if (nm == "FullyConnected") {
+            ExtraFc ef{};
+            if (od->serialized_extra.size() >= sizeof(ef))
+                std::memcpy(&ef, od->serialized_extra.data(), sizeof(ef));
+            m = ef.m; k = ef.k; n = ef.n; has_bias = ef.has_bias != 0;
+        } else {
+            ExtraMatMul em{};
+            if (!od->serialized_extra.empty()) {   /* min-size: 旧 bin 24B 无 has_bias */
+                size_t c = std::min(od->serialized_extra.size(), sizeof(em));
+                std::memcpy(&em, od->serialized_extra.data(), c);
+            }
+            m = em.m; k = em.k; n = em.n; has_bias = em.has_bias != 0;
+        }
+        if (has_bias)
+            snprintf(why, sizeof why, "has_bias (HMX bias path unverified)");
+        else if ((m % 32u) || (k % 32u) || (n % 32u))
+            snprintf(why, sizeof why, "shape %ux%ux%u not 32-aligned", m, k, n);
+        else if (need_mm(m, k, n) > kVTCM)
+            snprintf(why, sizeof why, "scratch need %llu > VTCM %llu (m%u k%u n%u)",
+                     (unsigned long long)need_mm(m, k, n),
+                     (unsigned long long)kVTCM, m, k, n);
+        else {
+            engine = 2u;           /* WT_ENG_HMX; batched runtime loops per batch */
+            snprintf(why, sizeof why, "m%u k%u n%u 32-aligned, need %llu <= 16MB",
+                     m, k, n, (unsigned long long)need_mm(m, k, n));
+        }
+    } else if (nm == "Conv2d") {
+        engine = 2u;               /* WT_ENG_HMX */
+        snprintf(why, sizeof why, "conv has HMX path");
+    } else if (nm == "Add" || nm == "Eltwise_Binary" || nm == "Eltwise_Unary" ||
+               nm == "ElementWiseNeuron" || nm == "Softmax") {
+        /* 003 精度修正: 仅这些 op 名有默认开启的 HVX 内核。其余 elemwise/内存 op
+         * (Transpose/Gather/Concat/Reshape/Split/Reduce/Pad/StridedSlice/Ternary)
+         * 无 HVX 内核, RmsNorm 的 HVX 内核默认关(精度 0.5× 偏差未修) —— 一律 scalar,
+         * 勿虚报 HVX 致运行期回落/静默替换 (FR-004/FR-008)。 */
+        uint64_t n = 1;
+        for (uint32_t i = 0; i < od->output_def.rank && i < 5; ++i)
+            n *= (uint64_t)od->output_def.dims[i];
+        if ((n % 32u) == 0u) {
+            engine = 1u;           /* WT_ENG_HVX */
+            snprintf(why, sizeof why, "n=%llu 32-aligned", (unsigned long long)n);
+        } else {
+            engine = 0u;           /* WT_ENG_SCALAR */
+            snprintf(why, sizeof why, "n=%llu not 32-aligned", (unsigned long long)n);
+        }
+    } else {
+        snprintf(why, sizeof why, "no fast kernel for '%s'", nm.c_str());
+    }
+    if (getenv("GEHTP_DEBUG_ENGINE")) {
+        static const char* eng_name[] = {"SCALAR", "HVX", "HMX"};
+        std::fprintf(stderr, "[engine] op %llu %-18s -> %-6s (%s)\n",
+                     (unsigned long long)od->op_id, nm.c_str(),
+                     eng_name[engine & 3u], why);
+    }
+    return wt_annot_pack(engine, fb_allowed, fb_engine);
+}
 
 /* 跨 handler 共享的 emit() 函数域状态(重构前 Conv2d 分支隐式捕获):
  * H/W/C = 图输入 NCHW 几何; w_slot/b_slot = 首个 Conv2d 的权重/偏置槽

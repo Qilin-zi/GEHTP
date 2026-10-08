@@ -309,6 +309,100 @@ static void test_overlap_no_share() {
               << ", saved: " << alloc.vtcm_saved_by_reuse() << "\n";
 }
 
+// ---------------------------------------------------------------------------
+// Test 10: Free-list coalescing — two adjacent freed holes merge, letting a
+//   big group fit that fits in neither alone.
+//   A[0,1]512, B[1,2]512, C[2,2]512, D[3,3]1024.
+//   Without coalescing: D can't fit in either 512 hole → bump @1024 (used=2048).
+//   With coalescing: [0,512)+[512,1024) → [0,1024) → D@0 (used=1024).
+// ---------------------------------------------------------------------------
+static void test_freelist_coalescing() {
+    std::cout << "\n[Test 10] Free-list coalescing (adjacent holes merge)\n";
+    std::vector<FancyAllocator::AllocRequest> reqs = {
+        {1, 512,  0, 1},  // A
+        {2, 512,  1, 2},  // B
+        {3, 512,  2, 2},  // C
+        {4, 1024, 3, 3},  // D: needs the merged hole
+    };
+    FancyAllocator alloc;
+    auto results = alloc.allocate_with_lifetime(reqs, 1 << 20);
+
+    check(results[1].offset == 0,    "A at offset 0");
+    check(results[2].offset == 512,  "B at offset 512 (A alive at lb=1)");
+    check(results[3].offset == 0,    "C at offset 0 (reuses A)");
+    check(results[4].offset == 0,    "D at offset 0 (merged [0,512)+[512,1024))");
+    check(alloc.total_vtcm_used() == 1024, "used = 1024 (no false-overflow bump)");
+    check(alloc.vtcm_saved_by_reuse() == 1536, "saved = 1536");
+
+    std::cout << "  VTCM used: " << alloc.total_vtcm_used()
+              << ", saved: " << alloc.vtcm_saved_by_reuse() << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: Carve remainder persists while its donor is still alive, then
+//   merges with a later free.
+//   A[0,2]1024 (long-lived), B[1,1]512, C[2,3]256, D[3,4]256, E[4,4]512.
+//   C@1024 carves B's hole (A alive → no merge); remainder [1280,1536)
+//   survives; D@0 carves freed A; E@256 merges D-remainder [256,1024)
+//   with freed C [1024,1280) and leftover [1280,1536) → [256,1536).
+// ---------------------------------------------------------------------------
+static void test_carve_remainder_and_triple_merge() {
+    std::cout << "\n[Test 11] Carve remainder + merge across live tenant\n";
+    std::vector<FancyAllocator::AllocRequest> reqs = {
+        {1, 1024, 0, 2},  // A: long-lived
+        {2, 512,  1, 1},  // B
+        {3, 256,  2, 3},  // C: carves B's hole while A alive
+        {4, 256,  3, 4},  // D: carves freed A
+        {5, 512,  4, 4},  // E: merges D-remainder + freed C + B-leftover
+    };
+    FancyAllocator alloc;
+    auto results = alloc.allocate_with_lifetime(reqs, 1 << 20);
+
+    check(results[1].offset == 0,    "A at offset 0");
+    check(results[2].offset == 1024, "B at offset 1024 (A alive)");
+    check(results[3].offset == 1024, "C at offset 1024 (carves B; A alive → no merge)");
+    check(results[4].offset == 0,    "D at offset 0 (carves freed A)");
+    check(results[5].offset == 256,  "E at offset 256 (merged [256,1024)+[1024,1536))");
+    check(alloc.total_vtcm_used() == 1536, "used = 1536");
+    check(alloc.vtcm_saved_by_reuse() == 1024, "saved = 1024");
+
+    std::cout << "  VTCM used: " << alloc.total_vtcm_used()
+              << ", saved: " << alloc.vtcm_saved_by_reuse() << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: Address-ordered first-fit — when several holes fit, the LOWEST
+//   address wins regardless of reclaim/insertion order.
+//   A[0,2]128, B[1,1]128, C[2,9]128, D[3,3]128, E[4,4]384, F[5,5]128, G[6,6]128.
+//   At G: holes are [256,640) (E's, reclaimed first) and [0,128) (F's,
+//   reclaimed second), separated by live C@128. Both fit 128; sorted
+//   first-fit must pick [0,128), not the first-inserted [256,640).
+// ---------------------------------------------------------------------------
+static void test_first_fit_lowest_address() {
+    std::cout << "\n[Test 12] First-fit picks lowest-address hole\n";
+    std::vector<FancyAllocator::AllocRequest> reqs = {
+        {1, 128, 0, 2},  // A
+        {2, 128, 1, 1},  // B
+        {3, 128, 2, 9},  // C: long-lived tenant between future holes
+        {4, 128, 3, 3},  // D
+        {5, 384, 4, 4},  // E: big, bumps to 256
+        {6, 128, 5, 5},  // F
+        {7, 128, 6, 6},  // G: two non-touching holes fit; must pick lowest
+    };
+    FancyAllocator alloc;
+    auto results = alloc.allocate_with_lifetime(reqs, 1 << 20);
+
+    check(results[3].offset == 128, "C at offset 128 (reuses B)");
+    check(results[4].offset == 0,   "D at offset 0 (reuses A)");
+    check(results[5].offset == 256, "E at offset 256 (bump past live C)");
+    check(results[6].offset == 0,   "F at offset 0 (reuses D)");
+    check(results[7].offset == 0,   "G at offset 0 (lowest hole, not first-inserted)");
+    check(alloc.total_vtcm_used() == 640, "used = 640");
+
+    std::cout << "  VTCM used: " << alloc.total_vtcm_used()
+              << ", saved: " << alloc.vtcm_saved_by_reuse() << "\n";
+}
+
 int main() {
     std::cout << "=== VTCM Lifetime-Aware First-Fit Reuse Test ===\n";
 
@@ -321,6 +415,9 @@ int main() {
     test_alignment();
     test_maximal_reuse();
     test_overlap_no_share();
+    test_freelist_coalescing();
+    test_carve_remainder_and_triple_merge();
+    test_first_fit_lowest_address();
 
     std::cout << "\n=== " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

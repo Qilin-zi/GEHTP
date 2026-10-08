@@ -114,6 +114,8 @@ gehtp run m.wtop --input x0_new.f16.raw --output out.f16.raw   # x1 用编译时
 | 拉到陈旧输出 | 不可能（run 前自动 rm）；若见即 bug |
 | **设备输出全 -inf / 全同值** | **先查烘焙**：blob 未给 `--input-f16` 时其余图输入固化全零——mask 全零经 EQ 语义=全掩码全 -inf（EQ 修复前 ADD 兜底反而不点火，2026-09-22 实锤）。再查 emit 静默兜底：unknown operation 曾静默 ADD/直通（已改硬错误）；host 链正常但设备死 = host/emit 语义分叉，逐 op dump 对拍 |
 | **设备输出非 inf 但 cos 崩 / 部分 op 全 nan** | **tagged.bin 不填 op_data**：deserialize 路径只写 `serialized_extra`，emit 直读 `od->op_data` 恒空 → 标量参数(axis 等)静默默认 0（2026-09-28 Gather axis 实锤）。**三输入 op 广播**：SELECT 等设备侧仅标量广播，部分广播(如 cond [64,64]→16 头)+标量 true 分支 → 只写 1 元素余下读旧 temp 全 nan；emit 必须 OP_BROADCAST_F16 物化到全尺寸（op_eltwise_ternary 同款） |
+| **烘焙输入槽 dtype 陷阱（2026-10-08 003 实锤）** | 三件套 = `ids.i32.raw, mask_ones.f16.raw, pos_arange.i32.raw`，各按消费语义定 dtype：mask 是 f16 槽面（图输入节点 loader 口径全 Float32，`.i32.raw` 强保 i32 → 设备 f16 视图把 i32 1 读成两个 +0.0 → `EQ(0,0)=1` → mask 全 -inf，与 v3f 全零同症状异根因）；pos 是 i32（非 `.i32.raw` 后缀会被 f32→f16 当 denormal 洗成 0，RoPE/GDN 位置全灭）。emit 有 `GEHTP_DEBUG_INPUTS=1` 逐槽探针可核对 |
+| **blob ver=3 契约（003 引擎调度）** | 24B slot + 引擎注解 footer（engine∈{0,1,2}/fb_allowed/fb_engine）+ 可选 carve footer；carve 生命期重叠⇒空间交叠、footprint 超_cap、carve/TEMPOFF 双源不一致 = emit 期**硬错误**（ctest 负例锁定）；运行期 `fb_allowed=0` 且计划引擎不可用 = die（op_ts ver3 dev=2），绝不静默换单元；ver<=2 blob 走 legacy 路径逐字节不变 |
 | 编译器覆盖 | 20 型 opcode 家谱（0.8B 全模型）；新 op 报 `opcode N unhandled` 是编译器缺口不是门户问题 |
 
 ## 6. 已验证矩阵（52f67807 实测）

@@ -134,6 +134,35 @@ static bool write_file(const std::string& path, const void* data, size_t len) {
     return ok;
 }
 
+/* 003 T015: W4A16 图 — W const 槽长 K*N/2 (const_data_size=K*N, f32→f16 折半
+ * 后命中 w4 判定), Input[M,K] → FullyConnected(M,K,N) → Output, act=主输入
+ * (EXT_IN 槽 0) = staging 预置形态。 */
+static void build_matmul_w4(GraphPrepare& gp, uint32_t M, uint32_t K, uint32_t N) {
+    OutputDef w_od{};
+    w_od.rank = 2; w_od.dims[0] = N; w_od.dims[1] = K;
+    w_od.element_size = 1;
+    w_od.dtype = static_cast<uint32_t>(DType::Float32);
+    std::vector<uint8_t> W((size_t)N * K, 0x5A);
+    gp.append_const_node(1, w_od, W.data(), W.size());
+    gp.get_op_at(1)->name_tag = string_tag_t::map_str("W");
+
+    OutputDef in_od{};
+    in_od.rank = 2; in_od.dims[0] = M; in_od.dims[1] = K;
+    in_od.element_size = 2;
+    in_od.dtype = static_cast<uint32_t>(DType::Float16);
+    gp.append_node("Input", 10, nullptr, 0, &in_od, 1, nullptr);
+
+    InputDef mm_in[2] = {{10, 0}, {1, 0}};
+    OutputDef mm_od{};
+    mm_od.rank = 2; mm_od.dims[0] = M; mm_od.dims[1] = N;
+    mm_od.element_size = 2;
+    mm_od.dtype = static_cast<uint32_t>(DType::Float16);
+    gp.append_node("FullyConnected", 20, mm_in, 2, &mm_od, 1, nullptr);
+
+    InputDef oin[1] = {{20, 0}};
+    gp.append_node("Output", 40, oin, 1, nullptr, 0, nullptr);
+}
+
 static bool load_file(const std::string& path, std::vector<uint8_t>& out) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -279,6 +308,27 @@ int main() {
         CHECK(wb->ops[3].args[3] == 32768, "ADD n_elem=32768");
     }
 
+    // 4b. v3 引擎注解 footer 契约 (T006): 发射即 ver=3 + 逐 op 注解
+    {
+        CHECK(wb->ver == WT_BLOB_VER_3, "v3: blob ver == 3");
+        CHECK(wb->annot_base != NULL, "v3: 引擎注解 footer 存在");
+        bool eng_ok = true;
+        for (uint32_t i = 0; i < wb->n_ops; i++) {
+            uint32_t a = wt_rd_u32(wb->annot_base + (size_t)i * 4);
+            if (wt_annot_engine(a) > 2u) eng_ok = false;      /* engine ∈ {0,1,2} */
+            if (wt_annot_fb_engine(a) > 2u) eng_ok = false;
+        }
+        CHECK(eng_ok, "v3: 每 op 注解 engine/fallback_engine ∈ {0,1,2}");
+        /* conv_add 图 5 op = [TG, IM2COL, CONV, ADD, TG]:
+         * TG/ADD 输出 32768 元素 %32 → HVX; IM2COL/CONV 由 Conv2d 指派 HMX。
+         * (注解引擎码 0/1/2 = SCALAR/HVX/HMX, 与 oplist_exec.h wt_engine 一致;
+         *  此处用字面量避免宿主测试引入设备头 oplist_exec.h) */
+        CHECK(wt_annot_engine(wt_rd_u32(wb->annot_base + 2 * 4)) == 2u,
+              "v3: CONV op 指派 HMX");
+        CHECK(wt_annot_engine(wt_rd_u32(wb->annot_base + 3 * 4)) == 1u,
+              "v3: ADD op 指派 HVX");
+    }
+
     // 5. 负例
     {
         std::vector<uint8_t> bad;
@@ -295,7 +345,8 @@ int main() {
             wt_blob* wb2 = new wt_blob{};
             wt_parse(blob.data(), blob.size(), wb2);
             uint32_t n_slots = wb2->n_slots;
-            size_t op0 = 16 + (size_t)n_slots * 16;
+            size_t op0 = 16 + (size_t)n_slots *
+                ((wb2->ver >= WT_BLOB_VER_2) ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE);
             uint16_t wrong = 0;
             std::memcpy(bad.data() + op0 + 2, &wrong, 2);
         }
@@ -411,6 +462,7 @@ int main() {
         std::vector<uint8_t> dma = build_blob(OP_DMA,
             {0x8000u | 0u, WT_REF_VTCM_FLAG | 9u, 128u, 0u, 0u, 1u, 0u /*FC_CPU*/, 2u /*FC_HMX*/});
         CHECK(wt_parse(dma.data(), dma.size(), w3) == WT_OK, "P5: OP_DMA arity 8 wt_parse OK");
+        CHECK(w3->annot_base == NULL, "P5: ver=1 blob 无注解 footer (legacy)");
         CHECK(w3->ops[0].opcode == 33 && w3->ops[0].n_args == 8, "P5: OP_DMA=33 arity=8 契约");
         /* 正例: src/dst 0xC000|引擎面 豁免槽界 */
         std::vector<uint8_t> eng = build_blob(OP_DMA,
@@ -596,6 +648,274 @@ int main() {
                     CHECK(y == yref, msg);
                 }
             }
+        }
+    }
+
+    /* 9. v3 引擎注解 footer round-trip + ver<=2 legacy (T006):
+     * 手组最小 blob (1 slot + 1 NOP op [+ footer]), 断言:
+     *   v3: wt_parse OK, annot_base 非空, engine/fallback 字段解包正确;
+     *   v2/v1: wt_parse OK, annot_base == NULL (legacy 不受影响)。 */
+    {
+        auto build_blob_v = [](uint16_t ver, uint32_t slot_rec,
+                               const std::vector<uint32_t>& annot) {
+            std::vector<uint8_t> b;
+            auto w16 = [&b](uint16_t v) { b.push_back((uint8_t)(v & 0xff)); b.push_back((uint8_t)(v >> 8)); };
+            auto w32 = [&b](uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((uint8_t)(v >> (8 * i))); };
+            b.insert(b.end(), {'W', 'T', 'O', 'P'});
+            w16(ver); w16(WT_ENDIAN_CHK);
+            w32(1); w32(1);                       // 1 slot, 1 op
+            if (slot_rec == WT_SLOT_SIZE_V2)
+                { w32(128); w32(1); w32(0); w32(0); w32(0); w32(0); }  // len,count,off_lo,off_hi,addr,rsv
+            else
+                { w32(128); w32(1); w32(0); w32(0); }                  // len,count,off,addr
+            w16(OP_NOP); w16(0);                  // 1 个 NOP op (arity 0)
+            for (uint32_t a : annot) w32(a);      // footer (仅 v3 有)
+            while (b.size() % 128) b.push_back(0);
+            b.resize(b.size() + 128, 0);          // weight 区
+            return b;
+        };
+        wt_blob* w4 = new wt_blob{};
+        std::vector<uint8_t> v3 = build_blob_v(WT_BLOB_VER_3, WT_SLOT_SIZE_V2,
+                                               {wt_annot_pack(2u, 0u, 0u)});
+        CHECK(wt_parse(v3.data(), v3.size(), w4) == WT_OK, "v3: ver=3 round-trip wt_parse OK");
+        CHECK(w4->ver == WT_BLOB_VER_3 && w4->annot_base != NULL, "v3: annot_base 非空");
+        CHECK(wt_annot_engine(wt_rd_u32(w4->annot_base)) == 2u, "v3: engine=HMX 解包正确");
+        CHECK(wt_annot_fb_allowed(wt_rd_u32(w4->annot_base)) == 0u, "v3: fallback_allowed=0 解包正确");
+        CHECK(wt_annot_fb_engine(wt_rd_u32(w4->annot_base)) == 0u, "v3: fallback_engine=0 解包正确");
+
+        std::vector<uint8_t> v2 = build_blob_v(WT_BLOB_VER_2, WT_SLOT_SIZE_V2, {});
+        CHECK(wt_parse(v2.data(), v2.size(), w4) == WT_OK, "legacy: ver=2 wt_parse OK");
+        CHECK(w4->annot_base == NULL, "legacy: ver=2 无注解 footer");
+
+        std::vector<uint8_t> v1 = build_blob_v(WT_BLOB_VER, WT_SLOT_SIZE, {});
+        CHECK(wt_parse(v1.data(), v1.size(), w4) == WT_OK, "legacy: ver=1 wt_parse OK");
+        CHECK(w4->annot_base == NULL, "legacy: ver=1 无注解 footer");
+
+        auto build_carve_blob = [](uint32_t count, bool truncate_record) {
+            std::vector<uint8_t> b;
+            auto w16 = [&b](uint16_t v) { b.push_back((uint8_t)(v & 0xff)); b.push_back((uint8_t)(v >> 8)); };
+            auto w32 = [&b](uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((uint8_t)(v >> (8 * i))); };
+            b.insert(b.end(), {'W', 'T', 'O', 'P'});
+            w16(WT_BLOB_VER_3); w16(WT_ENDIAN_CHK);
+            w32(1); w32(1);
+            w32(128); w32(1); w32(0); w32(0); w32(0); w32(0);
+            w16(OP_NOP); w16(0);
+            w32(wt_annot_pack(2u, 0u, 0u));
+            w32(WT_CARVE_MAGIC); w32(count);
+            for (uint32_t i = 0; i < count; i++) {
+                w32(7u + i); w32(2048u * i); w32(2048u);
+                w32(3u + i); w32(9u + i);
+            }
+            /* truncate_record: 不做 128B 对齐填充/权重区 —— 截断必须落在
+             * carve 记录内部(填充后 size 仍 ≥ 记录末端, 解析器会继续走到
+             * 权重区并报 WEIGHT_OVERRUN, 测不到 OP_TRUNC)。 */
+            if (truncate_record) {
+                if (!b.empty()) b.pop_back();
+                return b;
+            }
+            while (b.size() % 128) b.push_back(0);
+            b.resize(b.size() + 128, 0);
+            return b;
+        };
+
+        std::vector<uint8_t> with_carve = build_carve_blob(2u, false);
+        CHECK(wt_parse(with_carve.data(), with_carve.size(), w4) == WT_OK,
+              "carve: footer round-trip wt_parse OK");
+        CHECK(w4->n_carve == 2u && w4->carve_base != NULL,
+              "carve: count/base 解析正确");
+        CHECK(wt_rd_u32(w4->carve_base + 0) == 7u &&
+              wt_rd_u32(w4->carve_base + 4) == 0u &&
+              wt_rd_u32(w4->carve_base + 8) == 2048u &&
+              wt_rd_u32(w4->carve_base + 12) == 3u &&
+              wt_rd_u32(w4->carve_base + 16) == 9u,
+              "carve: 五字段及小端布局正确");
+        CHECK(wt_rd_u32(w4->carve_base + WT_CARVE_REC_SIZE) == 8u &&
+              wt_rd_u32(w4->carve_base + WT_CARVE_REC_SIZE + 4) == 2048u,
+              "carve: 多记录步长正确");
+
+        std::vector<uint8_t> empty_carve = build_carve_blob(0u, false);
+        CHECK(wt_parse(empty_carve.data(), empty_carve.size(), w4) == WT_OK,
+              "carve: count=0 footer 解析 OK");
+        CHECK(w4->n_carve == 0u && w4->carve_base != NULL,
+              "carve: count=0 保留 footer 指针");
+
+        std::vector<uint8_t> truncated_carve = build_carve_blob(1u, true);
+        CHECK(wt_parse(truncated_carve.data(), truncated_carve.size(), w4) == WT_ERR_OP_TRUNC,
+              "carve: 截断记录 -> OP_TRUNC");
+
+        std::vector<uint8_t> no_carve = build_blob_v(WT_BLOB_VER_3, WT_SLOT_SIZE_V2,
+                                                      {wt_annot_pack(2u, 0u, 0u)});
+        CHECK(wt_parse(no_carve.data(), no_carve.size(), w4) == WT_OK &&
+              w4->n_carve == 0u && w4->carve_base == NULL,
+              "carve: 无 footer 不误判对齐填充");
+        delete w4;
+    }
+
+    /* 9. 003 T015: W4A16 act 预置 — DDR→VTCM OP_DMA + 引用规范化。
+     * 图带 mem plan (DDR 池 + VTCM 池 → TEMPOFF 槽); --dma-runlist 下:
+     *   ops = [OP_DMA {0x8000|0, 0x4000|stg, M*K*2, 0,0, 1, FF, FF},
+     *          OP_MATMUL_W4A16 {0x4000|stg, w 裸 slot, out, M,K,N}]
+     * TEMPOFF 含 staging 驻留项 (2048 对齐), carve footer 记录覆盖 DMA op。
+     * 无 --dma-runlist: 主输入 act 不可表达 (运行期仅认裸 slot/0x4000|temp)
+     * → emit 硬错误退出。 */
+    {
+        const uint32_t M = 32, K = 64, N = 32;
+        auto emit_w4 = [&](bool runlist) -> int {
+            GraphPrepare g;
+            build_matmul_w4(g, M, K, N);
+            g.set_plan_budgets(64u << 20, 1u << 20);
+            HexagonNNEnv env2;
+            env2.set_soc_type(75);
+            env2.set_num_nsps(1);
+            if (g.prepare(env2) != GraphStatus::Success) return -1;
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) return -1;
+            const std::string bp = dir + "w4pre.bin";
+            const std::string ip = dir + "w4pre.f16.raw";
+            const std::string op2 = dir + "w4pre.wtop";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint16_t> in16((size_t)M * K, 0x3C00);
+            write_file(ip, in16.data(), in16.size() * 2);
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2;
+            if (runlist) c2 += " --dma-runlist";
+            c2 += " 2>/dev/null";
+            return std::system(c2.c_str());
+        };
+        CHECK(emit_w4(false) != 0, "T015: 无 --dma-runlist 主输入 act → emit 硬错误");
+        CHECK(emit_w4(true) == 0, "T015: --dma-runlist emit exit 0");
+        std::vector<uint8_t> bl;
+        wt_blob* w = new wt_blob{};
+        CHECK(load_file(dir + "w4pre.wtop", bl) &&
+              wt_parse(bl.data(), bl.size(), w) == WT_OK, "T015: wt_parse OK");
+        if (w->n_ops == 2 && w->ops[0].opcode == OP_DMA &&
+            w->ops[1].opcode == OP_MATMUL_W4A16) {
+            const wt_op& d = w->ops[0];
+            const wt_op& mm = w->ops[1];
+            CHECK(d.n_args == 8 && d.args[0] == (0x8000u | 0u) &&
+                  d.args[2] == M * K * 2u && d.args[3] == 0u && d.args[4] == 0u &&
+                  d.args[5] == 1u && d.args[6] == WT_DMA_FENCE_NONE &&
+                  d.args[7] == WT_DMA_FENCE_NONE,
+                  "T015: DMA 线格式 {EXT_IN, 0x4000|stg, M*K*2, 0,0,1,FF,FF}");
+            CHECK((d.args[1] & 0x4000u) && !(d.args[1] & 0x8000u) &&
+                  mm.args[0] == d.args[1],
+                  "T015: dst=0x4000|stg 且 matmul act 同引用");
+            CHECK(!(mm.args[1] & 0xC000u) && mm.args[1] < w->n_slots &&
+                  mm.args[3] == M && mm.args[4] == K && mm.args[5] == N,
+                  "T015: w 裸 slot 引用 + M/K/N");
+            CHECK(w->annot_base && wt_annot_engine(wt_rd_u32(w->annot_base)) == 0u &&
+                  wt_annot_engine(wt_rd_u32(w->annot_base + 4)) == 2u,
+                  "T015: 注解 DMA=SCALAR / matmul=HMX");
+            uint32_t stg_off = 0xFFFFFFFFu;
+            const wt_slot* tp = nullptr;
+            for (uint32_t s = 0; s < w->n_slots && !tp; s++)
+                if (w->slots[s].addr == WT_SLOT_TEMPOFF) tp = &w->slots[s];
+            if (tp) {
+                const uint8_t* p = w->weight_base + tp->offset;
+                uint32_t n; std::memcpy(&n, p + 8, 4);
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t tid, off, sz;
+                    std::memcpy(&tid, p + 12 + i * 12, 4);
+                    std::memcpy(&off, p + 16 + i * 12, 4);
+                    std::memcpy(&sz, p + 20 + i * 12, 4);
+                    if ((tid & 0x4000u) && (tid & 0x3FFFu) == (d.args[1] & 0x3FFFu) &&
+                        sz == M * K * 2u && (off & 2047u) == 0u) {
+                        stg_off = off;
+                        break;
+                    }
+                }
+            }
+            CHECK(tp && stg_off != 0xFFFFFFFFu,
+                  "T015: TEMPOFF staging 项 (0x4000|tid, 2048 对齐, M*K*2)");
+            bool carve_ok = false;
+            for (uint32_t i = 0; i < w->n_carve && !carve_ok; i++) {
+                const uint8_t* r = w->carve_base + (size_t)i * WT_CARVE_REC_SIZE;
+                if (wt_rd_u32(r + 4u) == stg_off && wt_rd_u32(r + 8u) == M * K * 2u &&
+                    wt_rd_u32(r + 12u) <= 0u && 0u < wt_rd_u32(r + 16u))
+                    carve_ok = true;
+            }
+            CHECK(carve_ok, "T015: carve footer 记录 (off/size 一致, 窗口盖 DMA op 0)");
+        } else {
+            CHECK(false, "T015: ops = [OP_DMA, OP_MATMUL_W4A16]");
+        }
+        delete w;
+    }
+
+    /* 10. 003 T022: carve 重叠不变量负例 — conv_add 图 + 预算(多 temp 驻留
+     * VTCM, op3 转置输出与 op6 conv 输出在 Add 处并发存活), 把 TAG_MEM_PLAN
+     * 全部 entries 拉平到同一 VTCM 偏移 → 生命期重叠的 carve 窗口必撞 →
+     * wtop_emit 组装段不变量必须硬错误退出 (绝不静默产重叠 carve 表; 线框
+     * [encoded][wc][wc][payload], encoded = ((tag&0xFFFF)|(tag<<16))^0xFFFF,
+     * TAG_MEM_PLAN=0x4D50)。 */
+    {
+        GraphPrepare g2;
+        build_conv_add(g2);
+        g2.set_plan_budgets(64u << 20, 1u << 20);
+        HexagonNNEnv env2;
+        env2.set_soc_type(75);
+        env2.set_num_nsps(1);
+        CHECK(g2.prepare(env2) == GraphStatus::Success, "T022: conv 图 prepare");
+        std::vector<uint8_t> b2(1u << 20, 0);
+        size_t b2sz = 0;
+        CHECK(g2.serialize(b2.data(), b2.size(), b2sz) && b2sz > 0, "T022: serialize");
+        b2.resize(b2sz);
+        const std::string bp = dir + "conv_pre.bin";
+        CHECK(write_file(bp, b2.data(), b2.size()), "T022: write conv_pre.bin");
+        std::string cmd0 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                           " --input-f16 " + dir + "X.f16.raw --out " + dir +
+                           "conv_pre.wtop 2>/dev/null";
+        CHECK(std::system(cmd0.c_str()) == 0, "T022: 未腐蚀 emit exit 0 (基线)");
+
+        const uint32_t kEnc = ((0x4D50u) | (0x4D50u << 16)) ^ 0xFFFFu;
+        bool found = false, have0 = false;
+        uint32_t nvtcm = 0, vtcm_off0 = 0;
+        for (size_t i = 0; i + 12 <= b2.size(); i += 4) {
+            uint32_t enc, wc1, wc2;
+            std::memcpy(&enc, b2.data() + i, 4);
+            std::memcpy(&wc1, b2.data() + i + 4, 4);
+            std::memcpy(&wc2, b2.data() + i + 8, 4);
+            if (enc != kEnc || wc1 != wc2 || wc1 < 11u) continue;
+            uint8_t* pl = b2.data() + i + 12;
+            size_t plsz = (size_t)wc1 * 4;
+            uint32_t ne;
+            std::memcpy(&ne, pl + 16, 4);
+            size_t no = 20;
+            for (uint32_t e = 0; e < ne && no + 20 <= plsz; e++, no += 20) {
+                uint32_t flags;
+                std::memcpy(&flags, pl + no + 16, 4);
+                if (flags & 1u) {
+                    nvtcm++;
+                    if (!have0) {
+                        std::memcpy(&vtcm_off0, pl + no + 8, 4);
+                        have0 = true;
+                    }
+                }
+            }
+            CHECK(nvtcm >= 2, "T022: TAG_MEM_PLAN ≥2 个 VTCM 驻留项");
+            if (nvtcm < 2) break;
+            no = 20;
+            const uint32_t one = 1;
+            for (uint32_t e = 0; e < ne && no + 20 <= plsz; e++, no += 20) {
+                std::memcpy(pl + no + 8, &vtcm_off0, 4);
+                std::memcpy(pl + no + 16, &one, 4);
+            }
+            found = true;
+            break;
+        }
+        CHECK(found, "T022: 扫描定位并腐蚀 TAG_MEM_PLAN");
+        if (found) {
+            write_file(dir + "conv_alias.bin", b2.data(), b2.size());
+            std::string c = std::string(WTOP_EMIT_PATH) + " --bin " + dir +
+                            "conv_alias.bin --input-f16 " + dir + "X.f16.raw --out " +
+                            dir + "conv_alias.wtop 2>" + dir + "conv_alias.err";
+            CHECK(std::system(c.c_str()) != 0,
+                  "T022: carve 偏移碰撞 -> wtop_emit 硬错误退出");
+            std::vector<uint8_t> err;
+            load_file(dir + "conv_alias.err", err);
+            err.push_back(0);
+            CHECK(std::strstr((const char*)err.data(), "carve") != nullptr,
+                  "T022: 错误信息指向 carve 不变量");
         }
     }
 

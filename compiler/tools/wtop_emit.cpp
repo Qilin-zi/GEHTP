@@ -112,6 +112,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
 
     Emitter em;
     em.ext_weights = ext_weights;  // 路线B: 权重外置(ensure_weight_slot → ext_weight_area)
+    em.dma_runlist = dma_runlist;  // 003 T015: 搬移显式化模式(W4A16 act DDR→VTCM 预置)
     if (gp.has_mem_plan()) {
         // M2: 静态规划由编译器定稿(TAG_MEM_PLAN)——照抄, 不再自算。
         const auto& mp = gp.mem_plan();
@@ -381,9 +382,12 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     // spill/fill 不钉 temp: 0.8B 默认预算下全图溢出 → 上千 spill 记录,
     // 钉住会把整个活跃集抬到 16879。(M3: 旧 spill 段已删, 溢出走 TAG_MEM_PLAN 阶段二)
     WtopEmitShared sh{H, W, C, w_slot, b_slot};
+    std::vector<uint32_t> emit_boundary(order.size() + 1, 0);
     for (size_t pos = 0; pos < order.size(); pos++) {
+        emit_boundary[pos] = (uint32_t)em.ops.size();
         op_id_t id = order[pos];
         em.cur_op = id;
+        em.cur_engine = wt_annot_pack(0u, 1u, 0u);  /* 默认内存/控制 op: scalar, 可回落 */
         if (pos < 8 || id < 100) {
             const OpDef* dbg = gp.get_op_at(id);
             std::fprintf(stderr, "[dbg] pos=%zu id=%llu name=%s const=%d\n", pos,
@@ -431,8 +435,41 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::fprintf(stderr, "error: unsupported op '%s' in wtop_emit\n", nm.c_str());
             return 4;
         }
+        em.cur_engine = assign_engine(od, nm);  /* 计算 op 编译期引擎指派 (v3 footer) */
         int hrc = hit->second(em, gp, od, wslots, nm, sh);
         if (hrc) return hrc;
+        /* 003 T015: handler 内新发的预置 staging 回填生命期 = 本位+1 (消费
+         * op 即本节点; DMA 与 matmul 相邻发射, 无中间图节点可插 carve) */
+        for (size_t si = em.stage_mark; si < em.pending_stages.size(); si++)
+            em.pending_stages[si].end_pos = (uint32_t)pos + 1u;
+        em.stage_mark = em.pending_stages.size();
+        /* 003 US2 (T012): VTCM 驻留张量登记 carve 记录 — 编译期静态定址 +
+         * 精确生命期区间。op_index 取本 op 在发射序里的下标 (SPILL/FILL
+         * 插桩在下一步追加, 故此刻 em.ops.size()-1 正是计算 op 本体)。
+         * 生命期 = 生产位置 pos .. 最后一个消费者位置+1 (release_at 同口径)。
+         * 只按"物化 temp"登记: ddr_op_vtcm 是计划态(常量折叠/未物化也算),
+         * 运行期只认 TEMPOFF 表 —— 记录源与 TEMPOFF 同表 (ddr_temp_tab),
+         * 双源一致由构造保证, 不物化的 VTCM 计划项不发记录。 */
+        if (!em.ddr_op_vtcm.empty() && em.ddr_op_vtcm.count(id) && em.ddr_op_vtcm.at(id)) {
+            auto tit = em.op_temp.find(Emitter::tkey(id, 0));
+            if (tit != em.op_temp.end()) {
+                auto dit = em.ddr_temp_tab.find(tit->second);
+                auto vit = em.ddr_temp_vtcm.find(tit->second);
+                if (dit != em.ddr_temp_tab.end() && dit->second.second > 0 &&
+                    vit != em.ddr_temp_vtcm.end() && vit->second) {
+                    auto lut = em.last_use.find(Emitter::tkey(id, 0));
+                    uint32_t rend = (lut != em.last_use.end())
+                                        ? lut->second + 1u
+                                        : static_cast<uint32_t>(order.size());
+                    uint32_t rstart = static_cast<uint32_t>(pos);
+                    if (rend <= rstart) rend = rstart + 1u;  /* 输出到循环外: 至少存活 1 位 */
+                    em.pending_carves.push_back({(uint32_t)(em.ops.size() - 1),
+                                                 (uint32_t)pos, rend,
+                                                 dit->second.first, dit->second.second});
+                }
+            }
+        }
+        em.cur_engine = wt_annot_pack(0u, 1u, 0u);  /* SPILL 插桩 = 内存 op */
         // 阶段二插桩(后): 溢出张量的生产 op 后插 SPILL(scratch temp → 溢出区)
         // 必须在 release 之前: release 会回收 temp 复用到后续 op。
         if (em.ddr_static && !em.ddr_spill_map.empty()) {
@@ -460,6 +497,31 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             em.release_at(Emitter::tkey(c.src_id, c.out_idx), pos);
     }
 
+    /* Top-of-loop boundaries are unconditional, including graph nodes skipped
+     * because they have no emitted op.  Resolve graph-order lifetimes after all
+     * FILL/SPILL insertion so residency_end uses actual emitted indices. */
+    emit_boundary[order.size()] = (uint32_t)em.ops.size();
+    for (const auto& pc : em.pending_carves) {
+        uint32_t end = pc.lifetime_end_pos <= order.size()
+                           ? emit_boundary[pc.lifetime_end_pos]
+                           : (uint32_t)em.ops.size();
+        if (end <= pc.op_index) end = pc.op_index + 1u;
+        em.carve_entries.push_back({pc.op_index, pc.vtcm_offset, pc.size_bytes,
+                                    pc.op_index, end});
+    }
+    em.pending_carves.clear();
+    /* 003 T015: 预置 staging → carve 记录。窗口 [DMA op, 消费 op 的下一图节点
+     * 边界): 锚点 = DMA op 下标 —— staging 数据在 DMA 落池, 窗口起点必须覆盖
+     * 写入点 (T013 运行期校验 st ≤ op_index < en, 活跃集含写入 op)。 */
+    for (const auto& stg : em.pending_stages) {
+        uint32_t end = stg.end_pos <= order.size()
+                           ? emit_boundary[stg.end_pos]
+                           : (uint32_t)em.ops.size();
+        if (end <= stg.op_index) end = stg.op_index + 1u;
+        em.carve_entries.push_back({stg.op_index, stg.vtcm_offset, stg.size_bytes,
+                                    stg.op_index, end});
+    }
+    em.pending_stages.clear();
 
     // 5b. 第7步阶段一: 静态 temp 偏移表 → TEMPOFF 槽
     // [cap u32][reserve u32][n u32][n × {temp_id u32, offset u32, size u32}]
@@ -505,16 +567,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
          * 内存侧 em.slots 恒为字节偏移, 仅此处线编码变化。小模型保持 v1 →
          * 存量 byte-exact 回归零影响。--force-v2 供小模型走 v2 通路做设备回归
          * (无需 4GB 资产)。 */
-        const uint64_t v1_off_max = 0xFFFFFF00ull;  // 留 256B 护栏
-        bool need_v2 = force_v2 ||
-                       em.weight_area.size() > v1_off_max ||
-                       em.ext_weight_area.size() > v1_off_max;
-        uint16_t ver = need_v2 ? WT_BLOB_VER_2 : WT_BLOB_VER;
-        const uint32_t slot_rec = need_v2 ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE;
-        if (need_v2)
-            std::fprintf(stderr, "[wtop] v2 格式: %s (weight_area=%zu ext=%zu), offset 升 u64\n",
-                         force_v2 ? "force-v2 强制" : "权重区超 v1 偏移上限",
-                         em.weight_area.size(), em.ext_weight_area.size());
+        /* v3 (003 编译器驱动调度): 恒 24B slot 记录 + 引擎注解 footer。
+         * 24B slot 由 ver>=2 单规则驱动, 与 v2 大权重路径共享线格式; 小模型
+         * 多付 12B/slot (可忽略)。--force-v2 语义并入 v3 (不再独立产 v2)。 */
+        const uint16_t ver = WT_BLOB_VER_3;
+        const uint32_t slot_rec = WT_SLOT_SIZE_V2;
+        if (force_v2)
+            std::fprintf(stderr, "[wtop] --force-v2 已并入 v3 (恒 24B slot)\n");
+        if (em.op_annot.size() != em.ops.size()) {
+            std::fprintf(stderr, "error: op_annot %zu != ops %zu (add_op 漏写注解)\n",
+                         em.op_annot.size(), em.ops.size());
+            return 3;
+        }
         em.blob.resize(16 + (size_t)n_slots * slot_rec + 1, 0);
         std::memcpy(em.blob.data(), "WTOP", 4);
         uint16_t eck = WT_ENDIAN_CHK;
@@ -527,18 +591,12 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::memcpy(s, &em.slots[i].len, 4);
             std::memcpy(s + 4, &em.slots[i].count, 4);
             uint64_t off = em.slots[i].offset;
-            if (need_v2) {
-                uint32_t lo = (uint32_t)(off & 0xFFFFFFFFu), hi = (uint32_t)(off >> 32);
-                std::memcpy(s + 8, &lo, 4);
-                std::memcpy(s + 12, &hi, 4);
-                std::memcpy(s + 16, &em.slots[i].addr, 4);
-                uint32_t zero = 0;
-                std::memcpy(s + 20, &zero, 4);
-            } else {
-                uint32_t off32 = (uint32_t)off;
-                std::memcpy(s + 8, &off32, 4);
-                std::memcpy(s + 12, &em.slots[i].addr, 4);
-            }
+            uint32_t lo = (uint32_t)(off & 0xFFFFFFFFu), hi = (uint32_t)(off >> 32);
+            std::memcpy(s + 8, &lo, 4);
+            std::memcpy(s + 12, &hi, 4);
+            std::memcpy(s + 16, &em.slots[i].addr, 4);
+            uint32_t zero = 0;
+            std::memcpy(s + 20, &zero, 4);
         }
         size_t p = 16 + (size_t)n_slots * slot_rec;
         em.blob.resize(p);
@@ -551,6 +609,118 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             for (uint16_t a = 0; a < o.n_args; a++)
                 std::memcpy(em.blob.data() + old + 4 + a * 4, &o.args[a], 4);
             p += sz;
+        }
+        /* v3: 引擎注解 footer (n_ops 条 u32), weight 区 128B 对齐前 */
+        for (uint32_t a : em.op_annot) {
+            size_t old = em.blob.size();
+            em.blob.resize(old + 4);
+            std::memcpy(em.blob.data() + old, &a, 4);
+            p += 4;
+        }
+        /* v3: 可选 VTCM carve footer — [magic u32][count u32][count × 20B],
+         * 位于引擎注解之后、weight 128B 对齐之前。运行期按此表逐 op 精确
+         * 定址, 不再"谁先谁抢满全量" (003 US2)。 */
+        if (!em.carve_entries.empty()) {
+            /* 不变式自校验 (FR: 活性重叠 ⇒ 内存不重叠): 按 residency_start
+             * 扫描, 活动集内两两判空间交叠; 交叠即编译期硬错误。 */
+            {
+                std::vector<const Emitter::CarveEntry*> act;
+                std::vector<const Emitter::CarveEntry*> iv;
+                for (const auto& c : em.carve_entries) iv.push_back(&c);
+                std::sort(iv.begin(), iv.end(),
+                          [](const Emitter::CarveEntry* a, const Emitter::CarveEntry* b) {
+                              return a->residency_start < b->residency_start;
+                          });
+                uint64_t vtcm_used = 0;
+                for (const Emitter::CarveEntry* c : iv) {
+                    if (c->op_index >= em.ops.size()) {
+                        std::fprintf(stderr, "error: carve op_index %u >= n_ops %zu\n",
+                                     c->op_index, em.ops.size());
+                        return 3;
+                    }
+                    if (c->residency_start >= c->residency_end) {
+                        std::fprintf(stderr, "error: carve op %u empty lifetime [%u,%u)\n",
+                                     c->op_index, c->residency_start, c->residency_end);
+                        return 3;
+                    }
+                    for (size_t k = act.size(); k-- > 0;) {
+                        const Emitter::CarveEntry* o = act[k];
+                        if (o->residency_start >= c->residency_end) continue; /* 已结束 */
+                        if (o->residency_end <= c->residency_start) continue;
+                        uint64_t a0 = o->vtcm_offset, a1 = a0 + o->size_bytes;
+                        uint64_t b0 = c->vtcm_offset, b1 = b0 + c->size_bytes;
+                        if (a0 < b1 && b0 < a1) {
+                            std::fprintf(stderr,
+                                "error: carve alias: op %u [%llu,%llu) vs op %u [%llu,%llu)\n",
+                                o->op_index, (unsigned long long)a0, (unsigned long long)a1,
+                                c->op_index, (unsigned long long)b0, (unsigned long long)b1);
+                            return 3;
+                        }
+                    }
+                    act.push_back(c);
+                    uint64_t e1 = (uint64_t)c->vtcm_offset + c->size_bytes;
+                    if (e1 > vtcm_used) vtcm_used = e1;
+                }
+                if (vtcm_used > (uint64_t)em.ddr_vtcm_cap) {
+                    std::fprintf(stderr,
+                        "error: carve footprint %llu > VTCM cap %llu\n",
+                        (unsigned long long)vtcm_used, (unsigned long long)em.ddr_vtcm_cap);
+                    return 3;
+                }
+                /* 双源一致性: TEMPOFF 的 VTCM 驻留项(offset,size) 与 carve footer
+                 * 的 (vtcm_offset,size_bytes) 作集合比较(去重) —— temp id 回收
+                 * 复用同一段 VTCM 时 carve 会出现重复对(各自生命期窗口), 属合法,
+                 * 重数不同不是漂移。缺项/幻影项才是漂移: 运行期 temp 地址只认
+                 * TEMPOFF, carve footer 若漂移就成了骗人的第二套真相(踩踏/全 -inf 难查)。 */
+                {
+                    auto dedup = [](std::vector<std::pair<uint32_t, uint32_t>> v) {
+                        std::sort(v.begin(), v.end());
+                        v.erase(std::unique(v.begin(), v.end()), v.end());
+                        return v;
+                    };
+                    std::vector<std::pair<uint32_t, uint32_t>> a, b;
+                    for (const auto& [tid, offsz] : em.ddr_temp_tab) {
+                        auto vit = em.ddr_temp_vtcm.find(tid);
+                        if (vit != em.ddr_temp_vtcm.end() && vit->second)
+                            a.push_back({offsz.first, offsz.second});
+                    }
+                    for (const auto& c : em.carve_entries)
+                        b.push_back({c.vtcm_offset, c.size_bytes});
+                    a = dedup(a); b = dedup(b);
+                    if (a != b) {
+                        std::fprintf(stderr,
+                            "error: carve/TEMPOFF VTCM 布局不一致 (TEMPOFF %zu 项, carve %zu 项)\n",
+                            a.size(), b.size());
+                        size_t n = a.size() < b.size() ? a.size() : b.size();
+                        for (size_t i = 0; i < n; i++)
+                            if (a[i] != b[i]) {
+                                std::fprintf(stderr,
+                                    "  [%zu] TEMPOFF off=%u sz=%u vs carve off=%u sz=%u\n",
+                                    i, a[i].first, a[i].second, b[i].first, b[i].second);
+                                break;
+                            }
+                        return 3;
+                    }
+                }
+                std::fprintf(stderr, "[carve] %zu entries, footprint %llu B (cap %llu)\n",
+                             iv.size(), (unsigned long long)vtcm_used,
+                             (unsigned long long)em.ddr_vtcm_cap);
+            }
+            auto put32 = [&](uint32_t v) {
+                size_t old = em.blob.size();
+                em.blob.resize(old + 4);
+                std::memcpy(em.blob.data() + old, &v, 4);
+                p += 4;
+            };
+            put32(WT_CARVE_MAGIC);
+            put32((uint32_t)em.carve_entries.size());
+            for (const auto& c : em.carve_entries) {
+                put32(c.op_index);
+                put32(c.vtcm_offset);
+                put32(c.size_bytes);
+                put32(c.residency_start);
+                put32(c.residency_end);
+            }
         }
         size_t woff = (p + 127) & ~(size_t)127;
         em.blob.resize(woff + em.weight_area.size(), 0);

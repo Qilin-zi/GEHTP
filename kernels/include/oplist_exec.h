@@ -73,10 +73,14 @@ int  wt_exec_run_io(const struct wt_blob* b, const void* in_ptr, void* out_ptr,
  * 时从此基址+slot.offset 读)。NULL=禁用。与 run_io 解耦(权重常驻)。 */
 void wt_exec_set_ext_weights(const void* wgt_ptr);
 /* ---- PROF 战役 W-P2: 逐 op 时间戳对 + optrace 开关 ----
- * wt_op_ts: 每 op 的 {start_us, dur_us, dma_us, dma_bytes, engine}, start_us 相对
- * run_range 入口 (u32 us, 约 71min 回绕, 单 run 不会超)。注册后 run/run_range 自动
- * 回填; 索引 = 全局 op 序号, 缓冲须 >= n_ops (run_range 分段调用时按绝对序号写)。
- * 不注册 = 零开销旧行为。 */
+ * wt_op_ts: 每 op 的 {start_us, dur_us, dma_us, dma_bytes, engine,
+ * planned_engine, deviation}, start_us 相对 run_range 入口 (u32 us, 约 71min
+ * 回绕, 单 run 不会超)。注册后 run/run_range 自动回填; 索引 = 全局 op 序号,
+ * 缓冲须 >= n_ops (run_range 分段调用时按绝对序号写)。不注册 = 零开销旧行为。
+ * 003 T019: 后两字段 = 编译期指派引擎 + 偏差标志 (US3 报告契约):
+ *   deviation 0=按计划执行 (planned==actual)
+ *             1=允许回落 (fallback_allowed=1, actual==fallback_engine)
+ *             2=已中止 (fallback 禁止或不可执行, run 在本 op 停止) */
 enum wt_engine { WT_ENG_SCALAR = 0, WT_ENG_HVX = 1, WT_ENG_HMX = 2 };
 struct wt_op_ts {
     uint32_t start_us;    /* 相对 run_range 入口 */
@@ -84,6 +88,8 @@ struct wt_op_ts {
     uint32_t dma_us;      /* 本 op 内 UserDMA 累计耗时 */
     uint32_t dma_bytes;   /* 本 op 内 UserDMA 累计搬运字节 */
     uint32_t engine;      /* WT_ENG_* 主计算引擎 */
+    uint32_t planned_engine; /* WT_ENG_* 编译期指派 (v3 footer; ver<3 恒 scalar) */
+    uint32_t deviation;   /* 0=按计划 1=允许回落 2=已中止 (见上) */
 };
 void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap);
 
@@ -92,6 +98,9 @@ void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap);
  * fprintf; run 级 rtrace 里程碑常开 (M4.2 崩溃取证命脉)。句柄铁律不动:
  * 仍只有 g_rtrace 一个 FILE*, 开关只控 fopen 与否, 绝不新建路径。 */
 void wt_exec_set_trace(int on);
+/* 005 US3b (T019): bias 默认走 HMX (SC-005 已过); 本钩子仅测试例 (46) 强制
+ * 标量参照, 生产恒 0 */
+void wt_exec_force_bias_scalar(int on);
 
 /* 逐 op 张量 dump 钩子 (精度排查): spec = "opidx:temp,opidx:temp,...", 执行到
  * op idx (run_range 局部序号, 与 optrace 行号一致) 且 rc==0 后, 把 temp 按
