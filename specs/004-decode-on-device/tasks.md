@@ -84,6 +84,7 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 - [X] T009 [US1] deploy loop 验证：`build_libs.sh`（full，勿 `one`）+ `gehtp setup --device d0f1784`（勿信 `[ -f signed.so ] || build` 短路 → stale arity），复现 prefill cos 0.998643/top1 29/32（G10）
   - **绿（2026-10-08，d0f1784，新库 a42720a5 = full build + setup 重推）**：prefill v17 blob（`qwen35_08b_v17.wtop`，i32 ids=prompt0）→ **cos=0.998642 / top1=30/32 / exec 34.1s / wall 37.6s**；历史基线（9/28 旧库产物 `output_v17bhmx_0.f16.raw`）cos=0.998646/29/32。Δcos=4e-6（f16 噪声级）、top1 反升、wall 持平（基线 33.9s）——**无回归**
   - **Δ来源（已知且良性）**：v17 全部 175 个 matmul_f16 均 M<32 → 旧库部分走 GEMV HVX 向量体（N≥64 的 !t0/!t1 分支），新库禁用后走标量 → row0-4 逐字节同、position 5 起微差（HVX 向量体与标量 f32 累加的舍入差）；这正是 T008 ② 修复的副作用，设备侧 GEMV 单测补齐后回开可收回 +0.2s
+  - **口径修正（T013 轮复核，parse_wtop 真源）**：上条归因不成立——v17 的 matmul_f16（opcode 24）实为 **325 个、M 直方图 {32:199, 64:126}，M<32 计数 = 0**；"175 个"实为 OP_TRANSPOSE_GEN_F16=27 的条数，"M<32"是把 args[3]（d0 维度）误当 M。v17 从不进 GEMV（M<32）分支，新旧库在该图上 matmul 路径逐字节相同 → Δ 4e-6 是跨构建 f16 噪声（T011 族带宽 ±4e-6 内），非 GEMV 禁用副作用。T014 已实证 GEMV 回开后 v17 逐字节不变，双重确认 additive
 
 **Checkpoint**: US1 独立交付——decode 单 token 前向上板正确，deploy loop 无 stale arity。**0.8B 双门（decode 门 + wall 对照 T001）过**。可 commit。
 
@@ -116,8 +117,16 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 **Independent Test**: decode 步 optrace 全 GEMV；prefill（M=32/64）逐字节不变（additive 分支不碰原路径）
 
-- [ ] T013 [US3] optrace 验证：decode 步（M=1）所有 matmul 走 `exec_matmul_f16_gemv`，无标量回落（optrace engine 列）
-- [ ] T014 [US3] prefill 逐字节回归：M=32/64 prefill 路径逐字节不变（GEMV 分支 additive，不碰原 HMX 门/标量回落）
+- [X] T013 [US3] optrace 验证：decode 步（M=1）所有 matmul 走 `exec_matmul_f16_gemv`，无标量回落（optrace engine 列）
+  - **GEMV 向量体修复 + 回开（2026-10-08，d0f1784，全量重建库）**：T008 禁用的 `!t0&&!t1` 体回开 + 新增 t1 vec_dot 体（`oplist_exec.c::exec_matmul_f16_gemv`）
+  - **根因实锤——native mpyacc acc 布局是「连续两半」**：`Q6_Wsf_vmpyacc_WsfVhfVhf`（v81 构建）的 acc = lo=第 0..31 列输出、hi=第 32..63 列，正确 epilogue = 纯 concat（`hvx_vec_f32_to_f16_shuff(lo,hi)`）。三观测自洽：vdeal → 偶元素 stride-2 抽样（T008 实锤）、vshuff → [w0,w32,w1,w33..] 交错（本轮实锤）、shuff 无 shuffle → **2048/2048 元素精确匹配**。教训：`<79` 模拟路径（Q6_Wqf32_vmpy）是 pair-interleave，两代指令布局不同，**勿以模拟码推 native 语义**
+  - **t1 体**：W 存 [N,K]（输出行 K 连续）→ 逐输出列 vec_dot：mpyacc 累加 → `HVX_OP_ADD_F32(lo,hi)` 通道加 → `hvx_vec_reduce_sum_f32` 水平归约（hvx-fa-kernels.h vec_dot 同款收尾）；对 lo/hi 布局不敏感（求和无序），一次即对；K 尾数标量免 OOB
+  - **数值验证**：杀手形状 op2718（K=1/N=256/Bn=8）hook cos **0.999999**；全部 M=1 t1 FC OK（lm_head op16211 K=1024/N=248320 cos 0.999974）；seq1 judge 双门 **PASS 且优于标量版**——主门 0.999987（标量 0.999981）/ 基线门 0.999970（标量 0.999960），top1 全精确
+  - **optrace（op_ts.bin ver=2 engine 列）**：M<32 matmul **200/200 engine=HVX**（WT_ENG_HVX=1），无标量回落（scalar 参照轮 200/200=SCALAR）；该类 op 总耗时 **19.66s→0.69s（28.5×）**；lm_head op16211 单 op **6.86s→240ms**；seq1 整图 **wall 36.72s→17.74s（2.07×）**（exec 17.74s / 端到 wall 21.2s）
+  - **取证教训**：hook 对拍 BAD 时先验证参照链自洽——本轮 host_id_4560 与 host 自身 4557(q)/4559(k) 矛盾（cos 0.644），离线证明 dev 输出 == q_dump·k_dump 精确一致后判定参照坏而非设备错；T008"首发散 gid 4560"部分是坏参照伪影
+- [X] T014 [US3] prefill 逐字节回归：M=32/64 prefill 路径逐字节不变（GEMV 分支 additive，不碰原 HMX 门/标量回落）
+  - **绿（2026-10-08，d0f1784）**：v17 prefill（`qwen35_08b_v17.wtop`）用 GEMV 回开后的同一新库跑 → 输出与 T009 基线（GEMV 禁用库）**逐字节一致**（cmp 全同）；judge prefill 门 PASS **cos=0.998642 / top1=30/32**
+  - **结构性解释**：v17 的 325 个 matmul_f16 全 M=32/64（见 T009 口径修正）→ GEMV 分支（M<32 门）从不进入，字节一致是构造使然 + 实测确认，additive 成立
 
 **Checkpoint**: US3 独立交付——M=1 加速落地，prefill 零回归。**0.8B 双门（cos 不回归 + wall 对照 T001）过**。可 commit。
 

@@ -37,6 +37,8 @@
 #include "hmx_crouton.h"
 #if defined(__HVX__) || defined(__hexagon__)
 #include "internal/hvx-base.h"  /* GEMV 向量体: hvx_vmemu / hvx_vec_mpyacc_f32_f16 / hvx_vec_f32_to_f16 */
+#include "internal/hvx-fa-kernels.h"  /* HVX_OP_ADD_F32 (vec_dot 收尾通道加) */
+#include "internal/hvx-reduce.h"      /* hvx_vec_reduce_sum_f32 (水平归约) */
 #endif
 
 #define MAX_TEMPS 4096  /* 0.8B 全模型 temp id 至 1403+ (输出 temp 1401); 256 实锤死 op2616, 与 WT_EXEC_MAX_TEMPS 同步 */
@@ -1464,15 +1466,14 @@ static int exec_matmul_f16_gemv(const uint16_t* a, const uint16_t* w, uint16_t* 
                                 char* err, size_t errn) {
 #if defined(__HVX__) || defined(__hexagon__)
     uint32_t bb_max = batched ? Bn : 1u;
-    /* 仅对常见的 A[M,K] × W[K,N] 行主序布局向量化：
-     * 固定 k，W 的 N 维连续，正好符合 GEMV 的 stream-W 访问模式。
-     * 转置布局仍由下面的通用标量实现，避免对非连续维度做越界向量读。
-     * !!! seq=1 上板实锤该向量体数值错 (Bn=8,K=1,N=256 输出 = W 的偶元素
-     * 抽样): mpyacc pair-interleave 与 f32_to_f16 的 vdeal 组合不匹配
-     * (对照 hvx-mm-kernels-flat.h 的 vec_dot: 其收尾是 lo+hi 归约, 无逐元
-     * 素回写先例)。host 单测覆盖不到 (#if 体不参与 host 编译)。在设备侧
-     * 单测补齐前禁用, 全部走下方已对拍 bit 级一致的标量路径。 */
-    if (0 && !t0 && !t1) {
+    /* 布局 A[M,K] × W[K,N] (行主序, W 的 N 维连续): 固定 k 流 W 行。
+     * !!! mpyacc (Q6_Wsf_vmpyacc_WsfVhfVhf, v81 构建) 的 acc 布局是
+     * 「连续两半」: lo=第 0..31 列输出, hi=第 32..63 列 —— 收尾 = 纯
+     * concat (shuff), 禁 vdeal/vshuff。004 T013 设备实锤 (2048/2048 精确
+     * 匹配): vdeal→偶元素 stride-2 抽样 (T008), vshuff→[w0,w32,w1,w33..]
+     * 交错。旧 <79 模拟路径是 pair-interleave, 两代指令布局不同, 勿以
+     * 模拟码推 native 语义。 */
+    if (!t0 && !t1) {
         for (uint32_t bb = 0; bb < bb_max; ++bb) {
             const uint16_t* ab = a + (size_t)bb * M * K;
             const uint16_t* wb = w + (size_t)bb * K * N_full;
@@ -1486,7 +1487,8 @@ static int exec_matmul_f16_gemv(const uint16_t* a, const uint16_t* w, uint16_t* 
                         HVX_Vector wv = hvx_vmemu(wb + (size_t)k * N_full + n0 + n);
                         acc = hvx_vec_mpyacc_f32_f16(acc, av, wv);
                     }
-                    HVX_Vector out = hvx_vec_f32_to_f16(Q6_V_lo_W(acc), Q6_V_hi_W(acc));
+                    HVX_Vector out = hvx_vec_f32_to_f16_shuff(Q6_V_lo_W(acc),
+                                                              Q6_V_hi_W(acc));
                     hvx_vmemu(yb + (size_t)m * N_full + n0 + n) = out;
                 }
                 /* 只有完整 HVX 向量才走快路径；尾列走精确标量。 */
@@ -1496,6 +1498,38 @@ static int exec_matmul_f16_gemv(const uint16_t* a, const uint16_t* w, uint16_t* 
                         acc += f16_to_f32(ab[(size_t)m * K + k]) *
                                f16_to_f32(wb[(size_t)k * N_full + n0 + n]);
                     yb[(size_t)m * N_full + n0 + n] = f32_to_f16(acc);
+                }
+            }
+        }
+        g_last_engine = WT_ENG_HVX;
+        return 0;
+    }
+    /* 布局 A[M,K] × W[N,K] (t1 转置, 输出行 K 连续): 逐输出列 vec_dot,
+     * hvx-fa-kernels.h 同款收尾 (mpyacc pair 累加 → lo+hi 通道加 → 水平
+     * 归约)。K 尾数走标量, 免向量过读越界。004 T013: seq1 全部 187 个
+     * M=1 t1 FC (含 lm_head K=1024/N=248320) 走此体。 */
+    if (t1 && !t0) {
+        for (uint32_t bb = 0; bb < bb_max; ++bb) {
+            const uint16_t* ab = a + (size_t)bb * M * K;
+            const uint16_t* wb = w + (size_t)bb * (size_t)N_full * K;
+            uint16_t* yb = y + (size_t)bb * M * N_full;
+            for (uint32_t m = 0; m < M; ++m) {
+                const uint16_t* xb = ab + (size_t)m * K;
+                for (uint32_t n = 0; n < N; ++n) {
+                    const uint16_t* wr = wb + (size_t)(n0 + n) * K;
+                    HVX_VectorPair rp = Q6_W_vzero();
+                    uint32_t k = 0;
+                    for (; k + 64u <= K; k += 64u)
+                        rp = hvx_vec_mpyacc_f32_f16(rp, hvx_vmemu(xb + k),
+                                                    hvx_vmemu(wr + k));
+                    float tail = 0.0f;
+                    for (; k < K; ++k)
+                        tail += f16_to_f32(xb[k]) * f16_to_f32(wr[k]);
+                    HVX_Vector rs = HVX_OP_ADD_F32(Q6_V_lo_W(rp), Q6_V_hi_W(rp));
+                    rs = hvx_vec_reduce_sum_f32(rs);
+                    float vsum;
+                    hvx_vec_store_u(&vsum, 4u, rs);
+                    yb[(size_t)m * N_full + n0 + n] = f32_to_f16(vsum + tail);
                 }
             }
         }
