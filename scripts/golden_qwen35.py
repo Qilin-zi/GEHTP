@@ -23,11 +23,11 @@ import struct
 import sys
 
 import numpy as np
-import torch
 
-from export_qwen35_onnx import QPM_ROOT, load_remapped
-
-sys.path.insert(0, QPM_ROOT)
+# torch / modeling 类仅金标生成路径需要(重 import); --cut-row 切行 helper
+# 在裸环境(numpy only)可用。export_qwen35_onnx 转用 transformers>=4.57 内建
+# Qwen3_5 类后已无 QPM_ROOT 常量, 旧 QPM 路径留 compat 缺省。
+QPM_ROOT_DEFAULT = "/disk2/Qwen35dev/qwen3.5_4b_base/example1"
 
 
 # --------------------------------------------------------------------------
@@ -210,8 +210,14 @@ def gguf_to_state_dict(gguf_path, text_cfg):
 
 def build_model(model_dir, weights):
     """weights: 'hf' | ('gguf', path)。返回 (model, cfg)。"""
-    from huggingface.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-    from huggingface.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+    import torch
+    try:
+        from transformers import Qwen3_5Config, Qwen3_5ForCausalLM
+    except ImportError:  # 旧环境: QPM modeling 包
+        sys.path.insert(0, QPM_ROOT_DEFAULT)
+        from huggingface.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+        from huggingface.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+    from export_qwen35_onnx import load_remapped
 
     cfg = Qwen3_5Config.from_pretrained(model_dir).text_config
     model = Qwen3_5ForCausalLM(cfg).to(torch.float32).eval()
@@ -231,6 +237,7 @@ def build_model(model_dir, weights):
 
 
 def run_prompts(model, cfg, seq, n_prompts, seed=42):
+    import torch
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n_prompts):
@@ -247,9 +254,23 @@ def run_prompts(model, cfg, seq, n_prompts, seed=42):
     return out
 
 
+def load_golden_row(out_dir, prompt_idx, row=-1, seq=32):
+    """T010: 从 cpu_golden 的 logits_{i}.f32.raw [seq,V] 切单行 [V](默认末行)。
+
+    P1 无 KV 时 row=0(SC-001 锚: seq=1 blob @ pos0 == prefill 首位);
+    P2 KV 接线后 row=-1(SC-002 锚: 真 decode 步 == prefill 末位 == 第 seq token)。
+    """
+    a = np.fromfile(os.path.join(out_dir, f"logits_{prompt_idx}.f32.raw"), dtype=np.float32)
+    vocab = a.size // seq if seq else 0
+    if vocab == 0 or a.size != seq * vocab:
+        raise ValueError(f"logits_{prompt_idx}: {a.size} elems 非 [{seq},V]")
+    r = row if row >= 0 else seq + row
+    return a.reshape(seq, vocab)[r]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--model-dir", default=None)
     ap.add_argument("--gguf", default=None)
     ap.add_argument("--seq", type=int, default=32)
     ap.add_argument("--n-prompts", type=int, default=4)
@@ -257,7 +278,22 @@ def main():
     ap.add_argument("--text", action="append", default=None,
                     help="真实文本(可多次),编码后跑 top-1 一致性判据")
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--cut-row", type=int, default=None, metavar="R",
+                    help="切行模式(无需模型环境): 从 out-dir/hf/logits_{i}.f32.raw 切第 R 行"
+                         "(负数从未尾数, -1=末位)落 logits_{i}_row{R}.f32.raw, 配 --n-prompts/--seq")
     args = ap.parse_args()
+
+    if args.cut_row is not None:
+        sub = os.path.join(args.out_dir, "hf")
+        r = args.cut_row if args.cut_row >= 0 else args.seq + args.cut_row
+        for i in range(args.n_prompts):
+            row = load_golden_row(sub, i, args.cut_row, args.seq)
+            outp = os.path.join(sub, f"logits_{i}_row{r}.f32.raw")
+            row.tofile(outp)
+            print(f"[cut-row] prompt{i} row{r} -> {outp} top1={int(row.argmax())}")
+        return
+    if not args.model_dir:
+        ap.error("金标生成需 --model-dir (切行模式用 --cut-row)")
 
     os.makedirs(args.out_dir, exist_ok=True)
     results = {}
@@ -290,6 +326,7 @@ def main():
 
     # 真实文本 top-1 一致性(量化语义级判据)
     if args.text and len(results) == 2:
+        import torch
         from tokenizers import Tokenizer
         tok = Tokenizer.from_file(os.path.join(args.model_dir, "tokenizer.json"))
         sub = os.path.join(args.out_dir, "text")
@@ -314,7 +351,6 @@ def main():
             agree = (tops["hf"] == tops["q4_0"]).sum()
             print(f"[text] prompt{ti} top-1 agreement: {agree}/{len(ids)}")
             assert agree / len(ids) >= 0.8, f"text{ti} top-1 一致性过低: {agree}/{len(ids)}"
-    print("done")
 
     with open(os.path.join(args.out_dir, "manifest.json"), "w") as f:
         json.dump({"seq": args.seq, "n_prompts": args.n_prompts, "modes": list(results)}, f, indent=2)

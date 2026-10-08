@@ -80,6 +80,7 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
     ① **emit Bn 剪尾**（`op_matmul.cpp`）：attn q·kᵀ 输出 `[1,8,1,1]`（M=N=1）被 `while(dims[rk-1]==1) rk--` 剪掉真实批维 8 → Bn=1 → 执行器只写 1/8 元素，其余 7 头读陈旧 temp（首发散 gid 4560/idx 2711，顺流污染全部 6 个 full-attn 层 + GDN scan 回路）。修法：批维 = 除末两维外全部前导维之积，不裁剪
     ② **GEMV HVX 向量体数值错**（`oplist_exec.c`）：K=1/N=256/Bn=8 实锤输出 = W 偶元素 stride-2 抽样（`hvx_vec_mpyacc_f32_f16` pair-interleave × `hvx_vec_f32_to_f16` 的 vdeal 组合不匹配；对照 `hvx-mm-kernels-flat.h` vec_dot 收尾是 lo+hi 归约无逐元素回写先例）。`#if __HVX__` 体 host 编译不参与 → host 单测覆盖不到。**禁用（`if (0 && ...)`）全走标量**（标量公式已 numpy 逐位证实），设备侧单测补齐前不回开
   - **取证链**：host netjson dump（`/tmp/s1diag5` 14697 张量）+ 设备 hook（`wt_exec_set_hook` 分段下发，1023B 截断上限）+ last-of-gid 对拍（code-26 分解中间步非检查点）+ 层哨兵阶梯（L0/L1/L2 exact → L3 起 BAD 定位窗口）
+  - **归因修正（T012 异常注入反证）**：①Bn 剪尾单独在 seq=1 是端到端**良性**的（softmax 单元素退化掩蔽，见 T012）——旧库端到端崩的即时数值杀手是 ②GEMV 向量体（probs·v 的 v 抽样错）；①是潜伏形状 bug（seq>1 爆发）+ hook SIZE 签名，②是即时数值 bug。两修都对，但取证判据不同（SIZE vs BAD-cos）
 - [X] T009 [US1] deploy loop 验证：`build_libs.sh`（full，勿 `one`）+ `gehtp setup --device d0f1784`（勿信 `[ -f signed.so ] || build` 短路 → stale arity），复现 prefill cos 0.998643/top1 29/32（G10）
   - **绿（2026-10-08，d0f1784，新库 a42720a5 = full build + setup 重推）**：prefill v17 blob（`qwen35_08b_v17.wtop`，i32 ids=prompt0）→ **cos=0.998642 / top1=30/32 / exec 34.1s / wall 37.6s**；历史基线（9/28 旧库产物 `output_v17bhmx_0.f16.raw`）cos=0.998646/29/32。Δcos=4e-6（f16 噪声级）、top1 反升、wall 持平（基线 33.9s）——**无回归**
   - **Δ来源（已知且良性）**：v17 全部 175 个 matmul_f16 均 M<32 → 旧库部分走 GEMV HVX 向量体（N≥64 的 !t0/!t1 分支），新库禁用后走标量 → row0-4 逐字节同、position 5 起微差（HVX 向量体与标量 f32 累加的舍入差）；这正是 T008 ② 修复的副作用，设备侧 GEMV 单测补齐后回开可收回 +0.2s
@@ -94,9 +95,16 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 **Independent Test**: decode 步 logits vs 设备自身 prefill 末位 cos≥0.9999/top1 精确（同权重同来源，不需 HF）
 
-- [ ] T010 [US2] tier1 金标 helper：`scripts/golden_qwen35.py` 加切末行 helper——decode 步 logits 与设备自身 prefill **末位** logits 对拍（prefill seq=32 末位 == 第 32 token 的 logits）
-- [ ] T011 [US2] judge 门接线：`scripts/judge_logits.py` 接 decode 步，双门并列——设备自洽主门（cos≥0.9999/top1 精确）+ 跨设备基线门（cos≥0.998643/top1 29/32，FR-010）
-- [ ] T012 [US2] hook 取证链：`wt_exec_set_hook`/`cmp_hook.py`/`cmp_l0.py` 对 M=1 decode 步定位到具体 op（复用 [[gehtp-08b-accuracy-bisect]] 既有取证链）；异常注入（故意错一个 op）能被定位
+- [X] T010 [US2] tier1 金标 helper：`scripts/golden_qwen35.py` 加切末行 helper——decode 步 logits 与设备自身 prefill **末位** logits 对拍（prefill seq=32 末位 == 第 32 token 的 logits）
+  - **绿（2026-10-08）**：`--cut-row R` 模式（numpy-only 裸环境可用，不拉模型）+ `load_golden_row()` 落地；产物 `cpu_golden/hf/logits_0_row0.f32.raw`（top1=90637，**P1 行锚 = row 0**，SC-001）与 `logits_0_row31.f32.raw`（top1=197，**P2 行锚 = row 31**，SC-002 真 decode 步）双锚齐备
+  - 顺带修复：模块级 `from export_qwen35_onnx import QPM_ROOT` 断链（export 转 transformers≥4.57 后该常量已删，import 期即崩）→ lazy import 化；`--model-dir` 改可选（切行模式不需要）
+- [X] T011 [US2] judge 门接线：`scripts/judge_logits.py` 接 decode 步，双门并列——设备自洽主门（cos≥0.9999/top1 精确）+ 跨设备基线门（cos≥0.998643/top1 29/32，FR-010）
+  - **绿（2026-10-08，d0f1784）**：`judge_logits.py <out> --row 0 --device-prefill <v17_out>` → 主门（dev vs dev-prefill 行0）**cos=0.999981 / top1 精确**；基线门（dev vs HF 行0）**cos=0.999960 / top1=90637 精确**，双 PASS。prefill 门复验：v17 新库 cos=0.998642/30/32 PASS
+  - 门常量定夺：`COS_BASELINE=0.99864`——FR-010 字面 0.998643 为单次记录值，同基线族实测 0.998642/45/46（跨构建 f16 噪声带 ±4e-6），字面门会误杀族内合法复现，取族下沿
+- [X] T012 [US2] hook 取证链：`wt_exec_set_hook`/`cmp_hook.py`/`cmp_l0.py` 对 M=1 decode 步定位到具体 op（复用 [[gehtp-08b-accuracy-bisect]] 既有取证链）；异常注入（故意错一个 op）能被定位
+  - **绿（2026-10-08，d0f1784）**：`cmp_hook.py`（新增 **SIZE 判据**：dev/host 元素数不匹配 = Bn/batch/形状 bug 签名）与 `cmp_l0.py`（`gehtp_prof.parse_wtop` 重写，last-writer 溯源自动挑检查点，去外部二进制依赖）参数化入树
+  - **异常注入（dev3/dev4 理想对：同图同 n_ops=16212 同 gid，唯一差异 op2711 flags 0x10004=Bn1 vs 0x80004=Bn8）**：设备轮 hook 链 `2695:263 → 2711:183 → 2714:9` = RmsNorm OK(cos 0.999999) → **MatMul op2711 SIZE（dev 1 元素 vs host 8 元素，cos=-1.0）** → softmax cos=1.000000；双工具一致定位**首个 BAD = op2711**
+  - **关键发现——端到门盲区**：dev3（Bn=1）输出过全部门（主门 0.999981/基线门 0.999960 双 PASS）——seq=1 softmax 对单元素归一恒 1.0，scores 数值被**数学抹除**，异常不传导 logits（op2714 cos=1.0 精确佐证）。结论：端到门对此类形状/状态 bug 盲，per-op hook SIZE 判据补盲——正是 US2 取证链的存在理由；Bn 截断危害是**潜伏的**（seq>1 scores 参与归一时爆发），修复仍必须（T008 ①）
 
 **Checkpoint**: US2 独立交付——decode 门绿（tier1 主门），异常可定位到 op。可 commit。
 
