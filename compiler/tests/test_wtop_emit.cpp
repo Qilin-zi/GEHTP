@@ -353,6 +353,57 @@ int main() {
         CHECK(wt_parse(bad.data(), bad.size(), wb) == WT_ERR_ARITY, "neg: 坏 arity -> ARITY");
     }
 
+    /* 5b. 烘焙输入槽防静默零填充门(缺文件曾是 v3f 事故根因):
+     * 双输入图: 只喂主输入文件 → emit 非零退出 + "has no input file";
+     * --allow-missing-inputs 逃生 → 退出 0 且 blob 可解析;
+     * 文件数 > 图输入数 → 非零退出。 */
+    {
+        GraphPrepare g;
+        auto od = make_od4(1, 1, 1, 32);
+        od.dtype = static_cast<uint32_t>(DType::Float16);
+        g.append_node("Input", 1, nullptr, 0, &od, 1, nullptr);
+        g.append_node("Input", 2, nullptr, 0, &od, 1, nullptr);
+        InputDef ein[2] = {{1, 0}, {2, 0}};
+        g.append_node("Eltwise_Binary", 3, ein, 2, &od, 1, nullptr);
+        InputDef oin[1] = {{3, 0}};
+        g.append_node("Output", 4, oin, 1, nullptr, 0, nullptr);
+        CHECK(g.prepare(env) == GraphStatus::Success, "inpgate: prepare");
+        std::vector<uint8_t> gb(1u << 16, 0);
+        size_t gbn = 0;
+        CHECK(g.serialize(gb.data(), gb.size(), gbn) && gbn > 0, "inpgate: serialize");
+        gb.resize(gbn);
+        const std::string gdir = "/tmp/wtop_emit_test/inpgate/";
+        std::system(("mkdir -p " + gdir).c_str());
+        const std::string gbp = gdir + "two_in.bin";
+        CHECK(write_file(gbp, gb.data(), gb.size()), "inpgate: write .bin");
+        std::vector<uint8_t> f16in(64, 0);
+        CHECK(write_file(gdir + "only0.f16.raw", f16in.data(), f16in.size()), "inpgate: write f16");
+        const std::string errp = gdir + "err.log";
+        auto err_has = [&](const char* s) {
+            std::vector<uint8_t> e;
+            load_file(errp, e);
+            return std::string(reinterpret_cast<char*>(e.data()), e.size()).find(s) !=
+                   std::string::npos;
+        };
+        std::string cmd1 = std::string(WTOP_EMIT_PATH) + " --bin " + gbp + " --input-f16 " +
+                           gdir + "only0.f16.raw --out " + gdir + "out1.wtop 2>" + errp;
+        CHECK(std::system(cmd1.c_str()) != 0, "inpgate: 缺次输入文件 -> 非零退出");
+        CHECK(err_has("has no input file"), "inpgate: 缺文件报错文案命中");
+        std::string cmd2 = std::string(WTOP_EMIT_PATH) + " --bin " + gbp + " --input-f16 " +
+                           gdir + "only0.f16.raw --allow-missing-inputs --out " + gdir +
+                           "out2.wtop 2>" + errp;
+        CHECK(std::system(cmd2.c_str()) == 0, "inpgate: --allow-missing-inputs 逃生退出 0");
+        std::vector<uint8_t> gblob;
+        CHECK(load_file(gdir + "out2.wtop", gblob), "inpgate: 逃生 blob 落盘");
+        wt_blob* gw = new wt_blob{};
+        CHECK(wt_parse(gblob.data(), gblob.size(), gw) == WT_OK, "inpgate: 逃生 blob wt_parse OK");
+        std::string cmd3 = std::string(WTOP_EMIT_PATH) + " --bin " + gbp + " --input-f16 " +
+                           gdir + "only0.f16.raw," + gdir + "only0.f16.raw," + gdir +
+                           "only0.f16.raw --out " + gdir + "out3.wtop 2>" + errp;
+        CHECK(std::system(cmd3.c_str()) != 0, "inpgate: 文件数>图输入数 -> 非零退出");
+        CHECK(err_has("silent-corruption"), "inpgate: 超额文件报错文案命中");
+    }
+
     /* 6. operation 映射契约(2026-09-22 静默兜底治理):
      * EQUAL(binary op=3) → OP_BINARY_F16 sub=4;
      * SOFTPLUS(neuron op=7) → OP_UNARY_F16 sub=13;

@@ -74,7 +74,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& out_path, const std::string& manifest_path,
          const std::string& gguf_path, const std::string& match_path,
          bool ext_weights = false, const std::string& ext_weights_path = "",
-         bool force_v2 = false, bool dma_runlist = false) {
+         bool force_v2 = false, bool dma_runlist = false,
+         bool allow_missing_inputs = false) {
     // 1. deserialize .bin
     std::vector<uint8_t> bin;
     if (!load_file(bin_path, bin)) { std::fprintf(stderr, "error: cannot open %s\n", bin_path.c_str()); return 2; }
@@ -146,6 +147,13 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             }
         }
         /* Input 节点按 op_id 升序(与 host_run 同约定) — in_ids 已在图级信息段收集 */
+        if (in_paths.size() > in_ids.size()) {
+            std::fprintf(stderr,
+                         "error: %zu input files for %zu graph inputs — file count/order "
+                         "mismatch is a silent-corruption risk; check --input-f16 list\n",
+                         in_paths.size(), in_ids.size());
+            return 2;
+        }
         em.main_input_id = in_ids[0];
         if (getenv("GEHTP_DEBUG_INPUTS"))
             std::fprintf(stderr, "[inputs] in_ids=%zu in_paths=%zu\n", in_ids.size(), in_paths.size());
@@ -167,6 +175,22 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                              (unsigned long long)(iop->output_def.rank > 3 ? iop->output_def.dims[3] : 0),
                              (unsigned)iop->output_def.dtype, elems,
                              k < in_paths.size() ? in_paths[k].c_str() : "(zeros)");
+            /* 缺文件防静默零填充: k>=1 的烘焙槽是活常量(mask/pos 全零曾在
+             * v3f 伪装成引擎 bug); k=0 槽 payload 运行时被 EXT_IN 替换, 仅警告 */
+            if (k >= in_paths.size()) {
+                if (k > 0 && !allow_missing_inputs) {
+                    std::fprintf(stderr,
+                                 "error: graph input %zu (op=%llu) has no input file — refusing "
+                                 "to emit zero-filled baked slot; pass it via --input-f16 or "
+                                 "use --allow-missing-inputs\n",
+                                 k, (unsigned long long)in_ids[k]);
+                    return 2;
+                }
+                std::fprintf(stderr,
+                             "warning: graph input %zu (op=%llu) zero-filled%s\n",
+                             k, (unsigned long long)in_ids[k],
+                             k == 0 ? " (slot0 payload is a dead default; EXT_IN replaces it at runtime)" : "");
+            }
             /* 设备槽面统一 f16: f32 文件(4B/元素)转 f16 后塞槽;
              * 已是 f16(2B/元素)直塞。 */
             std::vector<uint8_t> data;
@@ -827,6 +851,7 @@ int main(int argc, char** argv) {
     bool ext_weights = false;  // --ext-weights: 路线B 权重外置(blob 描述符 + model.weights.bin)
     bool force_v2 = false;     // --force-v2: 小模型强制 v2 槽记录(设备回归 v2 通路用)
     bool dma_runlist = false;  // --dma-runlist: 溢出搬移发射真 OP_DMA(非 SPILL/FILL)
+    bool allow_missing_inputs = false;  // --allow-missing-inputs: 缺文件的烘焙输入槽退回零填充(默认硬错)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -847,12 +872,14 @@ int main(int argc, char** argv) {
         else if (a == "--weights-bin") ext_weights_path = next();
         else if (a == "--force-v2") force_v2 = true;
         else if (a == "--dma-runlist") dma_runlist = true;
+        else if (a == "--allow-missing-inputs") allow_missing_inputs = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (bin_path.empty() || out_path.empty()) {
-        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ext-weights [--weights-bin <params.bin>]] [--dma-runlist]\n");
+        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ext-weights [--weights-bin <params.bin>]] [--dma-runlist] [--allow-missing-inputs]\n");
         return 2;
     }
     return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path,
-                ext_weights, ext_weights_path, force_v2, dma_runlist);
+                ext_weights, ext_weights_path, force_v2, dma_runlist,
+                allow_missing_inputs);
 }
