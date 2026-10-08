@@ -899,4 +899,104 @@ uint32_t QnnIRLoader::load_qnn_ir(const std::string& cpp_path, const std::string
     return load_cpp(cpp_path);
 }
 
+// f16 → f32 精确拓宽(与 hnnx_compile.cpp widen_f16 同式)。池内 payload 按
+// f32 存(权重物化视角), emit ensure_weight_slot 再 rne 回 f16 — f16→f32→f16
+// 往返位级还原。
+static float widen_f16_exact(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t u;
+    if (exp == 0) {
+        if (mant == 0) { u = sign; }
+        else {  // f16 次正规 → f32 正规
+            int e = -1;
+            while (!(mant & 0x400)) { mant <<= 1; e--; }
+            mant &= 0x3FF;
+            u = sign | ((uint32_t)(114 + e) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        u = sign | 0x7F800000u | (mant << 13);  // Inf/NaN
+    } else {
+        u = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+bool QnnIRLoader::materialize_static_input(const std::string& tensor_name,
+                                           const std::string& file_path, std::string& err) {
+    auto tit = tensors_.find(tensor_name);
+    if (tit == tensors_.end()) { err = "tensor not found in net.json"; return false; }
+    const QnnTensorInfo& ti = tit->second;
+    if (ti.type != 0) {
+        err = "not a graph input (type=" + std::to_string(ti.type) + ")";
+        return false;
+    }
+    auto iit = tensor_opids_.find(tensor_name);
+    if (iit == tensor_opids_.end()) { err = "no op id mapping for tensor"; return false; }
+    op_id_t iid = iit->second;
+    OpDef* inp = gp_.get_op_at(iid);
+    if (!inp || !inp->name_tag || !inp->name_tag->name() ||
+        std::strcmp(inp->name_tag->name(), "Input") != 0) {
+        err = "op " + std::to_string((unsigned long long)iid) + " is not an Input node";
+        return false;
+    }
+    // 主输入(id 最小的图输入 = emit 的 EXT_IN 槽 0)不可物化: 物化后剩余
+    // 输入会滑进主槽位, 运行时注入语义错位
+    uint32_t main_id = UINT32_MAX;
+    for (const auto& [n2, t2] : tensors_)
+        if (t2.type == 0 && t2.id < main_id) main_id = t2.id;
+    if ((uint32_t)iid == main_id) {
+        err = "main input (lowest-id graph input, EXT_IN slot 0) cannot be materialized";
+        return false;
+    }
+
+    size_t elems = 1;
+    for (uint32_t d : ti.dims) elems *= d;
+    if (file_path.size() >= 8 &&
+        file_path.compare(file_path.size() - 8, 8, ".i32.raw") == 0) {
+        err = "i32 语义静态输入不支持导入期物化(设备槽需 i32 原文, const 通用路径"
+              "会 f32→f16 洗白); 用 emit --input-f16 供给(其缺文件硬门已守)";
+        return false;
+    }
+    std::vector<uint8_t> raw;
+    {
+        std::ifstream f(file_path, std::ios::binary);
+        if (!f) { err = "cannot open " + file_path; return false; }
+        raw.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
+    std::vector<uint8_t> payload;  // 池内 f32 拓宽
+    if (raw.size() == elems * 4) {
+        payload = std::move(raw);
+    } else if (raw.size() == elems * 2) {
+        payload.resize(elems * 4);
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(raw.data());
+        float* w = reinterpret_cast<float*>(payload.data());
+        for (size_t i = 0; i < elems; i++) w[i] = widen_f16_exact(h[i]);
+    } else {
+        err = "file size " + std::to_string(raw.size()) + " != elems*2/4 (elems=" +
+              std::to_string(elems) + ")";
+        return false;
+    }
+
+    // 同 id 替换: 消费者 src_id 不动; 形状元数据沿用原 Input od(免 rank 填充
+    // 口径分歧), 仅改 dtype/element_size 为 f16 语义
+    OutputDef od2 = inp->output_def;
+    od2.dtype = static_cast<uint32_t>(DType::Float16);
+    od2.element_size = 2;
+    gp_.erase_op(iid);
+    op_id_t cid = gp_.append_const_node(static_cast<uint32_t>(iid), od2,
+                                        payload.data(), payload.size());
+    if (cid != iid) {
+        err = "append_const_node failed";
+        return false;
+    }
+    std::printf("[static-input] '%s' op=%llu elems=%zu -> const (pool f32 %zuB) from %s\n",
+                tensor_name.c_str(), (unsigned long long)iid, elems, payload.size(),
+                file_path.c_str());
+    return true;
+}
+
 } // namespace hnnx

@@ -67,6 +67,15 @@ public:
     // net.json 路径的权重注入(2.48 params.bin 适配后经 TAR 加载进来)
     void set_weights(std::map<std::string, std::vector<uint8_t>> w) { weights_ = std::move(w); }
 
+    // --static-input name=file: 导入期把图输入物化为 const 节点(值进入管线
+    // 时机从 emit 提前到导入, 缺文件/尺寸不符 = 硬错)。仅支持 f16 语义
+    // (f32/f16 文件 → 池内 f32 拓宽, emit 权重路径洗回 f16, 与输入槽烘焙
+    // 位级同字节)。".i32.raw" 拒绝: 设备槽需 i32 原文, const 通用路径会
+    // f32→f16 洗白 — 保持 emit --input-f16 供给(其 P1 硬门守)。
+    // 主输入(id 最小的图输入, emit 的 EXT_IN 槽 0)不可物化。
+    bool materialize_static_input(const std::string& tensor_name, const std::string& file_path,
+                                  std::string& err);
+
 private:
     GraphPrepare& gp_;
     std::map<std::string, QnnTensorInfo> tensors_;

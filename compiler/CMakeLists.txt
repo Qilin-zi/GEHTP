@@ -305,6 +305,17 @@ target_compile_definitions(test_wtop_emit PRIVATE WTOP_EMIT_PATH="${CMAKE_BINARY
 add_dependencies(test_wtop_emit wtop_emit)
 add_test(NAME test_wtop_emit COMMAND test_wtop_emit)
 
+# P2: --static-input 导入期物化(loader → prepare → emit 全链 + 负例)
+add_executable(test_static_input tests/test_static_input.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
+target_link_libraries(test_static_input htp_core)
+target_include_directories(test_static_input PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
+target_compile_definitions(test_static_input PRIVATE
+    WTOP_EMIT_PATH="${CMAKE_BINARY_DIR}/wtop_emit"
+    HNNX_COMPILE_PATH="${CMAKE_BINARY_DIR}/hnnx_compile")
+add_dependencies(test_static_input wtop_emit hnnx_compile)
+add_test(NAME test_static_input COMMAND test_static_input)
+
 # M1: Qwen3.5 IR 摄取 + scalar_params + 往返
 add_executable(test_qwen35_ir tests/test_qwen35_ir.cpp)
 target_link_libraries(test_qwen35_ir htp_core)

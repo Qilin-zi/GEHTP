@@ -51,6 +51,8 @@ static void usage() {
         "  --graph-name <name>  Graph name (default: from net.json or 'compiled_graph')\n"
         "  --no-pass <name>    关闭单个图优化 pass(可重复; 默认全开)\n"
         "  --enable-pass <name> 打开单个图优化 pass(默认关的 fusion_* 用; 可重复)\n"
+        "  --static-input <name>=<file> 图输入导入期物化为 const(可重复; f16/f32 raw,\n"
+        "                       缺文件/尺寸不符=编译错; 主输入与 .i32.raw 不支持)\n"
         "  --opt-stats         打印各 pass 匹配/折叠统计与前后条目数\n"
         "  --ddr-offsets <tsv> 第7步阶段一: 导出静态 DDR 偏移表 TSV(check_offsets 消费)\n"
         "  --ddr-budget <n>    DDR 池字节(0=不规划; M2 起喂 TAG_MEM_PLAN)\n"
@@ -297,6 +299,7 @@ int main(int argc, char** argv) {
     uint64_t ddr_budget = 0;            // --ddr-budget: DDR 池字节(0=不规划; M2 起喂 TAG_MEM_PLAN)
     uint64_t plan_vtcm_budget = 0;      // --plan-vtcm-budget: M2 VTCM 驻留池字节(静态规划用)
     bool external_weights = false;      // --external-weights: 路线B 权重外置(跳过 0xCF56)
+    std::vector<std::pair<std::string, std::string>> static_inputs;  // --static-input name=file
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -310,6 +313,16 @@ int main(int argc, char** argv) {
         else if (arg == "--graph-name" && i+1 < argc) graph_name = argv[++i];
         else if (arg == "--no-pass" && i+1 < argc) PassManager::instance().disable(argv[++i]);
         else if (arg == "--enable-pass" && i+1 < argc) PassManager::instance().enable(argv[++i]);
+        else if (arg == "--static-input" && i+1 < argc) {
+            std::string spec = argv[++i];
+            size_t eq = spec.find('=');
+            if (eq == std::string::npos || eq == 0 || eq + 1 >= spec.size()) {
+                std::fprintf(stderr, "Error: --static-input expects <name>=<file>, got '%s'\n",
+                             spec.c_str());
+                return 1;
+            }
+            static_inputs.push_back({spec.substr(0, eq), spec.substr(eq + 1)});
+        }
         else if (arg == "--opt-stats") opt_stats = true;
         else if (arg == "--ddr-offsets" && i+1 < argc) ddr_offsets_path = argv[++i];
         else if (arg == "--ddr-budget" && i+1 < argc) ddr_budget = strtoull(argv[++i], nullptr, 0);
@@ -367,6 +380,15 @@ int main(int argc, char** argv) {
     }
     std::printf("[1] Loaded QNN IR: %u op nodes, %zu total nodes\n",
                 op_count, gp.op_count());
+    // --static-input: 图输入导入期物化(必须在 prepare 前, 让 const_fold 可及)
+    for (const auto& [si_name, si_file] : static_inputs) {
+        std::string si_err;
+        if (!loader.materialize_static_input(si_name, si_file, si_err)) {
+            std::fprintf(stderr, "Error: --static-input %s=%s: %s\n",
+                         si_name.c_str(), si_file.c_str(), si_err.c_str());
+            return 1;
+        }
+    }
     if (verbose) {
         for (op_id_t id = 1; id < 200; id++) {
             const OpDef* od = gp.get_op_at(id);
