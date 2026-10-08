@@ -37,6 +37,9 @@ struct ConstExtent {
     uint64_t size;    // 字节数
 };
 
+// 005 US3a: pass_fc_bias 复用(与 emit 同源的 MatMul 形状/标志推导)
+std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& opdef);
+
 class GraphPrepare {
 public:
     GraphPrepare();

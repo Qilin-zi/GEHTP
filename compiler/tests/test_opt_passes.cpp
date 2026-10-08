@@ -744,6 +744,153 @@ int main() {
         }
     }
 
+    // [15] fc_bias_fold US3a: MatMul 链头(非对齐折/对齐挡/batched 挡)
+    {
+        auto def_r = [](std::initializer_list<uint32_t> dims) {
+            OutputDef od{};
+            od.rank = (uint32_t)dims.size();
+            od.dtype = static_cast<uint32_t>(DType::Float32);
+            uint32_t i = 0;
+            for (uint32_t d : dims) od.dims[i++] = d;
+            od.element_size = 4;
+            return od;
+        };
+        auto set_eb_oper = [](OpDef* od, int code) {
+            auto sp = unpack_scalar_params(od->op_data);
+            bool found = false;
+            for (auto& p : sp)
+                if (p.name == "operation") {
+                    p.is_numeric = true; p.value_num = (double)code; p.value_str.clear();
+                    found = true;
+                }
+            if (!found) {
+                ScalarParam p; p.name = "operation"; p.is_numeric = true;
+                p.value_num = (double)code;
+                sp.push_back(std::move(p));
+            }
+            od->op_data = pack_scalar_params(sp);
+        };
+        auto mark_has_bias = [](GraphPrepare& gp, op_id_t id) -> bool {
+            OpDef* od = gp.get_op_at(id);
+            if (!od) return false;
+            auto sp = unpack_scalar_params(od->op_data);
+            const ScalarParam* p = scalar_get(sp, "has_bias");
+            return p && p->is_numeric && p->value_num != 0;
+        };
+
+        std::printf("=== [15a] 非对齐 MatMul+bias 折叠(M=3) ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, def_r({3, 100}));
+            auto w = add_const_f32(gp, 1, def_r({100, 64}), std::vector<float>(100 * 64, 0.5f));
+            auto b = add_const_f32(gp, 2, def_r({64}), std::vector<float>(64, 0.25f));
+            auto mm = add_unary_op(gp, 30, "MatMul", {in, w}, def_r({3, 64}));
+            auto ad = add_unary_op(gp, 31, "Eltwise_Binary", {mm, b}, def_r({3, 64}));
+            set_eb_oper(gp.get_op_at(ad), 0);
+            add_output(gp, 20, ad);
+            gp.run_optimize_passes(env);
+
+            OpDef* m = gp.get_op_at(mm);
+            OpDef* a = gp.get_op_at(ad);
+            CHECK(a && a->is_dead(), "matmul-bias: Add 标 dead");
+            CHECK(m && !m->is_dead() && m->inputs.size() == 3 &&
+                      m->inputs[2].src_id == b,
+                  "matmul-bias: bias 并入 MatMul inputs[2]");
+            CHECK(mark_has_bias(gp, mm), "matmul-bias: op_data has_bias=1 标记");
+        }
+
+        std::printf("=== [15d] 数值门: 折/不折 execute_host 三方对拍 ===\n");
+        {
+            const uint32_t M = 3, K = 100, N = 64;
+            std::vector<float> x(M * K), w(K * N), b(N);
+            for (uint32_t i = 0; i < x.size(); ++i) x[i] = -1.0f + 2.0f * ((i * 7 + 3) % 97) / 97.0f;
+            for (uint32_t i = 0; i < w.size(); ++i) w[i] = -0.5f + ((i * 13 + 5) % 89) / 89.0f;
+            for (uint32_t i = 0; i < b.size(); ++i) b[i] = -2.0f + 4.0f * ((i * 11 + 1) % 71) / 71.0f;
+
+            auto build = [&](GraphPrepare& gp) {
+                auto in = add_input(gp, 5, def_r({M, K}));
+                auto wc = add_const_f32(gp, 1, def_r({K, N}), w);
+                auto bc = add_const_f32(gp, 2, def_r({N}), b);
+                auto mm = add_unary_op(gp, 30, "MatMul", {in, wc}, def_r({M, N}));
+                auto ad = add_unary_op(gp, 31, "Eltwise_Binary", {mm, bc}, def_r({M, N}));
+                set_eb_oper(gp.get_op_at(ad), 0);
+                add_output(gp, 20, ad);
+                return ad;
+            };
+
+            GraphPrepare gp_nofold;
+            build(gp_nofold);
+            PassManager::instance().disable("fc_bias_fold");
+            gp_nofold.run_optimize_passes(env);
+            PassManager::instance().enable("fc_bias_fold");
+            auto r0 = gp_nofold.execute_host(x);
+
+            GraphPrepare gp_fold;
+            build(gp_fold);
+            gp_fold.run_optimize_passes(env);
+            auto r1 = gp_fold.execute_host(x);
+
+            // numpy 同式参考: X[M,K] @ W[K,N] + B[N]
+            std::vector<float> ref(M * N);
+            for (uint32_t i = 0; i < M; ++i)
+                for (uint32_t j = 0; j < N; ++j) {
+                    float acc = 0.0f;
+                    for (uint32_t p = 0; p < K; ++p) acc += x[i * K + p] * w[p * N + j];
+                    ref[i * N + j] = acc + b[j];
+                }
+
+            CHECK(r0.ok && r1.ok && r0.output.size() == M * N,
+                  "matmul-bias 数值: execute_host 双跑成功");
+            double max_d = 0.0;
+            uint32_t n_fold_diff = 0;
+            for (uint32_t i = 0; i < M * N; ++i) {
+                double d1 = std::fabs((double)r1.output[i] - ref[i]);
+                if (d1 > max_d) max_d = d1;
+                if (r0.output[i] != r1.output[i]) n_fold_diff++;
+            }
+            double scale = 1.0;
+            for (double v : ref) scale = std::max(scale, std::fabs((double)v));
+            CHECK(max_d / scale < 1e-5,
+                  "matmul-bias 数值: 折后 vs 手算参考 (1e-5 相对)");
+            CHECK(n_fold_diff == 0,
+                  "matmul-bias 数值: 折/不折 execute_host 位级一致");
+        }
+
+        std::printf("=== [15b] 反例: 32 对齐不折(HMX 门) ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, def_r({64, 64}));
+            auto w = add_const_f32(gp, 1, def_r({64, 64}), std::vector<float>(64 * 64, 0.5f));
+            auto b = add_const_f32(gp, 2, def_r({64}), std::vector<float>(64, 0.25f));
+            auto mm = add_unary_op(gp, 30, "MatMul", {in, w}, def_r({64, 64}));
+            auto ad = add_unary_op(gp, 31, "Eltwise_Binary", {mm, b}, def_r({64, 64}));
+            set_eb_oper(gp.get_op_at(ad), 0);
+            add_output(gp, 20, ad);
+            gp.run_optimize_passes(env);
+            OpDef* m = gp.get_op_at(mm);
+            OpDef* a = gp.get_op_at(ad);
+            CHECK(a && !a->is_dead(), "matmul-bias 反例: 32 对齐不折(防 HMX 倒退)");
+            CHECK(m && m->inputs.size() == 2, "matmul-bias 反例: bias 未并入");
+        }
+
+        std::printf("=== [15c] 反例: batched BMM 不折(设备硬错防御) ===\n");
+        {
+            GraphPrepare gp;
+            auto in = add_input(gp, 5, def_r({2, 3, 100}));
+            auto w = add_const_f32(gp, 1, def_r({2, 100, 64}), std::vector<float>(2 * 100 * 64, 0.5f));
+            auto b = add_const_f32(gp, 2, def_r({64}), std::vector<float>(64, 0.25f));
+            auto mm = add_unary_op(gp, 30, "MatMul", {in, w}, def_r({2, 3, 64}));
+            auto ad = add_unary_op(gp, 31, "Eltwise_Binary", {mm, b}, def_r({2, 3, 64}));
+            set_eb_oper(gp.get_op_at(ad), 0);
+            add_output(gp, 20, ad);
+            gp.run_optimize_passes(env);
+            OpDef* m = gp.get_op_at(mm);
+            OpDef* a = gp.get_op_at(ad);
+            CHECK(a && !a->is_dead(), "matmul-bias 反例: batched 不折");
+            CHECK(m && m->inputs.size() == 2, "matmul-bias 反例: batched bias 未并入");
+        }
+    }
+
     std::printf("\n%s: %d failures\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

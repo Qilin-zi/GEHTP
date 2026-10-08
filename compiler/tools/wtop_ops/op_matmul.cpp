@@ -25,19 +25,44 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             std::memcpy(&ef, od->serialized_extra.data(), sizeof(ef));
         m = ef.m; k = ef.k; nn = ef.n;
     } else {
-        if (od->serialized_extra.size() >= sizeof(em2))
-            std::memcpy(&em2, od->serialized_extra.data(), sizeof(em2));
+        if (!od->serialized_extra.empty()) {
+            size_t c = std::min(od->serialized_extra.size(), sizeof(em2));
+            std::memcpy(&em2, od->serialized_extra.data(), c);
+        }
         m = em2.m; k = em2.k; nn = em2.n;
     }
     if (m == 0 || k == 0 || nn == 0) {
         std::fprintf(stderr, "error: %s extra 未提取 (M/K/N=0)\n", nm.c_str());
         return 4;
     }
+    /* FC bias 折叠(pass_fc_bias)配套: ExtraFc.has_bias 只认 pass 写入的
+     * op_data scalar 标记(extract_fc_extra 同源口径; 注入的 N 元素 wscale
+     * const 不再误判)。此处再核实 inputs[2] 确为 const 才发 BIAS opcode。
+     * 005 US3a: MatMul 链头同标记同通道(em2.has_bias, 旧 bin 24B 无此
+     * 字段按 0)。 */
+    const OpDef* bias_op = nullptr;
+    bool mm_mark = (nm == "MatMul") && em2.has_bias;
+    bool has_bias = ((nm == "FullyConnected") ? (ef.has_bias != 0) : mm_mark) &&
+                    od->inputs.size() > 2;
+    if (nm == "MatMul" && od->serialized_extra.size() == 24u)
+        has_bias = false;                     // 旧 bin: 无 has_bias 字段
+    if (has_bias) {
+        const OpDef* bp = gp.get_op_at(od->inputs[2].src_id);
+        if (bp && (bp->is_const() || bp->const_data_size > 0)) bias_op = bp;
+        else has_bias = false;
+    }
     /* Q4_0 打包权重(K*N/2 字节)→ W4A16;f16 池权重 → MATMUL_F16
      * (float 图; probe 首撞: f16 权重被按 W4A16 执行直接失败) */
     bool w4 = w_is_const && (w_s != em.dummy_slot_id) &&
               (em.slots[w_s & 0x7FFFu].len == (k * nn / 2u));
     if (w4) {
+        if (has_bias) {
+            /* W4A16 的 bias 走权重内嵌表(exec_matmul 扫槽), 独立 bias 槽
+             * 无通道, 静默丢 bias = 数值错 —— 硬报错, 待 W4A16+bias 通道 */
+            std::fprintf(stderr, "error: FC has_bias + W4A16 权重组合暂不支持 (M=%u K=%u N=%u)\n",
+                         m, k, nn);
+            return 4;
+        }
         em.add_op(OP_MATMUL_W4A16, {a_t, w_s, out_t, m, k, nn});
     } else {
         uint32_t flags = 0;
@@ -71,7 +96,7 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             return off_s + 2048u;
         };
         const size_t kVTCMTotal = 16u * 1024u * 1024u;
-        if (!em2.batched && (m % 32u) == 0u && (k % 32u) == 0u && (nn % 32u) == 0u &&
+        if (!has_bias && !em2.batched && (m % 32u) == 0u && (k % 32u) == 0u && (nn % 32u) == 0u &&
             need_mm(m, k, nn) > kVTCMTotal) {
             /* 二分找最大 32 倍数 N_c 使 need(m,k,N_c) ≤ 预算 (need 随 N 单调) */
             uint32_t N_chunk = 0, lo = 32u, hi = nn;
@@ -91,6 +116,24 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
                 }
                 return 0;
             }
+        }
+        if (has_bias) {
+            /* OP_MATMUL_F16_BIAS (opcode 36): 尾部追加 bias 槽。设备 v1 仅
+             * 标量路径应用 bias —— pass 门已挡 HMX 形折叠, 此处若遇 32 对齐
+             * 形(源图原生 3 输入 FC)内核自动走标量, 正确优先。
+             * 005 US3a 硬约束: MatMul+has_bias 的 32 对齐形违禁(3b 前会被
+             * 强制标量, 且 pass 门不该产出) —— 硬报错, 对齐 W4A16+bias 风格。 */
+            if (nm == "MatMul" &&
+                (m % 32u) == 0u && (k % 32u) == 0u && (nn % 32u) == 0u) {
+                std::fprintf(stderr,
+                    "error: MatMul has_bias + 32对齐形违禁 (M=%u K=%u N=%u): "
+                    "HMX 路径无 bias 通道, 设备会静默丢 bias\n",
+                    m, k, nn);
+                return 4;
+            }
+            uint32_t bias_s = 0x8000u | em.ensure_weight_slot(gp, bias_op, wslots, od->grouping);
+            em.add_op(OP_MATMUL_F16_BIAS, {a_t, w_s, out_t, m, k, nn, flags, bias_s});
+            return 0;
         }
         em.add_op(OP_MATMUL_F16, {a_t, w_s, out_t, m, k, nn, flags});
     }

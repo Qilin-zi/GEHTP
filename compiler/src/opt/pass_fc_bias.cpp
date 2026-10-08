@@ -22,6 +22,7 @@
 #include "hnnx/opt/pass_manager.hpp"
 #include "hnnx/opt/optimization_passes.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
+#include "hnnx/ir/op_extra.hpp"
 #include "hnnx/ir/scalar_params.hpp"
 
 #include <algorithm>
@@ -126,9 +127,14 @@ Match match_pattern(OpDef* op, GraphPrepare* gp) {
             fc = gp->get_op_at(chain->inputs[0].src_id);
             if (!live(fc)) continue;
         }
-        if (std::string(op_name(fc)) != "FullyConnected") continue;
+        // US3a: 链头接受 MatMul(形状/标志经 extract_matmul_extra 同源推导,
+        // 与 emit/序列化唯一口径; serialized_extra 在 pass 期为空, 不能读)
+        std::string fc_nm = op_name(fc);
+        bool is_fc = fc_nm == "FullyConnected";
+        bool is_mm = fc_nm == "MatMul";
+        if (!is_fc && !is_mm) continue;
         if (fc->inputs.size() < 2) continue;           // 无权重, 畸形
-        if (fc->consumers.size() != 1) continue;       // FC 只喂本链
+        if (fc->consumers.size() != 1) continue;       // 链头只喂本链
         if (has_bias_mark(fc)) continue;               // 已折过(幂等)
         const OpDef* w = gp->get_op_at(fc->inputs[1].src_id);
         if (!w || !(w->is_const() || w->const_data_size > 0)) continue;
@@ -136,7 +142,8 @@ Match match_pattern(OpDef* op, GraphPrepare* gp) {
 
         // M/K/N + bias 长度 == N(严格 [N], 不猜广播)
         uint64_t m = 0, k = 0, n = 0;
-        {
+        bool batched = false;
+        if (is_fc) {
             const OutputDef& od = fc->output_def;
             uint32_t ork = eff_rank(od);
             if (ork < 1) continue;
@@ -146,8 +153,16 @@ Match match_pattern(OpDef* op, GraphPrepare* gp) {
             uint32_t wr = eff_rank(w->output_def);
             if (wr < 1) continue;
             k = w->output_def.dims[wr - 1];            // [N,K] 内维
-            if (m == 0 || k == 0 || n == 0) continue;
+        } else {
+            std::vector<uint8_t> ex = extract_matmul_extra(*gp, *fc);
+            ExtraMatMul em{};
+            if (ex.size() < sizeof(em)) continue;
+            std::memcpy(&em, ex.data(), sizeof(em));
+            m = em.m; k = em.k; n = em.n;
+            batched = (em.batched != 0);
+            if (batched) continue;   // 设备硬错防御: matmul_f16_bias 不支持 batched
         }
+        if (m == 0 || k == 0 || n == 0) continue;
         if (eff_elems(biasc->output_def) != n) continue;
 
         // HMX 门: 设备会走 HMX 的形状不折(内核 v1 仅标量路径应用 bias)

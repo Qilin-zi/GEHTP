@@ -1709,6 +1709,9 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
 // extractor 从图中推导参数(权重 const 形状 + 注入的 stride/pad/dilation
 // const 数据), 不依赖任何模型特判。
 // ---------------------------------------------------------------------------
+// 005 US3a: pass_fc_bias 复用同源形状推导(声明前置, 定义在匿名 ns 之后)
+std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& opdef);
+
 namespace {
 using ExtraInfoFn = std::vector<uint8_t>(*)(const GraphPrepare& gp, const OpDef& opdef);
 
@@ -2005,50 +2008,6 @@ std::vector<uint8_t> extract_fc_extra(const GraphPrepare& gp, const OpDef& opdef
     return raw_extra(&e, sizeof(e));
 }
 
-std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& opdef) {
-    ExtraMatMul e{};
-    // M/K/N: a [M,K] b [K,N](transpose_in0/1 由 scalar 决定; 默认 0=不转置)
-    e.transpose_in0 = static_cast<uint32_t>(scalar_num(opdef, "transpose_in0", 0));
-    e.transpose_in1 = static_cast<uint32_t>(scalar_num(opdef, "transpose_in1", 0));
-    const OpDef* a = opdef.inputs.size() > 0 ? gp.get_op_at(opdef.inputs[0].src_id) : nullptr;
-    const OpDef* b = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
-    if (a && b && a->output_def.rank >= 2 && b->output_def.rank >= 2) {
-        uint32_t ar = a->output_def.rank, br = b->output_def.rank;
-        /* 压尾 1 得有效 rank(QNN 前置填充 [1,1,m,k]) */
-        while (ar > 0 && a->output_def.dims[ar - 1] == 1) ar--;
-        while (br > 0 && b->output_def.dims[br - 1] == 1) br--;
-        /* K 一致性校验: 压尾后两侧 K 不一致 ⇒ 尾 1 是真实外积 K 维
-         * (RoPE inv_freq [1,64,1] × pos [1,1,16] → [1,64,16]), 回退未压秩 */
-        if (ar >= 2 && br >= 2 &&
-            a->output_def.dims[ar - 1] != b->output_def.dims[br - 2]) {
-            ar = a->output_def.rank; br = b->output_def.rank;
-        }
-        uint32_t bk = e.transpose_in1 ? b->output_def.dims[br - 1] : b->output_def.dims[br - 2];
-        uint32_t bn = e.transpose_in1 ? b->output_def.dims[br - 2] : b->output_def.dims[br - 1];
-        (void)bk;
-        e.n = bn;
-        /* batched BMM(attention q·kᵀ / probs·v): 有效 rank≥3 且 A/B 批维
-         * 同构 → 批维不折叠, m = 每批行数(批数由输出形状推)。
-         * rank≤2 或 B 批维广播 → 普通 GEMM 折批(等价)。 */
-        uint64_t mprod = 1;
-        uint32_t alast = a->output_def.dims[ar - 1];
-        bool same_batch = (ar >= 3 && br >= 3);
-        if (same_batch)
-            for (uint32_t i = 0; i + 2 < ar; ++i)
-                if (a->output_def.dims[i] != b->output_def.dims[i]) same_batch = false;
-        if (same_batch) {
-            e.batched = 1;
-            e.m = a->output_def.dims[ar - 2];
-            e.k = alast;
-        } else {
-            for (uint32_t i = 0; i + 1 < ar; ++i) mprod *= a->output_def.dims[i];
-            if (e.transpose_in0) { e.m = alast; e.k = (uint32_t)mprod; }
-            else { e.m = (uint32_t)mprod; e.k = alast; }
-        }
-    }
-    return raw_extra(&e, sizeof(e));
-}
-
 std::vector<uint8_t> extract_strided_slice_extra(const GraphPrepare& gp, const OpDef& opdef) {
     ExtraStridedSlice e{};
     e.begin_mask = static_cast<uint32_t>(scalar_num(opdef, "begin_mask", 0));
@@ -2202,6 +2161,52 @@ std::map<std::string, ExtraInfoFn>& extra_info_registry() {
     return reg;
 }
 } // namespace
+
+std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraMatMul e{};
+    // M/K/N: a [M,K] b [K,N](transpose_in0/1 由 scalar 决定; 默认 0=不转置)
+    e.transpose_in0 = static_cast<uint32_t>(scalar_num(opdef, "transpose_in0", 0));
+    e.transpose_in1 = static_cast<uint32_t>(scalar_num(opdef, "transpose_in1", 0));
+    const OpDef* a = opdef.inputs.size() > 0 ? gp.get_op_at(opdef.inputs[0].src_id) : nullptr;
+    const OpDef* b = opdef.inputs.size() > 1 ? gp.get_op_at(opdef.inputs[1].src_id) : nullptr;
+    if (a && b && a->output_def.rank >= 2 && b->output_def.rank >= 2) {
+        uint32_t ar = a->output_def.rank, br = b->output_def.rank;
+        /* 压尾 1 得有效 rank(QNN 前置填充 [1,1,m,k]) */
+        while (ar > 0 && a->output_def.dims[ar - 1] == 1) ar--;
+        while (br > 0 && b->output_def.dims[br - 1] == 1) br--;
+        /* K 一致性校验: 压尾后两侧 K 不一致 ⇒ 尾 1 是真实外积 K 维
+         * (RoPE inv_freq [1,64,1] × pos [1,1,16] → [1,64,16]), 回退未压秩 */
+        if (ar >= 2 && br >= 2 &&
+            a->output_def.dims[ar - 1] != b->output_def.dims[br - 2]) {
+            ar = a->output_def.rank; br = b->output_def.rank;
+        }
+        uint32_t bk = e.transpose_in1 ? b->output_def.dims[br - 1] : b->output_def.dims[br - 2];
+        uint32_t bn = e.transpose_in1 ? b->output_def.dims[br - 2] : b->output_def.dims[br - 1];
+        (void)bk;
+        e.n = bn;
+        /* batched BMM(attention q·kᵀ / probs·v): 有效 rank≥3 且 A/B 批维
+         * 同构 → 批维不折叠, m = 每批行数(批数由输出形状推)。
+         * rank≤2 或 B 批维广播 → 普通 GEMM 折批(等价)。 */
+        uint64_t mprod = 1;
+        uint32_t alast = a->output_def.dims[ar - 1];
+        bool same_batch = (ar >= 3 && br >= 3);
+        if (same_batch)
+            for (uint32_t i = 0; i + 2 < ar; ++i)
+                if (a->output_def.dims[i] != b->output_def.dims[i]) same_batch = false;
+        if (same_batch) {
+            e.batched = 1;
+            e.m = a->output_def.dims[ar - 2];
+            e.k = alast;
+        } else {
+            for (uint32_t i = 0; i + 1 < ar; ++i) mprod *= a->output_def.dims[i];
+            if (e.transpose_in0) { e.m = alast; e.k = (uint32_t)mprod; }
+            else { e.m = (uint32_t)mprod; e.k = alast; }
+        }
+    }
+    e.has_bias = (scalar_num(opdef, "has_bias", 0) != 0) ? 1u : 0u;
+    return raw_extra(&e, sizeof(e));
+}
+
 
 // serialize_opdef: write a single op's structural record (TAG_OP_RECORD).
 //   [uint32 name_len][char[] name, 4-aligned][uint64 op_id][uint16 flags]

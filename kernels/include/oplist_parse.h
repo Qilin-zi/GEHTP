@@ -162,6 +162,12 @@ enum {
        逐字节恒等五纪律见 spec FR-013 (每 tile clracc / 重装 bias 页 /
        k 升序 / 回落全有或全无 / 同引擎)。 */
     OP_MATMUL_F16_SPLIT = 35,
+    /* FC bias 折叠 (pass_fc_bias, 2026-09-29): 与 OP_MATMUL_F16 同源 + 尾部
+     * 追加 bias 槽引用。 [a_ref,w_s,out_t,M,K,N,flags,bias_s] arity 8
+     * bias_s = 0x8000|slot (N 元素 f16 按列加); flags 同 bit 布局。
+     * 设备 v1 仅标量路径应用 bias (f32 累加器按列加); HMX 形状由编译期
+     * pass 门挡住 (M/K/N 全 32 倍数不折), 故本 opcode 实际只遇标量形。 */
+    OP_MATMUL_F16_BIAS = 36,
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -197,6 +203,7 @@ enum {
 #define WT_ARITY_DMA 8
 #define WT_ARITY_PAD_F16 7
 #define WT_ARITY_MATMUL_F16_SPLIT 9
+#define WT_ARITY_MATMUL_F16_BIAS 8
 
 struct wt_slot {
     uint32_t len;

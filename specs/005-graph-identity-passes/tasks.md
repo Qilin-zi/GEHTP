@@ -90,13 +90,13 @@ description: "Task list for 005-graph-identity-passes implementation"
 
 ### Tests for User Story 3a
 
-- [ ] T014 [US3] 在 `compiler/tests/test_opt_passes.cpp` 增 [15] 段（先写、先败）：非对齐 MatMul+bias 正例 / 32 对齐反例（M%32==0 ∧ K%32==0 ∧ N%32==0 不折）/ batched 反例（flags&4 排除）
+- [x] T014 [US3] 在 `compiler/tests/test_opt_passes.cpp` 增 [15] 段（先写、先败）：非对齐 MatMul+bias 正例 / 32 对齐反例（M%32==0 ∧ K%32==0 ∧ N%32==0 不折）/ batched 反例（flags&4 排除）
 
 ### Implementation for User Story 3a
 
-- [ ] T015 [US3] 匹配器扩展（`compiler/src/opt/pass_fc_bias.cpp`）：链头接受 `"MatMul"`（在既有 FullyConnected 旁）；沿用 HMX 形状门；排除 batched（设备硬错 `matmul_f16_bias 不支持 batched`）；op_data 写同一 `has_bias=1` 标记（contracts 表：FC 与 MatMul 链头同标记）
-- [ ] T016 [US3] 发射门放行（`compiler/tools/wtop_ops/op_matmul.cpp:40`）：`nm == "FullyConnected"` → `nm == "FullyConnected" || nm == "MatMul"`，has_bias 核实逻辑不变；**同时加硬报错**：32 对齐 MatMul 带 has_bias 标记发射 36 号 → 编译期 error（契约"违禁组合必须硬报错"，对齐既有 W4A16+bias 硬错风格）。**共享文件**：动手前 `git status` 查 003 在途
-- [ ] T017 [US3] P3a 集成门：0.8B 编译 + `--opt-stats` 折叠数（预期 0-5，注意力系 32 对齐形被门挡是**刻意**防倒退）+ 上板无回退 + ctest；SC-004；合成小 blob（非对齐 MatMul+bias）host_run 对拍手算
+- [x] T015 [US3] 匹配器扩展（`compiler/src/opt/pass_fc_bias.cpp`）：链头接受 `"MatMul"`（在既有 FullyConnected 旁）；沿用 HMX 形状门；排除 batched（设备硬错 `matmul_f16_bias 不支持 batched`）；op_data 写同一 `has_bias=1` 标记（contracts 表：FC 与 MatMul 链头同标记）
+- [x] T016 [US3] 发射门放行（`compiler/tools/wtop_ops/op_matmul.cpp:40`）：`nm == "FullyConnected"` → `nm == "FullyConnected" || nm == "MatMul"`，has_bias 核实逻辑不变；**同时加硬报错**：32 对齐 MatMul 带 has_bias 标记发射 36 号 → 编译期 error（契约"违禁组合必须硬报错"，对齐既有 W4A16+bias 硬错风格）。**共享文件**：动手前 `git status` 查 003 在途
+- [x] T017 [US3] P3a 集成门：0.8B 编译 + `--opt-stats` 折叠数（预期 0-5，注意力系 32 对齐形被门挡是**刻意**防倒退）+ 上板无回退 + ctest；SC-004；合成小 blob（非对齐 MatMul+bias）host_run 对拍手算
 
 **Checkpoint**: US3a 安全合入——不撤 HMX 门、零设备语义改动。
 
