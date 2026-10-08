@@ -51,6 +51,26 @@ static const char* NET_JSON =
     "\"/add\":{\"type\":\"Eltwise_Binary\",\"input_names\":[\"input\",\"mask\"],"
     "\"output_names\":[\"out\"]}}}}";
 
+// 折叠链图: mask → EQ(mask,mask) → SELECT(eq, mask, zeros) → ADD(input, sel)。
+// sel/out dtype=f16(0x216): 终折 const 池内 f16-native → 发射走原样入槽分支。
+// 预期: EQ/SELECT 两 op 被 const_fold 折掉, blob 只剩 1 个计算 op 且含
+// f16 2.0×4 常量槽。
+static const char* NET_JSON_FOLD =
+    "{\"graph\":{\"tensors\":{"
+    "\"input\":{\"id\":1,\"type\":0,\"data_type\":562,\"dims\":[1,4]},"
+    "\"mask\":{\"id\":2,\"type\":0,\"data_type\":562,\"dims\":[1,4]},"
+    "\"zc\":{\"id\":5,\"type\":4,\"data_type\":562,\"dims\":[1,4]},"
+    "\"eqo\":{\"id\":6,\"type\":3,\"data_type\":562,\"dims\":[1,4]},"
+    "\"selo\":{\"id\":7,\"type\":3,\"data_type\":534,\"dims\":[1,4]},"
+    "\"out\":{\"id\":8,\"type\":1,\"data_type\":534,\"dims\":[1,4]}},"
+    "\"nodes\":{"
+    "\"/eq\":{\"type\":\"Eltwise_Binary\",\"input_names\":[\"mask\",\"mask\"],"
+    "\"output_names\":[\"eqo\"],\"scalar_params\":{\"operation\":{\"50\":3}}},"
+    "\"/sel\":{\"type\":\"Eltwise_Ternary\",\"input_names\":[\"eqo\",\"mask\",\"zc\"],"
+    "\"output_names\":[\"selo\"]},"
+    "\"/add\":{\"type\":\"Eltwise_Binary\",\"input_names\":[\"input\",\"selo\"],"
+    "\"output_names\":[\"out\"],\"scalar_params\":{\"operation\":{\"50\":0}}}}}}";
+
 int main() {
     std::printf("=== test_static_input (P2 import-time materialization) ===\n\n");
     register_all_ops();
@@ -159,6 +179,38 @@ int main() {
         if (all2) { found_mask_slot = true; break; }
     }
     CHECK(found_mask_slot, "blob 含 f16 2.0×4 常量槽(8B)");
+
+    // ---- 折叠链: materialize → const_fold 吃链 → f16-native 池 const 发射 ----
+    const std::string njf = dir + "fold_net.json";
+    CHECK(write_file(njf, NET_JSON_FOLD, std::strlen(NET_JSON_FOLD)), "write fold_net.json");
+    const std::string binf = dir + "fold.tagged.bin";
+    std::string cmdf = std::string(HNNX_COMPILE_PATH) + " --net-json " + njf +
+                       " --static-input mask=" + mask_f32 +
+                       " --format tagged --output " + binf + " >" + dir + "cf.log 2>&1";
+    CHECK(std::system(cmdf.c_str()) == 0, "fold 链 compile 退出 0");
+    const std::string blobf = dir + "fold.wtop";
+    std::string cmde = std::string(WTOP_EMIT_PATH) + " --bin " + binf + " --input-f16 " +
+                       in_f32 + " --out " + blobf + " 2>" + dir + "ef.log";
+    CHECK(std::system(cmde.c_str()) == 0, "fold 链 emit 退出 0");
+    std::vector<uint8_t> blob2;
+    CHECK(load_file(blobf, blob2), "read fold blob");
+    wt_blob* wb2 = new wt_blob{};
+    CHECK(wt_parse(blob2.data(), blob2.size(), wb2) == WT_OK, "fold blob wt_parse OK");
+    CHECK(wb2->n_ops == 1, "EQ/SELECT 已折, 仅剩 1 个计算 op");
+    bool found_fold_slot = false;
+    for (uint32_t s = 0; s < wb2->n_slots; s++) {
+        const wt_slot& sl = wb2->slots[s];
+        if (sl.len != 8) continue;
+        const uint8_t* p = wb2->weight_base + sl.offset;
+        bool all2 = true;
+        for (int i = 0; i < 4; i++) {
+            uint16_t h;
+            std::memcpy(&h, p + i * 2, 2);
+            if (h != 0x4000) { all2 = false; break; }
+        }
+        if (all2) { found_fold_slot = true; break; }
+    }
+    CHECK(found_fold_slot, "折后 f16-native 池 const 原样入槽(2.0×4)");
 
     std::printf("\n%s\n", failed ? "FAILED" : "ALL PASSED");
     return failed ? 1 : 0;

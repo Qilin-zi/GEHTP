@@ -413,6 +413,22 @@ struct Emitter {
             wslots[w->op_id] = id;
             return id;
         }
+        /* es=2 池宽度双约定判别: 权重/物化 const = f32 拓宽(4B/elem, 下方
+         * f32→f16 洗回); const_fold 自产 const = f16-native(2B/elem, 字节
+         * 即设备面, 原样入槽)。size == 2*elems 与 4*elems 互斥, 判别无歧义 */
+        {
+            size_t dims_elems = 1;
+            for (uint32_t i = 0; i < w->output_def.rank && i < 5; ++i)
+                dims_elems *= (size_t)w->output_def.dims[i];
+            if (w->output_def.element_size == 2 && dims_elems > 0 &&
+                (size_t)w->const_data_size == dims_elems * 2 &&
+                w->const_data_offset + dims_elems * 2 <= gp.const_pool().size()) {
+                const uint8_t* src = gp.const_pool().data() + w->const_data_offset;
+                uint32_t id = slot_for((uint32_t)(dims_elems * 2), (uint32_t)dims_elems, src);
+                wslots[w->op_id] = id;
+                return id;
+            }
+        }
         std::vector<uint16_t> w16(n);
         /* 权重字节源始终从 const_pool 读 (const_data_offset 是 const_pool 内偏移)。
          * 路线B 仅改变槽路由: slot_for 已按 ext_weights 选 add_ext_slot/add_slot。

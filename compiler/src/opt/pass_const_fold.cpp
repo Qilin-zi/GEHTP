@@ -82,6 +82,18 @@ static std::vector<float> widen_const(const GraphPrepare* gp, const OpDef* pc) {
     if (es == 4) {
         std::memcpy(buf.data(), src, pc->const_data_size);
     } else if (es == 2) {
+        /* es=2 的池宽度两种并存: 权重/物化 const 池内 f32 拓宽(4B/elem,
+         * ensure_weight_slot 同读法); const_fold 自产 const f16-native
+         * (2B/elem)。按尺寸判别: size ≥ 4*elems → f32 读 */
+        size_t dims_elems = 1;
+        for (uint32_t i = 0; i < pc->output_def.rank && i < 5; ++i)
+            dims_elems *= (size_t)pc->output_def.dims[i];
+        if (dims_elems > 0 && pc->const_data_size >= dims_elems * 4) {
+            elem_n = dims_elems;
+            buf.resize(elem_n, 0.0f);
+            std::memcpy(buf.data(), src, dims_elems * 4);
+            return buf;
+        }
         for (size_t i = 0; i < elem_n; i++) {
             uint16_t h;
             std::memcpy(&h, src + i * 2, 2);
