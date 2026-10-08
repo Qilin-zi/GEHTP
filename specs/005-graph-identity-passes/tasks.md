@@ -109,9 +109,9 @@ description: "Task list for 005-graph-identity-passes implementation"
 
 ### Implementation for User Story 3b
 
-- [ ] T018 [US3] 内核实现（`kernels/src/runtime/oplist_exec.c`）：`exec_matmul_f16_hmx` 加 bias 参数——GEMM 出 crouton 后、unpack 写回前，VTCM 内 f32 累加器逐列加（与标量路径同口径）；**协调**：该文件 003 会话在途（T014/T015 落地空窗再动，或走私有名隔离）
-- [ ] T019 [US3] 合成 blob 上板验证：pack_oplist 造 32 对齐形 + bias 的 matmul（HMX 路径）对比标量路径输出；SC-005 达标后才撤 `if (bias) want_hmx = 0`（oplist_exec.c:1857）
-- [ ] T020 [US3] P3b 集成门：0.8B 撤 MatMul 折叠的 HMX 门重编译 → 42 候选全折 → 上板 wall 对比（bias 上 HMX 后注意力 matmul 不再回落标量）→ SC-001 口径复测 + ctest
+- [x] T018 [US3] 内核实现（`kernels/src/runtime/oplist_exec.c`）：`exec_matmul_f16_hmx` 加 bias 参数——实现取 scale 区奇位 out_bias 技法（cvt 一步 f16(acc·1.0+bias) 单次舍入, 与 exec_conv2d_hmx 同源; 较任务书"unpack 前逐列加"更优: 零额外 pass、与已上板 conv2d 路径同验证链）；**协调**：该文件 003 会话在途（提交走精确暂存, 003 在途 hunk 不吸收）
+- [x] T019 [US3] 合成 blob 上板验证（46 号例, pack_hmx_bias.py M=32/K=1024/N=2048）：SC-005 **通过** —— 引擎双到位(ref=SCALAR/hmx=HMX)、cos=1.000000、逐元素三判据(位距≤2 或 |d|≤2·ulp(ref) 或 |d|≤2^-14 取消地板) 0 违例、NaN 0；首跑 max_ulp=460 根因=近零对消输出的次正规位距膨胀(全部 outlier |v|<6e-4/绝对差<3e-5/散布无列 tile 聚类, 排除 bias 错装)，撤门后(默认 HMX)复跑 6/6；`if (bias) want_hmx = 0` 已删, 换 `wt_exec_force_bias_scalar` 测试钩子(默认 0=生产 HMX)
+- [x] T020 [US3] P3b 集成门：撤 pass_fc_bias HMX 32 对齐门 + op_matmul.cpp emit 硬错(两处同撤否则编译失败)；单测 [15b]/图 B 改正例(32 对齐折)；ctest 47/47；0.8B 重编译——US3a 已证 36 候选另侧全非 const(42 候选系 activity-activity 加法), 撤门后仍 **0 次 MatMul 折**, 发射 md5 与 005_us3a 逐字节一致(见 US3b 证据)→SC-004 门证据沿用；设备 wall 对比无变化面(blob 同字节)
 
 **Checkpoint**: 全 Story 完成，US3 收益兑现。
 

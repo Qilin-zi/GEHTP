@@ -118,19 +118,10 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             }
         }
         if (has_bias) {
-            /* OP_MATMUL_F16_BIAS (opcode 36): 尾部追加 bias 槽。设备 v1 仅
-             * 标量路径应用 bias —— pass 门已挡 HMX 形折叠, 此处若遇 32 对齐
-             * 形(源图原生 3 输入 FC)内核自动走标量, 正确优先。
-             * 005 US3a 硬约束: MatMul+has_bias 的 32 对齐形违禁(3b 前会被
-             * 强制标量, 且 pass 门不该产出) —— 硬报错, 对齐 W4A16+bias 风格。 */
-            if (nm == "MatMul" &&
-                (m % 32u) == 0u && (k % 32u) == 0u && (nn % 32u) == 0u) {
-                std::fprintf(stderr,
-                    "error: MatMul has_bias + 32对齐形违禁 (M=%u K=%u N=%u): "
-                    "HMX 路径无 bias 通道, 设备会静默丢 bias\n",
-                    m, k, nn);
-                return 4;
-            }
+            /* OP_MATMUL_F16_BIAS (opcode 36): 尾部追加 bias 槽。
+             * 005 US3b: 设备 HMX 路径已有 bias 通道(scale 区 out_bias,
+             * SC-005 三判据 0 违例), 32 对齐形默认走 HMX —— US3a 的
+             * 对齐硬报错已随 pass 门一并移除。 */
             uint32_t bias_s = 0x8000u | em.ensure_weight_slot(gp, bias_op, wslots, od->grouping);
             em.add_op(OP_MATMUL_F16_BIAS, {a_t, w_s, out_t, m, k, nn, flags, bias_s});
             return 0;

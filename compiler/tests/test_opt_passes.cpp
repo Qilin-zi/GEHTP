@@ -326,7 +326,8 @@ int main() {
             CHECK(fo && fo->inputs[3].src_id == qm, "fc_bias: quant_marker 不动");
             CHECK(!ao || ao->is_dead(), "fc_bias: 注入形态 Add 标 dead");
         }
-        // 图 B: HMX 门 — M/K/N 全 32 倍数 (N=64) 不折(内核 v1 仅标量路径应用 bias)
+        // 图 B: HMX 形 (M/K/N 全 32 倍数, N=64) 也折 —— US3b 撤 HMX 门
+        // (设备 HMX 路径已有 bias 通道, SC-005 已过)
         {
             GraphPrepare gp;
             auto in   = add_input(gp, 5, f32_def(1, 32, 1024, 1));
@@ -338,8 +339,9 @@ int main() {
             gp.run_optimize_passes(env);
             OpDef* fo = gp.get_op_at(fc);
             OpDef* ao = gp.get_op_at(add);
-            CHECK(fo && fo->inputs.size() == 2, "fc_bias: HMX 形不折, FC 保持 2 输入");
-            CHECK(ao && !ao->is_dead(), "fc_bias: HMX 形不折, Add 保留");
+            CHECK(fo && fo->inputs.size() == 3 && fo->inputs[2].src_id == bias,
+                  "fc_bias: HMX 形折叠, bias 并入 FC inputs[2](US3b 撤门)");
+            CHECK(ao && ao->is_dead(), "fc_bias: HMX 形折叠, Add 标 dead");
         }
         // 图 C: disable 后不折
         {
@@ -856,7 +858,7 @@ int main() {
                   "matmul-bias 数值: 折/不折 execute_host 位级一致");
         }
 
-        std::printf("=== [15b] 反例: 32 对齐不折(HMX 门) ===\n");
+        std::printf("=== [15b] 正例: 32 对齐也折(US3b 撤 HMX 门) ===\n");
         {
             GraphPrepare gp;
             auto in = add_input(gp, 5, def_r({64, 64}));
@@ -869,8 +871,10 @@ int main() {
             gp.run_optimize_passes(env);
             OpDef* m = gp.get_op_at(mm);
             OpDef* a = gp.get_op_at(ad);
-            CHECK(a && !a->is_dead(), "matmul-bias 反例: 32 对齐不折(防 HMX 倒退)");
-            CHECK(m && m->inputs.size() == 2, "matmul-bias 反例: bias 未并入");
+            CHECK(a && a->is_dead(), "matmul-bias: 32 对齐 Add 标 dead(US3b 撤门)");
+            CHECK(m && m->inputs.size() == 3 && m->inputs[2].src_id == b,
+                  "matmul-bias: 32 对齐 bias 并入 MatMul inputs[2]");
+            CHECK(mark_has_bias(gp, mm), "matmul-bias: 32 对齐 has_bias=1 标记");
         }
 
         std::printf("=== [15c] 反例: batched BMM 不折(设备硬错防御) ===\n");

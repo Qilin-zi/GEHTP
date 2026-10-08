@@ -165,9 +165,6 @@ Match match_pattern(OpDef* op, GraphPrepare* gp) {
         if (m == 0 || k == 0 || n == 0) continue;
         if (eff_elems(biasc->output_def) != n) continue;
 
-        // HMX 门: 设备会走 HMX 的形状不折(内核 v1 仅标量路径应用 bias)
-        if ((m % 32u) == 0u && (k % 32u) == 0u && (n % 32u) == 0u) continue;
-
         mt.add = op; mt.reshape = reshape; mt.fc = fc; mt.bias = biasc;
         return mt;
     }
