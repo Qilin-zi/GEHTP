@@ -1268,6 +1268,72 @@ int main() {
             CHECK(std::strstr((const char*)rpt.data(), "shape_misalign") != nullptr,
                   "q4e2e: sidecar reason=shape_misalign");
         }
+        /* 12b-4: tie 去重 — 两个图 const 映射同一 GGUF 张量(同 offset/nbytes)
+         * → 共享单个 tile 槽, sidecar 记 dedup/0 */
+        {
+            GraphPrepare g;
+            build_matmul(g, 32, 64, 96);
+            g.get_op_at(1)->grouping = "test_w";
+            OutputDef w_od{};
+            w_od.rank = 2; w_od.dims[0] = 96; w_od.dims[1] = 64;
+            w_od.element_size = 4;
+            w_od.dtype = static_cast<uint32_t>(DType::Float32);
+            std::vector<uint8_t> W2(96 * 64 * 4, 0);
+            g.append_const_node(2, w_od, W2.data(), W2.size());
+            g.get_op_at(2)->grouping = "test_w2";
+            OutputDef mm2_od{};
+            mm2_od.rank = 2; mm2_od.dims[0] = 32; mm2_od.dims[1] = 96;
+            mm2_od.element_size = 2;
+            mm2_od.dtype = static_cast<uint32_t>(DType::Float16);
+            InputDef fc2_in[2] = {{10, 0}, {2, 0}};
+            g.append_node("FullyConnected", 21, fc2_in, 2, &mm2_od, 1, nullptr);
+            InputDef ain2[2] = {{20, 0}, {21, 0}};
+            g.append_node("Eltwise_Binary", 22, ain2, 2, &mm2_od, 1, nullptr);
+            g.get_op_at(40)->inputs[0] = {22, 0};
+            CHECK(g.prepare(env) == GraphStatus::Success, "q4e2e: dedup prepare");
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2n = 0;
+            CHECK(g.serialize(b2.data(), b2.size(), b2n) && b2n > 0, "q4e2e: dedup serialize");
+            const std::string d2 = dir + "q4_dedup/";
+            std::system(("mkdir -p " + d2).c_str());
+            write_file(d2 + "g.bin", b2.data(), b2n);
+            std::vector<uint8_t> in16(32 * 64 * 2, 0);
+            write_file(d2 + "in.f16.raw", in16.data(), in16.size());
+            std::vector<uint8_t> gbuf((size_t)96 * 2 * 18, 0);
+            for (uint32_t n = 0; n < 96; n++)
+                for (uint32_t kt = 0; kt < 2; kt++) {
+                    size_t b = (size_t)n * 2 + kt;
+                    uint16_t dv = r_f32_to_f16(0.05f + 0.007f * (float)(n % 9));
+                    std::memcpy(gbuf.data() + b * 18, &dv, 2);
+                    for (uint32_t j = 0; j < 16; j++)
+                        gbuf[b * 18 + 2 + j] = (uint8_t)(n * 37u + kt * 11u + j * 29u);
+                }
+            write_file(d2 + "syn.gguf", gbuf.data(), gbuf.size());
+            std::string tsv = "node\tgguf_name\tggml_type\tfile_offset\tnbytes\tdims\n"
+                              "test_w\tT_w\t2\t0\t3456\t64,96\n"
+                              "test_w2\tT_w2\t2\t0\t3456\t64,96\n";
+            write_file(d2 + "m.tsv", tsv.data(), tsv.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + d2 + "g.bin" +
+                             " --input-f16 " + d2 + "in.f16.raw --out " + d2 + "o.wtop" +
+                             " --gguf " + d2 + "syn.gguf --match " + d2 + "m.tsv" +
+                             " 2>/dev/null";
+            CHECK(std::system(c2.c_str()) == 0, "q4e2e: dedup emit exit 0");
+            std::vector<uint8_t> bl2;
+            CHECK(load_file(d2 + "o.wtop", bl2), "q4e2e: dedup read blob");
+            wt_blob* w2 = new wt_blob{};
+            CHECK(wt_parse(bl2.data(), bl2.size(), w2) == WT_OK, "q4e2e: dedup wt_parse");
+            uint32_t n3840 = 0;
+            for (uint32_t s = 0; s < w2->n_slots; s++)
+                if (w2->slots[s].len == 3840u) n3840++;
+            CHECK(n3840 == 1, "q4e2e: 同 GGUF 张量两个 const → 单 tile 槽 (dedup)");
+            delete w2;
+            std::vector<uint8_t> rpt;
+            load_file(d2 + "o.wtop.w4report.tsv", rpt);
+            rpt.push_back(0);
+            CHECK(std::strstr((const char*)rpt.data(), "\tw4\tdedup\t0") != nullptr &&
+                  std::strstr((const char*)rpt.data(), "\tw4\tnone\t3840") != nullptr,
+                  "q4e2e: sidecar 记 dedup/0 + 唯一实槽 none/3840");
+        }
         /* 12b-3: FR-003 kind2 miss → 退出码 4 */
         {
             GraphPrepare g;

@@ -307,6 +307,10 @@ struct Emitter {
     std::vector<W4DomainRecord> w4_records;
     std::vector<std::string> w4_missing;   // FR-003: matmul 权重 miss 名单(收尾硬错误)
     std::map<uint64_t, bool> wslot_is_q4;  // const op_id → w4 tile 槽(复用冲突防护)
+    /* tie 权重槽去重: GGUF 张量身份(file_offset,nbytes) → slot。embed Gather 与
+     * lm_head MatMul 是不同图 const 但同一 GGUF 张量(token_embd tie), tile 字节
+     * 只由源决定 → 共槽(0.8B 省 2×151.5MB, SC-003 预算的关键) */
+    std::map<std::pair<uint64_t, uint64_t>, uint32_t> gguf_w4_dedup;
 
     // GGUF Q4_0 → 640B/tile 纯重排(007 US2 Route A; payload 576B 零重量化,
     // 量化 nibble 与 per-block d 数值原样保留 — 仅做 nibble 面序置换; +64B
@@ -433,11 +437,21 @@ struct Emitter {
                     const std::string layer =
                         consumer_grp.empty() ? w->grouping : consumer_grp;
                     if (e.type == 2 && q4k != 0 && K % 32 == 0 && NN % 32 == 0) {
-                        /* 007 US2: Q4_0 → 576B/tile 纯重排(0.5625 B/elem, GGUF
-                         * 量化零损); 设备 exec_matmul_f16_hmx / exec_gather 的
-                         * Q4 分支按槽长判别消费 */
+                        /* 007 US2: Q4_0 → 640B/tile 纯重排(量化零损); 设备
+                         * exec_matmul_f16_hmx / exec_gather 的 Q4 分支按槽长
+                         * 判别消费。tie(同 GGUF 张量多图 const)共槽 */
+                        const auto dkey = std::make_pair(e.file_offset, e.nbytes);
+                        auto dit = gguf_w4_dedup.find(dkey);
+                        if (dit != gguf_w4_dedup.end()) {
+                            wslots[w->op_id] = dit->second;
+                            wslot_is_q4[w->op_id] = true;
+                            w4_records.push_back({layer, mit->first, "w4", "dedup", 0});
+                            gguf_hits++;
+                            return dit->second;
+                        }
                         auto tile = repack_q4_0_tiles(src, e.nbytes, K, NN);
                         id = slot_for((uint32_t)tile.size(), (uint32_t)(K * NN), tile.data());
+                        gguf_w4_dedup[dkey] = id;
                         w4_records.push_back({layer, mit->first, "w4", "none", tile.size()});
                         wslot_is_q4[w->op_id] = true;
                     } else if (e.type == 2) {
@@ -553,9 +567,13 @@ struct Emitter {
             if (isl != input_slots.end()) return 0x8000u | isl->second;
         }
         const OpDef* p = gp.get_op_at(op_id);
-        // 有池数据即按 const 槽(is_const 标志对 loader 的 tensor_param const 不可靠)
+        // 有池数据即按 const 槽(is_const 标志对 loader 的 tensor_param const 不可靠)。
+        // consumer = cur_op(主循环发射位上的消费 op): q4 准入/复用防护按真实
+        // 消费者裁决 —— 不带 consumer 会被判 kind 0, 把 Gather(embed 表) 等
+        // 合法 w4 消费误杀在复用防护门上
         if (p && (p->is_const() || p->const_data_size > 0)) {
-            uint32_t s = ensure_weight_slot(gp, p, wslots);
+            const OpDef* cons = cur_op && cur_op != op_id ? gp.get_op_at(cur_op) : nullptr;
+            uint32_t s = ensure_weight_slot(gp, p, wslots, cons);
             return 0x8000u | s;
         }
         bool param_const_name = false;
