@@ -48,10 +48,10 @@ description: "Task list: 全图 VTCM 驻留 + 显式 DMA 流水（008 中期性�
 
 - [x] T005 [US1] mem_plan 激活：`compiler/src/ir/graph_prepare.cpp` 诊断并修复 0.8B 图 `has_mem_plan()==false`（research D1：v4 emit 日志 88 行无 [ddr] 行 = 整条旁路）——重发后 stderr 出现两行 [ddr]
 - [x] T006 [US1] 预算单源化：`compiler/tools/wtop_emit.cpp` 加 `--vtcm-budget N`（默认 16777216）透传 GraphPrepare，**弃** `get_vtcm_tile_size()` 陈旧源（graph_prepare.cpp:476-477，budget×0.75）；C2 惰性门 = 不加旗标时编译/emit md5 与现库同图一致
-- [ ] T007 [US1] 驻留标记扩面：`compiler/src/vtcm/ddr_offsets.cpp` 非 matmul temp（eltwise/broadcast/reshape 产物）进 lifetime 打包 + `in_vtcm` 判据（大小/生命期阈值可配；未驻留项进 spill 名单含 reason——显式降级非静默）
+- [ ] T007 [US1] 驻留标记扩面：`compiler/src/vtcm/ddr_offsets.cpp` 非 matmul temp（eltwise/broadcast/reshape 产物）进 lifetime 打包 + `in_vtcm` 判据（大小/生命期阈值可配；未驻留项进 spill 名单含 reason——显式降级非静默）。**T010 校准修正**：`in_vtcm` 判据必须按消费引擎分域（HMX 消费→VTCM / HVX·scalar 消费→DDR），无差别驻留实测净负 +11.5s（见 `evidence/budget-baseline.md` GATE3 表）
 - [x] T008 [US1] 三方全局预算门 + `--residency-report PATH`：`compiler/tools/wtop_emit.cpp` 校验 `resident+staging×2+carve_peak ≤ budget`（超限硬报错，错误文本含三项数值）；落盘 BudgetReport（resident/staging/carve/slack 四行）+ spill 名单 + coverage（temp 字节加权）。**TEMPOFF 槽保持唯一真相源**（沿 :694-716 carve 一致性校验，禁第二套表）
 - [x] T009 [P] [US1] 契约测试 `compiler/tests/test_wtop_emit.cpp`：预算门负例（`--vtcm-budget 1048576` → 硬报错退出）/ TEMPOFF 追加字段 round-trip / 惰性门（无新旗标产物 md5 同）
-- [ ] T010 [US1] 板跑三门（quickstart 场景 2）：位级 md5 vs 基线 blob ／ coverage ≥80% ／ wall 首锚记录；门值首跑校准后冻结入 GateRecord（data-model.md）
+- [x] T010 [US1] 板跑三门（quickstart 场景 2）：GATE1 位级 PASS（md5 `f87461e2…` == v4 锚，003/007 双 lib）／ GATE2 PASS（coverage 0.8395）／ GATE3 校准完成（07lib A/B：无驻留 24.24s vs 全图驻留 37.65s，ΣΔ 闭合；**全图无差别驻留净负，HMX +2% / HVX 广播 43×**）——GateRecord 冻结值见 `evidence/budget-baseline.md`（机理候选留 US2 V81 迹重放裁决）
 
 **Checkpoint**: SC-001 + SC-004(f16 列) + FR-001/002/003 达成；US1 独立成立
 

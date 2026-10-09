@@ -558,32 +558,82 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     // 上取整 —— probe VTCM 驻留 256KB = 256 单位)。VTCM 驻留项 temp_id
     // 带 0x4000 标记(WT_REF_VTCM_FLAG)。
     if (em.ddr_static) {
-        uint64_t bump_res = em.bump_reserve ? em.bump_reserve
-                                            : std::max<uint64_t>(4u << 20, em.ddr_static_cap / 4);
-        uint32_t reserve = ((uint32_t)((em.ddr_vtcm_cap + 1023) / 1024) << 16)
-                         | ((uint32_t)((bump_res + 1023) / 1024) & 0xFFFFu);
+        /* 008 T010: 划痕窗终算 — 末 op 的窗深不会触发复位, 补入峰值;
+         * 窗 [cap-peak, cap) 与规划器静态区 [0, planner_end) 必须不相交
+         * (planner_end = ddr_temp_tab 非 VTCM 项的最大 off+sz; scratch 项
+         * 在独立 ddr_scratch_tab, 不混入此计算)。 */
+        if (em.scratch_cur > em.scratch_peak) em.scratch_peak = em.scratch_cur;
+        uint64_t planner_end = 0;
+        for (const auto& [tid, offsz] : em.ddr_temp_tab) {
+            auto vit = em.ddr_temp_vtcm.find(tid);
+            if (vit != em.ddr_temp_vtcm.end() && vit->second) continue;
+            planner_end = std::max<uint64_t>(planner_end, (uint64_t)offsz.first + offsz.second);
+        }
+        if (em.scratch_peak) {
+            uint64_t win_lo = em.ddr_static_cap - em.scratch_peak;
+            if (win_lo < planner_end) {
+                std::fprintf(stderr,
+                             "error: emit 划痕窗 [%.1fMB, %.1fMB) 与规划静态区 [0, %.1fMB) 交叠 — "
+                             "升 --ddr-budget\n",
+                             win_lo / 1048576.0, em.ddr_static_cap / 1048576.0,
+                             planner_end / 1048576.0);
+                return 3;
+            }
+            std::fprintf(stderr, "[scratch] 物化窗 peak=%lluB (planner_end=%lluB cap=%lluB) entries=%zu\n",
+                         (unsigned long long)em.scratch_peak, (unsigned long long)planner_end,
+                         (unsigned long long)em.ddr_static_cap, em.ddr_scratch_tab.size());
+        }
+        if (em.ddr_static_cap > 0xFFFFFFFFull) {
+            std::fprintf(stderr, "error: TEMPOFF cap %llu 超 u32 线格式上限\n",
+                         (unsigned long long)em.ddr_static_cap);
+            return 3;
+        }
+        uint64_t bump_plan = em.bump_reserve ? em.bump_reserve
+                                             : std::max<uint64_t>(4u << 20, em.ddr_static_cap / 4);
+        /* 008 T010: 计划 bump = max(4MB, cap/4) 与实际表外需求无关 — 取
+         * emit 仿真峰值(泄漏式, 与运行期 temp_get 路径 2 同语义)兜底。
+         * p3 板跑实锤: 8MB bump 在 op1310 被广播物化 temp 耗尽。 */
+        uint64_t bump_res = std::max<uint64_t>(bump_plan, em.sim_bump_peak);
+        std::fprintf(stderr, "[bump] plan=%llu sim_peak=%llu chosen=%llu\n",
+                     (unsigned long long)bump_plan, (unsigned long long)em.sim_bump_peak,
+                     (unsigned long long)bump_res);
+        uint32_t pool_kb = (uint32_t)((em.ddr_vtcm_cap + 1023) / 1024);
+        uint32_t bump_kb = (uint32_t)((bump_res + 1023) / 1024);
+        /* reserve 两域各 16 位 KB — 超 65535KB 静默回绕 = 运行期池错配
+         * (p2 板跑实锤: cap 2GB → bump 512MB → 低 16 位回绕成 0)。 */
+        if (pool_kb > 0xFFFFu || bump_kb > 0xFFFFu) {
+            std::fprintf(stderr,
+                         "error: TEMPOFF reserve 域溢出: pool=%uKB bump=%uKB (上限各 65535KB) — "
+                         "降 --plan-vtcm-budget / --ddr-budget (bump=max(4MB,cap/4))\n",
+                         pool_kb, bump_kb);
+            return 3;
+        }
+        uint32_t reserve = (pool_kb << 16) | bump_kb;
         std::vector<uint8_t> tab;
         auto put32 = [&](uint32_t v) {
             for (int i = 0; i < 4; i++) tab.push_back((uint8_t)(v >> (8 * i)));
         };
         put32((uint32_t)em.ddr_static_cap);
         put32(reserve);
-        put32((uint32_t)em.ddr_temp_tab.size());
-        for (const auto& [tid, offsz] : em.ddr_temp_tab) {
-            uint32_t tagged_tid = tid;
-            if (em.ddr_temp_vtcm.count(tid) && em.ddr_temp_vtcm.at(tid))
-                tagged_tid |= WT_REF_VTCM_FLAG;
-            put32(tagged_tid);
-            put32(offsz.first);
-            put32(offsz.second);
-        }
+        put32((uint32_t)(em.ddr_temp_tab.size() + em.ddr_scratch_tab.size()));
+        auto put_entry = [&](uint32_t tid, uint32_t off, uint32_t sz, bool vtcm) {
+            put32(vtcm ? (tid | WT_REF_VTCM_FLAG) : tid);
+            put32(off);
+            put32(sz);
+        };
+        for (const auto& [tid, offsz] : em.ddr_temp_tab)
+            put_entry(tid, offsz.first, offsz.second,
+                      em.ddr_temp_vtcm.count(tid) && em.ddr_temp_vtcm.at(tid));
+        for (const auto& [tid, offsz] : em.ddr_scratch_tab)
+            put_entry(tid, offsz.first, offsz.second, false);
         uint32_t sid = em.add_slot((uint32_t)tab.size(),
                                    (uint32_t)(tab.size() / 4), tab.data());
         em.slots[sid].addr = WT_SLOT_TEMPOFF;
-        std::fprintf(stderr, "[ddr] TEMPOFF slot %u: cap=%llu vtcm_cap=%llu n_temps=%zu (vtcm=%zu)\n",
+        std::fprintf(stderr, "[ddr] TEMPOFF slot %u: cap=%llu vtcm_cap=%llu n_temps=%zu (vtcm=%zu scratch=%zu)\n",
                      sid, (unsigned long long)em.ddr_static_cap,
                      (unsigned long long)em.ddr_vtcm_cap,
-                     em.ddr_temp_tab.size(), em.ddr_temp_vtcm.size());
+                     em.ddr_temp_tab.size() + em.ddr_scratch_tab.size(),
+                     em.ddr_temp_vtcm.size(), em.ddr_scratch_tab.size());
     }
 
     // 5c. 008 US1: 三方全局预算门 + BudgetReport。物理模型 = 运行期镜像
@@ -667,6 +717,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::fprintf(rf, "hmx_arena_max %llu\n", (unsigned long long)arena_max);
             std::fprintf(rf, "carve_peak %llu\n", (unsigned long long)carve_peak);
             std::fprintf(rf, "staging_sum %llu\n", (unsigned long long)staging_sum);
+            std::fprintf(rf, "emit_scratch_peak %u\n", em.scratch_peak);
+            std::fprintf(rf, "bump_demand_sim %llu\n", (unsigned long long)em.sim_bump_peak);
             std::fprintf(rf, "slack %llu\n", (unsigned long long)slack);
             std::fprintf(rf, "coverage %.6f\n", coverage);
             std::fprintf(rf, "n_temps %zu n_resident %zu n_spill %zu\n",

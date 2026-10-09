@@ -129,6 +129,24 @@ struct Emitter {
     uint64_t ddr_static_cap = 0;   // 编译期静态区大小(表外 temp 池尾 bump)
     uint64_t ddr_vtcm_cap = 0;     // VTCM 驻留池大小(0=无驻留)
     uint64_t bump_reserve = 0;     // 表外 bump 预留(字节; M2 起由 TAG_MEM_PLAN 供给)
+    /* 008 T010: 表外 temp 的运行期 bump 需求仿真(泄漏式, 与 temp_get 路径 2
+     * 同语义: 同 id 够大即复用, 不够则新块不回收)。计划 bump=max(4MB,cap/4)
+     * 与实际需求无关 — 广播物化 temp 恒 out_idx!=0 无静态项(p3 板跑实锤:
+     * 8MB bump 在 op1310 耗尽 → "broadcast ref fail")。 */
+    uint64_t sim_bump_used = 0, sim_bump_peak = 0;
+    std::unordered_map<uint32_t, uint32_t> sim_bump_bytes;
+    /* 008 T010: 表外物化 temp (broadcast materialize, out_idx≥6 约定) 静态
+     * 划痕窗 — 从 DDR 静态区顶部向下, 逐 op 复位(物化 temp 生命期 = 本 op
+     * 内: 同 handler 里产即被消费, 图 last_use 查无此项)。全图只占单 op
+     * 并发峰值, 不进池尾泄漏 bump (p3 实锤: 1622 个广播 temp 共 103.8MB
+     * 需求击穿 8MB 预留; 且 reserve 低 16 位 KB 域上限才 64MB, bump 扩容
+     * 路线在本图数学上不可行)。单用 id 不回收(从不 release), 窗偏移跨 op
+     * 复用 = TEMPOFF 表里多 id 同 offset 生命期不相交, 与规划器同范式。 */
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> ddr_scratch_tab;  // temp_id → {offset, size}
+    uint32_t scratch_top = 0;    /* 窗顶 = ddr_static_cap (首用惰性初始化) */
+    uint32_t scratch_cur = 0;    /* 本 op 内已用深度 */
+    uint32_t scratch_peak = 0;   /* 全图单 op 峰值 (TEMPOFF 落盘前须终算) */
+    uint64_t scratch_op = ~0ull; /* 当前窗所属 op (换 op 即复位) */
     // 阶段二: 溢出张量 → SPILL/FILL 插桩
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> ddr_spill_map;  // op_id → {溢出区偏移, size}
     uint32_t spill_pool_slot = 0;
@@ -247,6 +265,48 @@ struct Emitter {
                 auto vit = ddr_op_vtcm.find(op_id);
                 if (vit != ddr_op_vtcm.end() && vit->second)
                     ddr_temp_vtcm[t] = true;
+            } else if (out_idx >= 6 &&
+                       ddr_temp_tab.find(t) == ddr_temp_tab.end() &&
+                       ddr_scratch_tab.find(t) == ddr_scratch_tab.end() &&
+                       last_use.find(tkey(op_id, out_idx)) == last_use.end()) {
+                /* 008 T010: 物化 temp 静态划痕窗(域注释见字段声明)。
+                 * last_use 查无此项 = 图内无后来者引用 = 生命期限于本 op,
+                 * 窗偏移下个 op 即可复用; 真·多输出图张量(消费者在后)有
+                 * last_use 项 → 不进窗, 留在 bump 路径由 sim 峰值兜底判门。 */
+                if (!scratch_top) {
+                    if (ddr_static_cap == 0 || ddr_static_cap > 0xFFFFFFFFull) {
+                        std::fprintf(stderr, "error: emit 划痕窗 cap 异常 (%llu)\n",
+                                     (unsigned long long)ddr_static_cap);
+                        std::exit(3);
+                    }
+                    scratch_top = (uint32_t)ddr_static_cap;
+                }
+                if (scratch_op != op_id) {
+                    if (scratch_cur > scratch_peak) scratch_peak = scratch_cur;
+                    scratch_cur = 0;
+                    scratch_op = op_id;
+                }
+                uint64_t al = (need + 127u) & ~127ull;
+                if (al > ddr_static_cap || (uint64_t)scratch_cur + al > ddr_static_cap) {
+                    std::fprintf(stderr,
+                                 "error: emit 静态划痕窗溢出 (op %llu 内需求 %lluB > cap %lluB)\n",
+                                 (unsigned long long)op_id, (unsigned long long)((uint64_t)scratch_cur + al),
+                                 (unsigned long long)ddr_static_cap);
+                    std::exit(3);
+                }
+                scratch_cur += (uint32_t)al;
+                ddr_scratch_tab[t] = {scratch_top - scratch_cur, (uint32_t)need};
+            }
+        }
+        if (!(ddr_static && (ddr_temp_tab.count(t) || ddr_scratch_tab.count(t)))) {
+            /* 008 T010: 运行期此 temp 走池尾 bump(temp_get 路径 2):
+             * 同 id 缓冲够大即复用, 不够则 128 对齐新块且不回收(泄漏式)。
+             * 广播物化 fresh_temp(op_id, 6/7) 恒无静态项 → 全在此路径。 */
+            auto sit = sim_bump_bytes.find(t);
+            if (sit == sim_bump_bytes.end() || sit->second < need) {
+                sim_bump_used += (need + 127u) & ~127u;
+                sim_bump_bytes[t] = (uint32_t)need;
+                if (sim_bump_used > sim_bump_peak) sim_bump_peak = sim_bump_used;
             }
         }
         if (next_temp > 32768) {

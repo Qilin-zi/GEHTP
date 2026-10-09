@@ -77,3 +77,70 @@ p0 emit 出现完整 `[ddr] TAG_MEM_PLAN` + `[ddr] TEMPOFF` 两行（v4 同图 8
 - 静态规划唯一门 = `graph_prepare.cpp:591` `if (plan_ddr_budget_ > 0)`；预算来自 `hnnx_compile --ddr-budget`（:328）+ `--plan-vtcm-budget`（:329），缺省 0 = 不规划。
 - v4 的 tagged.bin 编译时无预算旗标 → 无 TAG_MEM_PLAN → `wtop_emit.cpp:117` `if (gp.has_mem_plan())` 旁路 → 无 `[ddr]` 行/无 TEMPOFF 槽（emit 日志 88 行实证）。
 - scripts/gehtp 编译段（L79-89）预算旗标为可选透传——v4 配方未带。**修复 = 配方层（带旗标重编），已由 p0 实证。**
+
+## T010 首跑失败与根因（2026-10-09 00:45, p2 blob, d0f1784 + libhvxhmx_003 md5 4059fa2a）
+
+```
+[FAIL] wt_exec_run_io rc=-1 tempoff pool alloc
+```
+
+- 运行期 TEMPOFF 解析（oplist_exec.c:2242）`memalign(128, cap + reserve)`，cap = `--ddr-budget` = **2GB** → 设备堆（DSP 预算 ~3GB，blob 已占 2GB）不可能满足。**首个真图 TEMPOFF 板跑**才暴露（此前板跑全是无 mem_plan 的 v4 路径或小 cap 合成 blob）。
+- **次生缺陷（同因实锤）**：bump_reserve = max(4MB, cap/4)（graph_prepare.cpp:600）= 512MB = 524288KB，TEMPOFF reserve 低 16 位 KB 域**静默回绕成 0** —— 与 VTCM 4GB 回绕同类陷阱。
+- **修复双管**：①配方 — p3 `--ddr-budget 33554432`（TSV 实测 max extent **18.10MB**/12535 planned/550MB sum → 32MB 不绑规划；bump=8MB；总 memalign 40MB DSP 安全）；②代码 — wtop_emit TEMPOFF 块 reserve 域溢出硬门（pool/bump 各 >65535KB 即 exit 3，test_wtop_emit 全绿）。
+- p2 板跑 census 前置全对（ops=14216 = v4+28 纯 SPLIT 差，opcode36=0），失败点在运行期池分配，非 blob 结构。
+
+## T010 p3 二跑失败与划痕窗根因（2026-10-09 01:3x, p3 blob @32MB DDR）
+
+```
+[FAIL] wt_exec_run_io rc=1311 broadcast ref fail
+```
+
+- op1310 (OP_BROADCAST_F16) 输出 `temp_get` NULL：**8MB bump 在 op1310 恰好耗尽**。根因 = 广播物化 temp 恒 `fresh_temp(op_id, 6/7)`（out_idx≠0 不做静态登记）→ 1622 个全走运行期泄漏式 bump，流过 103.8MB，泄漏口径需求 108.9MB —— **超 reserve 低 16 位 KB 域上限 64MB，bump 扩容路线本图数学不可行**。
+- **修复（emit 侧，运行期/设备 lib 零改动，md5 仍 4059fa2a）= 静态划痕窗**（wtop_ops.hpp `fresh_temp`）：`out_idx≥6` 且图 `last_use` 查无此项（= 生命期限于本 op）的物化 temp，从 DDR 静态区**顶部向下**发静态偏移，**逐 op 复位窗深**；全图只占单 op 并发峰值。窗与规划器静态区碰撞 / 窗溢出 = 硬错误。
+- p3 重 emit 冻结数字：
+
+```
+[scratch] 物化窗 peak=262144B (planner_end=15892480B cap=33554432B) entries=1622
+[bump] plan=8388608 sim_peak=0 chosen=8388608        ← 表外需求仿真 0, 全部静态化
+[ddr] TEMPOFF slot 1942: cap=33554432 vtcm_cap=4194304 n_temps=3253 (vtcm=1630 scratch=1622)
+[vtcm] pool=4194304 arena_max=12570624 carve_peak=3082496 slack=12288 coverage=0.8395
+```
+
+## T010 三门结果（2026-10-09, p3 blob, d0f1784, 全套私有名 runner/job/output）
+
+| 门 | 结果 | 证据 |
+|---|---|---|
+| GATE1 位级 | **PASS** `md5=f87461e2a5089c48413e70463f4aa7dc` == v4 锚（libhvxhmx_003 md5 4059fa2a）；**007 lib 叠加复验同 md5** | `.scratch_008/output_008.f16.raw` / `output_008x007.f16.raw` |
+| GATE2 覆盖 | **PASS** coverage=0.839522（1630/1631 物化 temp VTCM 驻留，唯一 nonresident = 输出 temp 3252 planner_displaced 15.9MB） | `budget_report_p3.txt` |
+| GATE3 wall 校准 | **完成**：全图无差别驻留 = 净负优化，见下表 | op_ts census ×2 |
+
+## GATE3 校准：驻留 wall 归因（007 lib 同库 A/B）
+
+同为 libhvxhmx_007.so（md5 5a023fbb，广播 HVX 内核）：
+
+- **无驻留基线** = 007 会话 `qwen35_08b_v4_007.wtop`（14188 ops = v4 图恒等，fold/块化同 v4）：`wall_us=24,240,344`（24.24s）
+- **p3 驻留**（1630 temp 全驻 4MB 池 + 12MB SPLIT 阈值）：`wall_us=37,651,234`（37.65s）
+- **Δ = +13.41s**，per-opcode 闭合（ΣΔ=13.3s ≈ 总差）：
+
+| opcode | n | 无驻留 | p3 驻留 | Δ | 倍率 |
+|---|---|---|---|---|---|
+| BROADCAST_F16 | 1622 | 0.082s (50µs/op) | 3.516s (2168µs/op) | **+3.43s** | **43×** |
+| OP35 (lm_head SPLIT) | 32→78 | 4.247s | 6.176s | **+1.93s** | 重切块 |
+| STRIDED_SLICE | 2373 | 3.353s | 4.952s | +1.60s | 1.48× |
+| UNARY | 2909 | 2.997s | 4.563s | +1.57s | 1.52× |
+| REDUCE | 1170 | 0.338s | 1.567s | +1.23s | 4.6× |
+| SCATTER_ND | 1154 | 0.140s | 1.097s | +0.96s | 7.8× |
+| CONV1D_SSM | 18 | 0.324s | 1.007s | +0.68s | 3.1× |
+| TRANSPOSE/BINARY/GATHER/RMSNORM/其余 | — | — | — | +2.0s | 1.3-2.3× |
+| MATMUL_F16 | 325→307 | 9.439s | 9.629s | +0.19s | **1.02×** |
+
+**结论（冻结，GateRecord）**：
+1. **HMX 读驻留无惩罚**（MATMUL +2%）——驻留机制本身成立（位级 + 预算门 + carve 一致性全绿）。
+2. **HVX/scalar 算子读 VTCM 驻留 temp 全线 1.3-43× 变慢**（同内核同数据量：广播 HVX DDR 输入 50µs → VTCM 输入 2168µs）——**全图无差别 f16 驻留是净负（−11.5s 扣除重切块 +1.9s）**。
+3. 重切块 +1.93s 是 pool 4MB 强制 SPLIT 阈值 16→12MB 的连锁（32→78 chunk，实测 ~42ms/chunk 固定开销）。
+4. **机理待裁**：V81 器件书实测 VTCM ~109GB/s/线程平坦、7 拍延迟 → **非 VTCM 带宽本身**；候选 = 跨核别名（书：VTCM 按核私有互相不可见）/ bank 冲突 / HVX 内核对 VTCM 输入的访存形态。US2 用 V81HexSim 迹重放裁决（fence/DMA 竞态照旧不背书）。
+5. **US2 设计输入**：驻留必须按消费引擎分域——HMX 消费 → VTCM 驻留；HVX/scalar 消费 → DDR（时间复用候选 B 口径）。
+
+GateRecord 冻结值：f16 位级锚 `f87461e2…`（003/007 双 lib）；coverage 0.8395；wall 24.24s（无驻留基线，007 lib）/ 37.65s（US1 全图驻留，007 lib）/ 43.62s（US1 @003 lib，广播标量回落 1023 次）；库指纹 5a023fbb（007）/ 4059fa2a（003）；设备 d0f1784。
+
+叠加跑资产：`.scratch_008/{run_008x007_board.sh, build_runner_008x007.sh, x007.device.txt, x007.op_ts.bin, output_008x007.f16.raw}`（runner NEEDED=libhvxhmx_007.so；板上 2GB blob 复用未重推）。
