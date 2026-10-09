@@ -1,0 +1,72 @@
+# T011 fence 并发 micro-test（US2 硬前置闸）— 证据
+
+- 日期: 2026-10-09
+- 设备: d0f1784（Permissive 预检过，run_main_on_hex 互斥过）
+- **库指纹: libhvxhmx_007.so md5 `5a023fbb8a41cc4783662848af23f774`**（与 T010 校准同库；
+  runner = `ex47f.so` 私有名，NEEDED=libhvxhmx_007.so，vgather=0）
+- 源: `kernels/examples/47_fence_conc/main.c`；构建/推板/跑:
+  `.scratch_008/build_run_47fence.sh`；结果文件 `/data/local/tmp/hrt/gehtp/47_fence_conc.txt`
+- 资产: 板上 `assets/s256`（23_fence 同款 packed_weight/folded_bias/act_table/
+  out_table/act_surface，M=256）
+
+## 设计（23_fence 只证串行交接，本例证真并发面）
+
+单线程发起；每轮 r（ROUNDS=1000，图案 p=r&7，双缓冲槽 s=r&1）：
+
+1. 提交 6-desc 链（R-D1 纪律镜像 dc_parts.c：mutex 内 poll-IDLE 再 submit，
+   只走 dmstart 分支；desc 持久不 free；完成先 dmwait 排空再 poll 自有 dstate）:
+   - act(p+1) DDR→staging[s^1] 128KB
+   - 权重流 wgt_src→wgt_stage 512KB（4×128KB，纯 DMA 负载，模拟 US2 权重预取）
+   - moveback outb[s^1] VTCM→DDR sink[p-1] 128KB
+2. fence **DMA→HMX @VTCM = INVALIDATE**（staging[s] 供给面）
+3. `dc_w4_invoke`（HMX busy，与链上 DMA 硬件并发）
+4. fence **HMX→DMA @VTCM = FLUSH**（outb[s] 作 moveback src 的契约）
+5. poll 链完成（**2s 超时看护**）→ fence DMA→CPU @DDR = INVALIDATE →
+   sink[p-1] 与串行参考**逐字节** memcmp
+
+对照：G2 串行参考 8 图案（阻塞 dc_dma_once in→INVALIDATE→invoke→FLUSH→
+out→INVALIDATE→自洽）+ 图案敏感性（ref[0]≠ref[1]）。
+
+## 门与结果（首跑 + 3 连复跑，全 7/7 PASS，时序稳定 ±1µs）
+
+```
+[PASS] fence_conc_table_paths               err=0   (本例 3 条路径与决策表全等)
+[PASS] fence_conc_setup                     err=0
+[PASS] fence_conc_serial_ref_8pat           err=0   (串行参考自洽 + moveback 自洽)
+[PASS] fence_conc_pattern_sensitivity       err=0   (旋转图案输出必异)
+[PASS] fence_conc_1000rounds_bitexact       err=0   (1000 轮全逐字节==串行参考;
+                                                      含 epilogue 末轮+权重流校验)
+[PASS] fence_conc_watchdog_2s               err=0   (max_poll ≤ 16µs, 距 2s 门余量 5 个量级)
+[PASS] fence_conc_overlap_vs_sum            err=0   (overlap 31µs ≤ 0.9×43µs)
+
+serial(blocking dc_dma_once)=1437us/round — 含 ~2×700µs submit/drain 固定开销
+hmx_only=28us dma_only=14us equiv_sum=42us | overlap=31us/round max_poll=15us
+```
+
+## 判读
+
+1. **并发正确性门过**：1000 轮 HMX∥DMA 重叠窗口（每轮 DMA 链 768KB ≈14µs
+   完全落在 HMX invoke ≈28µs 内）双向 fence 决策表路径下输出逐字节不变，
+   4 次全绿复跑稳定 → **T012-T015 上板闸解锁**。
+2. **真并发实证（max-vs-sum）**：overlap 31µs ≈ max(hmx 28, dma 14)+3 ≈
+   hmx_only —— DMA 全隐藏；若两引擎实为串行则应 ≈42µs（差 27%，>10% 门）。
+   max_poll=15µs 说明链通常在 invoke 返回前已完成。
+3. **DMA 链带宽**：768KB 混向（DDR→VTCM 640KB + VTCM→DDR 128KB）/ 14µs
+   ≈ 55GB/s —— 预取带宽不构成 US2 瓶颈。
+4. **⚠ 阻塞路径固定开销（T012/T013 直接设计输入）**：`dc_dma_once` 每次调用
+   ~700µs（mutex+IDLE-poll+submit+dmwait 排空的每调用固定成本，非带宽）。
+   串行参考 1437µs/轮中 ~1400µs 是开销不是搬运。**US2 发射器必须用
+   "desc 链一次 submit + 计算后晚 poll"（本例 async_submit/async_poll 范式），
+   逐 op 阻塞 dc_dma_once 会把每 op ~1.4ms 开销烧进全图**（v4 图 ~14k op 量级
+   下不可承受）。等效地：dma_us 计量口径（T014 双时间轴）也应区分
+   in-flight 与 blocking-call 墙钟。
+
+## 限制（如实登记）
+
+- `dc_w4_invoke` 是阻塞库调用，看护只覆盖 desc 链 poll（2s）；invoke 悬挂不在
+  看护内（HMX 引擎故障会导致测试悬挂而非 FAIL——V81 仿真器同样不背书此
+  竞态，本测试即为此存在）。
+- 单线程发起（submit 与 invoke 同线程），验证的是"DMA 在飞时 HMX 读写 VTCM
+  邻域 + fence 边界"的并发面，非跨线程 submit 竞态（那由 R-D1 纪律静态规避）。
+- HMX 工作负载为 W4A16 256³（~28µs/轮）；比全图真实 HMX op 小——更大的
+  invoke 只会拉长重叠窗口，不改变 fence 边界正确性结论。
