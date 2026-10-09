@@ -180,13 +180,13 @@ static void test_delta_chunks(void) {
     float* SA = calloc((size_t)H * D * D, 4);
     rec_state_t stA = { H, D, SA };
     uint16_t* yA = malloc(kvq * 2);
-    CHECK(delta_chunk_f16(&stA, k, v, q, beta, g, yA, NTOK, NTOK) == 0, "delta A");
+    CHECK(delta_chunk_f16(&stA, k, v, q, beta, g, yA, NTOK, NTOK, 0) == 0, "delta A");
 
     /* B: 拆 2 chunk: c=2 (ntok=3 缓冲但只算前 2) → c=1 (独立 1-token 缓冲) */
     float* SB = calloc((size_t)H * D * D, 4);
     rec_state_t stB = { H, D, SB };
     uint16_t* yB = malloc(kvq * 2);
-    CHECK(delta_chunk_f16(&stB, k, v, q, beta, g, yB, 2, NTOK) == 0, "delta B0");
+    CHECK(delta_chunk_f16(&stB, k, v, q, beta, g, yB, 2, NTOK, 0) == 0, "delta B0");
     uint16_t *k1 = malloc((size_t)H * D * 2), *v1 = malloc((size_t)H * D * 2),
              *q1 = malloc((size_t)H * D * 2);
     uint16_t *b1 = malloc((size_t)H * 2), *g1 = malloc((size_t)H * 2);
@@ -197,7 +197,7 @@ static void test_delta_chunks(void) {
         memcpy(q1 + (size_t)h * D, q + ((size_t)h * NTOK + 2) * D, (size_t)D * 2);
         b1[h] = beta[h * NTOK + 2]; g1[h] = g[h * NTOK + 2];
     }
-    CHECK(delta_chunk_f16(&stB, k1, v1, q1, b1, g1, yB1, 1, 1) == 0, "delta B1");
+    CHECK(delta_chunk_f16(&stB, k1, v1, q1, b1, g1, yB1, 1, 1, 0) == 0, "delta B1");
     for (uint32_t h = 0; h < H; h++)
         memcpy(yB + ((size_t)h * NTOK + 2) * D, yB1 + (size_t)h * D, (size_t)D * 2);
 

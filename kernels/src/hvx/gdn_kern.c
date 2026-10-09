@@ -68,10 +68,10 @@ int solve_tri_f16(const int16_t* L, int16_t* T, int c) {
 /* ================= B2: delta-rule chunk (per head 批) ================= */
 int delta_chunk_f16(rec_state_t* st, const int16_t* k, const int16_t* v,
                     const int16_t* q, const int16_t* beta, const int16_t* g,
-                    int16_t* y, int c, int ntok) {
+                    int16_t* y, int c, int ntok, int q_raw) {
     if (c < 1 || c > GDN_C_MAX) return 1;
     int H = st->h, d = st->d;
-    float scale = 1.0f / sqrtf((float)d);
+    float scale = q_raw ? 1.0f : 1.0f / sqrtf((float)d);
     int16_t* T = malloc((size_t)c * c * 2);
     float *kf = malloc((size_t)c * d * 4), *vf = malloc((size_t)c * d * 4),
           *qf = malloc((size_t)c * d * 4), *G = malloc((size_t)c * 4),
