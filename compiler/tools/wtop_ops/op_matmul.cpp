@@ -134,13 +134,22 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             return off_s + 2048u;
         };
         const size_t kVTCMTotal = 16u * 1024u * 1024u;
+        /* 008 T006 预算单源化: 驻留池在场时 chunk 预算 = total − pool
+         * (运行期 attach cap = vs − pool_size, oplist_exec.c f16 attach)。
+         * p0 实测: pool 满额 16MB → arena≈0, 16MB 级大 chunk 运行时全部
+         * attach 失败回落标量。池不在场(v4 惰性路径)保持 16MB 原口径。 */
+        size_t vtcm_eff = kVTCMTotal;
+        if (em.ddr_static && em.ddr_vtcm_cap > 0) {
+            uint64_t pool_rounded = ((em.ddr_vtcm_cap + 1023) / 1024) * 1024;
+            vtcm_eff = pool_rounded < (uint64_t)kVTCMTotal ? kVTCMTotal - (size_t)pool_rounded : 0;
+        }
         if (!has_bias && !em2.batched && (m % 32u) == 0u && (k % 32u) == 0u && (nn % 32u) == 0u &&
-            need_mm(m, k, nn) > kVTCMTotal) {
+            need_mm(m, k, nn) > vtcm_eff) {
             /* 二分找最大 32 倍数 N_c 使 need(m,k,N_c) ≤ 预算 (need 随 N 单调) */
             uint32_t N_chunk = 0, lo = 32u, hi = nn;
             while (lo <= hi) {
                 uint32_t mid = lo + ((hi - lo) / 64u) * 32u;
-                if (need_mm(m, k, mid) <= kVTCMTotal) { N_chunk = mid; lo = mid + 32u; }
+                if (need_mm(m, k, mid) <= vtcm_eff) { N_chunk = mid; lo = mid + 32u; }
                 else { hi = mid - 32u; }
             }
             if (N_chunk == 0) {

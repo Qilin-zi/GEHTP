@@ -3933,6 +3933,10 @@ size_t GraphPrepare::get_vtcm_tile_size() const {
     // Returns usable VTCM = min(budget, 4MB) × 0.75
     // 0x400000 = 4MB hard limit; 0.75 coefficient (0x3fe8000000000000 as double)
     // 1/4 reserved for system/stack
+    // 008 T006 预算单源化: 显式 --plan-vtcm-budget 优先(真 VTCM=16MB 口径,
+    // 两处消费 supertile 规划 + tcm_migration 同数); 缺省 0 走旧 3MB 路径
+    // (惰性门: 无旗标时产物逐字节不变)。
+    if (plan_vtcm_budget_) return plan_vtcm_budget_;
     constexpr uint64_t VTCM_4MB = 0x400000;
     constexpr double VTCM_FACTOR = 0.75;
     uint64_t budget = 4 * 1024 * 1024; // default 4MB

@@ -1,0 +1,152 @@
+---
+description: "Task list: 全图 VTCM 驻留 + 显式 DMA 流水（008 中期性能线）"
+---
+
+# Tasks: 全图 VTCM 驻留 + 显式 DMA 流水（008）
+
+**Input**: [spec.md](spec.md) / [plan.md](plan.md)（必读）/ [research.md](research.md)（D1-D8 代码实查，机制现状矩阵）/ [data-model.md](data-model.md) / [contracts/contracts.md](contracts/contracts.md)（C1-C5）/ [quickstart.md](quickstart.md)（4 个验证场景）
+
+**Prerequisites**: plan.md, spec.md, research.md, data-model.md, contracts/
+
+**Tests**: 契约测试任务按 house 惯例纳入（test_wtop_emit.cpp 范式，非 TDD 流程）
+
+**Organization**: 按 user story 分阶段独立可测；US1 = MVP。**库纪律**：改共享文件前 `git status`（协调表重叠段：oplist_exec.c↔004、wtop_emit.cpp↔007、graph_prepare.cpp↔003 区、op_matmul.cpp↔007/009）；板上 d0f1784 私有名+互斥；判据/evidence 入库不入 /tmp。
+
+## Format: `[ID] [P?] [Story] Description`
+
+- **[P]**: 可并行（不同文件、无未完成依赖）
+- **[Story]**: US1-US4（Setup/Foundational/Polish 无标）
+
+---
+
+## Phase 1: Setup（共享基础设施）
+
+**Purpose**: 隔离工作树 + 锚与设备登记
+
+- [x] T001 建 worktree `/disk1/gehtp-wt/008-vtcm-residency-dma`（分支 `008-vtcm-residency-dma` off task/prof-wp tip；照 004/007 先例；开工前主树 `git status` + 读跨会话协调表 008/009 行）
+- [x] T002 [P] 锚与设备登记 → `specs/008-vtcm-residency-dma/evidence/anchors.md`：d0f1784 getenforce Permissive 预检、pgrep run_main 互斥、当前设备库指纹、基线 blob（007 交卷锚；未交卷则 v4 35.31s 口径 + 回退预案标注）
+
+---
+
+## Phase 2: Foundational（预算基线冻结，无代码改动）
+
+**Purpose**: 把 spec 最大风险（工作集预算）变成冻结数字；阻塞 US1 阈值校准
+
+- [x] T003 现编译器重发 v4 同图（发射配方照抄 `.scratch_003_rebuild/`（run_v4_board.sh / wtop_emit_v4.log 参照），只采集不改造），stderr 抓 `[ddr] TAG_MEM_PLAN: cap= vtcm_cap= n_temps= n_spills=` 与 `[ddr] TEMPOFF slot: cap= vtcm_cap= n_temps= (vtcm=)` 两行 + `emit_ddr_offset_table` TSV → 冻结入 `evidence/budget-baseline.md`。**若两行仍不出现 = has_mem_plan 旁路根因未消**，把诊断（序列化缺环/pass 未跑）写成 T005 的直接输入
+- [x] T004 [P] census `[vtcm]` 1107 op 语义重导（`scripts/gehtp_prof.py` + manifest：确认 = `0x4000|temp` 引用旗标层标注而非池驻留事实），结论并入 budget-baseline.md 防后续误读
+
+**Checkpoint**: 盘子口径冻结（resident 可用额度 / n_temps / spill 规模量级）；US1 判据可校准
+
+---
+
+## Phase 3: User Story 1 - 全图激活 VTCM 驻留 (Priority: P1) 🎯 MVP
+
+**Goal**: 启用+扩面库内「第 7 步」静态 temp 规划，预算三方单源化，coverage ≥80%，f16 期位级不动
+**Independent Test**: quickstart 场景 2 —— emit 出 residency-report、新 blob 板跑输出与基线逐字节 md5 一致、coverage ≥80%、预算门负例硬报错
+
+### Implementation for User Story 1
+
+- [x] T005 [US1] mem_plan 激活：`compiler/src/ir/graph_prepare.cpp` 诊断并修复 0.8B 图 `has_mem_plan()==false`（research D1：v4 emit 日志 88 行无 [ddr] 行 = 整条旁路）——重发后 stderr 出现两行 [ddr]
+- [x] T006 [US1] 预算单源化：`compiler/tools/wtop_emit.cpp` 加 `--vtcm-budget N`（默认 16777216）透传 GraphPrepare，**弃** `get_vtcm_tile_size()` 陈旧源（graph_prepare.cpp:476-477，budget×0.75）；C2 惰性门 = 不加旗标时编译/emit md5 与现库同图一致
+- [ ] T007 [US1] 驻留标记扩面：`compiler/src/vtcm/ddr_offsets.cpp` 非 matmul temp（eltwise/broadcast/reshape 产物）进 lifetime 打包 + `in_vtcm` 判据（大小/生命期阈值可配；未驻留项进 spill 名单含 reason——显式降级非静默）
+- [x] T008 [US1] 三方全局预算门 + `--residency-report PATH`：`compiler/tools/wtop_emit.cpp` 校验 `resident+staging×2+carve_peak ≤ budget`（超限硬报错，错误文本含三项数值）；落盘 BudgetReport（resident/staging/carve/slack 四行）+ spill 名单 + coverage（temp 字节加权）。**TEMPOFF 槽保持唯一真相源**（沿 :694-716 carve 一致性校验，禁第二套表）
+- [x] T009 [P] [US1] 契约测试 `compiler/tests/test_wtop_emit.cpp`：预算门负例（`--vtcm-budget 1048576` → 硬报错退出）/ TEMPOFF 追加字段 round-trip / 惰性门（无新旗标产物 md5 同）
+- [ ] T010 [US1] 板跑三门（quickstart 场景 2）：位级 md5 vs 基线 blob ／ coverage ≥80% ／ wall 首锚记录；门值首跑校准后冻结入 GateRecord（data-model.md）
+
+**Checkpoint**: SC-001 + SC-004(f16 列) + FR-001/002/003 达成；US1 独立成立
+
+---
+
+## Phase 4: User Story 2 - tile 级 DMA 双缓冲 + 权重预取 (Priority: P2)
+
+**Goal**: 搬运藏进计算（HMX 族 wall ≤ 锚 50%），dma_us>0，失败显式回落
+**Independent Test**: quickstart 场景 3 —— fence micro-test 证据 + op_ts 双时间轴 + 位级门 + 回落负例偏差不变量 PASS
+
+### Implementation for User Story 2
+
+- [ ] T011 [US2] **fence 并发 micro-test（硬前置闸）**：设备端 HMX matmul 与 `dc_dma` 搬运并发 ≥100 轮、双向 fence（fence.c 决策表：DMA→HMX@VTCM=INVALIDATE / HMX→DMA=FLUSH），输出逐字节比对 + 超时看护 → `evidence/fence-microtest.txt`（含库指纹）。**未过门 T012-T015 一律不上板**（V81 不背书此竞态）
+- [ ] T012 [US2] `--dma-runlist` 扩全图：`compiler/tools/wtop_emit.cpp` + `compiler/tools/wtop_ops/op_matmul.cpp` 主力 HMX 族（in_proj/out_proj/lm_head chunk）权重/激活按执行序预取发射；staging 槽在 T008 预算表内分配（不得与驻留激活争额）
+- [ ] T013 [US2] 双缓冲轮换：DmaStreamDesc `buf_slot 0/1` + 发射序「tile i+1 搬运发射 → tile i invoke → completion poll」；任一环失败回落串行 + deviation 记录（003「允许回落+上报」契约，绝不静默）
+- [ ] T014 [P] [US2] op_ts 双时间轴报告：`kernels/examples/42_gehtp_runner/main.c`（dma_us 落盘已有 ver3）+ `scripts/gehtp_prof.py` 加 HMX 族重叠率列（dma 在途 ÷ compute dur）
+- [ ] T015 [US2] 板跑（quickstart 场景 3）：dma_us>0 ／ SC-002 HMX 族 dur ≤ 50% 锚 ／ 位级 md5 同 ／ 构造 staging 失败 → deviation=1 + 串行继续（偏差报告不变量 PASS）
+
+**Checkpoint**: SC-002 + FR-004/005 达成
+
+---
+
+## Phase 5: User Story 3 - 残余搬运消化 (Priority: P3)
+
+**Goal**: STRIDED_SLICE/UNARY(reshape)/TRANSPOSE_GEN 三族合计 ≤2s，census 驱动留证据
+**Independent Test**: US1 落地后重跑 census → digest；三族门 + 位级（消除类）/计划=实际（HVX 类）
+
+### Implementation for User Story 3
+
+- [ ] T016 [US3] US1 落地后重跑 census（`scripts/gehtp_prof.py --csv`）→ `evidence/census-digest.md`（三族新盘子；spec 表内 7-8s 投影作废，以实测为准）
+- [ ] T017 [US3] 驻留面零拷贝折叠：纯 reshape/slice（不改字节序）→ emit 期引用消除（opt-stats 计数，op 消失；位级一致）
+- [ ] T018 [US3] 剩余物理搬运 HVX 化：`kernels/src/runtime/oplist_exec.c`（`hvx_copy_f16_uu`/分段 memcpy，007 P1 broadcast 三形态范式：块拷贝循环+尾部标量；emit assign_engine 计划=实际，dev=0）
+- [ ] T019 [US3] 板跑：三族合计 ≤2s + digest 归档；不达标则 digest 指认残余根因（不硬凑门，FR-006）
+
+**Checkpoint**: SC-005 前半达成
+
+---
+
+## Phase 6: User Story 4 - per-op 开销批量化 (Priority: P4)
+
+**Goal**: 逐 op 裁决+记录 ~1.4s → ≤0.5s，幂等可关
+**Independent Test**: `--op-ts-sample` 跑通且报告口径标注；默认模式 op_ts 逐条与现库一致
+
+### Implementation for User Story 4
+
+- [ ] T020 [P] [US4] op_ts 抽样/批写：`kernels/examples/42_gehtp_runner/main.c` 加 `--op-ts-sample K`（默认关=全量逐条）；抽样模式报告头显式口径标注（防 census 类对拍误读）
+- [ ] T021 [US4] run_range 裁决批化：`kernels/src/runtime/oplist_exec.c` ver=3 静态计划下消逐 op 引擎重裁决（planned 已定，deviation 语义与偏差不变量不动——003 契约）
+- [ ] T022 [US4] 板跑：开销 ≤0.5s（抽样口径）+ 幂等门（默认模式行为/位级与现库一致）
+
+**Checkpoint**: SC-005 后半达成
+
+---
+
+## Phase 7: Polish & 收口
+
+- [ ] T023 终局板跑：SC-003 总门 ≤8s（007 锚口径；007 未交卷按 v4 35.31s 回退等比重校并登记）+ 双口径判分登记（`scripts/judge_logits.py` f16/W4 双列，沿 007 冻结值）
+- [ ] T024 [P] 003 blob-v3 五场景 + ctest 全绿复验（devA/devB/w4v3/t2l/ver1-legacy；证据入库不入 /tmp）
+- [ ] T025 [P] quickstart.md 四场景全复跑 + evidence 归档收口（specs/008 目录内）
+- [ ] T026 跨会话协调表 + memory 回写：BudgetReport 口径向 009 GDN 融合线交接（窗口=009 US3 前）、004 reconcile 面终态、库指纹变更登记
+
+---
+
+## Dependencies & Execution Order
+
+### Phase 依赖
+- Setup(T001-T002) → Foundational(T003-T004) → **US1(T005-T010, MVP)** → US2(T011-T015) / US3(T016-T019) → US4(T020-T022) → Polish(T023-T026)
+- **T011 是 T012-T015 的硬前置闸**（fence 未实证不上流水）
+- T016 依赖 T010（census 基线 = US1 落地后）
+
+### Story 依赖
+- **US1**: Foundational 后即可开工，与 007 W4 供给无依赖（f16 位级门最干净）——007 延期不阻塞
+- **US2**: 依赖 US1 的预算表与 staging 槽语义（T008/T012）+ T011 过门
+- **US3**: 依赖 US1（驻留面折叠前提）；与 US2 可并行起步（不同文件段：emit 折叠 vs dma 发射，**同文件 wtop_emit.cpp/oplist_exec.c 不同段，并行时逐日 git status**）
+- **US4**: 独立，排最后（收益垫底）；与 US2/US3 可并行
+
+### 并行示例
+```
+Foundational 后:
+  A: T005 → T006 → T007 → T008 → T009(并行) → T010   (US1 主线)
+  B: T011 (fence micro-test, 独立文件, 与 US1 并行)
+US1 收口后:
+  A: T012 → T013 → T015    (US2)
+  B: T016 → T017 → T019    (US3)
+```
+
+## Implementation Strategy
+
+### MVP First（US1 only）
+1. T001-T004 基线冻结（**T003 是全链最早可跑的纯测量，无代码改动**）
+2. T005-T010 US1 落地 → **STOP 验证**：位级 + coverage ≥80% + 预算门负例（此时已可交付「已实现→已兑现」第一跳）
+
+### Incremental
+US1 → +US2（SC-002）→ +US3（三族 ≤2s）→ +US4（≤0.5s）→ T023 总门。每步位级/契约门全绿才进下一步；门值首跑校准冻结后只收紧不放松。
+
+## Notes
+- 改 `oplist_exec.c`（temp 物化/run_range 段）与 004 状态表段同文件——每次开工前 `git status`；004 回合主线时 reconcile
+- census `out_b` 列含逻辑展开字节（Σ1.2TB/max34GB 已证伪）——**任何预算讨论只用 T003 冻结口径**
+- 板上判分 llmserv env；op_ts 解析纪律：byte24 起、gehtp_prof.py --strict（二进制判读纪律）

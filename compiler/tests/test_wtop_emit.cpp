@@ -970,6 +970,115 @@ int main() {
         }
     }
 
+    /* 10. 008 US1 T008: 三方全局预算门(--vtcm-budget) + --residency-report。
+     *   (a) 纯 arena 负例: f16 matmul need≈0.3MB, --vtcm-budget 65536 → 硬错;
+     *       缺省预算(16MB)同图 exit 0 (正控制)。
+     *   (b) pool+arena 负例: w4 预置图 --vtcm-budget 4096 → 硬错, 错误文本
+     *       含 resident_pool/数值 (C1: 硬报错含三项数值)。
+     *   (c) 报告 round-trip: pool_reserve_rounded 与 TEMPOFF 槽 reserve
+     *       高 16 位(KB)一致; coverage ∈ [0,1] (TEMPOFF 唯一真相源)。
+     *   (d) 旗标缺省恒等: 无旗标 vs --vtcm-budget 16777216 产物逐字节同
+     *       (惰性门的 flag-at-default 面; v4 全量 md5 门在 evidence 流程)。 */
+    {
+        const uint32_t M = 32, K = 512, N = 256;
+        auto emit_mm = [&](const std::string& extra, const std::string& outs) -> int {
+            GraphPrepare g;
+            build_matmul(g, M, K, N);
+            if (g.prepare(env) != GraphStatus::Success) return -1;
+            std::vector<uint8_t> b2(1u << 24, 0);
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) return -1;
+            const std::string bp = dir + "gatemm.bin";
+            const std::string ip = dir + "gatemm.f16.raw";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint8_t> in16((size_t)M * K * 2, 0);
+            write_file(ip, in16.data(), in16.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + outs;
+            if (!extra.empty()) c2 += " " + extra;
+            c2 += " 2>" + dir + "gatemm.err";
+            return std::system(c2.c_str());
+        };
+        CHECK(emit_mm("", dir + "gatemm_ok.wtop") == 0,
+              "T008a: 缺省预算 f16 matmul emit exit 0");
+        CHECK(emit_mm("--vtcm-budget 65536", dir + "gatemm_bad.wtop") != 0,
+              "T008a: --vtcm-budget 65536 < arena → emit 硬错误退出");
+        std::vector<uint8_t> err;
+        load_file(dir + "gatemm.err", err);
+        err.push_back(0);
+        CHECK(std::strstr((const char*)err.data(), "hmx_arena") != nullptr &&
+              std::strstr((const char*)err.data(), "resident_pool") != nullptr,
+              "T008a: 错误文本含 resident_pool/hmx_arena 数值");
+
+        const uint32_t WM = 32, WK = 64, WN = 32;
+        auto emit_w4b = [&](const std::string& extra) -> int {
+            GraphPrepare g;
+            build_matmul_w4(g, WM, WK, WN);
+            g.set_plan_budgets(64u << 20, 1u << 20);
+            HexagonNNEnv env2;
+            env2.set_soc_type(75);
+            env2.set_num_nsps(1);
+            if (g.prepare(env2) != GraphStatus::Success) return -1;
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) return -1;
+            const std::string bp = dir + "gatew4.bin";
+            const std::string ip = dir + "gatew4.f16.raw";
+            const std::string op2 = dir + "gatew4.wtop";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint16_t> in16((size_t)WM * WK, 0x3C00);
+            write_file(ip, in16.data(), in16.size() * 2);
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 + " --dma-runlist";
+            if (!extra.empty()) c2 += " " + extra;
+            c2 += " 2>" + dir + "gatew4.err";
+            return std::system(c2.c_str());
+        };
+        CHECK(emit_w4b("") == 0, "T008b: 缺省预算 w4 预置图 emit exit 0");
+        CHECK(emit_w4b("--vtcm-budget 4096") != 0,
+              "T008b: --vtcm-budget 4096 < pool+arena → emit 硬错误退出");
+        err.clear();
+        load_file(dir + "gatew4.err", err);
+        err.push_back(0);
+        CHECK(std::strstr((const char*)err.data(), "resident_pool") != nullptr,
+              "T008b: 错误文本含 resident_pool 数值");
+
+        CHECK(emit_w4b("--residency-report " + dir + "gatew4.report") == 0,
+              "T008c: --residency-report emit exit 0");
+        std::vector<uint8_t> rpt;
+        CHECK(load_file(dir + "gatew4.report", rpt), "T008c: 报告落盘存在");
+        rpt.push_back(0);
+        const char* rp = (const char*)rpt.data();
+        unsigned long long pool_rr = 0;
+        double cov = -1.0;
+        std::sscanf(std::strstr(rp, "pool_reserve_rounded"), "pool_reserve_rounded %llu", &pool_rr);
+        std::sscanf(std::strstr(rp, "coverage"), "coverage %lf", &cov);
+        CHECK(cov >= 0.0 && cov <= 1.0, "T008c: coverage ∈ [0,1]");
+        std::vector<uint8_t> blr;
+        wt_blob* wr = new wt_blob{};
+        CHECK(load_file(dir + "gatew4.wtop", blr) &&
+              wt_parse(blr.data(), blr.size(), wr) == WT_OK, "T008c: wt_parse OK");
+        uint32_t temppool_kb = 0xFFFFFFFFu;
+        for (uint32_t s = 0; s < wr->n_slots; s++)
+            if (wr->slots[s].addr == WT_SLOT_TEMPOFF) {
+                uint32_t reserve;
+                std::memcpy(&reserve, wr->weight_base + wr->slots[s].offset + 4, 4);
+                temppool_kb = reserve >> 16;
+                break;
+            }
+        CHECK(temppool_kb != 0xFFFFFFFFu && pool_rr == (unsigned long long)temppool_kb * 1024ull,
+              "T008c: pool_reserve_rounded == TEMPOFF reserve 高16位(KB) — 唯一真相源");
+        delete wr;
+
+        CHECK(emit_mm("", dir + "gate_lazy1.wtop") == 0 &&
+              emit_mm("--vtcm-budget 16777216", dir + "gate_lazy2.wtop") == 0,
+              "T008d: 两次 emit exit 0");
+        std::vector<uint8_t> l1, l2;
+        CHECK(load_file(dir + "gate_lazy1.wtop", l1) && load_file(dir + "gate_lazy2.wtop", l2) &&
+              l1 == l2,
+              "T008d: --vtcm-budget 取缺省值(16777216) 与无旗标产物逐字节同");
+    }
+
     std::printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASS", failed);
     return failed ? 1 : 0;
 }
