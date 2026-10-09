@@ -158,6 +158,14 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? std::max(0.0f, in0[i]) : 0.0f;
     } else if (op_type_name == "Add" || op_type_name == "ElementWiseBinary") {
         for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) + in_bc(1, i);
+    } else if (op_type_name == "IsNan" || op_type_name == "IsInf") {
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        const bool isnan = (op_type_name == "IsNan");
+        for (size_t i = 0; i < n; ++i) {
+            float v = in0 ? in0[i] : 0.0f;
+            if (isnan) out[i] = (v != v) ? 1.0f : 0.0f;
+            else out[i] = (v == v && (v > 3.4e38f || v < -3.4e38f)) ? 1.0f : 0.0f;
+        }
     } else if (op_type_name == "Eltwise_Binary") {
         /* QNN 2.48 枚举: ADD=0 AND=1 DIVIDE=2 ... MULTIPLY=13 ...
          * SUBTRACT=18 POWER=16(与旧版 0/1/2/3=ADD/SUB/MUL/DIV 不同 —
@@ -198,6 +206,11 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
              * Equal; int 0 的位模式即 0.0f) */
             for (size_t i = 0; i < n; ++i)
                 out[i] = (in_bc(0, i) == in_bc(1, i)) ? 1.0f : 0.0f;
+        } else if (oper == 1) {
+            /* AND: bool 语义(0.0f/1.0f), 与设备 OP_BINARY_F16 subtype 5 同款。
+             * 走 float 缓冲: 非 0 即真(NaN 也算真) */
+            for (size_t i = 0; i < n; ++i)
+                out[i] = (in_bc(0, i) != 0.0f && in_bc(1, i) != 0.0f) ? 1.0f : 0.0f;
         } else {
             for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) + in_bc(1, i);
         }
@@ -783,7 +796,6 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             uint32_t td[5], xd[5], od[5];
             uint32_t irank = in_defs.empty() ? out_def.rank : compact(in_defs[0], td);
             uint32_t xrank = in_defs.size() > 1 ? compact(in_defs[1], xd) : 1;
-            compact(out_def, od);
             int axis = 0;
             auto sp2 = unpack_scalar_params(params);
             if (const ScalarParam* p = scalar_get(sp2, "axis"))
@@ -798,6 +810,19 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                                ? (int)in_defs[0].rank - (int)irank : 0;
             axis -= stripped;
             if (axis < 0 || axis >= (int)irank) axis = 0;
+            /* 输出坐标框架 = 表前段 ++ indices ++ 表后段(Gather 语义), 不能
+             * compact(out_def): indices 块全 1 时(0.8B seq=1 embedding
+             * idx [1,1,1,1])会连 indices 槽一起剥掉, 列维左移进 indices
+             * 坐标(mod 1 恒 0)→ 整行复制首元素, 下游全 decorrelate 实锤。
+             * 框架积 != n 时回退旧 compact 路径。 */
+            for (uint32_t d = 0; d < 5; d++) od[d] = 1;
+            uint32_t flen = 0;
+            for (uint32_t d = 0; d < (uint32_t)axis && flen < 5; d++) od[flen++] = td[d];
+            for (uint32_t k = 0; k < xrank && flen < 5; k++) od[flen++] = xd[k];
+            for (uint32_t d = (uint32_t)axis + 1; d < irank && flen < 5; d++) od[flen++] = td[d];
+            size_t fprod = 1;
+            for (uint32_t d = 0; d < 5; d++) fprod *= od[d];
+            if (fprod != n) compact(out_def, od);
             size_t ts[5] = {1, 1, 1, 1, 1}, os[5] = {1, 1, 1, 1, 1}, xs[5] = {1, 1, 1, 1, 1};
             for (int d = 3; d >= 0; d--) {
                 ts[d] = ts[d + 1] * td[d + 1];
@@ -986,17 +1011,28 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
     } else if (op_type_name == "Softmax") {
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
         if (!in0) { for (size_t i=0;i<n;++i) out[i]=0; return; }
-        /* per-row softmax: 行宽 = axis(缺省末维)维长; 行数 = n/行宽 */
+        /* per-row softmax: 行宽 = axis(缺省末维)维长; 行数 = n/行宽。
+         * 显式 axis 按 net.json 原 rank 计([1,8,1,1] axis=3); 运行时
+         * OutputDef 剥前导 1 维(→[8,1,1]), 尾维身份不变 → 越界钳末维。
+         * 旧 trailing-1 剥除启发在 seq=1 把轴错移到 heads 维(softmax 宽 8,
+         * 应为 1; layer3 首发散 cos 0.485 实锤), 仅无 axis 参数时保留。 */
         auto sp4 = unpack_scalar_params(params);
+        bool have_axis = false;
         int axis = -1;
-        if (const ScalarParam* p = scalar_get(sp4, "axis"))
+        if (const ScalarParam* p = scalar_get(sp4, "axis")) {
             axis = (int)(p->is_numeric ? p->value_num
                                        : std::strtol(p->value_str.c_str(), nullptr, 10));
+            have_axis = true;
+        }
         uint32_t rk = out_def.rank;
-        while (rk > 0 && out_def.dims[rk - 1] == 1) rk--;
         int ax = axis;
         if (ax < 0) ax += (int)rk;
         if (ax < 0 || ax >= (int)rk) ax = (int)rk - 1;
+        if (!have_axis) {
+            uint32_t rk2 = rk;
+            while (rk2 > 0 && out_def.dims[rk2 - 1] == 1) rk2--;
+            if (ax >= (int)rk2) ax = (int)rk2 - 1;
+        }
         size_t row_w = (rk > 0) ? out_def.dims[ax] : 1;
         if (row_w == 0) row_w = 1;
         size_t rows = n / row_w;
@@ -1133,7 +1169,38 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         const float* inp    = inputs.size() > 0 ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
         const float* weight = inputs.size() > 1 ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
         const float* bias   = inputs.size() > 2 ? reinterpret_cast<const float*>(inputs[2]) : nullptr;
-        if (!inp || !weight) {
+        /* QNN depthwise conv1d(GDN causal conv)参数驱动路径: converter 把
+         * stride/pad_amount/dilation 发成尾部 tensor_param(in3 [2]/in4 [2,2]/
+         * in5 [2], pad 行序=轴1/轴2, 时间轴=行1)。旧代码自造"居中"pad 推断,
+         * T=1 时取错 tap(实锤 host 用 w0, ONNX pads [3,3]+T=1 语义应为 w3)
+         * → seq=1 全链 decorrelate。data [1,1,T,C], weight [1,K,1,C](k-major)。 */
+        auto numel = [](const OutputDef& d) {
+            size_t v = 1;
+            for (uint32_t i = 0; i < d.rank && i < 5; ++i) v *= d.dims[i];
+            return v;
+        };
+        if (op_type_name == "DepthWiseConv2d" && inp && weight &&
+            in_defs.size() >= 6 && in_defs[0].rank >= 4 && in_defs[1].rank >= 4 &&
+            numel(in_defs[3]) == 2 && numel(in_defs[4]) == 4 && numel(in_defs[5]) == 2) {
+            const int32_t* st_ = reinterpret_cast<const int32_t*>(inputs[3]);
+            const int32_t* pd_ = reinterpret_cast<const int32_t*>(inputs[4]);
+            const int32_t* dl_ = reinterpret_cast<const int32_t*>(inputs[5]);
+            const size_t T_in = in_defs[0].dims[2], C = in_defs[0].dims[3];
+            const size_t T_out = out_def.dims[2], K = in_defs[1].dims[1];
+            const int64_t pb = pd_[2];
+            const int64_t st = st_[1] ? st_[1] : 1;
+            const int64_t dl = dl_[1] ? dl_[1] : 1;
+            for (size_t t = 0; t < T_out; t++)
+                for (size_t c = 0; c < C; c++) {
+                    float acc = bias ? bias[c] : 0.0f;
+                    for (size_t k = 0; k < K; k++) {
+                        int64_t st_t = (int64_t)t * st + (int64_t)k * dl - pb;
+                        if (st_t >= 0 && st_t < (int64_t)T_in)
+                            acc += weight[k * C + c] * inp[st_t * C + c];
+                    }
+                    out[t * C + c] = acc;
+                }
+        } else if (!inp || !weight) {
             for (size_t i = 0; i < n; ++i) out[i] = 0.0f;
         } else {
             // Extract shapes from in_defs and out_def (rank-4 NHWC)

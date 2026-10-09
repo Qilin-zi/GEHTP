@@ -700,6 +700,7 @@ inline uint32_t qnn_binary_to_sub(uint32_t op) {
     case 13: return 2;   /* MULTIPLY */
     case 2:  return 3;   /* DIVIDE */
     case 3:  return 4;   /* EQUAL → bool 0/1 (0.8B pad 掩码; 静默 ADD 兜底=设备全 -inf 实锤) */
+    case 1:  return 5;   /* AND → bool 0/1 */
     default: return 0xFFFFFFFFu;
     }
 }

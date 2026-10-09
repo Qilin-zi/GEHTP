@@ -17,13 +17,9 @@ import argparse
 import os
 import sys
 
-QPM_ROOT = "/disk2/Qwen35dev/qwen3.5_4b_base/example1"
-sys.path.insert(0, QPM_ROOT)
-
-# 强制 torch fallback: 环境若装了 CUDA 版 causal_conv1d/FLA,QPM 会走 GPU kernel 崩
-import transformers.utils.import_utils as _tf_import
-_tf_import.is_causal_conv1d_available = lambda *a, **k: False
-_tf_import.is_flash_linear_attention_available = lambda *a, **k: False
+# QPM_ROOT = "/disk2/Qwen35dev/qwen3.5_4b_base/example1"
+# Use built-in transformers Qwen3_5 classes (transformers>=4.57)
+# sys.path.insert(0, QPM_ROOT)
 
 import numpy as np
 import torch
@@ -32,22 +28,38 @@ from safetensors.torch import load_file
 # transformers 4.57 的 create_causal_mask 走 vmap 建掩码(sdpa_mask_recent_torch),
 # jit.trace 下 functorch vmap 崩(unordered_map::at)。替换为等价纯 torch 实现:
 # 加性 4D 掩码 [bsz,1,q,kv]: 0=参与, -inf=屏蔽, 上三角屏蔽(因果); 附带 attention_mask 填充语义。
+import transformers
 import transformers.masking_utils as _mu
 import transformers.modeling_attn_mask_utils as _mau
+import transformers.models.qwen3_5.modeling_qwen3_5 as _q35_model
+
+# torch.jit.trace does not set Transformers' export-mode guard, so the Qwen
+# gated-delta path otherwise emits unsupported linalg_solve_triangular ops.
+_q35_model.is_torchdynamo_exporting = lambda: True
+
+# The exporter only needs the model classes; Transformers imports sklearn for
+# optional assisted-generation support, which is ABI-incompatible in some
+# installed environments. Keep that optional dependency out of this process.
+_orig_is_pkg = transformers.utils.import_utils._is_package_available
+transformers.utils.import_utils._is_package_available = (
+    lambda name, *args, **kwargs: (False, None)
+    if name == "sklearn"
+    else _orig_is_pkg(name, *args, **kwargs)
+)
 
 
-def _jit_causal_mask(config, input_embeds, attention_mask=None, cache_position=None,
+def _jit_causal_mask(config, inputs_embeds, attention_mask=None, cache_position=None,
                      past_key_values=None, position_ids=None, **kwargs):
     # 因果掩码: keep = (row >= col) → 0, 否则 -inf。
     # 不用 torch.triu(diagonal=1): torch 2.10 导出 Trilu 会丢 k 属性(k=1 变 k=0,
     # 实测小实验)导致对角线被误掩 → softmax 全 -inf 行 → NaN。
-    bsz, q_len, _ = input_embeds.shape
+    bsz, q_len, _ = inputs_embeds.shape
     row = torch.arange(q_len).unsqueeze(1)  # [q,1]
     col = torch.arange(q_len).unsqueeze(0)  # [1,q]
     keep = row >= col
     m = torch.where(keep,
-                    torch.zeros((), dtype=input_embeds.dtype),
-                    torch.full((), float("-inf"), dtype=input_embeds.dtype))
+                    torch.zeros((), dtype=inputs_embeds.dtype),
+                    torch.full((), float("-inf"), dtype=inputs_embeds.dtype))
     m = m.unsqueeze(0).unsqueeze(0)  # [1,1,q,q]
     if attention_mask is not None:
         pad = torch.where(attention_mask == 0,
@@ -60,8 +72,7 @@ def _jit_causal_mask(config, input_embeds, attention_mask=None, cache_position=N
 _mu.create_causal_mask = _jit_causal_mask
 _mau.create_causal_mask = _jit_causal_mask
 
-from huggingface.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-from huggingface.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+from transformers import Qwen3_5Config, Qwen3_5ForCausalLM
 
 
 def load_remapped(model, model_dir):
@@ -138,11 +149,13 @@ def main():
     size_mb = os.path.getsize(args.out) / 1e6
     print(f"[export] {args.out} ({size_mb:.1f} MB, opset={args.opset})")
 
-    # 后处理(仅小 proto,不加载外部数据):
-    # 1) logits_to_keep=0 的整段切片: trace 产 Gather(data, 空 indices 图输入),
-    #    ONNX 空 indices=全量 → 换 Identity
-    # 2) 递归剥离悬空输入(jit trace 把未被消费的 traced 值提升为图输入,
-    #    如 text_position_ids 切片)→ 否则 ORT/转换器报缺 feed
+    if os.environ.get("GEHTP_EXPORT_RAW_ONLY"):
+        print("[export] raw graph saved; skipping post-processing")
+        return
+
+    # Keep the raw graph while checking parity. Runtime-shape Trilu lowering is
+    # only needed by qairt-converter and can be applied after ORT validates the
+    # exporter result.
     import onnx as _onnx
     _m = _onnx.load(args.out, load_external_data=False)
     # 空索引 Gather 的 indices = trace 自造图输入(如 onnx::Gather_4);
@@ -228,6 +241,21 @@ def main():
                 _upper = _a.i
             elif _a.name == "k":
                 _k = _a.i
+        # torch 2.10 导出的 Trilu 可能把 k 作为第二输入(Constant/initializer)
+        # 而非属性;漏读会把 tril(X,k=-1) 错降成 k=0(对角线误留)→ 精度崩。
+        if len(_n.input) >= 2 and _n.input[1]:
+            _kval = None
+            for _init in _m.graph.initializer:
+                if _init.name == _n.input[1]:
+                    _kval = _onnx.numpy_helper.to_array(_init)
+            if _kval is None:
+                for _n2 in _m.graph.node:
+                    if _n2.op_type == "Constant" and _n2.output and _n2.output[0] == _n.input[1]:
+                        for _a2 in _n2.attribute:
+                            if _a2.name == "value":
+                                _kval = _onnx.numpy_helper.to_array(_a2.t)
+            if _kval is not None:
+                _k = int(np.asarray(_kval).reshape(-1)[0])
         _p = f"{_n.name}_tri"
         _s = _p + "_s"
         _r2 = _p + "_r2"

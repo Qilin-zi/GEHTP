@@ -42,6 +42,8 @@ static int arity_of(uint16_t opcode) {
     case OP_PAD_F16: return WT_ARITY_PAD_F16;
     case OP_MATMUL_F16_SPLIT: return WT_ARITY_MATMUL_F16_SPLIT;
     case OP_MATMUL_F16_BIAS: return WT_ARITY_MATMUL_F16_BIAS;
+    case OP_CONV1D_SSM_STEP_F16: return WT_ARITY_CONV1D_SSM_STEP_F16;
+    case OP_DELTA_CHUNK_F16: return WT_ARITY_DELTA_CHUNK_F16;
     default: return -1;
     }
 }
@@ -77,6 +79,8 @@ static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     case OP_PAD_F16: return idx == 0;
     case OP_MATMUL_F16_SPLIT: return idx == 0 || idx == 1;
     case OP_MATMUL_F16_BIAS: return idx == 0 || idx == 1 || idx == 7;
+    case OP_CONV1D_SSM_STEP_F16: return idx == 0 || idx == 1;
+    case OP_DELTA_CHUNK_F16: return idx <= 4;
     default: return 0;
     }
 }

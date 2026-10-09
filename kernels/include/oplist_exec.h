@@ -37,8 +37,15 @@ uint32_t  wt_exec_temp_bytes(uint32_t id);
 /* 每 temp 最后写入字节数 (temp_bytes=分配大小, 复用只扩不缩可能大于实际) */
 uint32_t  wt_exec_temp_last_bytes(uint32_t id);
 
-/* 收尾: wtcache_close + temps 释放。任何路径退出前必须调。 */
+/* 收尾: wtcache_close + temps 释放。任何路径退出前必须调。
+ * 持久状态 (WT_SLOT_STATE) 不在此回收 —— 生命期 = 进程级, 跨 run_io
+ * 存活 (persistent decode 语义); 新序列用 wt_exec_state_reset 清零。 */
 void wt_exec_shutdown(void);
+
+/* 004 P2: 持久状态表全量清零 (KV ring 槽失效 + SSM 面归零)。
+ * 新序列(prefill 重来)前由 persistent runner 调用; 单测/合成 blob
+ * 每进程一次亦可不调。 */
+void wt_exec_state_reset(void);
 
 /* 第7步阶段一插槽: 编译期静态 temp 池 + 偏移表。
  * base=NULL && offsets=NULL 恢复运行时 bump 路径(默认)。
