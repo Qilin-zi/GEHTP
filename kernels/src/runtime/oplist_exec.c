@@ -202,11 +202,14 @@ static const uint8_t* ref_ptr(const struct wt_blob* b, uint32_t arg) {
     return (arg < MAX_TEMPS) ? g_exec.temps[arg] : NULL;
 }
 
-/* 引用元素数(f16 元素): slot → count; temp → temp_bytes/2; VTCM 未跟踪=0 */
+/* 引用元素数(f16 元素): slot → count; temp → g_last_bytes/2; VTCM 未跟踪=0。
+ * temp 用 g_last_bytes(最后写入字节)而非 temp_bytes(历史最大分配): 表外 temp
+ * 在 bump 路径"只增不缩", 复用为更小张量时 temp_bytes 残留旧大值, 会高估
+ * 元素数 (decode kv_append 的 k[512] 复用 3584 旧槽 → geometry 误判实锤)。 */
 static uint32_t ref_elem_count(const struct wt_blob* b, uint32_t arg) {
     if (arg & 0x8000u) { uint32_t s = arg & 0x7FFFu; return (s < b->n_slots) ? b->slots[s].count : 0; }
     if (arg & 0x4000u) return 0;
-    return (arg < MAX_TEMPS) ? g_exec.temp_bytes[arg] / 2u : 0;
+    return (arg < MAX_TEMPS) ? g_last_bytes[arg] / 2u : 0;
 }
 
 uint8_t* wt_exec_temp(uint32_t id) {
