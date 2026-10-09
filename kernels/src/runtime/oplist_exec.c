@@ -2075,8 +2075,34 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
+/* 007 US1 broadcast 形态判定 — 正典 = specs/007-perf-sprint-1/evidence/
+ * broadcast_census.md "判定规则"节; 孪生实现在
+ * compiler/tools/wtop_ops/wtop_ops.hpp broadcast_shape_class (判据互指, 勿单边改)。
+ * 1 = 整块 (in 外轴全广播: 块重复 / 整块铺标量)
+ * 2 = 行循环 (末轴 in==out 连续拷行 / in==1 逐行铺标量, 外轴里程计免除 div)
+ * 3 = 通用退化 (wrap 轴 / strided gather; 保留标量, emit 侧计划 scalar = 合法) */
+static int broadcast_shape_class(const uint32_t in_d[4], const uint32_t out_d[4])
+{
+    uint32_t r = 4;
+    while (r > 0 && out_d[r - 1] == 1) r--;
+    if (r == 0) r = 1;
+    uint32_t ir = 4;
+    if (ir > r) ir = r;
+    if (in_d[ir - 1] != out_d[r - 1] && in_d[ir - 1] != 1) return 3; /* 末轴 wrap */
+    uint32_t lead = r - ir;
+    int outer_bcast = 1;
+    for (uint32_t d = 0; d + 1 < ir; d++) {
+        if (in_d[d] == 1) continue;               /* 外轴广播 */
+        if (in_d[d] != out_d[d + lead]) return 3; /* 外轴 wrap (c%idim 环绕) */
+        outer_bcast = 0;
+    }
+    return outer_bcast ? 1 : 2;
+}
+
 /* numpy 广播: 右对齐逐轴, in==1 的轴扩到 out(缺失轴视 1)。
- * in_d/out_d 为 QNN 4D 填充 dims; 压尾 1 得有效 rank 后解坐标。 */
+ * in_d/out_d 为 QNN 4D 填充 dims; 压尾 1 得有效 rank 后解坐标。
+ * 007 US1: 形态 1/2 有 HVX 纯搬运执行体 (位级 = 标量逐元素拷贝, 无数值
+ * 语义), 消灭 per-element 坐标除法; 形态 3 与守卫不满足者保留标量。 */
 static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
                           char* err, size_t errn) {
     uint32_t b_t = op->args[0], y_t = op->args[1], n = op->args[2], b_elems = op->args[3];
@@ -2085,32 +2111,85 @@ static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* x = (const uint16_t*)ref_ptr(b, b_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)n * 2u);
     if (!x || !y || b_elems == 0) { snprintf(err, errn, "broadcast ref fail"); return -1; }
-    /* 003 T018 补漏 (t2l op_ts v3 机检实锤: emit 对 Eltwise_Broadcast 按
-     * n%32 计划 HVX, 但 broadcast 无 HVX/HMX 内核 —— 此前静默标量 =
-     * planned!=actual 且 dev=0 的契约违例)。按回落策略裁决。 */
-    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
-        engine_fallback_or_die(g_planned_engine, "broadcast has no HVX/HMX path",
-                               err, errn) != 0)
-        return -1;
     uint32_t r = 4;
     while (r > 0 && out_d[r - 1] == 1) r--;
     /* in 不去尾 1(末维 1 广播到 out 大维必须保留; host in_bc oid 1231 同款) */
     uint32_t ir = 4;
     if (r == 0) r = 1;
     if (ir > r) ir = r;  /* 输入 rank 不得高于输出(右对齐前导 1 已折叠) */
+    uint32_t lead = r - ir;
+    int bclass = broadcast_shape_class(in_d, out_d);
+    /* HVX 快路径: 计划 HVX 且形态 1/2 且整除守卫过 (守卫失败 = 形状异常,
+     * 落到下方按回落策略诚实记 dev, 不出错误字节)。ver<=2 无注解恒标量
+     * (legacy 字节流不动)。 */
+    int hvx_form = 0;  /* 0=无 1=整块 2=行循环 */
+    if (bclass == 1) {
+        if (n % b_elems == 0) hvx_form = 1;
+    } else if (bclass == 2) {
+        if (n % out_d[r - 1] == 0) hvx_form = 2;
+    }
+    if (b->annot_base && g_planned_engine == WT_ENG_HVX && hvx_form) {
+        uint32_t istr[4] = {1, 1, 1, 1};
+        for (int i = (int)ir - 2; i >= 0; i--) istr[i] = istr[i + 1] * in_d[i + 1];
+        if (hvx_form == 1) {
+            uint32_t L = b_elems;              /* in 即完整块(外轴全 1) */
+            if (L == 1) {
+                hvhx_v2_fill_f16(y, x[0], n);
+            } else {
+                uint32_t M = n / L;
+                hvhx_v2_copy_f16(y, x, L);     /* 首块自源 */
+                for (uint32_t m = 1; m < M; m++)
+                    hvhx_v2_copy_f16(y + (size_t)m * L, y, L); /* 续块自首块 */
+            }
+        } else {
+            uint32_t W = out_d[r - 1];         /* 行元素数 */
+            uint32_t rows = n / W;
+            int inner_copy = (in_d[ir - 1] == W);
+            /* 外轴里程计: oc[ax] = out 轴 ax 坐标 (ax ∈ [0, r-1)), 行间递增
+             * 免逐行 div/mod; 行源偏移 = Σ(拷贝外轴坐标 × in 步长)。 */
+            uint32_t oc[4] = {0, 0, 0, 0};
+            for (uint32_t row = 0; row < rows; row++) {
+                uint32_t in_off = 0;
+                for (uint32_t d = 0; d + 1 < ir; d++) {
+                    if (in_d[d] > 1)
+                        in_off += oc[d + lead] * istr[d];
+                }
+                uint16_t* dst_row = y + (size_t)row * W;
+                if (inner_copy)
+                    hvhx_v2_copy_f16(dst_row, x + in_off, W);
+                else
+                    hvhx_v2_fill_f16(dst_row, x[in_off], W);
+                for (int ax = (int)r - 2; ax >= 0; ax--) {
+                    if (++oc[ax] < out_d[ax]) break;
+                    oc[ax] = 0;
+                }
+            }
+        }
+        g_last_engine = WT_ENG_HVX;  /* 实跑即计划 (dev=0) */
+        return 0;
+    }
+    /* 003 T018 契约: 计划非 scalar 而不可快路径 (形态 3 / 守卫失败 / 计划
+     * HMX) → 按回落策略裁决 (允许回落记 dev=1, 禁止回落则死)。emit 侧形态 3
+     * 应已计划 scalar —— 走到这里 = 两侧判定漂移或形状异常, 诚实记录。 */
+    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
+        engine_fallback_or_die(g_planned_engine,
+                               hvx_form ? "broadcast form guard fail"
+                                        : "broadcast form3 (strided)",
+                               err, errn) != 0)
+        return -1;
     uint32_t istr[4] = {1, 1, 1, 1};
     for (int i = (int)ir - 2; i >= 0; i--) istr[i] = istr[i + 1] * in_d[i + 1];
     uint32_t ostr[4] = {1, 1, 1, 1};
     for (int i = (int)r - 2; i >= 0; i--) ostr[i] = ostr[i + 1] * out_d[i + 1];
     for (uint32_t i = 0; i < n; i++) {
         uint32_t rem = i, in_lin = 0;
-        uint32_t lead = r - ir;  /* 输入右对齐: 前 lead 轴广播为 0 */
+        uint32_t lead2 = r - ir;  /* 输入右对齐: 前 lead 轴广播为 0 */
         for (uint32_t d = 0; d < r; d++) {
             uint32_t c = rem / ostr[d];
             rem %= ostr[d];
-            if (d < lead) continue;
-            uint32_t idim = in_d[d - lead];
-            if (idim > 1) in_lin += (c % idim) * istr[d - lead];
+            if (d < lead2) continue;
+            uint32_t idim = in_d[d - lead2];
+            if (idim > 1) in_lin += (c % idim) * istr[d - lead2];
         }
         y[i] = x[in_lin];
     }

@@ -23,8 +23,8 @@ description: "Task list for feature implementation"
 
 **Purpose**: 让 007 worktree 具备编译/上板能力并锚定基线证据
 
-- [ ] T001 容器 `gehtp-toolchain:24.04` 内 cmake configure+build `/disk1/gehtp-wt/007-perf-sprint-1/compiler` → `build_linux`（kernels 先 source env.sh，参照 [[gehtp-build-env]]）
-- [ ] T002 [P] `kernels/` 基线全量构建：`cd kernels && ./build_libs.sh all`（验证工具链可用；本任务不推板，仅本地产物自洽）
+- [x] T001 容器 `gehtp-toolchain:24.04` 内 cmake configure+build `/disk1/gehtp-wt/007-perf-sprint-1/compiler` → `build_linux`（kernels 先 source env.sh，参照 [[gehtp-build-env]]）
+- [x] T002 [P] `kernels/` 基线全量构建：`cd kernels && ./build_libs.sh all`（验证工具链可用；本任务不推板，仅本地产物自洽）
 - [x] T003 基线锚采集：现有 003 v4 产物跑 `scripts/gehtp_prof.py` 取 broadcast 族回落 1023 / 族耗时 7.84s / wall 35.31s / cos 0.998642，登记 `specs/007-perf-sprint-1/evidence/baseline.md`（判据入库不入 /tmp）
 
 **Checkpoint**: 构建可用、基线数字落盘
@@ -49,13 +49,13 @@ description: "Task list for feature implementation"
 
 ### Implementation for User Story 1
 
-- [ ] T005 [P] [US1] 设备侧形态判定 + 三形态分派骨架：`kernels/src/runtime/oplist_exec.c` exec_broadcast 段（:2080 一带）——判定语义 = data-model BroadcastShapeClass 表，注释与 emit 侧互指（FR-001，防两侧漂移）；形态 3 暂走现状标量路径
-- [ ] T006 [US1] 形态 1 执行体：连续块 HVX 128B 块拷贝循环（v60，参照 `kernels/src/runtime/hvx_binary.c` 范式：HVX 循环 + 尾部标量），坐标志外仅按块推进，零 per-element 除法（depends T005）
-- [ ] T007 [US1] 形态 2 执行体：外层标量行循环 + 内层 HVX 块拷贝，行内坐标增量预计算（depends T006，同文件同段顺序改）
-- [ ] T008 [P] [US1] 编译器侧形态判定 + `assign_engine` 分派：类 1/2→HVX、类 3→scalar（fb_allowed 恒 1），`compiler/tools/wtop_emit.cpp` + `compiler/tools/wtop_ops/wtop_ops.hpp`；与 T005 同一判据语义、注释互指（FR-002）
-- [ ] T009 [US1] 契约测试：`compiler/tests/test_wtop_emit.cpp` 增三类形态的 planned engine 断言（类 3 计划 scalar = 合法非回落 dev=0）（depends T008）
-- [ ] T010 [US1] 全量验证构建 + 板跑：compiler ctest 47/47 → `build_libs.sh all`（多文件勿用 one，防陈旧 arity）→ d0f1784 推 `007_` 私有名资产（推前 df）跑 v17/prefill（depends T007, T009）
-- [ ] T011 [US1] P1 门验收 → `specs/007-perf-sprint-1/evidence/p1_gate.md`：回落 1023→0、broadcast 族耗时 ≤1s（SC-001）、wall ≤28s（SC-002 阶段门）、cos 0.998642 逐字节不动（SC-007）、类 3 不计入回落（偏差报告不变量）（depends T010）
+- [x] T005 [P] [US1] 设备侧形态判定 + 三形态分派骨架：`kernels/src/runtime/oplist_exec.c` exec_broadcast 段（:2080 一带）——判定语义 = data-model BroadcastShapeClass 表，注释与 emit 侧互指（FR-001，防两侧漂移）；形态 3 暂走现状标量路径
+- [x] T006 [US1] 形态 1 执行体：连续块 HVX 128B 块拷贝循环（v60，参照 `kernels/src/runtime/hvx_binary.c` 范式：HVX 循环 + 尾部标量），坐标志外仅按块推进，零 per-element 除法（depends T005）
+- [x] T007 [US1] 形态 2 执行体：外层标量行循环 + 内层 HVX 块拷贝，行内坐标增量预计算（depends T006，同文件同段顺序改）
+- [x] T008 [P] [US1] 编译器侧形态判定 + `assign_engine` 分派：类 1/2→HVX、类 3→scalar（fb_allowed 恒 1），`compiler/tools/wtop_emit.cpp` + `compiler/tools/wtop_ops/wtop_ops.hpp`；与 T005 同一判据语义、注释互指（FR-002）
+- [x] T009 [US1] 契约测试：`compiler/tests/test_wtop_emit.cpp` 增三类形态的 planned engine 断言（类 3 计划 scalar = 合法非回落 dev=0）（depends T008）
+- [x] T010 [US1] 全量验证构建 + 板跑：compiler ctest 47/47 → `build_libs.sh all`（多文件勿用 one，防陈旧 arity）→ d0f1784 推 `007_` 私有名资产（推前 df）跑 v17/prefill（depends T007, T009）
+- [x] T011 [US1] P1 门验收 → `specs/007-perf-sprint-1/evidence/p1_gate.md`：回落 1023→0、broadcast 族耗时 ≤1s（SC-001）、wall ≤28s（SC-002 阶段门）、cos 0.998642 逐字节不动（SC-007）、类 3 不计入回落（偏差报告不变量）（depends T010）
 
 **Checkpoint**: MVP 达成，可独立交付
 

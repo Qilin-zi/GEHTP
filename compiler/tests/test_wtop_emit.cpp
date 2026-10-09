@@ -18,6 +18,9 @@
 
 #include "oplist_parse.h"
 
+/* 007 US1 T009: 直连 emit 侧孪生形态判定 (header-inline, 无链接副作用) */
+#include "../tools/wtop_ops/wtop_ops.hpp"
+
 using namespace hnnx;
 
 static int failed = 0;
@@ -968,6 +971,120 @@ int main() {
             CHECK(std::strstr((const char*)err.data(), "carve") != nullptr,
                   "T022: 错误信息指向 carve 不变量");
         }
+    }
+
+    /* 11. 007 US1: 注入的 OP_BROADCAST_F16 子 op 引擎按形态分派契约。
+     * 孪生判定 = wtop_ops.hpp broadcast_shape_class (emit 侧, 本测试直连) =
+     * kernels oplist_exec.c broadcast_shape_class (设备侧, 板上 T010 验)。
+     *   形态 1 (外轴全广播: 铺标量/整块重复) → 计划 HVX;
+     *   形态 2 (行循环: 末轴 in==out 拷行 / in==1 铺行) → 计划 HVX;
+     *   形态 3 (wrap 轴退化) → 计划 SCALAR (合法非回落, 设备 dev=0)。
+     * 广播子 op 不得继承父 op 的 n%32 判据 (918 回落根因, census 实锤);
+     * SELECT (Eltwise_Ternary) 的 cond 物化同契约 (父 op 无快内核恒 scalar,
+     * 广播子 op 仍按自身形态拿 HVX)。 */
+    {
+        /* 11a. emit 侧形态判定直连单测 (不经图管线, 钉死孪生语义) */
+        {
+            using wtop::broadcast_shape_class;
+            const uint32_t i1[4] = {1, 1, 1, 1}, o1[4] = {1, 32, 16, 1};
+            CHECK(broadcast_shape_class(i1, o1) == 1, "bc: 标量铺 (1,1,1,1)→(1,32,16,1) = 形态 1");
+            const uint32_t i2[4] = {1, 1, 64, 64}, o2[4] = {1, 16, 64, 64};
+            CHECK(broadcast_shape_class(i2, o2) == 2, "bc: 拷行 (1,1,64,64)→(1,16,64,64) = 形态 2");
+            const uint32_t i3[4] = {1, 1, 3, 8}, o3[4] = {1, 1, 24, 8};
+            CHECK(broadcast_shape_class(i3, o3) == 3, "bc: wrap 轴 (1,1,3,8)→(1,1,24,8) = 形态 3");
+            const uint32_t i4[4] = {1, 64, 64, 1}, o4[4] = {1, 64, 64, 1};
+            CHECK(broadcast_shape_class(i4, o4) == 2, "bc: 恒等同形 = 形态 2 (末轴拷行)");
+        }
+
+        /* 11b. 端到端: 小 const 输入 → 物化注入 OP_BROADCAST_F16, 注解引擎
+         * 按形态断言 (HVX=1 / SCALAR=0)。in_d/out_d 传 fold4 折叠后期望值。 */
+        auto run_bcast = [&](const char* tag, const char* op_name,
+                             const uint64_t c_dims[4], const uint64_t out_dims[4],
+                             const uint32_t fin_d[4], const uint32_t fout_d[4],
+                             uint32_t expect_engine, uint16_t tail_opcode) {
+            GraphPrepare g;
+            OutputDef od = make_od4(out_dims[0], out_dims[1], out_dims[2], out_dims[3]);
+            od.dtype = static_cast<uint32_t>(DType::Float16);
+            g.append_node("Input", 1, nullptr, 0, &od, 1, nullptr);
+            uint64_t s_elems = c_dims[0] * c_dims[1] * c_dims[2] * c_dims[3];
+            uint64_t out_elems = out_dims[0] * out_dims[1] * out_dims[2] * out_dims[3];
+            OutputDef cod = make_od4(c_dims[0], c_dims[1], c_dims[2], c_dims[3]);
+            std::vector<float> cv((size_t)s_elems, 0.25f);
+            g.append_const_node(2, cod, reinterpret_cast<const uint8_t*>(cv.data()), cv.size() * 4);
+            g.get_op_at(2)->name_tag = string_tag_t::map_str("bc_src");
+            if (std::strcmp(op_name, "Eltwise_Binary") == 0) {
+                InputDef ein[2] = {{1, 0}, {2, 0}};   /* 小 const 在 b 位 → 物化 */
+                g.append_node(op_name, 3, ein, 2, &od, 1, nullptr);
+            } else {                                   /* SELECT: cond = 小 const */
+                InputDef tin[3] = {{2, 0}, {1, 0}, {1, 0}};
+                g.append_node(op_name, 3, tin, 3, &od, 1, nullptr);
+            }
+            InputDef oin[1] = {{3, 0}};
+            g.append_node("Output", 4, oin, 1, nullptr, 0, nullptr);
+            std::string pre = std::string("  [bc:") + tag + "] ";
+            if (g.prepare(env) != GraphStatus::Success) {
+                CHECK(false, (pre + "prepare").c_str()); return;
+            }
+            std::vector<uint8_t> b2(1u << 18, 0);
+            size_t b2n = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2n) || b2n == 0) {
+                CHECK(false, (pre + "serialize").c_str()); return;
+            }
+            b2.resize(b2n);
+            const std::string d2 = dir + "bc_" + tag + "/";
+            std::system(("mkdir -p " + d2).c_str());
+            const std::string bp = d2 + "g.bin";
+            const std::string ip = d2 + "in.f16.raw";
+            const std::string op2 = d2 + "o.wtop";
+            CHECK(write_file(bp, b2.data(), b2.size()), (pre + "write .bin").c_str());
+            std::vector<uint8_t> in16((size_t)out_elems * 2, 0);
+            CHECK(write_file(ip, in16.data(), in16.size()), (pre + "write f16").c_str());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 + " 2>/dev/null";
+            if (std::system(c2.c_str()) != 0) {
+                std::system((std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2).c_str());
+                CHECK(false, (pre + "emit exit 0").c_str()); return;
+            }
+            std::vector<uint8_t> bl2;
+            if (!load_file(op2, bl2)) { CHECK(false, (pre + "read blob").c_str()); return; }
+            wt_blob* w2 = new wt_blob{};
+            if (wt_parse(bl2.data(), bl2.size(), w2) != WT_OK) {
+                CHECK(false, (pre + "wt_parse").c_str()); delete w2; return;
+            }
+            uint32_t nb = 0, bi = 0;
+            for (uint32_t i = 0; i < w2->n_ops; i++)
+                if (w2->ops[i].opcode == OP_BROADCAST_F16) { nb++; bi = i; }
+            if (nb != 1 || w2->n_ops != 2 || w2->ops[1].opcode != tail_opcode) {
+                CHECK(false, (pre + "ops = [BROADCAST×1, 尾 op]").c_str()); delete w2; return;
+            }
+            CHECK(true, (pre + "ops = [OP_BROADCAST_F16 ×1, 尾 op]").c_str());
+            const wt_op* bc = &w2->ops[bi];
+            CHECK(bc->n_args == 12 && bc->args[2] == (uint32_t)out_elems &&
+                  bc->args[3] == (uint32_t)s_elems,
+                  (pre + "args n/s_elems 契约").c_str());
+            bool dims_ok = bc->args[4] == fin_d[0] && bc->args[5] == fin_d[1] &&
+                           bc->args[6] == fin_d[2] && bc->args[7] == fin_d[3] &&
+                           bc->args[8] == fout_d[0] && bc->args[9] == fout_d[1] &&
+                           bc->args[10] == fout_d[2] && bc->args[11] == fout_d[3];
+            CHECK(dims_ok, (pre + "fold4 后 in_d/out_d 进 args").c_str());
+            uint32_t an = wt_rd_u32(w2->annot_base + (size_t)bi * 4);
+            CHECK(wt_annot_engine(an) == expect_engine,
+                  (pre + "广播子 op 注解引擎按形态分派 (不继承父 n%32)").c_str());
+            CHECK(wt_annot_fb_allowed(an) == 1u, (pre + "fb_allowed=1").c_str());
+            delete w2;
+        };
+        const uint64_t sc[4] = {1, 1, 1, 1}, f2i[4] = {1, 1, 64, 64},
+                      f3i[4] = {1, 1, 3, 8};
+        const uint64_t oA[4] = {1, 32, 16, 1}, oB[4] = {1, 16, 64, 64},
+                      oC[4] = {1, 1, 24, 8};
+        const uint32_t eA_i[4] = {1, 1, 1, 1}, eA_o[4] = {1, 32, 16, 1};
+        const uint32_t eB_i[4] = {1, 1, 64, 64}, eB_o[4] = {1, 16, 64, 64};
+        const uint32_t eC_i[4] = {1, 1, 3, 8}, eC_o[4] = {1, 1, 24, 8};
+        run_bcast("f1_fill", "Eltwise_Binary", sc, oA, eA_i, eA_o, 1u, OP_ADD_F16);
+        run_bcast("f2_row", "Eltwise_Binary", f2i, oB, eB_i, eB_o, 1u, OP_ADD_F16);
+        run_bcast("f3_wrap", "Eltwise_Binary", f3i, oC, eC_i, eC_o, 0u, OP_ADD_F16);
+        run_bcast("f2_select", "Eltwise_Ternary", f2i, oB, eB_i, eB_o, 1u, OP_BINARY_F16);
     }
 
     std::printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASS", failed);
