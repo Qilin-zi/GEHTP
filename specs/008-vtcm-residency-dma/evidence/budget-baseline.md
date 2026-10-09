@@ -35,6 +35,25 @@ error: VTCM 三方预算门超限: resident_pool=16777216 + hmx_arena=16760832 >
 
 `--plan-vtcm-budget 4194304`（4MB ≥ carve_peak 2.94MB + staging 头寸）重编 + emit 侧 SPLIT 阈值单源化为 `16MB − pool`（已实现）→ 预期 gate PASS（pool 4MB + arena ≤12MB ≤16MB）。p1 编译已启动（`.scratch_008/hnnx_compile_p1.log`）。
 
+## p1 emit 冻结数字（2026-10-09 00:20, gate PASS）
+
+```
+[ddr] TAG_MEM_PLAN: cap=2147483648 vtcm_cap=4194304 n_temps=12517 n_spills=0
+[ddr] TEMPOFF slot 1942: cap=2147483648 vtcm_cap=4194304 n_temps=1675 (vtcm=1674)
+[vtcm] pool=4194304(reserve 4194304) arena_max=12570624 carve_peak=3082496 staging_sum=0 slack=12288 coverage=0.8401
+[carve] 12516 entries, footprint 3082496 B (cap 4194304)
+WTOP OK: slots=1943 ops=14180 bytes=2041539584 (gguf hits=0 miss=0)
+```
+
+- **三方门 PASS**：pool 4MB + arena 12,570,624 ≤ 16MB（slack 12,288）。SPLIT 阈值单源化（16MB−pool=12MB）后最大 chunk arena 12.57MB 贴 12MB 界。
+- 驻留面与 p0 恒等（1674/1675, coverage 0.8401, carve_peak 2.94MB）——pool 从 16MB 降到 4MB 只影响 SPLIT 粒度，不影响驻留分配。
+- carve 12516 条 = 12516 个 op 锚定生命期窗口去重后落到 1674 个 (offset,size) 池区（temp id 回收 + 生命期复用，双源一致性检查 PASS）。
+- **8-op 漂移（14188→14180）已归因，非 US1 面**：18 个 2-chunk SPLIT 新增 + lm_head 32→42 chunk（阈值变化，写不相交 N 列，值恒等）+ **fc_bias fold 差**（opcode36: 0→18 / ADD −18 / BROADCAST −18 / matmul24 −36）。v4 原编译 `fc_bias_fold=0/0`（旧 checkout），当前二进制 18/18 默认开。
+
+### p2 配方（纯驻离测试版, 2026-10-09 启动）
+
+fold 的 HMX bias 单舍入 vs 旧 matmul+ADD 双舍入可能破坏位级 md5 门 → p2 = p1 配方 + `--no-pass fc_bias_fold`（hnnx_compile.cpp:315 已有该旗标, PassManager::disable 对注册前名也生效）。期望：opcode36=0、opt-stats `fc_bias_fold=0/0`、after≈21139、ops = v4 14188 + SPLIT 阈值变化。**p2 是 T010 板跑主产物**（SC-004 位级门量的是纯驻留，fold 差属 005/007 线口径）。
+
 ## T005 — mem_plan 激活判定（已定论：配方层修复，无代码缺口）
 
 p0 emit 出现完整 `[ddr] TAG_MEM_PLAN` + `[ddr] TEMPOFF` 两行（v4 同图 88 行日志零 [ddr] 行）——旁路根因 = v4 编译配方未带预算旗标，**带旗标重发即激活全链**（规划→TAG_MEM_PLAN→TEMPOFF→运行时 vtcm_off_arr 池驻留）。

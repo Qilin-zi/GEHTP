@@ -675,6 +675,15 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::fprintf(rf, "uncovered_hmx_opcodes");
             for (uint32_t o : uncovered) std::fprintf(rf, " %u", o);
             std::fprintf(rf, "\n");
+            /* 未驻留物化 temp + reason: 显式降级非静默 (T007)。planner 按
+             * 全量 planned temp 打包(含 10.8k 未物化项), 物化项被挤出的
+             * 每一笔都在这里点名。 */
+            for (const auto& [tid, offsz] : em.ddr_temp_tab) {
+                auto vit = em.ddr_temp_vtcm.find(tid);
+                if (vit == em.ddr_temp_vtcm.end() || !vit->second)
+                    std::fprintf(rf, "nonresident %u %u planner_displaced\n",
+                                 tid, offsz.second);
+            }
             for (const auto& [op_id, os] : em.ddr_spill_map)
                 std::fprintf(rf, "spill %llu %u %u\n", (unsigned long long)op_id,
                              os.first, os.second);
