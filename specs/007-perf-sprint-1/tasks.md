@@ -25,7 +25,7 @@ description: "Task list for feature implementation"
 
 - [ ] T001 容器 `gehtp-toolchain:24.04` 内 cmake configure+build `/disk1/gehtp-wt/007-perf-sprint-1/compiler` → `build_linux`（kernels 先 source env.sh，参照 [[gehtp-build-env]]）
 - [ ] T002 [P] `kernels/` 基线全量构建：`cd kernels && ./build_libs.sh all`（验证工具链可用；本任务不推板，仅本地产物自洽）
-- [ ] T003 基线锚采集：现有 003 v4 产物跑 `scripts/gehtp_prof.py` 取 broadcast 族回落 1023 / 族耗时 7.84s / wall 35.31s / cos 0.998642，登记 `specs/007-perf-sprint-1/evidence/baseline.md`（判据入库不入 /tmp）
+- [x] T003 基线锚采集：现有 003 v4 产物跑 `scripts/gehtp_prof.py` 取 broadcast 族回落 1023 / 族耗时 7.84s / wall 35.31s / cos 0.998642，登记 `specs/007-perf-sprint-1/evidence/baseline.md`（判据入库不入 /tmp）
 
 **Checkpoint**: 构建可用、基线数字落盘
 
@@ -35,7 +35,7 @@ description: "Task list for feature implementation"
 
 **Purpose**: 形态分布定量，决定 US1 HVX 覆盖面与 US3 热点排序
 
-- [ ] T004 [P] broadcast 形态普查：对 0.8B 图全部 1622 个 broadcast op 按 data-model `BroadcastShapeClass`（形态1 连续块/形态2 行面重复/形态3 strided gather）分类统计，产出分布表与各形态 wall 占比 → `specs/007-perf-sprint-1/evidence/broadcast_census.md`（host 工具或脚本分析图 dump，只读不改码）
+- [x] T004 [P] broadcast 形态普查：对 0.8B 图全部 1622 个 broadcast op 按 data-model `BroadcastShapeClass`（形态1 连续块/形态2 行面重复/形态3 strided gather）分类统计，产出分布表与各形态 wall 占比 → `specs/007-perf-sprint-1/evidence/broadcast_census.md`（host 工具或脚本分析图 dump，只读不改码）
 
 **Checkpoint**: 形态 1/2 覆盖率已知（-7.3s 估计的实证）；US1/US2/US3 可开工
 
