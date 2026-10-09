@@ -2742,7 +2742,8 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
                 }
             }
             // 尾随 op_data blob(向后兼容: 旧流无此字段 → remaining < 4)
-            if (rr.remaining() >= 4) {
+            bool has_od_field = rr.remaining() >= 4;
+            if (has_od_field) {
                 uint32_t od_len = rr.r32();
                 if (od_len > 0 && rr.remaining() >= od_len) {
                     opdef->op_data.resize(od_len);
@@ -2750,8 +2751,8 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
                 }
             }
             // 004 线旧流无尾随 op_data 字段 → 从 serialized_extra 重建;
-            // 新流以写出侧原字节为准(rebuild 只作空回退, 勿覆盖)
-            if (opdef->op_data.empty()) rebuild_op_data_from_extra(opdef.get());
+            // 新流以写出侧原字节为准(空 op_data 也是合法态, 勿重建覆盖)。
+            if (!has_od_field) rebuild_op_data_from_extra(opdef.get());
 
             if (name == "Input") input_node_id_ = op_id;
             else if (name == "Output") output_node_id_ = op_id;
