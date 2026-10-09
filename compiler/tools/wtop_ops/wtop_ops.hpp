@@ -725,6 +725,37 @@ struct WtopEmitShared {
     uint32_t w_slot = 0, b_slot = 0;
 };
 
+/* 007 US1: broadcast 形态判定(孪生) — 正典 = specs/007-perf-sprint-1/evidence/
+ * broadcast_census.md "判定规则"节; 设备侧孪生 = kernels/src/runtime/
+ * oplist_exec.c broadcast_shape_class (判据互指, 勿单边改)。
+ * 1=整块(重复/铺标量) 2=行循环(拷行/铺行) 3=通用退化(strided)。
+ * 输入 = emit 进 args 的 fold4 后 4D in_d/out_d(与设备读到的完全同一数组)。 */
+inline int broadcast_shape_class(const uint32_t in_d[4], const uint32_t out_d[4])
+{
+    uint32_t r = 4;
+    while (r > 0 && out_d[r - 1] == 1) r--;
+    if (r == 0) r = 1;
+    uint32_t ir = 4;
+    if (ir > r) ir = r;
+    if (in_d[ir - 1] != out_d[r - 1] && in_d[ir - 1] != 1) return 3; /* 末轴 wrap */
+    uint32_t lead = r - ir;
+    int outer_bcast = 1;
+    for (uint32_t d = 0; d + 1 < ir; d++) {
+        if (in_d[d] == 1) continue;               /* 外轴广播 */
+        if (in_d[d] != out_d[d + lead]) return 3; /* 外轴 wrap */
+        outer_bcast = 0;
+    }
+    return outer_bcast ? 1 : 2;
+}
+
+/* 注入的 OP_BROADCAST_F16 子 op 引擎注解 (007 P1 修正: 父 op assign_engine
+ * 的 n%32 判据看不见 broadcast 自身形状 —— 按形态分派: 类 1/2 → HVX 纯搬运,
+ * 类 3 → scalar 计划(合法非回落, dev=0); fb_allowed 恒 1 沿 003 契约)。 */
+inline uint32_t broadcast_engine_annot(const uint32_t in_d[4], const uint32_t out_d[4])
+{
+    return wt_annot_pack(broadcast_shape_class(in_d, out_d) == 3 ? 0u : 1u, 1u, 0u);
+}
+
 /* ===================== 算子发射注册表 =====================
  * 每 op 一个 handler(QNN OpPackage 同构): 从 IR OpDef 读语义(serialized_extra/
  * dims/const 池), 编码为设备 opcode + args 并接线 slot/temp 引用。
