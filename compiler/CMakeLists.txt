@@ -316,6 +316,17 @@ target_compile_definitions(test_static_input PRIVATE
 add_dependencies(test_static_input wtop_emit hnnx_compile)
 add_test(NAME test_static_input COMMAND test_static_input)
 
+# VTCM 驻留缺省 auto (--plan-vtcm-budget 三态: auto/显式/0=关)
+add_executable(test_vtcm_auto tests/test_vtcm_auto.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
+target_link_libraries(test_vtcm_auto htp_core)
+target_include_directories(test_vtcm_auto PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
+target_compile_definitions(test_vtcm_auto PRIVATE
+    WTOP_EMIT_PATH="${CMAKE_BINARY_DIR}/wtop_emit"
+    HNNX_COMPILE_PATH="${CMAKE_BINARY_DIR}/hnnx_compile")
+add_dependencies(test_vtcm_auto wtop_emit hnnx_compile)
+add_test(NAME test_vtcm_auto COMMAND test_vtcm_auto)
+
 # M1: Qwen3.5 IR 摄取 + scalar_params + 往返
 add_executable(test_qwen35_ir tests/test_qwen35_ir.cpp)
 target_link_libraries(test_qwen35_ir htp_core)

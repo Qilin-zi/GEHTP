@@ -536,6 +536,21 @@ GraphStatus GraphPrepare::do_prepare2(HexagonNNEnv& env, VtcmCacheInstance& vtcm
 
     return GraphStatus::Success;
 }
+// ---- --plan-vtcm-budget 缺省(auto)解析用: HMX scratch 峰值普查 ----
+// need 公式与 op_matmul.cpp 的 US1 分块 lambda / wtop_ops.hpp assign_engine
+// 三处同口径拷贝, 改一处必同步三处(test_vtcm_auto 用大 matmul 锚住)。
+// vtcm_auto_scan 定义在匿名 ns 之后(extract_fc_extra 是匿名 ns 成员、
+// extract_matmul_extra 是 hnnx 域定义, 两名都在那里才可见; 此处只声明)。
+static uint64_t mm_scratch_need(uint32_t m, uint32_t k, uint32_t n) {
+    size_t a = (size_t)m * k * 2u, w = (size_t)n * k * 2u, o = (size_t)m * n * 2u;
+    size_t off_w = (a + 2047u) & ~(size_t)2047u;
+    size_t off_o = (off_w + w + 2047u) & ~(size_t)2047u;
+    size_t off_s = (off_o + o + 2047u) & ~(size_t)2047u;
+    return off_s + 2048u;
+}
+struct VtcmAutoScan { bool w4 = false; bool conv = false; uint64_t scratch_max = 0; };
+static VtcmAutoScan vtcm_auto_scan(const GraphPrepare& gp);
+
 // Source: graph_prepare.cc, 2329 bytes at 0xF71F00
 GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) {
     // 1. Final optimization passes
@@ -588,15 +603,45 @@ GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) 
     //    ddr 预算 0 = 不规划(与 emit --ddr-budget 缺省同语义)。
     has_mem_plan_ = false;
     mem_plan_ = MemPlan{};
-    if (plan_ddr_budget_ > 0) {
+    /* --plan-vtcm-budget 缺省 = auto: 纯默认编译(无 --ddr-budget、权重内嵌)
+     * 且图内无 W4A16 matmul 时, 驻留池 = 16MB − HMX scratch 峰值(镜像发射侧
+     * N 分块口径, 既有分块全部放得下 → op 流与关池一致, 运行时零新增回落)
+     * − 余量(运行时 attach 下界 align2048(wtcache pin_cap) + 杂项)。
+     * 显式传值(含 0)一律照用; 0 = 关(debug/旧口径)。 */
+    uint64_t vtcm_eff = plan_vtcm_budget_;
+    if (vtcm_eff == kVtcmPlanAuto) {
+        vtcm_eff = 0;
+        if (plan_ddr_budget_ > 0) {
+            std::fprintf(stderr, "[memplan] vtcm auto off: --ddr-budget 显式(旧口径, 要池请显式 --plan-vtcm-budget)\n");
+        } else if (const_pool_external_) {
+            std::fprintf(stderr, "[memplan] vtcm auto off: 权重外置路线B(池内字节不可判 W4)\n");
+        } else {
+            VtcmAutoScan vas = vtcm_auto_scan(*this);
+            constexpr uint64_t kVtcmTotal = 16ull << 20;  // 设备 A2 query; 发射侧 kVTCMTotal 同源
+            const uint64_t head = (vas.conv ? (2ull << 20) : 0ull) + (512ull << 10);
+            if (vas.w4) {
+                std::fprintf(stderr, "[memplan] vtcm auto off: 图含 W4A16 matmul (carve/池预算统一另线收口)\n");
+            } else if (vas.scratch_max + head < kVtcmTotal) {
+                vtcm_eff = (kVtcmTotal - vas.scratch_max - head) & ~uint64_t(1023u);
+                std::fprintf(stderr, "[memplan] vtcm auto: scratch_max=%llu conv=%d head=%llu → pool=%llu (%.2fMB)\n",
+                             (unsigned long long)vas.scratch_max, (int)vas.conv,
+                             (unsigned long long)head,
+                             (unsigned long long)vtcm_eff, vtcm_eff / 1048576.0);
+            } else {
+                std::fprintf(stderr, "[memplan] vtcm auto off: scratch_max=%llu + head=%llu ≥ VTCM 16MB\n",
+                             (unsigned long long)vas.scratch_max, (unsigned long long)head);
+            }
+        }
+    }
+    if (plan_ddr_budget_ > 0 || vtcm_eff > 0) {
         std::vector<DdrTempEntry> entries;
         std::vector<DdrSpillEntry> spills;
         uint64_t cap = 0, spill_total = 0, vcap = 0;
         if (compute_ddr_offsets(plan_ddr_budget_, &entries, &cap,
                                 &spills, &spill_total,
-                                plan_vtcm_budget_, &vcap) == 0) {
+                                vtcm_eff, &vcap) == 0) {
             mem_plan_.ddr_cap = cap;
-            mem_plan_.vtcm_cap = plan_vtcm_budget_ ? vcap : 0;
+            mem_plan_.vtcm_cap = vtcm_eff ? vcap : 0;
             mem_plan_.bump_reserve = std::max<uint64_t>(4u << 20, cap / 4);
             for (const auto& e : entries)
                 mem_plan_.entries.push_back({e.op_id, 0, e.offset, e.size, e.in_vtcm});
@@ -2207,6 +2252,64 @@ std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& o
     return raw_extra(&e, sizeof(e));
 }
 
+/* --plan-vtcm-budget auto 解析用的全图扫描: HMX scratch 峰值(镜像 op_matmul
+ * US1 分块口径) + conv 存在性 + W4A16 存在性(auto 池与 carve footer 的
+ * VTCM 布局未对齐, 混跑即拒)。M/K/N 取法镜像 serialize_opdef:
+ * serialized_extra 非空复用(回读 .bin 场景), 空则调注册表 extractor 现算
+ * (全新编译场景 —— serialized_extra 要到 serialize 阶段才落, step6 时恒空)。 */
+static VtcmAutoScan vtcm_auto_scan(const GraphPrepare& gp) {
+    constexpr uint64_t kVtcmTotal = 16ull << 20;
+    VtcmAutoScan r;
+    for (const OpDef* od : gp.get_sorted_opdefs()) {
+        if (!od->name_tag || !od->name_tag->name()) continue;
+        const char* nm = od->name_tag->name();
+        if (std::strcmp(nm, "MatMul") != 0 && std::strcmp(nm, "FullyConnected") != 0) {
+            if (std::strcmp(nm, "Conv2d") == 0 || std::strcmp(nm, "DepthWiseConv2d") == 0)
+                r.conv = true;
+            continue;
+        }
+        uint32_t m = 0, k = 0, n = 0, has_bias = 0, batched = 0;
+        std::vector<uint8_t> xb = od->serialized_extra;
+        if (std::strcmp(nm, "FullyConnected") == 0) {
+            if (xb.empty()) xb = extract_fc_extra(gp, *od);
+            ExtraFc ef{};
+            if (xb.size() >= sizeof(ef))
+                std::memcpy(&ef, xb.data(), sizeof(ef));
+            m = ef.m; k = ef.k; n = ef.n; has_bias = ef.has_bias;
+        } else {
+            if (xb.empty()) xb = extract_matmul_extra(gp, *od);
+            ExtraMatMul em{};
+            if (!xb.empty()) {   // min-size: 旧 bin 24B 无 has_bias/batched
+                size_t c = std::min(xb.size(), sizeof(em));
+                std::memcpy(&em, xb.data(), c);
+            }
+            m = em.m; k = em.k; n = em.n; has_bias = em.has_bias; batched = em.batched;
+        }
+        if (!m || !k || !n) continue;
+        // W4A16 判定(发射侧 slots.len==k*n/2 的编译期同口径): Q4 权重池字节数减半
+        if (od->inputs.size() > 1) {
+            const OpDef* w = gp.get_op_at(od->inputs[1].src_id);
+            if (w && w->const_data_size > 0 &&
+                (uint64_t)w->const_data_size * 2u == (uint64_t)k * n) { r.w4 = true; continue; }
+        }
+        // 可分块性镜像(op_matmul: !has_bias && !batched && 32 对齐 && 整 op 超界);
+        // 二分循环逐字照抄发射侧, 保证 N_chunk 一致 → scratch 峰值一致
+        uint64_t need = mm_scratch_need(m, k, n);
+        if (!has_bias && !batched && (m % 32u) == 0u && (k % 32u) == 0u && (n % 32u) == 0u &&
+            need > kVtcmTotal) {
+            uint32_t N_chunk = 0, lo = 32u, hi = n;
+            while (lo <= hi) {
+                uint32_t mid = lo + ((hi - lo) / 64u) * 32u;
+                if (mm_scratch_need(m, k, mid) <= kVtcmTotal) { N_chunk = mid; lo = mid + 32u; }
+                else { hi = mid - 32u; }
+            }
+            if (N_chunk != 0u) need = mm_scratch_need(m, k, N_chunk);
+            // N_chunk==0: 维持整 op(发射侧同款 warn 路径), need 不缩
+        }
+        r.scratch_max = std::max(r.scratch_max, need);
+    }
+    return r;
+}
 
 // serialize_opdef: write a single op's structural record (TAG_OP_RECORD).
 //   [uint32 name_len][char[] name, 4-aligned][uint64 op_id][uint16 flags]

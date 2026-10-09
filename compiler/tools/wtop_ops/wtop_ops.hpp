@@ -249,8 +249,10 @@ struct Emitter {
                     ddr_temp_vtcm[t] = true;
             }
         }
-        if (next_temp > 32768) {
-            std::fprintf(stderr, "error: >32768 live temps (live=%zu free=%zu released=%llu calls=%llu miss=%llu kept=%llu)\n",
+        /* 上限 16384 = 运行时 WT_EXEC_MAX_TEMPS, 也是 TEMPOFF tid 的 14 位编码
+         * 上限(tid|0x4000 后 & 0x3FFF)—— 超过即无法在 blob 里表达, 编译期拒 */
+        if (next_temp > 16384) {
+            std::fprintf(stderr, "error: >16384 temps (WT_EXEC_MAX_TEMPS/TEMPOFF tid 14-bit 上限; live=%zu free=%zu released=%llu calls=%llu miss=%llu kept=%llu)\n",
                          op_temp.size(), free_temps.size(),
                          (unsigned long long)dbg_released, (unsigned long long)dbg_calls,
                          (unsigned long long)dbg_miss, (unsigned long long)dbg_kept);

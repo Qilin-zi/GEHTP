@@ -36,7 +36,7 @@
 #include "hvxhmx_v2_matmul.h"
 #include "hmx_crouton.h"
 
-#define MAX_TEMPS 4096  /* 0.8B 全模型 temp id 至 1403+ (输出 temp 1401); 256 实锤死 op2616, 与 WT_EXEC_MAX_TEMPS 同步 */
+#define MAX_TEMPS 16384  /* VTCM 驻留默认开: 静态登记限制 temp id 回收, 0.8B 水位逼近全体 op 数(~14k), 4096 不够。上限=TEMPOFF tid 14 位编码(0x3FFF), 与 WT_EXEC_MAX_TEMPS 同步 */
 
 struct wt_exec {
     struct wtcache_ctx* wc;

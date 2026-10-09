@@ -380,6 +380,9 @@ public:
         plan_ddr_budget_ = ddr;
         plan_vtcm_budget_ = vtcm;
     }
+    // --plan-vtcm-budget 缺省哨兵: do_prepare2_late step6 解析为 auto 池
+    // (16MB − HMX scratch 峰值 − 余量); 显式值(含 0=关)不经过它
+    static constexpr uint64_t kVtcmPlanAuto = ~uint64_t(0);
     bool has_mem_plan() const { return has_mem_plan_; }
     const MemPlan& mem_plan() const { return mem_plan_; }
     // 路线B(4B 权重外置): true 时 do_serialize 跳过 0xCF56 常量数据块
