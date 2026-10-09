@@ -285,6 +285,12 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         }
         have_gguf = true;
         std::printf("[gguf] loaded %zu entries, %zu bytes\n", gguf_map.size(), gguf_data.size());
+        /* FR-003 预检: TSV 零条目 = 表不配套, 静默全 f16 掩盖配置错误, 硬错误 */
+        if (gguf_map.empty()) {
+            std::fprintf(stderr, "error: --match %s 解析出 0 条目 (需 wtlink 全量表)\n",
+                         match_path.c_str());
+            return 2;
+        }
     }
     if (have_gguf) {
         em.use_gguf = true;
@@ -317,7 +323,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (wi < 0 || od->inputs.size() <= (size_t)wi) continue;
             const OpDef* w = gp.get_op_at(od->inputs[wi].src_id);
             if (!w || w->const_data_size == 0) continue;
-            em.ensure_weight_slot(gp, w, wslots, od->grouping);
+            em.ensure_weight_slot(gp, w, wslots, od);
         }
     }
     // conv 分支的便捷引用(无 conv 图时为 0, conv 分支不会触发)
@@ -333,10 +339,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (conv->inputs.size() < 2) { std::fprintf(stderr, "error: conv missing weight input\n"); return 2; }
             const OpDef* w = gp.get_op_at(conv->inputs[1].src_id);
             if (!w) { std::fprintf(stderr, "error: weight const missing\n"); return 2; }
-            w_slot = em.ensure_weight_slot(gp, w, wslots, conv->grouping);
+            w_slot = em.ensure_weight_slot(gp, w, wslots, conv);
             if (conv->inputs.size() > 2) {
                 const OpDef* b = gp.get_op_at(conv->inputs[2].src_id);
-                if (b) b_slot = em.ensure_weight_slot(gp, b, wslots, conv->grouping);
+                if (b) b_slot = em.ensure_weight_slot(gp, b, wslots, conv);
             }
         }
     }
@@ -779,6 +785,38 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                     em.gguf_hits, em.gguf_miss);
 
     }
+    /* 007 US2 (FR-003/T013): matmul 权重 miss = 匹配表不全/GGUF 不配套 →
+     * 拒绝产出(静默 f16 会掩盖配置错误), 并落权重域报告 sidecar */
+    if (have_gguf && !em.w4_missing.empty()) {
+        std::fprintf(stderr, "error: %zu 个 matmul 权重不在匹配表 (FR-003 硬门):\n",
+                     em.w4_missing.size());
+        for (size_t i = 0; i < em.w4_missing.size() && i < 20; i++)
+            std::fprintf(stderr, "  miss[%zu] %s\n", i, em.w4_missing[i].c_str());
+        return 4;
+    }
+    if (have_gguf) {
+        uint64_t w4b = 0, f16b = 0;
+        for (const auto& r : em.w4_records) {
+            if (std::strcmp(r.domain, "w4") == 0) w4b += r.size_bytes;
+            else f16b += r.size_bytes;
+        }
+        std::printf("[w4report] w4 %llu B (%.1f MB) / f16 %llu B (%.1f MB), "
+                    "w4 占比 %.1f%%\n",
+                    (unsigned long long)w4b, w4b / 1048576.0,
+                    (unsigned long long)f16b, f16b / 1048576.0,
+                    (w4b + f16b) ? 100.0 * (double)w4b / (double)(w4b + f16b) : 0.0);
+        std::string rpt = out_path + ".w4report.tsv";
+        FILE* rf = std::fopen(rpt.c_str(), "wb");
+        if (rf) {
+            std::fprintf(rf, "layer\tgguf_name\tdomain\treason\tsize_bytes\n");
+            for (const auto& r : em.w4_records)
+                std::fprintf(rf, "%s\t%s\t%s\t%s\t%llu\n", r.layer.c_str(),
+                             r.gguf_name.c_str(), r.domain, r.reason,
+                             (unsigned long long)r.size_bytes);
+            std::fclose(rf);
+            std::printf("[w4report] %zu 条 -> %s\n", em.w4_records.size(), rpt.c_str());
+        }
+    }
     {
         FILE* f = std::fopen(out_path.c_str(), "wb");
         if (!f) { std::fprintf(stderr, "error: cannot write %s\n", out_path.c_str()); return 2; }
@@ -877,6 +915,13 @@ int main(int argc, char** argv) {
     }
     if (bin_path.empty() || out_path.empty()) {
         std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ext-weights [--weights-bin <params.bin>]] [--dma-runlist] [--allow-missing-inputs]\n");
+        return 2;
+    }
+    /* FR-003 预检: --gguf/--match 成对给。单给一个时旧逻辑静默忽略 → 全 f16
+     * 掩盖配置错误 (007 US2 实查修正), 硬错误 */
+    if (gguf_path.empty() != match_path.empty()) {
+        std::fprintf(stderr, "error: --gguf 与 --match 必须成对给出 (仅给其一会"
+                             "被静默忽略, 全图回落 f16)\n");
         return 2;
     }
     return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path,

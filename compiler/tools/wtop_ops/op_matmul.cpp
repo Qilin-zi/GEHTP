@@ -13,7 +13,7 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
     /* B 为 const(权重)→ 槽; 运行时(q·kᵀ 的 k)→ temp 引用 */
     bool w_is_const = w && (w->is_const() || w->const_data_size > 0);
     uint32_t w_s = w_is_const
-        ? (0x8000u | em.ensure_weight_slot(gp, w, wslots, od->grouping))
+        ? (0x8000u | em.ensure_weight_slot(gp, w, wslots, od))
         : (od->inputs.size() > 1
                ? em.src_ref(od->inputs[1], gp.get_input_node_id(), gp, wslots)
                : em.dummy_slot_id);
@@ -164,7 +164,7 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
              * 005 US3b: 设备 HMX 路径已有 bias 通道(scale 区 out_bias,
              * SC-005 三判据 0 违例), 32 对齐形默认走 HMX —— US3a 的
              * 对齐硬报错已随 pass 门一并移除。 */
-            uint32_t bias_s = 0x8000u | em.ensure_weight_slot(gp, bias_op, wslots, od->grouping);
+            uint32_t bias_s = 0x8000u | em.ensure_weight_slot(gp, bias_op, wslots, od);
             em.add_op(OP_MATMUL_F16_BIAS, {a_t, w_s, out_t, m, k, nn, flags, bias_s});
             return 0;
         }

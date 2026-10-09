@@ -1648,6 +1648,27 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
         ts[d] = ts[d + 1] * td[d + 1];
         xs[d] = xs[d + 1] * xd[d + 1];
     }
+    /* 007 US2 Route A: embed 表 Q4_0 tile 槽(640B/tile, 契约同 matmul 的
+     * exec_matmul_f16_hmx) → 逐元素行级 dequant。tile 内 quants = A 配对
+     * byte[(k/2)*32 + n%32](lo=k 偶/hi=k 奇; GGUF 源是 B 平面序, emit
+     * repack_q4_0_tiles 已做 B→A nibble 置换, 与 vendored unpack_tiled_q4_0
+     * 的逆变换逐字节一致)。扁平下标 src 行主(最快维 K=td[末]): k=src%K,
+     * n_glob=src/K; tile(ct=n/32, kt=k/32)@640, scale d f16@tile+512+2*(n%32)。
+     * embed 场景每 pass 仅 32×K 个元素, 标量足够。 */
+    const uint8_t* tbl_q4 = NULL;
+    uint32_t q4_K = 0, q4_nk = 0;
+    if ((op->args[0] & 0x8000u) && axis < irank) {
+        uint32_t tsx = op->args[0] & 0x7FFFu;
+        q4_K = td[irank - 1];
+        uint32_t q4_N = 1;
+        for (uint32_t d = 0; d + 1 < irank; d++) q4_N *= td[d];
+        if ((q4_K % 32u) == 0u && (q4_N % 32u) == 0u &&
+            tsx < b->n_slots &&
+            b->slots[tsx].len == (size_t)(q4_K / 32u) * (size_t)(q4_N / 32u) * 640u) {
+            tbl_q4 = (const uint8_t*)tbl;
+            q4_nk = q4_K / 32u;
+        }
+    }
     for (uint32_t i = 0; i < n; i++) {
         size_t rem = i;
         uint32_t oc[5];
@@ -1665,7 +1686,18 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
             uint32_t ocd = d + xrank - 1;
             src += (size_t)(ocd < 5 ? oc[ocd] : 0) * ts[d];
         }
-        y[i] = tbl[src];
+        if (tbl_q4) {
+            uint32_t k4 = (uint32_t)(src % q4_K);
+            uint32_t ng = (uint32_t)(src / q4_K);
+            const uint8_t* tile =
+                tbl_q4 + (((ng >> 5) * q4_nk) + (k4 >> 5)) * 640u;
+            uint8_t byte = tile[(k4 >> 1) * 32u + (ng & 31u)];
+            int q = (k4 & 1u) ? (int)(byte >> 4) : (int)(byte & 0xFu);
+            float d = f16_to_f32(((const uint16_t*)(const void*)(tile + 512u))[ng & 31u]);
+            y[i] = f32_to_f16(d * (float)(q - 8));
+        } else {
+            y[i] = tbl[src];
+        }
     }
     return 0;
 }
@@ -1720,7 +1752,7 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                                uint32_t M, uint32_t K, uint32_t N,
                                uint32_t n0, uint32_t N_full,
                                int t0, int t1, char* err, size_t errn,
-                               const uint16_t* bias) {
+                               const uint16_t* bias, const uint8_t* w_q4) {
     /* 003 T014 attach: 同 exec_conv2d_hmx —— wtcache 持 VTCM 时挂共享 scratch
      * 区, 不再整体放弃 (旧行为=静默回落标量)。scratch 覆盖 W4A16 arena →
      * matmul_carved 清零, 下一个 W4A16 op 重 carve。 */
@@ -1784,17 +1816,35 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
 
     /* pack wgt: B[K,N] (或 t1 转置) → crouton[(c*n_dot+kt)*1024] (row=ic=k, col=oc=n)。
      * 002 US1: 全局列号 = n0 + c*32 + n, 行主 [K,N_full] 布局 stride=N_full
-     * (n0=0/N_full=N 时与整 op 逐字节同公式) */
-    for (uint32_t c = 0; c < n_col; ++c)
-        for (uint32_t kt = 0; kt < n_dot; ++kt) {
-            uint16_t* tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
-            for (uint32_t k = 0; k < 32u; ++k)
-                for (uint32_t n = 0; n < 32u; ++n) {
-                    size_t src = t1 ? ((size_t)(n0 + c * 32u + n) * K + (kt * 32u + k))
-                                    : ((size_t)(kt * 32u + k) * N_full + (n0 + c * 32u + n));
-                    tile[hmx_crouton_pos(k, n)] = w[src];
-                }
+     * (n0=0/N_full=N 时与整 op 逐字节同公式)
+     * 007 US2 Route A: Q4_0 权重槽(640B/tile, payload 576 = emit
+     * repack_q4_0_tiles 契约)→ HVX 反量化整块直写 crouton wgt 面, 替代标量
+     * pack 循环。布局同源性双证: ① ggml 移植 dequant task 输出 = 逐 n 配对
+     * [k偶,k奇](scale-dup [d0,d0,d1,d1] × byte-interleave 逐对乘) =
+     * hmx_crouton_pos(k,n); ② 其消费方 core_dot 把 tile 指针直喂
+     * HMX_LOAD_MPY_DEEP_F16(与本函数 mxmem:deep 同一硬件指令同一布局)。
+     * SPLIT chunk 的列 tile 块在槽内 (ct 主序/kt 次序) 连续 → 基址平移
+     * (n0/32)*n_dot*640。t0/t1 是 f16 源布局标志, Q4 元素级映射方向无关。 */
+    if (w_q4) {
+        if (hvhx_v2_dequant_tiled_to_fp16(
+                w_q4 + (size_t)(n0 / 32u) * (size_t)n_dot * 640u,
+                (__fp16*)wgt_cr, N, K, HVHX_V2_WT_Q4_0) != 0) {
+            snprintf(err, errn, "matmul_f16 q4 dequant fail (N=%u K=%u n0=%u)",
+                     N, K, n0);
+            return -1;
         }
+    } else {
+        for (uint32_t c = 0; c < n_col; ++c)
+            for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                uint16_t* tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
+                for (uint32_t k = 0; k < 32u; ++k)
+                    for (uint32_t n = 0; n < 32u; ++n) {
+                        size_t src = t1 ? ((size_t)(n0 + c * 32u + n) * K + (kt * 32u + k))
+                                        : ((size_t)(kt * 32u + k) * N_full + (n0 + c * 32u + n));
+                        tile[hmx_crouton_pos(k, n)] = w[src];
+                    }
+            }
+    }
 
     /* HMX GEMM: 复刻 hmx_convf16.c convf16_hmx_multi 已验证路径
      * (crouton pair-interleave + mxmem:deep 累加 + cvt.hf=acc(2) 写回)。
@@ -1869,6 +1919,22 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* w = (const uint16_t*)ref_ptr(b, op->args[1]);
     uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N_full * Bn * 2u);
     if (!a || !w || !y) { snprintf(err, errn, "matmul_f16 ref fail"); return -1; }
+    /* 007 US2 Route A: Q4_0 tile 权重槽判别 (emit repack_q4_0_tiles 契约,
+     * 640B/tile = payload 576 + 64 pad, 0.625 B/elem)。槽长与 f16(2 B/elem)/
+     * W4A16 紧凑(0.5 B/elem) 互斥无歧义。仅 HMX 路径消费(HVX 反量化直写
+     * crouton); batched/标量路走到 = 硬错误(emit 侧未对齐/batched 已兜底
+     * f16, 此处防手构 blob 误用; host 执行器无 HMX, Q4 blob 属设备专属)。 */
+    const uint8_t* w_q4 = NULL;
+    if ((op->args[1] & 0x8000u) && (K % 32u) == 0u && (N_full % 32u) == 0u) {
+        uint32_t wsx = op->args[1] & 0x7FFFu;
+        if (wsx < b->n_slots &&
+            b->slots[wsx].len == (size_t)(K / 32u) * (size_t)(N_full / 32u) * 640u)
+            w_q4 = (const uint8_t*)w;
+    }
+    if (w_q4 && batched) {
+        snprintf(err, errn, "matmul_f16: Q4 权重槽不支持 batched (emit 应兜底 f16)");
+        return -1;
+    }
 #if defined(__HVX__) || defined(__hexagon__)
     /* HMX 快路径: M/K/N 均 32 倍数 → crouton + HMX GEMM。
      * batched attention (q·kᵀ, Bn 头) 同走 HMX: 逐 batch 切片调 exec_matmul_f16_hmx,
@@ -1912,19 +1978,19 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
                     const uint16_t* wb = w + (size_t)bb * K * N_full;
                     uint16_t* yb = y + (size_t)bb * M * N_full;
                     if (exec_matmul_f16_hmx(ab, wb, yb, M, K, N, 0, N_full, t0, t1,
-                                            err, errn, NULL) != 0) {
+                                            err, errn, NULL, NULL) != 0) {
                         engine = -1;
                         break;
                     }
                 }
             } else {
                 engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
-                                              bias) == 0)
+                                              bias, w_q4) == 0)
                              ? 1 : -1;
             }
         } else if (engine == 1) {
             if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
-                                     bias) != 0) {
+                                     bias, w_q4) != 0) {
                 snprintf(err, errn, "matmul_f16 split 混合路径 (FR-013 ④ 违禁): 前 chunk HMX 本 chunk 失败");
                 return -1;
             }
@@ -1947,6 +2013,13 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
         }
     }
 #endif
+    /* 007 US2: Q4 权重槽仅 HMX 路径消费 — 走到标量(非 hexagon 无 HMX /
+     * 计划标量 / HMX 失败回落) = 硬错误, 不静默读废值 */
+    if (w_q4) {
+        snprintf(err, errn, "matmul_f16: Q4 权重槽无标量路径 (M=%u K=%u N=%u, "
+                            "emit 未对齐时应兜底 f16)", M, K, N_full);
+        return -1;
+    }
     /* 标量路径: 列号 = n0 + n, 行主 stride = N_full (n0=0/N_full=N 即旧公式) */
     if (batched) {
         for (uint32_t bb = 0; bb < Bn; bb++)

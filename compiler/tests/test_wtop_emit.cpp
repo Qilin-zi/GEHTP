@@ -1087,6 +1087,221 @@ int main() {
         run_bcast("f2_select", "Eltwise_Ternary", f2i, oB, eB_i, eB_o, 1u, OP_BINARY_F16);
     }
 
+    /* 12. 007 US2: GGUF Q4_0 权重域 emit 契约 (Route A)。
+     * 12a 直连单测(无图管线): repack B→A nibble 置换 + f16 兜底反量化
+     *     - vendored 逆回环: tile → (qs,d) 重建 == 源块字节 (量化零损)
+     *     - gather 语义: tile A 配对解码 == B 平面参考 (逐元素)
+     *     - 640B/tile 步长 + 尾 64B pad 0 + scale f16 原样
+     *     - dequant_q4_0_f16 (T014 兜底) == B 平面参考反量化 (f16 位级)
+     * 12b 端到端: FC 图 + 合成 GGUF(裸 Q4 块字节流) + match TSV
+     *     - 对齐 (K64 N96): w4 tile 槽 len==(K/32)*(N/32)*640, blob 字节 ==
+     *       repack 输出逐字节; sidecar reason=none
+     *     - 形状未对齐 (N48): f16 槽 len==K*N*2, sidecar reason=shape_misalign
+     *     - FR-003: 准入 kind2 权重不在 TSV → emit 退出码 4 */
+    {
+        /* 12a. repack/dequant 直连单测 */
+        {
+            using E = wtop::Emitter;
+            const uint32_t K = 64, N = 64, n_kb = K / 32;  /* 2×2 tile */
+            std::vector<uint8_t> src((size_t)N * n_kb * 18);
+            std::vector<uint16_t> d16((size_t)N * n_kb);
+            for (uint32_t n = 0; n < N; n++)
+                for (uint32_t kt = 0; kt < n_kb; kt++) {
+                    size_t b = (size_t)n * n_kb + kt;
+                    d16[b] = r_f32_to_f16(0.05f + 0.007f * (float)(n % 9));
+                    std::memcpy(src.data() + b * 18, &d16[b], 2);
+                    for (uint32_t j = 0; j < 16; j++)
+                        src[b * 18 + 2 + j] = (uint8_t)(n * 37u + kt * 11u + j * 29u);
+                }
+            auto tiles = E::repack_q4_0_tiles(src.data(), src.size(), K, N);
+            CHECK(tiles.size() == 4u * 640u, "q4: tile 总长 4×640 (640B/tile 步长)");
+            bool pad0 = true, scale_ok = true, inv_ok = true, gat_ok = true;
+            for (uint32_t n = 0; n < N; n++)
+                for (uint32_t kt = 0; kt < n_kb; kt++) {
+                    const uint8_t* tile = tiles.data() + ((size_t)(n / 32) * n_kb + kt) * 640;
+                    const uint8_t* qs = src.data() + ((size_t)n * n_kb + kt) * 18 + 2;
+                    uint32_t r = n % 32;
+                    for (uint32_t i = 576; i < 640; i++)
+                        if (tile[i] != 0) pad0 = false;
+                    uint16_t d_t;
+                    std::memcpy(&d_t, tile + 512 + 2 * r, 2);
+                    if (d_t != d16[(size_t)n * n_kb + kt]) scale_ok = false;
+                    /* vendored unpack_tiled_q4_0 逆: tile A 配对 → B 平面 qs 重建 */
+                    uint32_t tq[32];
+                    for (uint32_t cp = 0; cp < 16; cp++) {
+                        uint8_t byte = tile[cp * 32 + r];
+                        tq[2 * cp] = byte & 0xF; tq[2 * cp + 1] = byte >> 4;
+                    }
+                    for (uint32_t j = 0; j < 16; j++)
+                        if ((tq[j] | (tq[j + 16] << 4)) != qs[j]) inv_ok = false;
+                    /* exec_gather 语义: A 配对解码 == B 平面参考 */
+                    for (uint32_t k = 0; k < 32; k++) {
+                        uint8_t byte = tile[(k >> 1) * 32 + r];
+                        uint32_t q = (k & 1) ? (byte >> 4) : (byte & 0xF);
+                        uint32_t v = (k < 16) ? (qs[k] & 0xF) : (qs[k - 16] >> 4);
+                        if (q != v) gat_ok = false;
+                    }
+                }
+            CHECK(pad0, "q4: 尾 64B pad 0");
+            CHECK(scale_ok, "q4: scale d f16 原样 @ tile+512+2r");
+            CHECK(inv_ok, "q4: vendored 逆回环 nibble 零损");
+            CHECK(gat_ok, "q4: gather A 配对解码 == B 平面参考");
+            /* dequant_q4_0_f16 vs 独立参考 (取值全 f16 正常域, RNE 位级) */
+            auto f16v = E::dequant_q4_0_f16(src.data(), src.size());
+            CHECK(f16v.size() == (size_t)N * K * 2, "q4: 兜底槽长 [N,K] f16");
+            bool dq_ok = true;
+            for (uint32_t n = 0; n < N; n++)
+                for (uint32_t k = 0; k < K; k++) {
+                    uint32_t kt = k / 32, b = (size_t)n * n_kb + kt;
+                    uint8_t byte = src[b * 18 + 2 + (k % 32 < 16 ? k % 32 : (k % 32) - 16)];
+                    uint32_t v = (k % 32 < 16) ? (byte & 0xF) : (byte >> 4);
+                    float d = r_f16_to_f32(d16[b]);
+                    uint16_t e = r_f32_to_f16(d * (float)((int)v - 8));
+                    uint16_t g;
+                    std::memcpy(&g, f16v.data() + ((size_t)n * K + k) * 2, 2);
+                    if (g != e) dq_ok = false;
+                }
+            CHECK(dq_ok, "q4: dequant_q4_0_f16 == B 平面参考 (f16 位级)");
+        }
+
+        /* 12b. 端到端 GGUF 供给 */
+        auto run_gguf_emit = [&](const char* tag, uint32_t M, uint32_t K, uint32_t N,
+                                 const char* w_key) {
+            GraphPrepare g;
+            build_matmul(g, M, K, N);
+            g.get_op_at(1)->grouping = w_key;
+            if (g.prepare(env) != GraphStatus::Success) {
+                CHECK(false, "gguf: prepare"); return (wt_blob*)nullptr;
+            }
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2n = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2n) || b2n == 0) {
+                CHECK(false, "gguf: serialize"); return (wt_blob*)nullptr;
+            }
+            const std::string d2 = dir + "q4_" + tag + "/";
+            std::system(("mkdir -p " + d2).c_str());
+            /* 合成 GGUF: N 行 × (K/32) 块, 确定性 d/qs (d 全正常域) */
+            const uint32_t n_kb = K / 32;
+            std::vector<uint8_t> gbuf((size_t)N * n_kb * 18);
+            for (uint32_t n = 0; n < N; n++)
+                for (uint32_t kt = 0; kt < n_kb; kt++) {
+                    size_t b = (size_t)n * n_kb + kt;
+                    uint16_t dv = r_f32_to_f16(0.05f + 0.007f * (float)(n % 9));
+                    std::memcpy(gbuf.data() + b * 18, &dv, 2);
+                    for (uint32_t j = 0; j < 16; j++)
+                        gbuf[b * 18 + 2 + j] = (uint8_t)(n * 37u + kt * 11u + j * 29u);
+                }
+            const std::string bp = d2 + "g.bin", ip = d2 + "in.f16.raw";
+            const std::string op2 = d2 + "o.wtop", gp2 = d2 + "syn.gguf", tp = d2 + "m.tsv";
+            write_file(bp, b2.data(), b2n);
+            std::vector<uint8_t> in16((size_t)M * K * 2, 0);
+            write_file(ip, in16.data(), in16.size());
+            write_file(gp2, gbuf.data(), gbuf.size());
+            char dims[32];
+            std::snprintf(dims, sizeof(dims), "%u,%u", K, N);
+            std::string tsv = std::string("node\tgguf_name\tggml_type\tfile_offset\tnbytes\tdims\n") +
+                              "other_x\tT_x\t0\t0\t64\t1,1\ntest_w\tT_w\t2\t0\t" +
+                              std::to_string(gbuf.size()) + "\t" + dims + "\n";
+            write_file(tp, tsv.data(), tsv.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 +
+                             " --gguf " + gp2 + " --match " + tp + " 2>/dev/null";
+            if (std::system(c2.c_str()) != 0) return (wt_blob*)nullptr;
+            std::vector<uint8_t> bl2;
+            if (!load_file(op2, bl2)) { CHECK(false, "gguf: read blob"); return (wt_blob*)nullptr; }
+            wt_blob* w2 = new wt_blob{};
+            if (wt_parse(bl2.data(), bl2.size(), w2) != WT_OK) {
+                CHECK(false, "gguf: wt_parse"); delete w2; return (wt_blob*)nullptr;
+            }
+            return w2;
+        };
+        auto find_slot = [](wt_blob* w2, uint32_t len) -> const wt_slot* {
+            for (uint32_t s = 0; s < w2->n_slots; s++)
+                if (w2->slots[s].len == len) return &w2->slots[s];
+            return nullptr;
+        };
+        /* 12b-1: 对齐 K64 N96 → w4 tile 槽 */
+        {
+            wt_blob* w2 = run_gguf_emit("align", 32, 64, 96, "test_w");
+            CHECK(w2 != nullptr, "q4e2e: 对齐 GGUF emit exit 0");
+            if (w2) {
+                const uint32_t n_kb = 64 / 32;
+                const wt_slot* s4 = find_slot(w2, n_kb * (96u / 32u) * 640u);
+                CHECK(s4 != nullptr, "q4e2e: w4 槽 len==(K/32)*(N/32)*640=3840");
+                if (s4) {
+                    CHECK(s4->count == 64u * 96u, "q4e2e: w4 槽 count=K*N");
+                    /* blob 字节 == repack 期望 (复刻 12a 源构造) */
+                    std::vector<uint8_t> expect((size_t)96 * n_kb * 18);
+                    for (uint32_t n = 0; n < 96; n++)
+                        for (uint32_t kt = 0; kt < n_kb; kt++) {
+                            size_t b = (size_t)n * n_kb + kt;
+                            uint16_t dv = r_f32_to_f16(0.05f + 0.007f * (float)(n % 9));
+                            std::memcpy(expect.data() + b * 18, &dv, 2);
+                            for (uint32_t j = 0; j < 16; j++)
+                                expect[b * 18 + 2 + j] = (uint8_t)(n * 37u + kt * 11u + j * 29u);
+                        }
+                    auto tiles = wtop::Emitter::repack_q4_0_tiles(expect.data(), expect.size(), 64, 96);
+                    CHECK(std::memcmp(w2->weight_base + s4->offset, tiles.data(), tiles.size()) == 0,
+                          "q4e2e: blob tile 字节 == repack 输出 (逐字节)");
+                }
+                delete w2;
+            }
+            /* sidecar: reason=none 行 */
+            std::vector<uint8_t> rpt;
+            load_file(dir + "q4_align/o.wtop.w4report.tsv", rpt);
+            rpt.push_back(0);
+            CHECK(std::strstr((const char*)rpt.data(), "test_w\ttest_w\tw4\tnone") != nullptr,
+                  "q4e2e: w4report sidecar 记 w4/none");
+        }
+        /* 12b-2: N=48 未对齐 → f16 兜底 + shape_misalign */
+        {
+            wt_blob* w2 = run_gguf_emit("misalign", 32, 64, 48, "test_w");
+            CHECK(w2 != nullptr, "q4e2e: 未对齐 GGUF emit exit 0");
+            if (w2) {
+                const wt_slot* sf = find_slot(w2, 64u * 48u * 2u);
+                CHECK(sf != nullptr, "q4e2e: 未对齐 → f16 槽 len==K*N*2=6144");
+                delete w2;
+            }
+            std::vector<uint8_t> rpt;
+            load_file(dir + "q4_misalign/o.wtop.w4report.tsv", rpt);
+            rpt.push_back(0);
+            CHECK(std::strstr((const char*)rpt.data(), "shape_misalign") != nullptr,
+                  "q4e2e: sidecar reason=shape_misalign");
+        }
+        /* 12b-3: FR-003 kind2 miss → 退出码 4 */
+        {
+            GraphPrepare g;
+            build_matmul(g, 32, 64, 96);
+            g.get_op_at(1)->grouping = "absent_w";
+            CHECK(g.prepare(env) == GraphStatus::Success, "q4e2e: FR-003 prepare");
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2n = 0;
+            CHECK(g.serialize(b2.data(), b2.size(), b2n) && b2n > 0, "q4e2e: FR-003 serialize");
+            const std::string d2 = dir + "q4_miss/";
+            std::system(("mkdir -p " + d2).c_str());
+            write_file(d2 + "g.bin", b2.data(), b2n);
+            std::vector<uint8_t> in16(32 * 64 * 2, 0);
+            write_file(d2 + "in.f16.raw", in16.data(), in16.size());
+            std::string tsv = "node\tgguf_name\tggml_type\tfile_offset\tnbytes\tdims\n"
+                              "other_x\tT_x\t0\t0\t64\t1,1\n";
+            write_file(d2 + "m.tsv", tsv.data(), tsv.size());
+            /* --gguf 文件必须可读(内容不被触达: miss 在 bounds 检查前), 空文件即可 */
+            write_file(d2 + "syn.gguf", "", 0);
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + d2 + "g.bin" +
+                             " --input-f16 " + d2 + "in.f16.raw --out " + d2 + "o.wtop" +
+                             " --gguf " + d2 + "syn.gguf --match " + d2 + "m.tsv" +
+                             " 2>" + d2 + "err.log";
+            int rc = std::system(c2.c_str());
+            CHECK(rc == 4 * 256, "q4e2e: FR-003 权重 miss → 退出码 4");
+            std::vector<uint8_t> err;
+            load_file(d2 + "err.log", err);
+            err.push_back(0);
+            CHECK(std::strstr((const char*)err.data(), "FR-003") != nullptr &&
+                  std::strstr((const char*)err.data(), "absent_w") != nullptr,
+                  "q4e2e: FR-003 报错点名 miss 权重");
+        }
+    }
+
     std::printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASS", failed);
     return failed ? 1 : 0;
 }
