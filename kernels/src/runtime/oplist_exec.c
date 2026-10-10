@@ -1832,18 +1832,30 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
      * SPLIT chunk 的列 tile 块在槽内 (ct 主序/kt 次序) 连续 → 基址平移
      * (n0/32)*n_dot*640。t0/t1 是 f16 源布局标志, Q4 元素级映射方向无关。 */
     if (w_q4) {
+        /* T017 优化: 标量 pack 9.72s(lm_head)/20.6s(MATMUL_F16 全图) → LUT 法。
+         * 每 tile 预解 512 档 lut[n][q] = f32_to_f16(d_n*(q-8)) (公式与逐元素
+         * 版逐位同), 填充按 crouton pos(k,n)=(k>>1)*64+2n+(k&1) 的 pair 面展
+         * 开: (k=2i, 2i+1) 两行的 32 列写进连续 u32 对 tile32[i*32+n], 源
+         * quant 字节 qt[i*32+n] 同样连续 → 逐 u32 顺序 LUT gather, 无浮点。 */
         const uint8_t* w4 = w_q4 + (size_t)(n0 / 32u) * (size_t)n_dot * 640u;
+        uint16_t lut[32][16];
         for (uint32_t c = 0; c < n_col; ++c)
             for (uint32_t kt = 0; kt < n_dot; ++kt) {
                 uint16_t* tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
                 const uint8_t* qt = w4 + ((size_t)c * n_dot + kt) * 640u;
                 const uint16_t* dv = (const uint16_t*)(qt + 512u);
-                for (uint32_t k = 0; k < 32u; ++k)
+                for (uint32_t n = 0; n < 32u; ++n) {
+                    float d = f16_to_f32(dv[n]);
+                    for (uint32_t q = 0; q < 16u; ++q)
+                        lut[n][q] = f32_to_f16(d * (float)((int)q - 8));
+                }
+                uint32_t* tile32 = (uint32_t*)(void*)tile;
+                const uint8_t* qb = qt;
+                for (uint32_t i = 0; i < 16u; ++i, qb += 32u)
                     for (uint32_t n = 0; n < 32u; ++n) {
-                        uint32_t q =
-                            (qt[(k >> 1) * 32u + n] >> ((k & 1u) * 4u)) & 0xFu;
-                        tile[hmx_crouton_pos(k, n)] =
-                            f32_to_f16(f16_to_f32(dv[n]) * (float)((int)q - 8));
+                        uint32_t b = qb[n];
+                        tile32[i * 32u + n] =
+                            ((uint32_t)lut[n][b >> 4] << 16) | lut[n][b & 0xFu];
                     }
             }
     } else {
