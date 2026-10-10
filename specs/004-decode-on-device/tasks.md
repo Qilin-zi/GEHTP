@@ -164,8 +164,12 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 ### 精度 + 性能收口
 
 - [x] T021 [US2] tier2 金标——**2026-10-10 完成，设备门双 PASS（d0f1784）**：**R1 解除**——GPU 对拍实证 HF Qwen3_5 `DynamicCache` 正确携带 GDN/SSM recurrent state（增量 32 行 vs 全序列行 cos≥0.999999、argmax 全同；金标环境 `PYTHONPATH=/disk1/qnn08b_official/tfenv` + llmserv torch，plan 期 QPM_ROOT_DEFAULT 路径已失效）。`golden_qwen35.py::run_decode`（增量贪心续写，返回 rows+tokens）+ CLI `--decode N --decode-prompt I`；金标落 `cpu_golden/hf/tier2_0.{logits.f32,tokens.i64}.raw`（random prompt0 32+16 步）+ `text_tier2.*`（"user: The capital of France is" 7+12 步）。**设备门**：persistent 链 reset→喂 prompt→贪心续写逐行对拍 tier2——random **16/16 token 一致、worst cos=0.999991**；text **12/12 一致、worst cos=0.999994**（" Paris"=11751 起逐 token 全对，含重复结构；与 T020 E2E serve 输出同串）。decode 步越过 prompt 边界仍与 HF 位级对齐 = KV+SSM 状态跨步积累正确（tier1 门只覆盖 prompt 内）。
-- [ ] T022 [US3] KV/SSM DDR 布局（FR-009）：状态落 DDR（KV 12KB/token、SSM ~19MB），不挤 VTCM 16MB（VTCM 留给 HMX scratch）；上板确认
-- [ ] T023 [US3] 端到端 wall：autoregressive 每步 wall 记录对照（目标：单步 decode 远小于 prefill 34s，lm_head 步不再全标量 4.24s）
+- [x] T022 [US3] KV/SSM DDR 布局（FR-009）——**2026-10-10 确认（代码路径 + blob 扫描 + 设备门佐证）**：`wt_exec_load_states`（oplist_exec.c:2071）经 `memalign(128, bytes)` 落 **CDSP DDR 堆**（DSP C 库堆；VTCM 只能经 `g_exec.vtcm_pool` wtcache 显式开——状态代码从不触碰），init-once 进程级生命期、`wt_exec_state_reset` 清零重建 ring。decode.wtop STATE 槽扫描（`gehtp_prof.parse_wtop` + oplist_parse.c:139 同式 weight_off）：**n=42、total 20.02 MiB**——kv 6×131072B（**=12.0 KiB/token @ MAX_POS=64**，G4 精确吻合）+ conv 18×73728B（3×6144 f32，G5 吻合）+ delta 18×1MiB（16×128×128 f32，G5 吻合）。上板佐证 = T019/T021 设备门（状态跨 32/48 步累积位级正确，此布局实跑）；20MiB ≪ CDSP 堆 2-2.9GB（008 探针），VTCM 16MB 留给计算暂存不受挤。
+- [x] T023 [US3] 端到端 wall——**2026-10-10 记录（d0f1784，与 T019/T020/T021 同批测量）**：
+  - prefill 基线（T009，v17 seq=32 单发）：exec **34.1s**、wall 37.6s ≈1.07s/token。
+  - persistent decode 步：设备 exec **1.10s/步**（optrace 关，job `trace` 默认 0；trace 开 2.66s 勿混口径）；含 adb 文件队列往返 **1.28s/步**（T019 门 41.0s/32 步）；serve 端到端 ≈**1.15s/步**（T020 E2E 17.0s/(3+12 tok)）。
+  - **门判**：单步 decode 1.10s ≪ prefill 34.1s（**31×**）✓；lm_head 在 1.10s 步内算术上不可能为 4.24s 全标量（US1 split 门：M=1 全走 GEMV 无标量回落，seq1 wall 36.7→17.7s 28.5×）✓。
+  - 诚实注记：per-token 口径 decode 1.10s ≈ prefill 1.07s/token（本阶段赢在权重一次装载+状态常驻+流式，非 per-token 加速）；每步 adb 往返 ~0.18s（占 16%），AP 侧 socket 桥若 wall 需要再立项（T019 备忘）。
 
 **Checkpoint**: P2 全绿——`42_gehtp_persistent` 每 socket 请求跑单 token 前向（权重+KV+SSM 常驻），`gehtp serve` 端到端 autoregressive。**0.8B 双门（decode 门 + wall 对照）过**。可 commit + push。
 
