@@ -761,6 +761,12 @@ struct SwitchedOp : TypicalOp {
     // Source: _switched_op.cc
 };
 
+// 009 GDN 块融合 (specs/009-gdn-block-fusion): pass 就地改名产出的锚 op,
+// host 参考语义在 TypicalOp::execute 的 "GdnBlock" 分支。
+struct GdnBlockOp : TypicalOp {
+    static std::unique_ptr<Op> construct(const OpIoPtrs& io, op_id_t id);
+};
+
 } // namespace hnnx
 
 namespace hnnx { void register_all_ops(); }

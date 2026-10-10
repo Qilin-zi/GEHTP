@@ -15,7 +15,9 @@
 // token 双口径 (1010 net.json 校名 + 合成测试口径):
 //   xqkv = FullyConnected/MatMul 且 grouping 含 "in_proj" 非 aux;
 //   beta = "/beta/" 或 "/Sigmoid_1" (真实 005 终态图名);
-//   g    = "/g/"    或 "/Softplus";
+//   g    = "/g/"    或 "/Softplus"; 接线前追索层内恰一 Eltwise_Binary(MULTIPLY)
+//          消费者 (= Softplus×烘焙 const −exp(A_log)), 命中即改接其输出 ——
+//          真 g 必须为负 log decay (HF 口径), Softplus 本体是正输出。
 //   conv_w const = grouping 含 "conv_w" 或 "conv1d"。
 // 覆盖率 C1 经 gdn_block_opt_stats() 输出 (hnnx_compile --opt-stats)。
 #include "hnnx/opt/pass_gdn_block.hpp"
@@ -160,6 +162,38 @@ int collapse_layer(OpDef* entry, GraphPrepare* gp) {
         }
     }
 
+    // ---- g 链追索 (fold 构造前) ----
+    // g-site 匹配到 Softplus = 正输出 (softplus(a+dt_bias)); 真 g = 该值 ×
+    // (−exp(A_log)) [T,H] 负 log decay (HF: g = -A_log.exp()*softplus(a+dt_bias))。
+    // converter 把 Neg(Exp(A_log)) 烘焙为 [H] const tensor, 层内 Softplus 的
+    // 恰一 Eltwise_Binary(MULTIPLY) 消费者即乘点 → 该 Mul 转 survivor,
+    // 接线源改接其输出 (1010 net.json 18/18 层实证单消费者+const 已烘焙)。
+    OpDef* g_tap = nullptr;
+    {
+        OpDef* gsite = nullptr;
+        for (size_t i = 0; i < members.size(); i++) {
+            if (!surv[i] || members[i]->is_const()) continue;
+            if (is_g_site(members[i]->grouping)) { gsite = members[i]; break; }
+        }
+        if (gsite) {
+            OpDef* mul = nullptr;
+            int n_mul = 0;
+            for (op_id_t c : gsite->consumers) {
+                OpDef* cc = gp->get_op_at(c);
+                if (!cc || cc->is_dead()) continue;
+                if (member_idx(c) < 0) continue;
+                if (name_is(cc, "Eltwise_Binary")) { mul = cc; n_mul++; }
+            }
+            if (n_mul == 1 && mul) {
+                surv[(size_t)member_idx(mul->op_id)] = 1;  // Mul 转 survivor
+                g_tap = mul;
+            } else if (n_mul > 1) {
+                note_fallback(key, "g 链追索多义(Softplus 多 binary 消费者)");
+            }
+            /* n_mul==0: 保持 Softplus 接线 (数值偏差挂账, 不静默) */
+        }
+    }
+
     std::vector<OpDef*> fold;
     for (size_t i = 0; i < members.size(); i++)
         if (!surv[i]) fold.push_back(members[i]);
@@ -184,6 +218,7 @@ int collapse_layer(OpDef* entry, GraphPrepare* gp) {
         else if (is_beta_site(g)) { beta = m; n_beta++; }
         else if (is_g_site(g)) { gdec = m; n_g++; }
     }
+    if (g_tap) gdec = g_tap;  // g 链追索命中: 真 g = Softplus×(−exp(A_log))
     if (n_convw != 1) {
         // 真实图回退: loader 给权重 const(kind==1) 不设 grouping → 不入层
         // 成员。conv_w = conv 成员(DepthWiseConv2d, 输入 0 = act)下标 ≥1 的
@@ -301,6 +336,30 @@ int collapse_layer(OpDef* entry, GraphPrepare* gp) {
         if (f == anchor) continue;
         f->flags |= OP_DEAD;
         n_dead++;
+    }
+    if (getenv("GEHTP_GDN_DBG")) {
+        auto dmp = [&](const char* tag, OpDef* o) {
+            std::fprintf(stderr, "  %s: %u %s dims=[", tag, o->op_id,
+                         o->name_tag ? o->name_tag->name() : "(-)");
+            for (uint32_t d = 0; d < o->output_def.rank && d < 5; ++d)
+                std::fprintf(stderr, "%llu%s",
+                             (unsigned long long)o->output_def.dims[d],
+                             d + 1 < o->output_def.rank && d < 4 ? "," : "");
+            std::fprintf(stderr, "]\n");
+        };
+        std::fprintf(stderr, "[gdn-dbg] %s lowered: anchor=", key.c_str());
+        std::fprintf(stderr, "%u %s dims=[", a_id,
+                     anchor->name_tag ? anchor->name_tag->name() : "(-)");
+        for (uint32_t d = 0; d < anchor->output_def.rank && d < 5; ++d)
+            std::fprintf(stderr, "%llu%s",
+                         (unsigned long long)anchor->output_def.dims[d],
+                         d + 1 < anchor->output_def.rank && d < 4 ? "," : "");
+        std::fprintf(stderr, "] dead=%d\n", n_dead);
+        dmp("xqkv", xqkv);
+        dmp("beta", beta);
+        dmp("g   ", gdec);
+        std::fprintf(stderr, "  conv_w: %u const_size=%llu\n", convw->op_id,
+                     (unsigned long long)convw->const_data_size);
     }
     g_stats.lowered++;
     return n_dead + 1;

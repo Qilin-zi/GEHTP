@@ -1272,7 +1272,10 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
          * 数学镜像 kernels/src/hvx/gdn_kern.c conv_f16/delta_chunk_f16 (f32 化),
          * f16 转换位级同 gdn_ref.c gdn_f32_to_f16 (RNE)。
          * 输入: in0=xqkv [T,3HD] (in_proj 出值, B1 不融); in1=conv_w [d_conv,3HD];
-         *       in2=beta [T,H]; in3=g 负 log decay [T,H] (均 token-major)。
+         *       in2=beta [T,H]; in3=g 负 log decay [T,H] (均 token-major;
+         *       pass 已追索到 Softplus×(−exp(A_log)) Mul 输出, 值恒负)。
+         * q/k l2norm (HF use_qk_l2norm_in_kernel=True: x·rsqrt(Σx²+1e-6)),
+         * q 再乘 1/√D。
          * 输出: y [T,HD] token-major, f16 量化值存 f32 缓冲 (B4, 喂 out_proj)。 */
         const float* xqkv = inputs.size() > 0 && inputs[0] ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
         const float* cw   = inputs.size() > 1 && inputs[1] ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
@@ -1370,10 +1373,20 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                 }
                 for (int t = 0; t < c; ++t) {
                     const float* yrow = &yc[(base + (size_t)t) * DI + (size_t)h * D];
+                    /* q/k l2norm (HF use_qk_l2norm_in_kernel=True, FLA 口径:
+                     * x·rsqrt(Σx²+eps), eps=1e-6); q 再乘 1/√D, k 不乘。 */
+                    float qsq = 0.0f, ksq = 0.0f;
                     for (int nn = 0; nn < D; ++nn) {
-                        kf[(size_t)t * D + nn] = yrow[HD + nn];        /* q|k|v 三段 (c1b 口径) */
+                        float qv = yrow[nn], kv = yrow[HD + nn];
+                        qsq += qv * qv;
+                        ksq += kv * kv;
                         vf[(size_t)t * D + nn] = yrow[2 * HD + nn];
-                        qf[(size_t)t * D + nn] = yrow[nn] * scale;
+                    }
+                    const float iq = 1.0f / std::sqrt(qsq + 1e-6f);
+                    const float ik = 1.0f / std::sqrt(ksq + 1e-6f);
+                    for (int nn = 0; nn < D; ++nn) {
+                        kf[(size_t)t * D + nn] = yrow[HD + nn] * ik;
+                        qf[(size_t)t * D + nn] = yrow[nn] * (iq * scale);
                     }
                 }
                 std::vector<float> L((size_t)c * c, 0.0f), Tm((size_t)c * c, 0.0f);
@@ -1620,6 +1633,7 @@ std::unique_ptr<Op> TileOp::construct(const OpIoPtrs& io, op_id_t id) { return g
 std::unique_ptr<Op> ConditionalOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> ConditionalAddOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> SwitchedOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
+std::unique_ptr<Op> GdnBlockOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 
 // Op registration helper
 // Source: op_package_registry.cc, op_package_ops_opts_registration.cc
@@ -1802,6 +1816,10 @@ void register_all_ops() {
         reg.register_op_fn("Conditional", ConditionalOp::construct);
         reg.register_op_fn("ConditionalAdd", ConditionalAddOp::construct);
         reg.register_op_fn("Switched", SwitchedOp::construct);
+        // 009 GDN 块融合锚 (pass 就地改名, host 参考在 TypicalOp::execute
+        // "GdnBlock" 分支)。未注册时 factory-null → 整层输出空缓冲,
+        // 融合 host 对拍假败(1010 T025 实锤 cos 0.15 = 18 层全跳过)。
+        reg.register_op_fn("GdnBlock", GdnBlockOp::construct);
 
     // HLX/HMX ops
     register_hlx_hmx_ops();
