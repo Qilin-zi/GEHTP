@@ -148,6 +148,12 @@ struct Emitter {
     std::vector<StageRec> pending_stages;
     size_t stage_mark = 0;                 /* 主循环已回填 end_pos 的水位 */
     uint32_t vtcm_stage_top = 0xFFFFFFFFu; /* 惰性: staging 起点 (planner 驻留区上沿对齐 2048) */
+    /* 009 T019: GdnBlock 内核私有 VTCM scratch (中间量 f32 驻留, FR-004)。
+     * 惰性分配一段 (alloc_vtcm_stage), 26 层非重叠生命期时间复用同段
+     * (层内 carve, 层间互斥不必同驻 — research D5; 生产形各层几何相同,
+     * 预算一致 3024896, 若未来层间几何分化需按 max 重分配, T025 复核)。 */
+    uint32_t gdn_scratch_off = 0xFFFFFFFFu;
+    uint32_t gdn_scratch_size = 0;
     // 池内 bump 一块 staging 区, 登记为静态 VTCM temp, 返回 temp id (失败 -1:
     // 无 mem plan / 无 VTCM 池 / 池放不下 / temp id 耗尽)。基线取 ddr_op_map
     // 全量计划态上沿 (非物化态: 首个 W4A16 到达时高偏移驻留 temp 可能尚未物化)。
@@ -621,6 +627,14 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
     } else if (nm == "Conv2d") {
         engine = 2u;               /* WT_ENG_HMX */
         snprintf(why, sizeof why, "conv has HMX path");
+    } else if (nm == "GdnBlock") {
+        /* 009 块融合: 单发射块内 matmul/conv HMX 主导 + elemwise HVX + DMA
+         * 双缓冲 (FR-006 三原则, 落地在 exec_gdn_block T020)。无标量回落:
+         * 块不可执行时应已编译期 FallbackRecord 降级, 运行时回落 = 静默数值错
+         * (禁静默 FR-004)。 */
+        engine = 2u;               /* WT_ENG_HMX */
+        fb_allowed = 0u;
+        snprintf(why, sizeof why, "fused block HMX-dominant (FR-006), no scalar fallback");
     } else if (nm == "Add" || nm == "Eltwise_Binary" || nm == "Eltwise_Unary" ||
                nm == "ElementWiseNeuron" || nm == "Softmax") {
         /* 003 精度修正: 仅这些 op 名有默认开启的 HVX 内核。其余 elemwise/内存 op

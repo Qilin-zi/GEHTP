@@ -253,6 +253,7 @@ add_executable(wtop_emit tools/wtop_emit.cpp
                tools/wtop_ops/op_scatter_nd.cpp
                tools/wtop_ops/op_copy_sem.cpp
                tools/wtop_ops/op_dwconv.cpp
+               tools/wtop_ops/op_gdn_block.cpp
                tools/wtop_ops/op_concat.cpp
                tools/wtop_ops/op_strided_slice.cpp
                tools/wtop_ops/op_split.cpp

@@ -462,6 +462,40 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         em.cur_engine = assign_engine(od, nm);  /* 计算 op 编译期引擎指派 (v3 footer) */
         int hrc = hit->second(em, gp, od, wslots, nm, sh);
         if (hrc) return hrc;
+        /* 009 T019: GdnBlock 内核私有 VTCM scratch carve — size = 闭式预算
+         * (ExtraGdnBlock.vtcm_budget_bytes, FR-004 单源), residency = 层内
+         * [pos, pos+1) (单发射 op 生命期)。26 层非重叠生命期时间复用同一
+         * scratch 段 (gdn_scratch_off 惰性分配, research D5 层间互斥)。仅
+         * 有 VTCM 池 (TAG_MEM_PLAN) 时发射; 无池/超池 = 编译期硬错误
+         * (FR-004 禁静默, 降级走 FallbackRecord)。合成单测无 mem plan 不进此支。 */
+        if (nm == "GdnBlock") {
+            ExtraGdnBlock eg{};
+            if (od->serialized_extra.size() < sizeof(eg)) {
+                std::fprintf(stderr, "error: GdnBlock extra 缺失/过短 (%zu < %zu)\n",
+                             od->serialized_extra.size(), sizeof(eg));
+                return 3;
+            }
+            std::memcpy(&eg, od->serialized_extra.data(), sizeof(eg));
+            if (eg.vtcm_budget_bytes == 0) {
+                std::fprintf(stderr, "error: GdnBlock vtcm_budget_bytes=0 (extractor 未跑?)\n");
+                return 3;
+            }
+            if (em.ddr_static && em.ddr_vtcm_cap > 0) {
+                if (em.gdn_scratch_off == 0xFFFFFFFFu) {
+                    int stg = em.alloc_vtcm_stage(eg.vtcm_budget_bytes, &em.gdn_scratch_off);
+                    if (stg < 0) {
+                        std::fprintf(stderr,
+                            "error: GdnBlock VTCM scratch %uB 超出池余量 (vtcm_cap=%llu) — 降级分立路径\n",
+                            eg.vtcm_budget_bytes, (unsigned long long)em.ddr_vtcm_cap);
+                        return 3;
+                    }
+                    em.gdn_scratch_size = eg.vtcm_budget_bytes;
+                }
+                em.pending_carves.push_back({(uint32_t)(em.ops.size() - 1),
+                                             (uint32_t)pos, (uint32_t)pos + 1u,
+                                             em.gdn_scratch_off, em.gdn_scratch_size});
+            }
+        }
         /* 003 T015: handler 内新发的预置 staging 回填生命期 = 本位+1 (消费
          * op 即本节点; DMA 与 matmul 相邻发射, 无中间图节点可插 carve) */
         for (size_t si = em.stage_mark; si < em.pending_stages.size(); si++)
