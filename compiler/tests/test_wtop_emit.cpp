@@ -1230,6 +1230,79 @@ int main() {
                 }
             }
         }
+
+        /* 回归: 裸 slot 引用槽存活 GC。RmsNorm gamma/bias 裸 id 引用(无
+         * 0x8000 位) — 板跑 rc=38 "rmsnorm2 rw0" 实锤: 只嗅 bit15 的扫描把
+         * gamma 槽剥成 len=0 哨兵。图 = FC(预打包在场, GC 启动) → RmsNorm。 */
+        {
+            const uint32_t M = 32, K = 64, N = 32;
+            GraphPrepare g;
+            auto mk2 = [](uint64_t d0, uint64_t d1, uint32_t es, uint32_t dt) {
+                OutputDef od{};
+                od.rank = 2; od.dims[0] = d0; od.dims[1] = d1;
+                od.element_size = es; od.dtype = dt;
+                return od;
+            };
+            OutputDef w_od = mk2(N, K, 4, static_cast<uint32_t>(DType::Float32));
+            std::vector<uint8_t> W(N * K * 4, 0);
+            for (size_t i = 0; i < (size_t)N * K; i++) {
+                float v = (float)((int)(i % 37) - 18);
+                std::memcpy(W.data() + i * 4, &v, 4);
+            }
+            g.append_const_node(1, w_od, W.data(), W.size());
+            g.get_op_at(1)->name_tag = string_tag_t::map_str("W");
+            OutputDef in_od = mk2(M, K, 2, static_cast<uint32_t>(DType::Float16));
+            g.append_node("Input", 10, nullptr, 0, &in_od, 1, nullptr);
+            InputDef mm_in[2] = {{10, 0}, {1, 0}};
+            OutputDef mm_od = mk2(M, N, 2, static_cast<uint32_t>(DType::Float16));
+            g.append_node("FullyConnected", 20, mm_in, 2, &mm_od, 1, nullptr);
+            OutputDef gm_od = mk2(1, N, 4, static_cast<uint32_t>(DType::Float32));
+            std::vector<float> G(N, 0.5f);
+            g.append_const_node(21, gm_od, reinterpret_cast<const uint8_t*>(G.data()), G.size() * 4);
+            g.get_op_at(21)->name_tag = string_tag_t::map_str("gamma");
+            InputDef rn_in[2] = {{20, 0}, {21, 0}};
+            OutputDef rn_od = mk2(M, N, 2, static_cast<uint32_t>(DType::Float16));
+            g.append_node("RmsNorm", 22, rn_in, 2, &rn_od, 1, nullptr);
+            InputDef oin[1] = {{22, 0}};
+            g.append_node("Output", 40, oin, 1, nullptr, 0, nullptr);
+            CHECK(g.prepare(env) == GraphStatus::Success, "T012: rmsnorm 图 prepare");
+            std::vector<uint8_t> b2(1u << 20, 0);
+            size_t b2_size = 0;
+            CHECK(g.serialize(b2.data(), b2.size(), b2_size) && b2_size > 0, "T012: rmsnorm 图 serialize");
+            const std::string bp = dir + "ppRN.bin";
+            const std::string ip = dir + "ppRN.f16.raw";
+            const std::string op2 = dir + "ppRN.wtop";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint8_t> in16((size_t)M * K * 2, 0);
+            write_file(ip, in16.data(), in16.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 +
+                             " --dma-runlist 2>/dev/null";
+            CHECK(std::system(c2.c_str()) == 0, "T012: rmsnorm 图 --dma-runlist emit exit 0");
+            std::vector<uint8_t> br;
+            wt_blob* wr = new wt_blob{};
+            CHECK(load_file(op2, br) && wt_parse(br.data(), br.size(), wr) == WT_OK &&
+                  wr->n_ops == 2 && wr->ops[0].opcode == OP_MATMUL_F16 &&
+                  wr->ops[1].opcode == OP_RMSNORM2_F16,
+                  "T012: rmsnorm 图 ops = [MATMUL, RMSNORM2]");
+            if (wr->n_ops == 2 && wr->ops[1].opcode == OP_RMSNORM2_F16) {
+                CHECK(wr->ops[0].args[6] & 8u,
+                      "T012: rmsnorm 图 FC bit3 预打包在场 (GC 确在跑)");
+                uint32_t gs = wr->ops[1].args[1] & 0x7FFFu;   /* 裸 id 引用 */
+                CHECK(gs < wr->n_slots && !(wr->ops[1].args[1] & 0x8000u) &&
+                          wr->slots[gs].len == N * 2u && wr->slots[gs].count == N,
+                      "T012: 裸引用 gamma 槽存活 GC (len=N*2, 非 len=0 哨兵)");
+                bool gok = false;
+                if (gs < wr->n_slots && wr->slots[gs].len == N * 2u) {
+                    const uint16_t* gv = (const uint16_t*)(wr->weight_base + wr->slots[gs].offset);
+                    gok = true;
+                    for (uint32_t i = 0; i < N; i++)
+                        if (gv[i] != r_f32_to_f16(0.5f)) { gok = false; break; }
+                }
+                CHECK(gok, "T012: gamma 槽字节压实后完好 (0.5f → f16)");
+            }
+            delete wr;
+        }
     }
 
     /* 11. 007 US1: 注入的 OP_BROADCAST_F16 子 op 引擎按形态分派契约。

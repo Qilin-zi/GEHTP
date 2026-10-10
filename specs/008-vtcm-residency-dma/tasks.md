@@ -66,7 +66,7 @@ description: "Task list: 全图 VTCM 驻留 + 显式 DMA 流水（008 中期性�
 
 - [x] T011 [US2] **fence 并发 micro-test（硬前置闸）**：设备端 HMX matmul 与 `dc_dma` 搬运并发 ≥100 轮、双向 fence（fence.c 决策表：DMA→HMX@VTCM=INVALIDATE / HMX→DMA=FLUSH），输出逐字节比对 + 超时看护 → `evidence/fence-microtest.txt`（含库指纹）。**未过门 T012-T015 一律不上板**（V81 不背书此竞态）
   **PASS（1009, d0f1784, libhvxhmx_007 md5 5a023fbb）**：`kernels/examples/47_fence_conc` 1000 轮 7/7 门×4 复跑全绿——逐字节==串行参考、看护 max_poll 16µs、overlap 31µs ≤ 0.9×(hmx 28+dma 14) 真并发实证（DMA 全隐藏，链 ~55GB/s）。**附带定谳：阻塞 `dc_dma_once` 每调用 ~700µs 固定开销 → T012/T013 发射器必须用 desc 链一次 submit+晚 poll 范式**（见 evidence 判读 4）
-- [ ] T012 [US2] `--dma-runlist` 扩全图：`compiler/tools/wtop_emit.cpp` + `compiler/tools/wtop_ops/op_matmul.cpp` 主力 HMX 族（in_proj/out_proj/lm_head chunk）权重/激活按执行序预取发射；staging 槽在 T008 预算表内分配（不得与驻留激活争额）。**探针修正（1009，`evidence/vtcm-access-probe.txt`）**：DMA 非瓶颈（55GB/s），pack_wgt 标量散写=66.4% wall → 机制改 **f16 权重编译期预打包 crouton 进 blob（W4A16 预置发射同款）+ 运行期 DMA DDR→VTCM 线性预取**（7MB≈130µs 藏进前一 op 计算）；unpack 标量散读 5.59ms/op 并档 HVX 化（007 P1 范式，G7 已证 HVX 线性读 VTCM=快侧 9.4×）
+- [x] T012 [US2] `--dma-runlist` 扩全图：`compiler/tools/wtop_emit.cpp` + `compiler/tools/wtop_ops/op_matmul.cpp` 主力 HMX 族（in_proj/out_proj/lm_head chunk）权重/激活按执行序预取发射；staging 槽在 T008 预算表内分配（不得与驻留激活争额）。**探针修正（1009，`evidence/vtcm-access-probe.txt`）**：DMA 非瓶颈（55GB/s），pack_wgt 标量散写=66.4% wall → 机制改 **f16 权重编译期预打包 crouton 进 blob（W4A16 预置发射同款）+ 运行期 DMA DDR→VTCM 线性预取**（7MB≈130µs 藏进前一 op 计算）；unpack 标量散读 5.59ms/op 并档 HVX 化（007 P1 范式，G7 已证 HVX 线性读 VTCM=快侧 9.4×）
 - [ ] T013 [US2] 双缓冲轮换：DmaStreamDesc `buf_slot 0/1` + 发射序「tile i+1 搬运发射 → tile i invoke → completion poll」；任一环失败回落串行 + deviation 记录（003「允许回落+上报」契约，绝不静默）
 - [ ] T014 [P] [US2] op_ts 双时间轴报告：`kernels/examples/42_gehtp_runner/main.c`（dma_us 落盘已有 ver3）+ `scripts/gehtp_prof.py` 加 HMX 族重叠率列（dma 在途 ÷ compute dur）
 - [ ] T015 [US2] 板跑（quickstart 场景 3）：dma_us>0 ／ SC-002 HMX 族 dur ≤ 50% 锚 ／ 位级 md5 同 ／ 构造 staging 失败 → deviation=1 + 串行继续（偏差报告不变量 PASS）
@@ -151,3 +151,4 @@ US1 → +US2（SC-002）→ +US3（三族 ≤2s）→ +US4（≤0.5s）→ T023 
 - 改 `oplist_exec.c`（temp 物化/run_range 段）与 004 状态表段同文件——每次开工前 `git status`；004 回合主线时 reconcile
 - census `out_b` 列含逻辑展开字节（Σ1.2TB/max34GB 已证伪）——**任何预算讨论只用 T003 冻结口径**
 - 板上判分 llmserv env；op_ts 解析纪律：byte24 起、gehtp_prof.py --strict（二进制判读纪律）
+  **PASS（1010, d0f1784, libhvxhmx_008t12 signed 81f034d3）**：四门全绿——位级 md5==v4 锚 / Σdma 22.53ms 1.4GB@66.7GB/s / 不变量 PASS(中止0, matmul 零回落) / MATMUL 18.1% wall≤50%；exec 24.24→13.38s（−44.8%）。两翻车教训入 `evidence/t012-prepack-boardrun.txt`：GC 裸槽 id 白名单六位点（漏标=活槽剥空 rc=38；泛标=temp 撞号 2.89GB 爆设备堆）

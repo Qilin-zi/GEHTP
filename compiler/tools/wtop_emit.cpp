@@ -759,11 +759,36 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     // weight/ext 区 → blob 不双存权重(打包=同字节量置换, 净增长≈0)。
     // 无预打包零触碰(惰性门 md5 不动)。
     if (!em.pp_recs.empty()) {
+        /* 槽引用位孪生表 — 与 oplist_parse.c arg_is_slot / 设备 exec 解引用
+         * 同表, 判据互指勿单边改。槽位上的值两种形态: 0x8000|slot (src_ref/
+         * matmul w/gather idx 等绝大多数) 或裸 slot id。裸形态只由六个发射
+         * 位点写出 (rmsnorm2 w/b, conv w/b, W4A16 w, conv1d_ssm w, SPILL/
+         * FILL 池) — 其余槽位上的裸值全是 temp 引用 (act/src), 不能当槽标
+         * 记, 否则 temp id 撞槽 id 把死槽全保活 (0.8B 板跑实锤: 2.04→2.89GB
+         * 近全量双存, 设备 malloc 爆)。漏标裸形态则反向丢活槽 (rc=38 rw0)。 */
+        auto arg_takes_bare_slot = [](uint16_t opcode, uint16_t idx) {
+            switch (opcode) {
+            case OP_RMSNORM2_F16: case OP_CONV2D_F16:
+                return idx == 1 || idx == 2;
+            case OP_MATMUL_W4A16: case OP_CONV1D_SSM_F16:
+                return idx == 1;
+            case OP_FILL:
+                return idx == 0;
+            case OP_SPILL:
+                return idx == 1;
+            default:
+                return false;
+            }
+        };
         std::vector<uint8_t> refd(em.slots.size(), 0);
         for (const auto& o : em.ops)
             for (uint16_t ai = 0; ai < o.n_args; ai++) {
                 uint32_t a = o.args[ai];
-                if ((a & 0x8000u) && (a & 0x7FFFu) < em.slots.size()) refd[a & 0x7FFFu] = 1;
+                if (a & 0x8000u) {
+                    if ((a & 0x7FFFu) < em.slots.size()) refd[a & 0x7FFFu] = 1;
+                } else if (arg_takes_bare_slot(o.opcode, ai) && a < em.slots.size()) {
+                    refd[a] = 1;
+                }
             }
         if (em.dummy_slot_id < em.slots.size()) refd[em.dummy_slot_id] = 1;
         std::vector<wt_slot> nslots;
