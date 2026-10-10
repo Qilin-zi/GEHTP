@@ -73,7 +73,7 @@ description: "Task list for feature implementation"
 - [x] T013 [US2] emit 权重域报告：`compiler/tools/wtop_emit.cpp` 输出逐层 WeightDomainRecord（字段 verbatim：layer / domain∈{w4,f16} / fallback_reason∈{none,shape_misalign,source_missing} / size_bytes）+ w4 占比汇总 + f16 兜底名单（注意与 T008 同文件，先 git status 确认 US1 已提交）
 - [x] T014 [US2] 形状边界兜底：M/K/N 对齐（沿 US1 lm_head 分块条件）不满足的 FC 显式 f16 并列名，`compiler/tools/wtop_ops/op_matmul.cpp`（depends T012, T013）
 - [x] T015 [US2] 编译 0.8B：v4 配方仅追加 `--gguf/--match` → `const_data_size` 折半核验 + 报告落盘 `evidence/w4_emit_report.md`（depends T014）
-- [ ] T016 [US2] 板跑 + q4_0 判分重锚：judge_logits.py 切 `cpu_golden/q4_0`，双门 cos ≥0.9986 同量级 + top1 ≥29/32，首跑校准后**冻结门值回填 data-model.md 双口径表**；与 hf 口径双列登记（FR-004，两口径 cos 不可直比）（depends T015）
+- [X] T016 [US2] 板跑 + q4_0 判分重锚：judge_logits.py 切 `cpu_golden/q4_0`，双门 cos ≥0.9986 同量级 + top1 ≥29/32，首跑校准后**冻结门值回填 data-model.md 双口径表**；与 hf 口径双列登记（FR-004，两口径 cos 不可直比）（depends T015）
 - [ ] T017 [US2] P2 门验收 → `evidence/p2_gate.md`：权重 ≤0.6GB（SC-003）、lm_head 51.7× 不回退、f16 兜底名单显式（depends T016）
 
 **Checkpoint**: P1+P2 双独立交付在位

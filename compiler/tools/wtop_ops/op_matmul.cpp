@@ -164,7 +164,7 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
              * 005 US3b: 设备 HMX 路径已有 bias 通道(scale 区 out_bias,
              * SC-005 三判据 0 违例), 32 对齐形默认走 HMX —— US3a 的
              * 对齐硬报错已随 pass 门一并移除。 */
-            uint32_t bias_s = 0x8000u | em.ensure_weight_slot(gp, bias_op, wslots, od);
+            uint32_t bias_s = 0x8000u | em.ensure_weight_slot(gp, bias_op, wslots, od, false);
             em.add_op(OP_MATMUL_F16_BIAS, {a_t, w_s, out_t, m, k, nn, flags, bias_s});
             return 0;
         }

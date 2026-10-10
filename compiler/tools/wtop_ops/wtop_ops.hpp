@@ -372,6 +372,30 @@ struct Emitter {
         return wb;
     }
 
+    /* ggml 2-D 张量内存序 (ne[0] 最快维) 与图 row-major (末维最快) 的关系按
+     * 消费者分两族 (T016 双向实锤, 勿一刀切):
+     *   Conv2d 族: 图权重 = [ne0, ne1] (kw×out) — 需转置 out[i0*d1+i1]=in[i0+d0*i1]。
+     *     依据: 18 个 ssm_conv1d.weight ne=[4,6144] 转置后与 v4 图真值位级吻合
+     *     24576/24576; 转置前板上 logits cos≈0。
+     *   MatMul/FullyConnected 族: 图权重 = ONNX [N,K] row-major = GGUF 线性序
+     *     原样, 不转置。依据: 36 个 in_proj_a/b (Q4 反量化槽) 与 v4 相关性
+     *     raw 序 0.9623 vs 转置序 0.6887 (0.96 = Q4 量化噪声水位, 方向裁决)。
+     * 仅 conv 消费者调用 (调用点判 consumer 名)。 */
+    static void gguf_transpose_2d(std::vector<uint8_t>& wb,
+                                  const std::vector<uint64_t>& dims) {
+        if (dims.size() != 2 || dims[0] < 2 || dims[1] < 2) return;
+        size_t d0 = (size_t)dims[0], d1 = (size_t)dims[1];
+        size_t n = wb.size() / 2;
+        if (d0 * d1 != n) return;
+        std::vector<uint8_t> t(wb.size());
+        const uint16_t* in = reinterpret_cast<const uint16_t*>(wb.data());
+        uint16_t* out = reinterpret_cast<uint16_t*>(t.data());
+        for (size_t i1 = 0; i1 < d1; i1++)
+            for (size_t i0 = 0; i0 < d0; i0++)
+                out[i0 * d1 + i1] = in[i0 + d0 * i1];
+        wb.swap(t);
+    }
+
     // 007 US2 Route A 准入门: 返回 0=否 / 1=Gather(embed 表, 设备 exec_gather
     // 行级 dequant 消费) / 2=对齐非 batched FullyConnected/MatMul(设备
     // exec_matmul_f16_hmx Q4 分支消费, 标量路=硬错误)。
@@ -403,9 +427,17 @@ struct Emitter {
     // 设 grouping, 权重 const 自身没有; TSV 键 = 消费节点名)
     uint32_t ensure_weight_slot(GraphPrepare& gp, const OpDef* w,
                                 std::map<uint64_t, uint32_t>& wslots,
-                                const OpDef* consumer = nullptr) {
+                                const OpDef* consumer = nullptr,
+                                bool consumer_name_fallback = true) {
         const std::string consumer_grp = consumer ? consumer->grouping : "";
         const int q4k = q4_consumer_kind(consumer);
+        /* 2-D 布局族判别 (gguf_transpose_2d 注释): 仅 conv 族图布局是
+         * [ne0,ne1] 转置序; matmul 族 [N,K] = GGUF 线性序原样 */
+        const char* cons_nm =
+            (consumer && consumer->name_tag && consumer->name_tag->name())
+                ? consumer->name_tag->name() : nullptr;
+        const bool conv_wgt = cons_nm &&
+            (!std::strcmp(cons_nm, "Conv2d") || !std::strcmp(cons_nm, "DepthWiseConv2d"));
         auto it = wslots.find(w->op_id);
         if (it != wslots.end()) {
             /* 已建 w4 tile 槽又被非 Q4 消费者复用(tie 权重 M 不齐等) → 设备侧
@@ -425,7 +457,11 @@ struct Emitter {
         };
         if (use_gguf && gguf_tab && gguf_bytes) {
             auto mit = gguf_tab->find(w->grouping);
-            if (mit == gguf_tab->end() && !consumer_grp.empty())
+            /* consumer 名回退仅限消费者主权重(TSV 一行一主权重)。次级 const
+             * (norm bias / fc bias / conv bias) 回退到消费者名会把主权重的
+             * GGUF 张量灌进 bias 槽 —— 0.8B q4 blob 79 个 RMSNORM2 bias 全
+             * 变 gamma 字节(rms +1.24 基线偏置)的根因, T016。 */
+            if (mit == gguf_tab->end() && consumer_name_fallback && !consumer_grp.empty())
                 mit = gguf_tab->find(consumer_grp);
             if (mit != gguf_tab->end()) {
                 const GgufEntry& e = mit->second;
@@ -458,6 +494,7 @@ struct Emitter {
                         /* Q4_0 但非 tile 候选(形状未对齐/非 Q4 消费者/batched)
                          * → 反量化 f16 槽(T014 兜底, 报告列名) */
                         auto wb = dequant_q4_0_f16(src, e.nbytes);
+                        if (conv_wgt) gguf_transpose_2d(wb, e.dims);
                         id = slot_for((uint32_t)wb.size(), (uint32_t)(K * NN), wb.data());
                         w4_records.push_back({layer, mit->first, "f16",
                                               (K % 32 == 0 && NN % 32 == 0)
@@ -470,6 +507,7 @@ struct Emitter {
                         for (size_t i = 0; i < n4; i++) w16[i] = f32_to_f16_rne(wf[i]);
                         std::vector<uint8_t> wb(n4 * 2);
                         std::memcpy(wb.data(), w16.data(), wb.size());
+                        if (conv_wgt) gguf_transpose_2d(wb, e.dims);
                         id = slot_for((uint32_t)wb.size(), (uint32_t)n4, wb.data());
                         w4_records.push_back({layer, mit->first, "f16", "none", wb.size()});
                     }

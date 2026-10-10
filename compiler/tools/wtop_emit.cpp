@@ -342,7 +342,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             w_slot = em.ensure_weight_slot(gp, w, wslots, conv);
             if (conv->inputs.size() > 2) {
                 const OpDef* b = gp.get_op_at(conv->inputs[2].src_id);
-                if (b) b_slot = em.ensure_weight_slot(gp, b, wslots, conv);
+                if (b) b_slot = em.ensure_weight_slot(gp, b, wslots, conv, false);
             }
         }
     }

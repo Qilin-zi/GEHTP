@@ -1691,8 +1691,13 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
             uint32_t ng = (uint32_t)(src / q4_K);
             const uint8_t* tile =
                 tbl_q4 + (((ng >> 5) * q4_nk) + (k4 >> 5)) * 640u;
-            uint8_t byte = tile[(k4 >> 1) * 32u + (ng & 31u)];
-            int q = (k4 & 1u) ? (int)(byte >> 4) : (int)(byte & 0xFu);
+            /* T016 修正: byte/nibble 索引必须用 tile 内 k (k4&31), 不能用
+             * 全局 k4 —— kt>=1 时 (k4>>1)*32 越过 tile 的 512B quants 区,
+             * 读进 scales/pad/下一 tile (embed 全模型 cos≈0 根因, Python
+             * 位级复刻 buggy 公式 == 设备输出 32768/32768 实证)。 */
+            uint32_t kk = k4 & 31u;
+            uint8_t byte = tile[(kk >> 1) * 32u + (ng & 31u)];
+            int q = (kk & 1u) ? (int)(byte >> 4) : (int)(byte & 0xFu);
             float d = f16_to_f32(((const uint16_t*)(const void*)(tile + 512u))[ng & 31u]);
             y[i] = f32_to_f16(d * (float)(q - 8));
         } else {
@@ -1817,22 +1822,30 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
     /* pack wgt: B[K,N] (或 t1 转置) → crouton[(c*n_dot+kt)*1024] (row=ic=k, col=oc=n)。
      * 002 US1: 全局列号 = n0 + c*32 + n, 行主 [K,N_full] 布局 stride=N_full
      * (n0=0/N_full=N 时与整 op 逐字节同公式)
-     * 007 US2 Route A: Q4_0 权重槽(640B/tile, payload 576 = emit
-     * repack_q4_0_tiles 契约)→ HVX 反量化整块直写 crouton wgt 面, 替代标量
-     * pack 循环。布局同源性双证: ① ggml 移植 dequant task 输出 = 逐 n 配对
-     * [k偶,k奇](scale-dup [d0,d0,d1,d1] × byte-interleave 逐对乘) =
-     * hmx_crouton_pos(k,n); ② 其消费方 core_dot 把 tile 指针直喂
-     * HMX_LOAD_MPY_DEEP_F16(与本函数 mxmem:deep 同一硬件指令同一布局)。
+     * 007 US2 Route A: Q4_0 权重槽(640B/tile, emit repack_q4_0_tiles 契约)
+     * → 标量反量化 + crouton pack, 布局与下方 f16 pack 同源 (hmx_crouton_pos)。
+     * T016 修正: 原走 ggml 移植 HVX dequant task, 板上 probe 微 blob 实证其
+     * 输出与 scale 字节无关(d≡1 与真 d 输出 97.9% 位级相同, 有限值 = 常数
+     * 0x39B9 × quant 整数), 且其 lane 序是 core_dot row-major pair 面, 与
+     * mxmem:deep 消费的 pair-interleave 面不同源。量化零损契约: quant nibble
+     * (k&1) @ tile[(k>>1)*32+n], d f16 @ tile+512+2n, 值 = d*(q-8)。
      * SPLIT chunk 的列 tile 块在槽内 (ct 主序/kt 次序) 连续 → 基址平移
      * (n0/32)*n_dot*640。t0/t1 是 f16 源布局标志, Q4 元素级映射方向无关。 */
     if (w_q4) {
-        if (hvhx_v2_dequant_tiled_to_fp16(
-                w_q4 + (size_t)(n0 / 32u) * (size_t)n_dot * 640u,
-                (__fp16*)wgt_cr, N, K, HVHX_V2_WT_Q4_0) != 0) {
-            snprintf(err, errn, "matmul_f16 q4 dequant fail (N=%u K=%u n0=%u)",
-                     N, K, n0);
-            return -1;
-        }
+        const uint8_t* w4 = w_q4 + (size_t)(n0 / 32u) * (size_t)n_dot * 640u;
+        for (uint32_t c = 0; c < n_col; ++c)
+            for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                uint16_t* tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
+                const uint8_t* qt = w4 + ((size_t)c * n_dot + kt) * 640u;
+                const uint16_t* dv = (const uint16_t*)(qt + 512u);
+                for (uint32_t k = 0; k < 32u; ++k)
+                    for (uint32_t n = 0; n < 32u; ++n) {
+                        uint32_t q =
+                            (qt[(k >> 1) * 32u + n] >> ((k & 1u) * 4u)) & 0xFu;
+                        tile[hmx_crouton_pos(k, n)] =
+                            f32_to_f16(f16_to_f32(dv[n]) * (float)((int)q - 8));
+                    }
+            }
     } else {
         for (uint32_t c = 0; c < n_col; ++c)
             for (uint32_t kt = 0; kt < n_dot; ++kt) {
