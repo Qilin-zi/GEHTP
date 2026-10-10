@@ -2358,18 +2358,20 @@ static int exec_transpose_gen(const struct wt_blob* b, const struct wt_op* op,
                                                    : "transpose innermost swapped",
                                err, errn) != 0)
         return -1;
-    uint32_t idx[4] = {0, 0, 0, 0};
-    for (size_t t = 0; t < n; t++) {
-        /* 输入线性坐标 → 输入多维坐标(与 perm 对应)→ 输出坐标 */
-        uint32_t rem = (uint32_t)t;
-        uint32_t ic[4] = {0, 0, 0, 0};
-        for (uint32_t i = 0; i < rk; i++) { ic[i] = rem / si[i]; rem %= si[i]; }
-        uint32_t oc[4] = {0, 0, 0, 0};
-        for (uint32_t ax = 0; ax < rk; ax++) oc[ax] = ic[p[ax]];
-        uint32_t ot = 0;
-        for (uint32_t ax = 0; ax < rk; ax++) ot += oc[ax] * so[ax];
-        dst[ot] = s16[t];
-        (void)idx; (void)out_dims;
+    /* 通用标量回落: 输出线性 odometer (免 div/mod, 连续写 + 跨步读) + pinv
+     * 映回输入线性。纯置换, 与旧输入线性 div/mod 版位级等价 (每输出元素写
+     * 一次, 读同一输入元素)。 */
+    uint32_t pinv2[4] = {0, 0, 0, 0};
+    for (uint32_t j = 0; j < rk; j++) pinv2[p[j]] = j;
+    uint32_t oc[4] = {0, 0, 0, 0};
+    for (size_t o = 0; o < n; o++) {
+        uint32_t t = 0;
+        for (uint32_t j = 0; j < rk; j++) t += oc[pinv2[j]] * si[j];
+        dst[o] = s16[t];
+        for (int ax = (int)rk - 1; ax >= 0; ax--) {
+            if (++oc[ax] < out_dims[ax]) break;
+            oc[ax] = 0;
+        }
     }
     return 0;
 }
