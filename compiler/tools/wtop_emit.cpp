@@ -1025,9 +1025,9 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                              (unsigned long long)((uint64_t)sl.offset + sl.len));
                 return 3;
             }
-        std::printf("WTOP OK: slots=%u ops=%u bytes=%zu (gguf hits=%u miss=%u)\n",
+        std::printf("WTOP OK: slots=%u ops=%u bytes=%zu (gguf hits=%u miss=%u) fold=%u\n",
                     (unsigned)em.slots.size(), (unsigned)em.ops.size(), em.blob.size(),
-                    em.gguf_hits, em.gguf_miss);
+                    em.gguf_hits, em.gguf_miss, em.fold_aliases);
 
     }
     {

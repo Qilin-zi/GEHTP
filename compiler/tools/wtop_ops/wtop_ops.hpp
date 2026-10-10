@@ -119,6 +119,7 @@ struct Emitter {
     uint32_t next_temp = 0;
     std::vector<uint32_t> free_temps;      // 活性分析释放的 temp(M2)
     std::map<uint64_t, uint32_t> last_use; // 复合键 → 最后消费位置(plan_order 下标)
+    uint32_t fold_aliases = 0;              // 008 US3 T017: 引用消除的别名数(op 消失)
 
     // 第7步阶段一: 静态 DDR 偏移表(emit 层注入)
     bool ddr_static = false;
@@ -222,6 +223,23 @@ struct Emitter {
         free_temps.push_back(it->second);
         op_temp.erase(it);
         dbg_released++;
+    }
+    /* 008 US3 T017: 引用消除 —— 纯恒等搬运(Reshape/连续切片)产出别名到输入
+     * temp(同字节, 不发射拷贝 op)。src_temp 必须是真 temp(无 0x8000 slot 位)。
+     * 缓冲真实生命期 = [生产者产位, max(生产者 last_use, 本 op last_use)]:
+     * 释放权交给本 op 键(last_use 取并集), 生产者键置 UINT32_MAX 永不放(其
+     * 缓冲由本 op 键在最后消费者处统一释放, 避免双 key 双 free)。连锁别名
+     * (reshape→reshape)时本 op 读 src 键当前 last_use(尚未置 INF)再取并集,
+     * 正确累积。返回 true=已别名, false=不可(源是 slot/输入)。 */
+    bool alias_temp(uint64_t op_id, uint32_t out_idx, uint32_t src_temp, uint64_t src_key) {
+        if (src_temp & 0x8000u) return false;   /* slot/权重/输入, 非 temp */
+        op_temp[tkey(op_id, out_idx)] = src_temp;
+        uint32_t src_last = last_use.count(src_key) ? last_use[src_key] : 0u;
+        uint32_t self_last = last_use.count(tkey(op_id, out_idx)) ? last_use[tkey(op_id, out_idx)] : 0u;
+        last_use[tkey(op_id, out_idx)] = src_last > self_last ? src_last : self_last;
+        last_use[src_key] = 0xFFFFFFFFu;
+        fold_aliases++;
+        return true;
     }
     uint32_t fresh_temp(GraphPrepare& gp, uint64_t op_id, uint32_t out_idx = 0) {
         const OpDef* od = gp.get_op_at(op_id);
