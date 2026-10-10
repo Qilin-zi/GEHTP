@@ -137,6 +137,7 @@ def parse_op_ts(path):
     ver, n_ops = struct.unpack_from("<II", data, 4)
     if ver not in (1, 2, 3, 4):
         raise SystemExit(f"unsupported op_ts ver {ver}")
+    (sample,) = struct.unpack_from("<I", data, 12)   # 008 T020: pad 承载抽样间隔 K (0=全量)
     (wall_us,) = struct.unpack_from("<Q", data, 16)
     ts = []
     off = 24
@@ -153,7 +154,7 @@ def parse_op_ts(path):
         else:
             s, d, dus, db, eng, pl, dv, fb = struct.unpack_from("<IIIIIIII", data, off); off += 32
             ts.append((s, d, dus, db, eng, pl, dv, fb))
-    return wall_us, ts
+    return wall_us, ts, sample
 
 
 def parse_optrace(path):
@@ -358,10 +359,15 @@ def main():
     # ---- join 时间
     wall_us = None
     ts = None
+    sample = 0
     if args.op_ts:
-        wall_us, ts = parse_op_ts(args.op_ts)
+        wall_us, ts, sample = parse_op_ts(args.op_ts)
     elif args.optrace:
         wall_us, ts = parse_optrace(args.optrace)
+    if sample:
+        print(f"warn: op_ts 抽样口径 K={sample} — 仅 op 序号 %K==0 有有效记录, "
+              f"非采样槽恒零 (族耗时按全量 op 数归一, 勿作逐 op 对拍)",
+              file=sys.stderr)
     if ts:
         if len(ts) != len(ops):
             msg = (f"ts n={len(ts)} != blob n_ops={len(ops)} — op_ts.bin 陈腐"

@@ -88,6 +88,10 @@ static uint32_t g_ts_cap = 0;
 void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap) {
     g_ts_buf = buf; g_ts_cap = buf ? cap : 0;
 }
+/* 008 T020 (US4): op_ts 抽样间隔 (0/1 = 全量逐条)。非采样 op 的 ts 槽保持零
+ * (runner memset 保证), 只省 dc_dma_get + 8 字段填充; 裁决/偏差不变量照旧。 */
+static uint32_t g_ts_sample = 0;
+void wt_exec_set_ts_sample(uint32_t k) { g_ts_sample = k; }
 /* PROF W-P3: 本 op 实际执行引擎 (WT_ENG_*)。各 exec_* 内部设置, run_range 读回 */
 static uint32_t g_last_engine = WT_ENG_SCALAR;
 /* 003 编译器驱动调度: 本 op 编译期指派引擎 (来自 blob v3 footer, 0/1/2)。
@@ -2852,7 +2856,10 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             const int64_t t1 = HAP_perf_get_time_us();
             if (op_us) op_us[ii] = t1 - t0;
             /* PROF W-P2: 打点对, 索引 = 全局 op 序号 (run_range 分段安全) */
-            if (g_ts_buf && i < g_ts_cap) {
+            /* 008 T020 (US4): 抽样模式下非采样 op 跳过 ts 填充 (槽保持零)。
+             * 裁决/偏差不变量仍逐 op 结算 (见上段), 只省 dc_dma_get + 8 字段。 */
+            if (g_ts_buf && i < g_ts_cap &&
+                (g_ts_sample == 0 || (i % g_ts_sample) == 0)) {
                 int64_t dma_us = 0, dma_bytes = 0;
                 dc_dma_get(&dma_us, &dma_bytes);   /* W-P3: 本 op UserDMA 量 */
                 g_ts_buf[i].start_us  = (uint32_t)(t0 - t_run0);

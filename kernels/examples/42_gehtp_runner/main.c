@@ -43,9 +43,11 @@
  * ver=1: 8B {start,dur}; ver=2: 20B {start,dur,dma_us,dma_bytes,engine} (W-P3);
  * ver=3: 28B +{planned_engine,deviation} (003 T019 US3 报告契约: 0=按计划
  * 1=允许回落 2=已中止); ver=4: 32B +{stg_fb} (008 T015 搬运面回落次数 —
- * 偏差不变量三腿: dev==0 ⟺ planned==actual ∧ stg_fb==0)。 */
+ * 偏差不变量三腿: dev==0 ⟺ planned==actual ∧ stg_fb==0)。
+ * 008 T020 (US4): pad 字段承载 op_ts 抽样间隔 K (0=全量逐条); K>0 时仅
+ * 全局 op 序号 i%K==0 的槽有有效记录, 其余槽保持零 (消费方读 pad 显式口径)。 */
 static int write_op_ts(const char* path, const struct wt_op_ts* ts, uint32_t n,
-                       uint64_t wall_us) {
+                       uint32_t sample, uint64_t wall_us) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return -1;
     uint8_t hdr[24];
@@ -53,6 +55,7 @@ static int write_op_ts(const char* path, const struct wt_op_ts* ts, uint32_t n,
     hdr[0] = 'W'; hdr[1] = 'T'; hdr[2] = 'S'; hdr[3] = '1';
     uint32_t v = 4; memcpy(hdr + 4, &v, 4);
     memcpy(hdr + 8, &n, 4);
+    memcpy(hdr + 12, &sample, 4);   /* 008 T020: pad 复用 = 抽样间隔 K (0=全量) */
     memcpy(hdr + 16, &wall_us, 8);
     int ok = 0;
     if (write(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) ok = -1;
@@ -189,6 +192,23 @@ int main(void) {
             ex_log("[fault] mask=%s", fault_s);
         }
     }
+    /* 008 T020 (US4): op_ts 抽样 (每 K 个 op 填一条 ts; 0/缺省 = 全量逐条)。
+     * 抽样口径显式标注 (防 census 类对拍误读): 设备日志 + op_ts.bin pad 字段。 */
+    static uint32_t op_ts_sample = 0;
+    {
+        static char sample_s[16];
+        memset(sample_s, 0, sizeof(sample_s));
+        if (job_get((char*)job, "op_ts_sample", sample_s, sizeof(sample_s)) == 0 && sample_s[0]) {
+            op_ts_sample = (uint32_t)strtoul(sample_s, NULL, 10);
+            if (op_ts_sample < 2) op_ts_sample = 0;  /* K<2 视同全量, 消歧义 */
+        }
+        wt_exec_set_ts_sample(op_ts_sample);
+        if (op_ts_sample)
+            ex_log("[prof] op_ts sample=%u (每 %u 个 op 填一条 ts, 非采样槽=零)",
+                   (unsigned)op_ts_sample, (unsigned)op_ts_sample);
+        else
+            ex_log("[prof] op_ts full (每 op 记录, 口径=全量逐条)");
+    }
     free(job);
     uint32_t out_temp = (uint32_t)strtoul(temp_s, NULL, 10);
     ex_log("M4 wgt_size=%s", have_wgt_size ? wgt_size_s : "(none)");
@@ -277,7 +297,7 @@ int main(void) {
         if (op_ts) {
             uint32_t n_pre = (rc > 0 && (uint32_t)rc <= w->n_ops)
                                  ? (uint32_t)rc : w->n_ops;
-            if (write_op_ts(OP_TS_PATH, op_ts, n_pre, (uint64_t)total_us) == 0)
+            if (write_op_ts(OP_TS_PATH, op_ts, n_pre, op_ts_sample, (uint64_t)total_us) == 0)
                 ex_log("[prof] op_ts.bin %u ops (aborted prefix)", (unsigned)n_pre);
         }
         wt_exec_shutdown();
@@ -320,7 +340,7 @@ int main(void) {
     }
     /* PROF W-P2: op_ts.bin 落盘 (rc==0 才写; 失败 run 的 ts 无意义不产) */
     if (op_ts) {
-        if (write_op_ts(OP_TS_PATH, op_ts, w->n_ops, (uint64_t)total_us) == 0)
+        if (write_op_ts(OP_TS_PATH, op_ts, w->n_ops, op_ts_sample, (uint64_t)total_us) == 0)
             ex_log("[prof] op_ts.bin %u ops", (unsigned)w->n_ops);
         else
             ex_log("[prof] op_ts.bin write FAIL");

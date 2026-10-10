@@ -96,6 +96,10 @@ struct wt_op_ts {
                              planned==actual ∧ stg_fb==0) */
 };
 void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap);
+/* 008 T020 (US4): op_ts 抽样 — 每 k 个 op 填一条 ts (k=0/1 = 全量逐条, 旧行为)。
+ * 非采样槽保持零 (runner 侧 memset 保证), 采样序 = 全局 op 序号 i % k == 0。
+ * 偏差不变量/裁决逻辑不受影响 (仍逐 op 裁决, 只省 ts 落盘字段填充)。 */
+void wt_exec_set_ts_sample(uint32_t k);
 
 /* optrace 逐 op 行开关。默认开(=旧行为, 存量 runner 零回归); 性能测量前
  * 显式 set_trace(0) 关 = 无落盘污染。只控 run_range 内 per-op pre/post

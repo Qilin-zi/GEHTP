@@ -106,9 +106,12 @@ description: "Task list: 全图 VTCM 驻留 + 显式 DMA 流水（008 中期性�
 
 ### Implementation for User Story 4
 
-- [ ] T020 [P] [US4] op_ts 抽样/批写：`kernels/examples/42_gehtp_runner/main.c` 加 `--op-ts-sample K`（默认关=全量逐条）；抽样模式报告头显式口径标注（防 census 类对拍误读）
-- [ ] T021 [US4] run_range 裁决批化：`kernels/src/runtime/oplist_exec.c` ver=3 静态计划下消逐 op 引擎重裁决（planned 已定，deviation 语义与偏差不变量不动——003 契约）
-- [ ] T022 [US4] 板跑：开销 ≤0.5s（抽样口径）+ 幂等门（默认模式行为/位级与现库一致）
+- [x] T020 [P] [US4] op_ts 抽样/批写：`kernels/examples/42_gehtp_runner/main.c` 加 `--op-ts-sample K`（默认关=全量逐条）；抽样模式报告头显式口径标注（防 census 类对拍误读）
+  **PASS（1010, d0f1784, 板跑 md5 f87461e2）**：job.txt 键 `op_ts_sample K`（K≥2 生效，0/缺省=全量）；`wt_exec_set_ts_sample(K)` 下发；op_ts.bin **pad 字段复用承载 K**（0=全量，非破坏）+ 设备日志 `[prof] op_ts full/sample=K`；`scripts/gehtp_prof.py` 读 pad=K stderr 口径警告。全量模式 pad=0/11504 全非零；sample=8 pad=8/1438 非零（11504/8 精确）。
+- [x] T021 [US4] run_range 裁决批化：`kernels/src/runtime/oplist_exec.c` ver=3 静态计划下消逐 op 引擎重裁决（planned 已定，deviation 语义与偏差不变量不动——003 契约）
+  **PASS（1010, 取证收口）**：实查 `wt_annot_engine/fb_allowed/fb_engine` 全 `static inline`（oplist_parse.h:291-293），计划引擎从 footer 一次 `wt_rd_u32` + 掩码加载，零重裁决——**「逐 op 引擎重裁决」003 已实质消除**，T021 无需再批化（未强行加冗余）。本轮仅给 ts 填充加抽样门 `(g_ts_sample==0 || i%g_ts_sample==0)`，裁决/偏差不变量仍逐 op 结算。
+- [x] T022 [US4] 板跑：开销 ≤0.5s（抽样口径）+ 幂等门（默认模式行为/位级与现库一致）
+  **PASS（1010, d0f1784, libhvxhmx_008t21, 板跑 md5 f87461e2 双跑）**：A 默认 full exec 6.308s / B sample=8 exec 6.310s / t20 对照 6.308s——抽样 Δ=+2ms（噪声），**per-op 裁决+记录开销 ~0，远低于 0.5s 门**；`sum_op_us`↔`wall_us` 缝隙仅 16-18ms。~1.4s 是 v4 时代陈旧估计（运行时自决已被 003 静态计划消掉）。幂等门 = 默认模式位级同现库。证据 `evidence/t022-us4-optsample-gate.md`。
 
 **Checkpoint**: SC-005 后半达成
 
