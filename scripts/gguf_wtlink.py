@@ -19,10 +19,85 @@ GGUF 布局实测契约(见 golden_qwen35.py docstring):
 """
 import argparse
 import json
+import math
+import struct
 import sys
 
-sys.path.insert(0, "/disk2/GEHTP/scripts")
-from golden_qwen35 import gguf_read_full, GGUF_Q4_0, GGUF_F32  # noqa: E402
+# 007 US2 (T012): golden_qwen35 的 import 链死依赖已删盘目录
+# (/disk2/GEHTP/scripts, /disk2/Qwen35dev); gguf_read_full 本体自包含,
+# 就地内联(与 golden_qwen35.py 逐行同语义, numpy.prod → math.prod)。
+GGUF_Q4_0 = 2
+GGUF_F32 = 0
+
+
+def _skip_value(data, pos, vtype):
+    """按 GGUF 类型推进 pos,返回新 pos(STRING 返回 (new_pos, value))。"""
+    if vtype == 8:  # STRING
+        vlen = struct.unpack_from("<Q", data, pos)[0]
+        pos += 8
+        val = data[pos:pos + vlen].decode()
+        return pos + vlen, val
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    if vtype in sizes:
+        return pos + sizes[vtype], None
+    if vtype == 9:  # ARRAY
+        elem_type, count = struct.unpack_from("<IQ", data, pos)
+        pos += 12
+        for _ in range(count):
+            pos, _ = _skip_value(data, pos, elem_type)
+        return pos, None
+    raise ValueError(f"unknown KV type {vtype}")
+
+
+def gguf_read_full(path):
+    """返回 (arch, tensors, data_start) — tensors: {name: (ggml_type, dims, data_bytes)}。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    magic, version = struct.unpack_from("<4sI", data, 0)
+    assert magic == b"GGUF" and version == 3, f"bad GGUF header {magic} v{version}"
+    n_tensors, n_kv = struct.unpack_from("<QQ", data, 8)
+    pos = 24
+    arch = ""
+    for _ in range(n_kv):
+        klen = struct.unpack_from("<Q", data, pos)[0]
+        pos += 8
+        key = data[pos:pos + klen].decode()
+        pos += klen
+        vtype = struct.unpack_from("<I", data, pos)[0]
+        pos += 4
+        pos, val = _skip_value(data, pos, vtype)
+        if key == "general.architecture":
+            arch = val
+    assert arch, "no general.architecture key"
+    tensors = {}
+    for _ in range(n_tensors):
+        nlen = struct.unpack_from("<Q", data, pos)[0]
+        pos += 8
+        name = data[pos:pos + nlen].decode()
+        pos += nlen
+        n_dims = struct.unpack_from("<I", data, pos)[0]
+        pos += 4
+        dims = struct.unpack_from(f"<{n_dims}Q", data, pos)
+        pos += 8 * n_dims
+        gtype = struct.unpack_from("<I", data, pos)[0]
+        pos += 4
+        offset = struct.unpack_from("<Q", data, pos)[0]
+        pos += 8
+        n_elems = math.prod(dims)
+        if gtype == GGUF_F32:
+            nbytes = n_elems * 4
+        elif gtype == GGUF_Q4_0:
+            assert n_elems % 32 == 0, f"{name}: Q4_0 非 32 对齐"
+            nbytes = n_elems // 32 * 18
+        else:
+            tensors[name] = (gtype, dims, 0, 0)  # 不支持的量化类型:跳过
+            continue
+        tensors[name] = (gtype, dims, offset, nbytes)
+    # GGUF tensor offset 相对数据段起点:数据段 = tensor info 表末尾,按 32 对齐
+    data_start = (pos + 31) & ~31
+    for name, (gtype, dims, offset, nbytes) in tensors.items():
+        tensors[name] = (gtype, dims, offset, nbytes)
+    return arch, tensors, data_start
 
 # GGUF 角色表(arch=qwen35; 由 golden_qwen35.py 的实测映射固化)
 ROLE_MAP = {
@@ -56,7 +131,11 @@ def parse_node_layer_role(node_name):
     'rms_norm_/model/layers.0/input_layernorm/' → (0, 'norm', 'input_layernorm')
     """
     parts = node_name.split("/")
-    # 顶层: '/model/norm/' 与 '/model/embed_tokens/'
+    # 顶层: '/model/norm/' 与 '/model/embed_tokens/' 与 '/lm_head/MatMul'
+    # lm_head = embed 转置 tie(007 US2 实测: onnx__MatMul_208884 == E.T, 抽样
+    # 3000 点 diff=0; GGUF 无 output.weight = llama.cpp tied 约定同证)
+    if "lm_head" in parts:
+        return None, "lm_head", "lm_head"
     if "model" in parts:
         mi = parts.index("model")
         if mi + 1 < len(parts) and parts[mi + 1] == "norm":
@@ -123,7 +202,8 @@ def main():
         if not wt_inputs:
             continue
         layer, block, role = loc if loc else (None, None, "")
-        valid_roles = set(ROLE_MAP) | {"A_log", "dt_bias", "embed_tokens", "norm"}
+        valid_roles = set(ROLE_MAP) | {"A_log", "dt_bias", "embed_tokens", "norm",
+                                       "lm_head"}
         if role not in valid_roles:
             # 节点名路径无有效角色(如 .../linear_attn/Add)→ 权重张量名通道
             for t in wt_inputs:
@@ -135,6 +215,9 @@ def main():
             continue
         # 顶层(layer=None)特殊: embed_tokens / norm
         if role == "embed_tokens":
+            gguf_name = "token_embd.weight"
+        elif role == "lm_head":
+            # tied lm_head: 源 = token_embd(实测 onnx__MatMul_208884 == E.T)
             gguf_name = "token_embd.weight"
         elif role == "norm" and block == "linear_attn":
             gguf_name = f"blk.{layer}.ssm_norm.weight"

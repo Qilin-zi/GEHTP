@@ -43,11 +43,13 @@ int solve_tri_f16(const int16_t* L, int16_t* T, int c);
 /* ---- B2 delta-rule chunk 更新 (32 head 批) ----
  * 缓冲布局 [h][ntok][dim], 调用方传 base+t0*dim (只加 token 偏移, head 步幅内部算)
  * c = 本 chunk 实际 token 数 (<= C_MAX, 尾块可不对齐); ntok = 缓冲的完整 token 跨度
- * 内部: 每 head 构建 L (含 decay mask + β), 调 solve_tri_f16, 回代 u, 出 y, 推 S */
+ * 内部: 每 head 构建 L (含 decay mask + β), 调 solve_tri_f16, 回代 u, 出 y, 推 S
+ * q_raw: 0 = q 预乘 1/√d (ref_delta_token 同款); 1 = q 原样 (0.8B 图内 chunk
+ * 机器无此 scale, decode 手术图 q̂ 直喂 — 数值契约见 004 T018)。 */
 #define GDN_C_MAX 64
 int delta_chunk_f16(rec_state_t* st, const int16_t* k, const int16_t* v,
                     const int16_t* q, const int16_t* beta, const int16_t* g,
-                    int16_t* y, int c, int ntok);
+                    int16_t* y, int c, int ntok, int q_raw);
 
 /* ---- 009 整块单发射 (B1 conv+SiLU → B2 delta chunk 级联) ----
  * 数学逐字镜像 compiler ops.cpp GdnBlock 分支 + numerics-contract (B1-B5):

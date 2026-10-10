@@ -38,9 +38,13 @@ static int op_eltwise_ternary(Emitter& em, GraphPrepare& gp, const OpDef* od, st
             uint32_t in_d[4] = {1, 1, 1, 1}, out_d[4] = {1, 1, 1, 1};
             fold4(src_op->output_def, in_d);
             fold4(od->output_def, out_d);
+            /* 007 US1: 同 op_eltwise_binary —— broadcast 子 op 按形态定引擎。 */
+            uint32_t saved_engine = em.cur_engine;
+            em.cur_engine = broadcast_engine_annot(in_d, out_d);
             em.add_op(OP_BROADCAST_F16, {t, tmp, (uint32_t)n, (uint32_t)s_elems,
                                          in_d[0], in_d[1], in_d[2], in_d[3],
                                          out_d[0], out_d[1], out_d[2], out_d[3]});
+            em.cur_engine = saved_engine;
             t = tmp;
         };
         materialize(c_t, gp.get_op_at(od->inputs[0].src_id), 6);

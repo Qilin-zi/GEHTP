@@ -270,3 +270,51 @@ void hvhx_v2_cvt_f32_to_f16(uint16_t * __restrict__ dst,
 #endif
 }
 
+/* ---- broadcast 纯搬运原语 (007 US1) ----
+ * 位级 = 标量逐元素拷贝 (无数值语义), 形态 1/2 执行体的唯一底层依赖。 */
+void hvhx_v2_fill_f16(uint16_t * __restrict__ dst, uint16_t s, uint32_t n)
+{
+#if HVX_V2_KERNELS_ENABLED
+    uint32_t i = 0;
+    /* dst 前导至 128B 对齐 */
+    uintptr_t daddr = (uintptr_t)dst;
+    uint32_t lead = (uint32_t)(((128u - (daddr & 127u)) & 127u) / 2u);
+    if (lead > n) lead = n;
+    for (; i < lead; ++i) dst[i] = s;
+    uint32_t body = (n - i) / VLEN_F16;
+    if (body) {
+        HVX_Vector vs = Q6_Vh_vsplat_R((int32_t)s);
+        HVX_Vector * __restrict__ dv = (HVX_Vector *)(dst + i);
+        for (uint32_t v = 0; v < body; ++v) dv[v] = vs;
+        i += body * VLEN_F16;
+    }
+    for (; i < n; ++i) dst[i] = s;
+#else
+    for (uint32_t i = 0; i < n; ++i) dst[i] = s;
+#endif
+}
+
+void hvhx_v2_copy_f16(uint16_t * __restrict__ dst,
+                      const uint16_t * __restrict__ src,
+                      uint32_t n)
+{
+#if HVX_V2_KERNELS_ENABLED
+    uint32_t i = 0;
+    /* dst 前导至 128B 对齐; src 侧 hvx_vmemu 容忍未对齐 */
+    uintptr_t daddr = (uintptr_t)dst;
+    uint32_t lead = (uint32_t)(((128u - (daddr & 127u)) & 127u) / 2u);
+    if (lead > n) lead = n;
+    for (; i < lead; ++i) dst[i] = src[i];
+    uint32_t body = (n - i) / VLEN_F16;
+    for (uint32_t v = 0; v < body; ++v) {
+        uint32_t base = i + v * VLEN_F16;
+        HVX_Vector vs = hvx_vmemu(src + base);
+        *(HVX_Vector *)(dst + base) = vs;
+    }
+    i += body * VLEN_F16;
+    for (; i < n; ++i) dst[i] = src[i];
+#else
+    for (uint32_t i = 0; i < n; ++i) dst[i] = src[i];
+#endif
+}
+

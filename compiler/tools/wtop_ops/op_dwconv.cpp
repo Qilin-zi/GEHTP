@@ -27,7 +27,7 @@ static int op_dwconv(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             e.kw = kw;
         }
     }
-    uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od->grouping) : em.dummy_slot_id;
+    uint32_t w_s = w ? em.ensure_weight_slot(gp, w, wslots, od) : em.dummy_slot_id;
     uint32_t out_t = em.fresh_temp(gp, od->op_id);
     uint64_t ne = elems_of(od);
     uint32_t seq = 1, ch = (uint32_t)ne;

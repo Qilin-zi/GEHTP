@@ -126,6 +126,32 @@ static int job_get(const char* job, const char* key, char* out, size_t n) {
     return -1;
 }
 
+/* 004 T018f: decode 循环单步 — 读一步输入 → run_io → 写出一步输出。
+ * KV/SSM 状态跨步常驻进程 (g_exec 进程级, run_io 可重入), 不 reset。 */
+static int run_one_step(struct wt_blob* w, const char* in_path, const char* out_path,
+                        uint32_t out_temp, char* err, size_t errn) {
+    size_t in_len = 0;
+    uint8_t* in = read_file(in_path, &in_len);
+    if (!in) { ex_log("[FAIL] read step input %s", in_path); return -1; }
+    int rc = wt_exec_run_io(w, in, NULL, out_temp, NULL, NULL, err, errn);
+    free(in);
+    if (rc) { ex_log("[FAIL] step run rc=%d %s", rc, err); return rc; }
+    uint32_t obytes = wt_exec_temp_last_bytes(out_temp);
+    const uint8_t* optr = wt_exec_temp(out_temp);
+    if (!obytes || !optr) { ex_log("[FAIL] step out temp %u empty", (unsigned)out_temp); return -1; }
+    int ofd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (ofd < 0) { ex_log("[FAIL] open %s", out_path); return -1; }
+    size_t wgot = 0;
+    while (wgot < obytes) {
+        ssize_t n = write(ofd, optr + wgot, obytes - wgot);
+        if (n <= 0) break;
+        wgot += (size_t)n;
+    }
+    close(ofd);
+    if (wgot != obytes) { ex_log("[FAIL] short write %s", out_path); return -1; }
+    return 0;
+}
+
 int main(void) {
     /* RESULT_NAME 身份制 (与 JOB_PATH 同律): 共享板上多 runner 变体并存时结果分家 */
 #if !defined(RESULT_NAME)
@@ -177,6 +203,13 @@ int main(void) {
             ex_log("[hook] tensor dump spec: %s", hook_s);
         }
     }
+    /* 004 T018f: decode 循环模式 (steps>1) — 状态跨步常驻进程, 每步
+     * input.<i> → output.<i> (in_p/out_p 作前缀) */
+    static char steps_s[16];
+    memset(steps_s, 0, sizeof(steps_s));
+    int n_steps = (job_get((char*)job, "steps", steps_s, sizeof(steps_s)) == 0) ? atoi(steps_s) : 1;
+    if (n_steps < 1) n_steps = 1;
+
     free(job);
     uint32_t out_temp = (uint32_t)strtoul(temp_s, NULL, 10);
     ex_log("M4 wgt_size=%s", have_wgt_size ? wgt_size_s : "(none)");
@@ -184,8 +217,8 @@ int main(void) {
     int64_t t_read0 = HAP_perf_get_time_us();  /* PROF W-P2: seg=read */
     size_t blob_len = 0, in_len = 0;
     uint8_t* blob = read_file(blob_p, &blob_len);
-    uint8_t* in = read_file(in_p, &in_len);
-    if (!blob || !in) { ex_log("[FAIL] read blob/input"); free(blob); free(in); return ex_summary() || 1; }
+    uint8_t* in = (n_steps > 1) ? NULL : read_file(in_p, &in_len);
+    if (!blob || (n_steps == 1 && !in)) { ex_log("[FAIL] read blob/input"); free(blob); free(in); return ex_summary() || 1; }
     ex_log("M5 blob %zu in %zu", blob_len, in_len);
 
     int64_t t_parse0 = HAP_perf_get_time_us();  /* PROF W-P2: seg=parse */
@@ -237,6 +270,31 @@ int main(void) {
 
     static char err[128];
     memset(err, 0, sizeof(err));
+
+    /* 004 T018f: decode 循环模式 — 状态( KV ring / SSM )常驻进程, 逐步读入
+     * input.<i> 跑单 token 前向, 输出 output.<i>。逐 op 计时/op_ts 对本模式无意义, 跳过。 */
+    if (n_steps > 1) {
+        ex_log("[decode-loop] %d steps (out_temp %u)", n_steps, (unsigned)out_temp);
+        int64_t t_loop0 = HAP_perf_get_time_us();
+        int loop_bad = 0;
+        for (int i = 0; i < n_steps; i++) {
+            char step_in[256], step_out[256];
+            snprintf(step_in, sizeof(step_in), "%s.%d", in_p, i);
+            snprintf(step_out, sizeof(step_out), "%s.%d", out_p, i);
+            int64_t ts = HAP_perf_get_time_us();
+            int r = run_one_step(w, step_in, step_out, out_temp, err, sizeof(err));
+            int64_t te = HAP_perf_get_time_us();
+            ex_log("[decode-loop] step %d rc=%d us=%lld", i, r, (long long)(te - ts));
+            if (r) { loop_bad = 1; break; }
+        }
+        ex_log("[decode-loop] total us=%lld%s",
+               (long long)(HAP_perf_get_time_us() - t_loop0), loop_bad ? " (FAIL)" : "");
+        wt_exec_shutdown();
+        free(blob); free(in); free(w); free(wgt);
+        ex_log(loop_bad ? "[FAIL] 42_gehtp_runner overall" : "[PASS] 42_gehtp_runner overall");
+        return ex_summary() || loop_bad;
+    }
+
     /* 逐 op 耗时表: wt_exec_run_io 填入 op_us[i](µs), 由 wt_exec_run_range
      * 内 HAP_perf_get_time_us 打点。测完按模板聚合打印 op_timing 行。 */
     int64_t* op_us = NULL;

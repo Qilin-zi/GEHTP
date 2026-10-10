@@ -70,6 +70,7 @@ add_library(htp_core STATIC
     src/api/hexagon_nn_env.cpp
     src/frontend/qnn_ir_loader.cpp
     src/ops/ops.cpp
+    src/ops/host_decode_state.cpp
     src/ops/hlx_hmx.cpp
     src/ops/quantize.cpp
     src/ops/weights.cpp
@@ -260,6 +261,7 @@ add_executable(wtop_emit tools/wtop_emit.cpp
                tools/wtop_ops/op_reduce.cpp
                tools/wtop_ops/op_cumsum.cpp
                tools/wtop_ops/op_isnan.cpp
+               tools/wtop_ops/op_decode_state.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
 target_link_libraries(wtop_emit htp_core)
 target_include_directories(wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)

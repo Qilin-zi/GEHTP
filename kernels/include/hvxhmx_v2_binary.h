@@ -48,6 +48,13 @@ void hvhx_v2_cvt_f16_to_f32(float * __restrict__ dst,
 void hvhx_v2_cvt_f32_to_f16(uint16_t * __restrict__ dst,
                             const float * __restrict__ src, uint32_t n);
 
+/* ---- broadcast 纯搬运原语 (007 US1; 位级 = 标量逐元素拷贝, 无数值语义) ----
+ * fill: dst[i] = s;  copy: dst[i] = src[i], i ∈ [0, n)。
+ * HVX 主体 + 首/尾标量; 任意地址安全。host 路径标量。 */
+void hvhx_v2_fill_f16(uint16_t * __restrict__ dst, uint16_t s, uint32_t n);
+void hvhx_v2_copy_f16(uint16_t * __restrict__ dst,
+                      const uint16_t * __restrict__ src, uint32_t n);
+
 #ifdef __cplusplus
 }
 #endif

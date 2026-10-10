@@ -21,6 +21,7 @@ import json
 import os
 import struct
 import sys
+import time
 
 import numpy as np
 
@@ -254,6 +255,44 @@ def run_prompts(model, cfg, seq, n_prompts, seed=42):
     return out
 
 
+def run_decode(model, prompt_ids, n_steps):
+    """tier2 金标: 贪心续写 n_steps 步 (增量 use_cache=True)。
+
+    R1 已实证 (2026-10-10, GPU 对拍): Qwen3_5 的 DynamicCache 正确携带
+    GDN/SSM recurrent state — 增量行 vs 全序列行 cos≥0.999999、argmax 全同,
+    故增量续写即真 decode 语义, 无需每步全序列重跑 (原 R1 风险解除)。
+
+    返回 (rows [n_steps, V] f32, tokens [n_steps] i64):
+    rows[k] = 喂入 prompt+已生成前 k 个 token 后的 logits (rows[0]=prompt 末位行),
+    tokens[k] = argmax(rows[k])。
+    """
+    import torch
+    dev = next(model.parameters()).device
+    ids = torch.tensor([list(prompt_ids)], dtype=torch.long, device=dev)
+    n = len(prompt_ids)
+    with torch.no_grad():
+        out = model(
+            input_ids=ids,
+            attention_mask=torch.ones(1, n, dtype=torch.long, device=dev),
+            position_ids=torch.arange(n, device=dev).unsqueeze(0),
+            use_cache=True,
+        )
+        pkv = out.past_key_values
+        rows = [out.logits[0, -1].float().cpu().numpy()]
+        tokens = []
+        for k in range(n_steps):
+            tokens.append(int(rows[k].argmax()))
+            if k + 1 < n_steps:
+                out = model(
+                    input_ids=torch.tensor([[tokens[k]]], dtype=torch.long, device=dev),
+                    past_key_values=pkv,
+                    use_cache=True,
+                )
+                pkv = out.past_key_values
+                rows.append(out.logits[0, -1].float().cpu().numpy())
+    return np.stack(rows).astype(np.float32), np.asarray(tokens, dtype=np.int64)
+
+
 def load_golden_row(out_dir, prompt_idx, row=-1, seq=32):
     """T010: 从 cpu_golden 的 logits_{i}.f32.raw [seq,V] 切单行 [V](默认末行)。
 
@@ -281,6 +320,10 @@ def main():
     ap.add_argument("--cut-row", type=int, default=None, metavar="R",
                     help="切行模式(无需模型环境): 从 out-dir/hf/logits_{i}.f32.raw 切第 R 行"
                          "(负数从未尾数, -1=末位)落 logits_{i}_row{R}.f32.raw, 配 --n-prompts/--seq")
+    ap.add_argument("--decode", type=int, default=None, metavar="N",
+                    help="tier2 贪心续写 N 步 (从 out-dir/hf/input_{i} 起; R1 已证增量 cache 真)")
+    ap.add_argument("--decode-prompt", type=int, default=0, metavar="I",
+                    help="续写起点 prompt 序号 (配 --decode)")
     args = ap.parse_args()
 
     if args.cut_row is not None:
@@ -291,6 +334,25 @@ def main():
             outp = os.path.join(sub, f"logits_{i}_row{r}.f32.raw")
             row.tofile(outp)
             print(f"[cut-row] prompt{i} row{r} -> {outp} top1={int(row.argmax())}")
+        return
+    if args.decode is not None:
+        import torch
+        if not args.model_dir:
+            ap.error("--decode 需 --model-dir")
+        sub = os.path.join(args.out_dir, "hf")
+        ids = np.fromfile(os.path.join(sub, f"input_{args.decode_prompt}.i64.raw"),
+                          dtype=np.int64)
+        model, cfg = build_model(args.model_dir, "hf")
+        if torch.cuda.is_available():
+            model = model.cuda()
+        t0 = time.time()
+        rows, tokens = run_decode(model, ids, args.decode)
+        dt = time.time() - t0
+        rows.tofile(os.path.join(sub, f"tier2_{args.decode_prompt}.logits.f32.raw"))
+        tokens.tofile(os.path.join(sub, f"tier2_{args.decode_prompt}.tokens.i64.raw"))
+        print(f"[decode] prompt{args.decode_prompt} ({len(ids)} tok) + {args.decode} 步 "
+              f"{dt:.1f}s → tier2_{args.decode_prompt}.{{logits.f32,tokens.i64}}.raw")
+        print(f"[decode] tokens: {tokens.tolist()}")
         return
     if not args.model_dir:
         ap.error("金标生成需 --model-dir (切行模式用 --cut-row)")

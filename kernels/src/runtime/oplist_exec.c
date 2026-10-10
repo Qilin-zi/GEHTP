@@ -41,6 +41,10 @@
 #include "internal/hvx-base.h"  /* GEMV 向量体: hvx_vmemu / hvx_vec_mpyacc_f32_f16 / hvx_vec_f32_to_f16 */
 #include "internal/hvx-fa-kernels.h"  /* HVX_OP_ADD_F32 (vec_dot 收尾通道加) */
 #include "internal/hvx-reduce.h"      /* hvx_vec_reduce_sum_f32 (水平归约) */
+#if defined(__hexagon__)
+#include <hexagon_types.h>          /* HMX Q6_* intrinsic 依赖 (Address/UWord32/Word32) */
+#include <hmx_hexagon_protos.h>     /* Q6_mxclracc_hf / Q6_bias_mxmem2_A / Q6_activation_hf_mxmem_RR_deep / Q6_mxmem_AR_after_hf */
+#endif
 #endif
 
 #define MAX_TEMPS 16384  /* VTCM 驻留默认开: 静态登记限制 temp id 回收, 0.8B 水位逼近全体 op 数(~14k), 4096 不够。上限=TEMPOFF tid 14 位编码(0x3FFF), 与 WT_EXEC_MAX_TEMPS 同步 */
@@ -78,6 +82,7 @@ struct wt_exec {
     uint32_t n_states;
     uint8_t* st_buf[WT_MAX_STATES];
     uint32_t st_bytes[WT_MAX_STATES];
+    uint32_t st_count[WT_MAX_STATES];   /* KV 自增位置计数器 (WT_KV_POS_AUTO) */
     struct kvc st_kvc[WT_MAX_STATES];   /* KV 状态的 ring 描述 (惰性 init) */
     uint32_t* st_posmap[WT_MAX_STATES]; /* ring posmap (首用时 malloc) */
     int st_kvc_ready[WT_MAX_STATES];
@@ -270,11 +275,14 @@ static const uint8_t* ref_ptr(const struct wt_blob* b, uint32_t arg) {
     return (arg < MAX_TEMPS) ? g_exec.temps[arg] : NULL;
 }
 
-/* 引用元素数(f16 元素): slot → count; temp → temp_bytes/2; VTCM 未跟踪=0 */
+/* 引用元素数(f16 元素): slot → count; temp → g_last_bytes/2; VTCM 未跟踪=0。
+ * temp 用 g_last_bytes(最后写入字节)而非 temp_bytes(历史最大分配): 表外 temp
+ * 在 bump 路径"只增不缩", 复用为更小张量时 temp_bytes 残留旧大值, 会高估
+ * 元素数 (decode kv_append 的 k[512] 复用 3584 旧槽 → geometry 误判实锤)。 */
 static uint32_t ref_elem_count(const struct wt_blob* b, uint32_t arg) {
     if (arg & 0x8000u) { uint32_t s = arg & 0x7FFFu; return (s < b->n_slots) ? b->slots[s].count : 0; }
     if (arg & 0x4000u) return 0;
-    return (arg < MAX_TEMPS) ? g_exec.temp_bytes[arg] / 2u : 0;
+    return (arg < MAX_TEMPS) ? g_last_bytes[arg] / 2u : 0;
 }
 
 uint8_t* wt_exec_temp(uint32_t id) {
@@ -890,22 +898,16 @@ static int exec_conv2d_hmx(const uint16_t* cols, const uint16_t* wm,
             uint16_t* out_tile = out_cr + ((size_t)r * n_col + c) * 1024u;
             hmx_enable_execution();
             hmx_unit_acquire();
-            asm volatile("mxclracc.hf" ::: "memory");
-            asm volatile("bias = mxmem2(%0)" :: "r"(sca) : "memory");
+            Q6_mxclracc_hf();
+            Q6_bias_mxmem2_A((void *)sca);
             for (uint32_t kt = 0; kt < n_dot; ++kt) {
                 const uint16_t* act_tile = act_cr + ((size_t)r * n_dot + kt) * 1024u;
                 const uint16_t* wgt_tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
-                asm volatile(
-                    "{ activation.hf = mxmem(%0, %1):deep\n"
-                    "  weight.hf = mxmem(%2, %3) }\n"
-                    :: "r"(act_tile), "r"(0x7FFu),
-                       "r"(wgt_tile), "r"(0x7FFu) : "memory");
+                Q6_activation_hf_mxmem_RR_deep((uintptr_t)act_tile, 0x7FFu);
+                Q6_weight_hf_mxmem_RR((uintptr_t)wgt_tile, 0x7FFu);
             }
             memset(out_tile, 0, 2048u);
-            asm volatile(
-                "cvt.hf = acc(%0)\n"
-                "mxmem(%1, %2) = cvt\n"
-                :: "r"(2), "r"(out_tile), "r"(0) : "memory");
+            Q6_mxmem_AR_after_hf((void *)out_tile, 0u);
             hmx_unit_release();
             hmx_disable_execution();
         }
@@ -1674,6 +1676,27 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
         ts[d] = ts[d + 1] * td[d + 1];
         xs[d] = xs[d + 1] * xd[d + 1];
     }
+    /* 007 US2 Route A: embed 表 Q4_0 tile 槽(640B/tile, 契约同 matmul 的
+     * exec_matmul_f16_hmx) → 逐元素行级 dequant。tile 内 quants = A 配对
+     * byte[(k/2)*32 + n%32](lo=k 偶/hi=k 奇; GGUF 源是 B 平面序, emit
+     * repack_q4_0_tiles 已做 B→A nibble 置换, 与 vendored unpack_tiled_q4_0
+     * 的逆变换逐字节一致)。扁平下标 src 行主(最快维 K=td[末]): k=src%K,
+     * n_glob=src/K; tile(ct=n/32, kt=k/32)@640, scale d f16@tile+512+2*(n%32)。
+     * embed 场景每 pass 仅 32×K 个元素, 标量足够。 */
+    const uint8_t* tbl_q4 = NULL;
+    uint32_t q4_K = 0, q4_nk = 0;
+    if ((op->args[0] & 0x8000u) && axis < irank) {
+        uint32_t tsx = op->args[0] & 0x7FFFu;
+        q4_K = td[irank - 1];
+        uint32_t q4_N = 1;
+        for (uint32_t d = 0; d + 1 < irank; d++) q4_N *= td[d];
+        if ((q4_K % 32u) == 0u && (q4_N % 32u) == 0u &&
+            tsx < b->n_slots &&
+            b->slots[tsx].len == (size_t)(q4_K / 32u) * (size_t)(q4_N / 32u) * 640u) {
+            tbl_q4 = (const uint8_t*)tbl;
+            q4_nk = q4_K / 32u;
+        }
+    }
     for (uint32_t i = 0; i < n; i++) {
         size_t rem = i;
         uint32_t oc[5];
@@ -1691,7 +1714,23 @@ static int exec_gather(const struct wt_blob* b, const struct wt_op* op,
             uint32_t ocd = d + xrank - 1;
             src += (size_t)(ocd < 5 ? oc[ocd] : 0) * ts[d];
         }
-        y[i] = tbl[src];
+        if (tbl_q4) {
+            uint32_t k4 = (uint32_t)(src % q4_K);
+            uint32_t ng = (uint32_t)(src / q4_K);
+            const uint8_t* tile =
+                tbl_q4 + (((ng >> 5) * q4_nk) + (k4 >> 5)) * 640u;
+            /* T016 修正: byte/nibble 索引必须用 tile 内 k (k4&31), 不能用
+             * 全局 k4 —— kt>=1 时 (k4>>1)*32 越过 tile 的 512B quants 区,
+             * 读进 scales/pad/下一 tile (embed 全模型 cos≈0 根因, Python
+             * 位级复刻 buggy 公式 == 设备输出 32768/32768 实证)。 */
+            uint32_t kk = k4 & 31u;
+            uint8_t byte = tile[(kk >> 1) * 32u + (ng & 31u)];
+            int q = (kk & 1u) ? (int)(byte >> 4) : (int)(byte & 0xFu);
+            float d = f16_to_f32(((const uint16_t*)(const void*)(tile + 512u))[ng & 31u]);
+            y[i] = f32_to_f16(d * (float)(q - 8));
+        } else {
+            y[i] = tbl[src];
+        }
     }
     return 0;
 }
@@ -1866,7 +1905,7 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                                uint32_t M, uint32_t K, uint32_t N,
                                uint32_t n0, uint32_t N_full,
                                int t0, int t1, char* err, size_t errn,
-                               const uint16_t* bias) {
+                               const uint16_t* bias, const uint8_t* w_q4) {
     /* 003 T014 attach: 同 exec_conv2d_hmx —— wtcache 持 VTCM 时挂共享 scratch
      * 区, 不再整体放弃 (旧行为=静默回落标量)。scratch 覆盖 W4A16 arena →
      * matmul_carved 清零, 下一个 W4A16 op 重 carve。 */
@@ -1930,22 +1969,63 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
 
     /* pack wgt: B[K,N] (或 t1 转置) → crouton[(c*n_dot+kt)*1024] (row=ic=k, col=oc=n)。
      * 002 US1: 全局列号 = n0 + c*32 + n, 行主 [K,N_full] 布局 stride=N_full
-     * (n0=0/N_full=N 时与整 op 逐字节同公式) */
-    for (uint32_t c = 0; c < n_col; ++c)
-        for (uint32_t kt = 0; kt < n_dot; ++kt) {
-            uint16_t* tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
-            for (uint32_t k = 0; k < 32u; ++k)
+     * (n0=0/N_full=N 时与整 op 逐字节同公式)
+     * 007 US2 Route A: Q4_0 权重槽(640B/tile, emit repack_q4_0_tiles 契约)
+     * → 标量反量化 + crouton pack, 布局与下方 f16 pack 同源 (hmx_crouton_pos)。
+     * T016 修正: 原走 ggml 移植 HVX dequant task, 板上 probe 微 blob 实证其
+     * 输出与 scale 字节无关(d≡1 与真 d 输出 97.9% 位级相同, 有限值 = 常数
+     * 0x39B9 × quant 整数), 且其 lane 序是 core_dot row-major pair 面, 与
+     * mxmem:deep 消费的 pair-interleave 面不同源。量化零损契约: quant nibble
+     * (k&1) @ tile[(k>>1)*32+n], d f16 @ tile+512+2n, 值 = d*(q-8)。
+     * SPLIT chunk 的列 tile 块在槽内 (ct 主序/kt 次序) 连续 → 基址平移
+     * (n0/32)*n_dot*640。t0/t1 是 f16 源布局标志, Q4 元素级映射方向无关。 */
+    if (w_q4) {
+        /* T017 优化: 标量 pack 9.72s(lm_head)/20.6s(MATMUL_F16 全图) → LUT 法。
+         * 每 tile 预解 512 档 lut[n][q] = f32_to_f16(d_n*(q-8)) (公式与逐元素
+         * 版逐位同), 填充按 crouton pos(k,n)=(k>>1)*64+2n+(k&1) 的 pair 面展
+         * 开: (k=2i, 2i+1) 两行的 32 列写进连续 u32 对 tile32[i*32+n], 源
+         * quant 字节 qt[i*32+n] 同样连续 → 逐 u32 顺序 LUT gather, 无浮点。 */
+        const uint8_t* w4 = w_q4 + (size_t)(n0 / 32u) * (size_t)n_dot * 640u;
+        uint16_t lut[32][16];
+        for (uint32_t c = 0; c < n_col; ++c)
+            for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                uint16_t* tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
+                const uint8_t* qt = w4 + ((size_t)c * n_dot + kt) * 640u;
+                const uint16_t* dv = (const uint16_t*)(qt + 512u);
                 for (uint32_t n = 0; n < 32u; ++n) {
-                    size_t src = t1 ? ((size_t)(n0 + c * 32u + n) * K + (kt * 32u + k))
-                                    : ((size_t)(kt * 32u + k) * N_full + (n0 + c * 32u + n));
-                    tile[hmx_crouton_pos(k, n)] = w[src];
+                    float d = f16_to_f32(dv[n]);
+                    for (uint32_t q = 0; q < 16u; ++q)
+                        lut[n][q] = f32_to_f16(d * (float)((int)q - 8));
                 }
-        }
+                uint32_t* tile32 = (uint32_t*)(void*)tile;
+                const uint8_t* qb = qt;
+                for (uint32_t i = 0; i < 16u; ++i, qb += 32u)
+                    for (uint32_t n = 0; n < 32u; ++n) {
+                        uint32_t b = qb[n];
+                        tile32[i * 32u + n] =
+                            ((uint32_t)lut[n][b >> 4] << 16) | lut[n][b & 0xFu];
+                    }
+            }
+    } else {
+        for (uint32_t c = 0; c < n_col; ++c)
+            for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                uint16_t* tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
+                for (uint32_t k = 0; k < 32u; ++k)
+                    for (uint32_t n = 0; n < 32u; ++n) {
+                        size_t src = t1 ? ((size_t)(n0 + c * 32u + n) * K + (kt * 32u + k))
+                                        : ((size_t)(kt * 32u + k) * N_full + (n0 + c * 32u + n));
+                        tile[hmx_crouton_pos(k, n)] = w[src];
+                    }
+            }
+    }
 
     /* HMX GEMM: 复刻 hmx_convf16.c convf16_hmx_multi 已验证路径
-     * (crouton pair-interleave + mxmem:deep 累加 + cvt.hf=acc(2) 写回)。
+     * (crouton pair-interleave + mxmem:deep 累加)。写回由 cvt.hf=acc(2)
+     * (mode 0) 改为 Q6_mxmem_AR_after_hf (:after.hf, mode 4) —— 同
+     * hmx_convf16.c 诊断 mode 4; 上板 bit-exact 已验证 (mm32 matmul
+     * 1024/1024, conv_add 32768/32768 对替换前裸 asm 基线)。
      * 勿用 hvhx_v2_hmx_gemm_dot_fp16 — 那是 ggml core_dot 移植路径, 布局
-     * (row-major pair) 与写回 (:after.hf) 都不同, 未上板验证。 */
+     * (row-major pair) 不同, 未上板验证。 */
     for (uint32_t r = 0; r < n_row; ++r) {
         for (uint32_t c = 0; c < n_col; ++c) {
             uint16_t* out_tile = out_cr + ((size_t)r * n_col + c) * 1024u;
@@ -1958,22 +2038,16 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                     sca[2u * n + 1u] = bias[n0 + c * 32u + n];
             hmx_enable_execution();
             hmx_unit_acquire();
-            asm volatile("mxclracc.hf" ::: "memory");
-            asm volatile("bias = mxmem2(%0)" :: "r"(sca) : "memory");
+            Q6_mxclracc_hf();
+            Q6_bias_mxmem2_A((void *)sca);
             for (uint32_t kt = 0; kt < n_dot; ++kt) {
                 const uint16_t* act_tile = act_cr + ((size_t)r * n_dot + kt) * 1024u;
                 const uint16_t* wgt_tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
-                asm volatile(
-                    "{ activation.hf = mxmem(%0, %1):deep\n"
-                    "  weight.hf = mxmem(%2, %3) }\n"
-                    :: "r"(act_tile), "r"(0x7FFu),
-                       "r"(wgt_tile), "r"(0x7FFu) : "memory");
+                Q6_activation_hf_mxmem_RR_deep((uintptr_t)act_tile, 0x7FFu);
+                Q6_weight_hf_mxmem_RR((uintptr_t)wgt_tile, 0x7FFu);
             }
             memset(out_tile, 0, 2048u);
-            asm volatile(
-                "cvt.hf = acc(%0)\n"
-                "mxmem(%1, %2) = cvt\n"
-                :: "r"(2), "r"(out_tile), "r"(0) : "memory");
+            Q6_mxmem_AR_after_hf((void *)out_tile, 0u);
             hmx_unit_release();
             hmx_disable_execution();
         }
@@ -2015,6 +2089,22 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* w = (const uint16_t*)ref_ptr(b, op->args[1]);
     uint16_t* y = (uint16_t*)temp_get(out_t, (size_t)M * N_full * Bn * 2u);
     if (!a || !w || !y) { snprintf(err, errn, "matmul_f16 ref fail"); return -1; }
+    /* 007 US2 Route A: Q4_0 tile 权重槽判别 (emit repack_q4_0_tiles 契约,
+     * 640B/tile = payload 576 + 64 pad, 0.625 B/elem)。槽长与 f16(2 B/elem)/
+     * W4A16 紧凑(0.5 B/elem) 互斥无歧义。仅 HMX 路径消费(HVX 反量化直写
+     * crouton); batched/标量路走到 = 硬错误(emit 侧未对齐/batched 已兜底
+     * f16, 此处防手构 blob 误用; host 执行器无 HMX, Q4 blob 属设备专属)。 */
+    const uint8_t* w_q4 = NULL;
+    if ((op->args[1] & 0x8000u) && (K % 32u) == 0u && (N_full % 32u) == 0u) {
+        uint32_t wsx = op->args[1] & 0x7FFFu;
+        if (wsx < b->n_slots &&
+            b->slots[wsx].len == (size_t)(K / 32u) * (size_t)(N_full / 32u) * 640u)
+            w_q4 = (const uint8_t*)w;
+    }
+    if (w_q4 && batched) {
+        snprintf(err, errn, "matmul_f16: Q4 权重槽不支持 batched (emit 应兜底 f16)");
+        return -1;
+    }
 #if defined(__HVX__) || defined(__hexagon__)
     /* FR-001: M<32 GEMV 快路径 (HVX f32-accumulate)，插在 HMX 门之前。
      * FR-002: stream W 行主序，无 crouton repack (memory-bound)。
@@ -2067,19 +2157,19 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
                     const uint16_t* wb = w + (size_t)bb * K * N_full;
                     uint16_t* yb = y + (size_t)bb * M * N_full;
                     if (exec_matmul_f16_hmx(ab, wb, yb, M, K, N, 0, N_full, t0, t1,
-                                            err, errn, NULL) != 0) {
+                                            err, errn, NULL, NULL) != 0) {
                         engine = -1;
                         break;
                     }
                 }
             } else {
                 engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
-                                              bias) == 0)
+                                              bias, w_q4) == 0)
                              ? 1 : -1;
             }
         } else if (engine == 1) {
             if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
-                                     bias) != 0) {
+                                     bias, w_q4) != 0) {
                 snprintf(err, errn, "matmul_f16 split 混合路径 (FR-013 ④ 违禁): 前 chunk HMX 本 chunk 失败");
                 return -1;
             }
@@ -2102,6 +2192,13 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
         }
     }
 #endif
+    /* 007 US2: Q4 权重槽仅 HMX 路径消费 — 走到标量(非 hexagon 无 HMX /
+     * 计划标量 / HMX 失败回落) = 硬错误, 不静默读废值 */
+    if (w_q4) {
+        snprintf(err, errn, "matmul_f16: Q4 权重槽无标量路径 (M=%u K=%u N=%u, "
+                            "emit 未对齐时应兜底 f16)", M, K, N_full);
+        return -1;
+    }
     /* 标量路径: 列号 = n0 + n, 行主 stride = N_full (n0=0/N_full=N 即旧公式) */
     if (batched) {
         for (uint32_t bb = 0; bb < Bn; bb++)
@@ -2230,8 +2327,34 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
+/* 007 US1 broadcast 形态判定 — 正典 = specs/007-perf-sprint-1/evidence/
+ * broadcast_census.md "判定规则"节; 孪生实现在
+ * compiler/tools/wtop_ops/wtop_ops.hpp broadcast_shape_class (判据互指, 勿单边改)。
+ * 1 = 整块 (in 外轴全广播: 块重复 / 整块铺标量)
+ * 2 = 行循环 (末轴 in==out 连续拷行 / in==1 逐行铺标量, 外轴里程计免除 div)
+ * 3 = 通用退化 (wrap 轴 / strided gather; 保留标量, emit 侧计划 scalar = 合法) */
+static int broadcast_shape_class(const uint32_t in_d[4], const uint32_t out_d[4])
+{
+    uint32_t r = 4;
+    while (r > 0 && out_d[r - 1] == 1) r--;
+    if (r == 0) r = 1;
+    uint32_t ir = 4;
+    if (ir > r) ir = r;
+    if (in_d[ir - 1] != out_d[r - 1] && in_d[ir - 1] != 1) return 3; /* 末轴 wrap */
+    uint32_t lead = r - ir;
+    int outer_bcast = 1;
+    for (uint32_t d = 0; d + 1 < ir; d++) {
+        if (in_d[d] == 1) continue;               /* 外轴广播 */
+        if (in_d[d] != out_d[d + lead]) return 3; /* 外轴 wrap (c%idim 环绕) */
+        outer_bcast = 0;
+    }
+    return outer_bcast ? 1 : 2;
+}
+
 /* numpy 广播: 右对齐逐轴, in==1 的轴扩到 out(缺失轴视 1)。
- * in_d/out_d 为 QNN 4D 填充 dims; 压尾 1 得有效 rank 后解坐标。 */
+ * in_d/out_d 为 QNN 4D 填充 dims; 压尾 1 得有效 rank 后解坐标。
+ * 007 US1: 形态 1/2 有 HVX 纯搬运执行体 (位级 = 标量逐元素拷贝, 无数值
+ * 语义), 消灭 per-element 坐标除法; 形态 3 与守卫不满足者保留标量。 */
 static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
                           char* err, size_t errn) {
     uint32_t b_t = op->args[0], y_t = op->args[1], n = op->args[2], b_elems = op->args[3];
@@ -2240,32 +2363,85 @@ static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* x = (const uint16_t*)ref_ptr(b, b_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, (size_t)n * 2u);
     if (!x || !y || b_elems == 0) { snprintf(err, errn, "broadcast ref fail"); return -1; }
-    /* 003 T018 补漏 (t2l op_ts v3 机检实锤: emit 对 Eltwise_Broadcast 按
-     * n%32 计划 HVX, 但 broadcast 无 HVX/HMX 内核 —— 此前静默标量 =
-     * planned!=actual 且 dev=0 的契约违例)。按回落策略裁决。 */
-    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
-        engine_fallback_or_die(g_planned_engine, "broadcast has no HVX/HMX path",
-                               err, errn) != 0)
-        return -1;
     uint32_t r = 4;
     while (r > 0 && out_d[r - 1] == 1) r--;
     /* in 不去尾 1(末维 1 广播到 out 大维必须保留; host in_bc oid 1231 同款) */
     uint32_t ir = 4;
     if (r == 0) r = 1;
     if (ir > r) ir = r;  /* 输入 rank 不得高于输出(右对齐前导 1 已折叠) */
+    uint32_t lead = r - ir;
+    int bclass = broadcast_shape_class(in_d, out_d);
+    /* HVX 快路径: 计划 HVX 且形态 1/2 且整除守卫过 (守卫失败 = 形状异常,
+     * 落到下方按回落策略诚实记 dev, 不出错误字节)。ver<=2 无注解恒标量
+     * (legacy 字节流不动)。 */
+    int hvx_form = 0;  /* 0=无 1=整块 2=行循环 */
+    if (bclass == 1) {
+        if (n % b_elems == 0) hvx_form = 1;
+    } else if (bclass == 2) {
+        if (n % out_d[r - 1] == 0) hvx_form = 2;
+    }
+    if (b->annot_base && g_planned_engine == WT_ENG_HVX && hvx_form) {
+        uint32_t istr[4] = {1, 1, 1, 1};
+        for (int i = (int)ir - 2; i >= 0; i--) istr[i] = istr[i + 1] * in_d[i + 1];
+        if (hvx_form == 1) {
+            uint32_t L = b_elems;              /* in 即完整块(外轴全 1) */
+            if (L == 1) {
+                hvhx_v2_fill_f16(y, x[0], n);
+            } else {
+                uint32_t M = n / L;
+                hvhx_v2_copy_f16(y, x, L);     /* 首块自源 */
+                for (uint32_t m = 1; m < M; m++)
+                    hvhx_v2_copy_f16(y + (size_t)m * L, y, L); /* 续块自首块 */
+            }
+        } else {
+            uint32_t W = out_d[r - 1];         /* 行元素数 */
+            uint32_t rows = n / W;
+            int inner_copy = (in_d[ir - 1] == W);
+            /* 外轴里程计: oc[ax] = out 轴 ax 坐标 (ax ∈ [0, r-1)), 行间递增
+             * 免逐行 div/mod; 行源偏移 = Σ(拷贝外轴坐标 × in 步长)。 */
+            uint32_t oc[4] = {0, 0, 0, 0};
+            for (uint32_t row = 0; row < rows; row++) {
+                uint32_t in_off = 0;
+                for (uint32_t d = 0; d + 1 < ir; d++) {
+                    if (in_d[d] > 1)
+                        in_off += oc[d + lead] * istr[d];
+                }
+                uint16_t* dst_row = y + (size_t)row * W;
+                if (inner_copy)
+                    hvhx_v2_copy_f16(dst_row, x + in_off, W);
+                else
+                    hvhx_v2_fill_f16(dst_row, x[in_off], W);
+                for (int ax = (int)r - 2; ax >= 0; ax--) {
+                    if (++oc[ax] < out_d[ax]) break;
+                    oc[ax] = 0;
+                }
+            }
+        }
+        g_last_engine = WT_ENG_HVX;  /* 实跑即计划 (dev=0) */
+        return 0;
+    }
+    /* 003 T018 契约: 计划非 scalar 而不可快路径 (形态 3 / 守卫失败 / 计划
+     * HMX) → 按回落策略裁决 (允许回落记 dev=1, 禁止回落则死)。emit 侧形态 3
+     * 应已计划 scalar —— 走到这里 = 两侧判定漂移或形状异常, 诚实记录。 */
+    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
+        engine_fallback_or_die(g_planned_engine,
+                               hvx_form ? "broadcast form guard fail"
+                                        : "broadcast form3 (strided)",
+                               err, errn) != 0)
+        return -1;
     uint32_t istr[4] = {1, 1, 1, 1};
     for (int i = (int)ir - 2; i >= 0; i--) istr[i] = istr[i + 1] * in_d[i + 1];
     uint32_t ostr[4] = {1, 1, 1, 1};
     for (int i = (int)r - 2; i >= 0; i--) ostr[i] = ostr[i + 1] * out_d[i + 1];
     for (uint32_t i = 0; i < n; i++) {
         uint32_t rem = i, in_lin = 0;
-        uint32_t lead = r - ir;  /* 输入右对齐: 前 lead 轴广播为 0 */
+        uint32_t lead2 = r - ir;  /* 输入右对齐: 前 lead 轴广播为 0 */
         for (uint32_t d = 0; d < r; d++) {
             uint32_t c = rem / ostr[d];
             rem %= ostr[d];
-            if (d < lead) continue;
-            uint32_t idim = in_d[d - lead];
-            if (idim > 1) in_lin += (c % idim) * istr[d - lead];
+            if (d < lead2) continue;
+            uint32_t idim = in_d[d - lead2];
+            if (idim > 1) in_lin += (c % idim) * istr[d - lead2];
         }
         y[i] = x[in_lin];
     }
@@ -2527,6 +2703,7 @@ static int wt_exec_load_states(const struct wt_blob* b, char* err, size_t errn) 
 void wt_exec_state_reset(void) {
     for (uint32_t i = 0; i < g_exec.n_states; i++) {
         memset(g_exec.st_buf[i], 0, g_exec.st_bytes[i]);
+        g_exec.st_count[i] = 0;
         if (g_exec.st_kvc_ready[i]) {
             kvc_init(&g_exec.st_kvc[i], g_exec.st_buf[i],
                      g_exec.st_kvc[i].slot_bytes, g_exec.st_kvc[i].nslots,
@@ -2582,7 +2759,18 @@ static int exec_kv_append(const struct wt_blob* b, const struct wt_op* op,
     if (!k || !v || !kn || kn != vn) { snprintf(err, errn, "kv append ref fail"); return -1; }
     struct kvc* c = state_kvc(op->args[2], kn, err, errn);
     if (!c) return -1;
-    if (kvc_append(c, k, v, op->args[3]) < 0) { snprintf(err, errn, "kvc_append"); return -1; }
+    /* T018: pos 哨兵 = 状态内自增计数器 (append 写当前值后 +1) */
+    uint32_t si = op->args[2] & 0x1FFFu;
+    uint32_t pos = op->args[3];
+    if (pos == WT_KV_POS_AUTO) {
+        if (g_exec.st_count[si] >= c->nslots) {
+            snprintf(err, errn, "kv append state %u count=%u >= nslots=%u (ctx 太长)",
+                     si, g_exec.st_count[si], c->nslots);
+            return -1;
+        }
+        pos = g_exec.st_count[si]++;
+    }
+    if (kvc_append(c, k, v, pos) < 0) { snprintf(err, errn, "kvc_append"); return -1; }
     return 0;
 }
 
@@ -2601,9 +2789,28 @@ static int exec_kv_gather(const struct wt_blob* b, const struct wt_op* op,
     }
     struct kvc* c = state_kvc(op->args[0], kv_heads * hd, err, errn);
     if (!c) return -1;
-    uint16_t* kT = (uint16_t*)temp_get(op->args[1], (size_t)n_heads * hd * n_kv * 2u);
-    uint16_t* vo = (uint16_t*)temp_get(op->args[2], (size_t)n_heads * n_kv * hd * 2u);
-    if (!kT || !vo) { snprintf(err, errn, "kv gather out alloc"); return -1; }
+    /* T018: n_kv 哨兵 = 计数器当前值 (append 先行, 已含本 token);
+     * kT/v 槽 0 = 该面跳过 (KT/V 拆两节点单输出形态, 只走一面写)。
+     * AUTO 输出 = nslots 宽定布局 (图内 kT/v 槽形状固定 [..,max_pos]),
+     * 尾位零填 — mask 面 -inf 湮灭尾位, 但 NaN 位型会穿 +(-inf), 必须清零。 */
+    uint32_t pstride = n_kv;
+    if (n_kv == WT_KV_POS_AUTO) {
+        uint32_t si = op->args[0] & 0x1FFFu;
+        if (g_exec.st_count[si] == 0u || g_exec.st_count[si] > c->nslots) {
+            snprintf(err, errn, "kv gather state %u count=%u bad (append 先行?)",
+                     si, g_exec.st_count[si]);
+            return -1;
+        }
+        n_kv = g_exec.st_count[si];
+        pstride = c->nslots;
+    }
+    uint16_t* kT = op->args[1] ? (uint16_t*)temp_get(op->args[1], (size_t)n_heads * hd * pstride * 2u) : NULL;
+    uint16_t* vo = op->args[2] ? (uint16_t*)temp_get(op->args[2], (size_t)n_heads * pstride * hd * 2u) : NULL;
+    if ((!kT && op->args[1]) || (!vo && op->args[2])) { snprintf(err, errn, "kv gather out alloc"); return -1; }
+    if (pstride > n_kv) {
+        if (kT) memset(kT, 0, (size_t)n_heads * hd * pstride * 2u);
+        if (vo) memset(vo, 0, (size_t)n_heads * pstride * hd * 2u);
+    }
     uint32_t rep = n_heads / kv_heads;
     for (uint32_t p = 0; p < n_kv; p++) {
         int slot = kvc_lookup(c, p);
@@ -2613,10 +2820,10 @@ static int exec_kv_gather(const struct wt_blob* b, const struct wt_op* op,
         for (uint32_t h = 0; h < n_heads; h++) {
             const uint16_t* ksrc = kf + (h / rep) * hd;
             const uint16_t* vsrc = vf + (h / rep) * hd;
-            uint16_t* kdst = kT + ((size_t)h * hd) * n_kv;
-            uint16_t* vdst = vo + (size_t)h * n_kv * hd;
-            for (uint32_t d = 0; d < hd; d++) kdst[(size_t)d * n_kv + p] = ksrc[d];
-            memcpy(vdst + (size_t)p * hd, vsrc, hd * 2u);
+            uint16_t* kdst = kT ? kT + ((size_t)h * hd) * pstride : NULL;
+            uint16_t* vdst = vo ? vo + (size_t)h * pstride * hd : NULL;
+            for (uint32_t d = 0; d < hd; d++) if (kdst) kdst[(size_t)d * pstride + p] = ksrc[d];
+            if (vdst) memcpy(vdst + (size_t)p * hd, vsrc, hd * 2u);
         }
     }
     return 0;
@@ -2648,7 +2855,7 @@ static int exec_conv1d_ssm_step(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
-/* OP_DELTA_CHUNK_F16: [k,v,q,beta,g,y_t,state_ref,c,ntok,H,D]
+/* OP_DELTA_CHUNK_F16: [k,v,q,beta,g,y_t,state_ref,c,ntok,H,D,q_raw]
  * 缓冲 [H][ntok][D] / [H][ntok]; 状态 S=[H*D*D] f32 原地; q/√D 在 kernel。 */
 static int exec_delta_chunk(const struct wt_blob* b, const struct wt_op* op,
                             char* err, size_t errn) {
@@ -2672,7 +2879,8 @@ static int exec_delta_chunk(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "delta state %u too small", si); return -1;
     }
     rec_state_t st = { (int)H, (int)D, (float*)g_exec.st_buf[si] };
-    if (delta_chunk_f16(&st, k, v, q, beta, g, y, (int)c, (int)ntok) != 0) {
+    uint32_t q_raw = op->args[11];
+    if (delta_chunk_f16(&st, k, v, q, beta, g, y, (int)c, (int)ntok, (int)q_raw) != 0) {
         snprintf(err, errn, "delta_chunk_f16"); return -1;
     }
     return 0;

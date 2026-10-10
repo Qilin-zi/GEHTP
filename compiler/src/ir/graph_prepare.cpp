@@ -12,6 +12,7 @@
 #include "hnnx/dma/spill_fill.hpp"
 #include "hnnx/cost/cost_model.hpp"
 #include "hnnx/ops/ops.hpp"
+#include "hnnx/host_decode_state.hpp"
 #include "hnnx/mcast/mcast_optimizer.hpp"
 #include "hnnx/scheduler/dp_sequencer.hpp"
 #include "hnnx/vtcm/dp_group_graph.hpp"
@@ -270,6 +271,13 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     // quant_marker/scale/output_rank 并把 tensor_param(perm 等)追加到 inputs。
     // 注入在 DCE 之前, 这样 DCE 不会误删被引用的 tensor_param const。
     inject_htp_prepare_inputs();
+    if (getenv("GEHTP_DBG_T18"))
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-inj] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     // 1. Set construction state
     construction_state_ = 1; // +0x45dc = 1 (construction phase)
@@ -282,6 +290,13 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     if (dce_result > 0) {
         std::fprintf(stderr, "do_prepare1: initial DCE removed %d ops\n", dce_result);
     }
+    if (getenv("GEHTP_DBG_T18"))
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-dce] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     // 1c. Split 消除已禁用: eliminate_split_nodes() 是 REQNN 逆向对拍实现,
     // 把 Split 消费者重定向到 dims=[1] 占位 const(模仿 QNN before_graph
@@ -419,6 +434,13 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     // (M01 实证 do_prepare1 @0xf66550 调用序)。pass 使能统一由
     // PassManager 管理(--no-pass 关单 pass); 结构不匹配 = 图不动。
     run_optimize_passes(env);
+    if (getenv("GEHTP_DBG_T18"))
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-opt] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     // 4. Initial node ordering
     order_nodes(true);
@@ -432,6 +454,14 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
 
     // 7. Mark construction complete
     construction_state_ = 2; // +0x45dc = 2 (optimization phase)
+
+    if (getenv("GEHTP_DBG_T18"))   /* T018d 探针: do_prepare1 尾 */
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-p1] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     return GraphStatus::Success;
 }
@@ -534,6 +564,29 @@ GraphStatus GraphPrepare::do_prepare2(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     // Source: do_prepare2 completion sets +0x45dc = 3
     construction_state_ = 3;
 
+    if (getenv("GEHTP_DBG_T18")) {  /* T018d 探针: do_prepare2 尾 */
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-p2] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
+        if (getenv("GEHTP_DBG_T18_L3"))
+            for (auto& [id, od] : opdef_map_) {
+                if (!od) continue;
+                const char* gn = od->grouping.c_str();
+                if (std::strstr(gn, "layers.3/self_attn/Slice") ||
+                    std::strstr(gn, "layers.3/self_attn/Concat") ||
+                    std::strstr(gn, "layers.3/self_attn/kv_append") ||
+                    std::strstr(gn, "layers.3/self_attn/Transpose"))
+                    std::fprintf(stderr, "[t18-l3] id=%llu name=%s grp=%s flags=0x%x csize=%llu odata=%zu\n",
+                                 (unsigned long long)id,
+                                 od->name_tag ? od->name_tag->name() : "?", gn,
+                                 od->flags, (unsigned long long)od->const_data_size,
+                                 od->op_data.size());
+            }
+    }
+
     return GraphStatus::Success;
 }
 // ---- --plan-vtcm-budget 缺省(auto)解析用: HMX scratch 峰值普查 ----
@@ -558,6 +611,14 @@ GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) 
 
     // 2. Re-order nodes (ensures ordering_ is populated for execution)
     order_nodes(false);
+
+    if (getenv("GEHTP_DBG_T18"))   /* T018d 探针: do_prepare2_late CSE 后 */
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-p2l] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     // 3. Runlist generation
     // Source: runlist_info.cc, run_order_to_alloc_info.cc
@@ -698,14 +759,74 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
         const std::vector<std::vector<float>>* multi_inputs) {
     ExecResult ret{};
     ops_passthru_reset();   /* A6: 每次 host 执行前清零直通计数 */
+    /* 004 T018c: decode 持久状态落盘协议 — GEHTP_HOST_STATE=<path>:
+     * 进程首步装载(不存在=零态新序列), 末尾覆写。多步驱动 = 逐进程串跑。 */
+    static const char* hstate_path = std::getenv("GEHTP_HOST_STATE");
+    if (hstate_path && *hstate_path) {
+        int rc = host_decode_state_load(hstate_path);
+        if (rc < 0)
+            std::fprintf(stderr, "[hostdec] state file %s corrupt, starting fresh\n",
+                         hstate_path);
+    }
 
     /* ops_ 在 do_prepare2 的 prepare_op 填充后, Phase7 fixpoint 的 DCE 仍会
      * 改 opdef_map_(删 op)——ops_ 保持陈旧(probe: Slice 被删但 TypicalOp
      * 照跑, tensor_param 注入/输入链全断)。以 opdef_map_ 为准重建。 */
     ops_.clear();
+    /* T018d: GEHTP_DBG_T18_IDS="153,155" 打指定 op 的执行期输入边(名字+源) */
+    const char* dbg_ids = std::getenv("GEHTP_DBG_T18_IDS");
     for (auto& [id, opdef] : opdef_map_) {
         if (!opdef || !opdef->is_enabled() || opdef->is_dead()) continue;
         if (!opdef->name_tag || !opdef->name_tag->name()) continue;
+        if (dbg_ids && *dbg_ids) {
+            char pat[32];
+            std::snprintf(pat, sizeof pat, ",%llu,", (unsigned long long)id);
+            std::string hay = std::string(",") + dbg_ids + ",";
+            if (std::strstr(hay.c_str(), pat)) {
+                std::fprintf(stderr, "[t18-edge] %s id=%llu n_in=%zu odata=%zu",
+                             opdef->name_tag->name(), (unsigned long long)id,
+                             opdef->inputs.size(), opdef->op_data.size());
+                {
+                    auto pv = unpack_scalar_params(opdef->op_data);
+                    for (const auto& p2 : pv)
+                        std::fprintf(stderr, " %s=%s", p2.name.c_str(),
+                                     p2.is_numeric ? std::to_string(p2.value_num).c_str()
+                                                   : p2.value_str.c_str());
+                }
+                for (const auto& c : opdef->inputs) {
+                    OpDef* s = get_op_at(c.src_id);
+                    std::fprintf(stderr, " <-%llu:%s(r%u,%u,%u,%u)",
+                                 (unsigned long long)c.src_id,
+                                 s && s->name_tag && s->name_tag->name()
+                                     ? s->name_tag->name() : "MISSING",
+                                 s ? s->output_def.dims[0] : 0,
+                                 s ? s->output_def.dims[1] : 0,
+                                 s ? s->output_def.dims[2] : 0,
+                                 s ? s->output_def.dims[3] : 0);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        if (getenv("GEHTP_DBG_T18")) {
+            const char* dn = opdef->name_tag->name();
+            if (std::strstr(dn, "KvAppend") || std::strstr(dn, "KvGather") ||
+                std::strstr(dn, "Conv1dSsmStep") || std::strstr(dn, "DeltaChunk") ||
+                std::strstr(dn, "DecodeFace")) {
+                std::fprintf(stderr, "[t18-ex] %s id=%llu op_data=%zu", dn,
+                             (unsigned long long)id, opdef->op_data.size());
+                auto spv = unpack_scalar_params(opdef->op_data);
+                for (const auto& pv : spv)
+                    std::fprintf(stderr, " %s=%g", pv.name.c_str(),
+                                 pv.is_numeric ? pv.value_num
+                                               : std::strtod(pv.value_str.c_str(), nullptr));
+                for (const auto& c : opdef->inputs) {
+                    OpDef* s = get_op_at(c.src_id);
+                    std::fprintf(stderr, " <-%llu%s", (unsigned long long)c.src_id,
+                                 s ? "" : "(MISSING)");
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
         OpIoPtrs io{};
         io.graph_prepare = this;
         io.opdef_ptr = opdef.get();
@@ -1076,6 +1197,10 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
     }
 
     ops_passthru_report("execute_host");   /* A6: 直通 N≠0 即假绿报警 */
+    if (hstate_path && *hstate_path) {
+        if (host_decode_state_save(hstate_path) != 0)
+            std::fprintf(stderr, "[hostdec] state save to %s failed\n", hstate_path);
+    }
     return ret;
 }
 
@@ -2234,6 +2359,47 @@ std::vector<uint8_t> extract_gdn_block_extra(const GraphPrepare& gp, const OpDef
     return raw_extra(&e, sizeof(e));
 }
 
+// 004 T018 decode 状态族: 5×u32 定长 extra 的 per-type 键表(extractor 与
+// rebuild_op_data_from_extra 双侧共用; 键域与 ops.cpp dnum / wtop_emit 一一对应)
+bool decode_state_keys(const char* nm, const char* (&keys)[5]) {
+    const char* kt[6][6] = {
+        {"DecodeFaceF16", "u16_begin", "u16_len", "", "", ""},
+        {"KvAppendF16", "state_idx", "kv_heads", "head_dim", "", ""},
+        {"KvGatherKT", "state_idx", "n_heads", "kv_heads", "head_dim", ""},
+        {"KvGatherV", "state_idx", "n_heads", "kv_heads", "head_dim", ""},
+        {"Conv1dSsmStepF16", "state_idx", "C", "d_conv", "", ""},
+        {"DeltaChunkF16", "state_idx", "H", "D", "q_raw", ""},
+    };
+    for (auto& row : kt)
+        if (!std::strcmp(nm, row[0])) {
+            for (int i = 0; i < 5; i++) keys[i] = row[i + 1];
+            return true;
+        }
+    return false;
+}
+
+// op_data(scalar_params, net.json loader 写入) → 5×u32 extra
+std::vector<uint8_t> extract_decode_state_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    (void)gp;
+    const char* nm = opdef.name_tag ? opdef.name_tag->name() : "";
+    const char* keys[5];
+    if (!decode_state_keys(nm, keys)) return {};
+    auto sp = unpack_scalar_params(opdef.op_data);
+    uint32_t v[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < 5; i++) {
+        if (!keys[i][0]) continue;
+        const ScalarParam* p = scalar_get(sp, keys[i]);
+        if (p) v[i] = (uint32_t)p->as_int();
+    }
+    if (getenv("GEHTP_DBG_T18"))
+        std::fprintf(stderr, "[t18-ext] %s id=%llu op_data=%zu -> [%u,%u,%u,%u,%u]\n", nm,
+                     (unsigned long long)opdef.op_id, opdef.op_data.size(),
+                     v[0], v[1], v[2], v[3], v[4]);
+    std::vector<uint8_t> out(sizeof v);
+    std::memcpy(out.data(), v, sizeof v);
+    return out;
+}
+
 std::map<std::string, ExtraInfoFn>& extra_info_registry() {
     static std::map<std::string, ExtraInfoFn> reg = [] {
         std::map<std::string, ExtraInfoFn> m;
@@ -2259,6 +2425,13 @@ std::map<std::string, ExtraInfoFn>& extra_info_registry() {
         m["ScatterNd"] = extract_scatternd_extra;
         m["Split"] = extract_split_extra;
         m["GdnBlock"] = extract_gdn_block_extra;
+        // 004 T018: decode 图状态族(net.json loader op_data → extra 尾随)
+        m["DecodeFaceF16"] = extract_decode_state_extra;
+        m["KvAppendF16"] = extract_decode_state_extra;
+        m["KvGatherKT"] = extract_decode_state_extra;
+        m["KvGatherV"] = extract_decode_state_extra;
+        m["Conv1dSsmStepF16"] = extract_decode_state_extra;
+        m["DeltaChunkF16"] = extract_decode_state_extra;
         return m;
     }();
     return reg;
@@ -2409,6 +2582,11 @@ void GraphPrepare::serialize_opdef(Serializer& ser, const OpDef& opdef) const {
     uint32_t grp_padded = (grp_len + 3) & ~uint32_t(3);
 
     // Compute total payload size for the tagged record header word count.
+    /* T018d: tensor_param_ids(axes/perm/ranges const 的挂靠表, loader 写入、
+     * execute_host 按 od2->tensor_param_ids 追加输入)此前不序列化 → --bin
+     * 路径 ReduceSum 退化 reduce-all、Transpose 丢 perm 全图发散(cos 0.08)。
+     * 尾随 [u32 n_tp][ids u64×n](恒写, 空=0 — 与 op_data 同为自描述尾段,
+     * 否则空 tp 的 op 反序列化会把 op_data 首 4B 误读成 n_tp 破坏字节全同) */
     size_t payload =
         4 + name_padded +            // name_len + name
         4 + grp_padded +             // grp_len + grouping(M2c)
@@ -2417,6 +2595,7 @@ void GraphPrepare::serialize_opdef(Serializer& ser, const OpDef& opdef) const {
         sizeof(OutputDef) +           // output_def
         8 + 8 +                       // const_data_offset, const_data_size
         4 + extra.size() +            // 尾随 [u32 extra_len][extra bytes]
+        4 + opdef.tensor_param_ids.size() * 8 +  // 尾随 [u32 n_tp][ids u64×n](恒写, 空=0)
         4 + opdef.op_data.size();     // 尾随 [u32 op_data_len][op_data bytes]
     payload = (payload + 3) & ~size_t(3);  // 4B 对齐，匹配 tagged record 的 word_count
 
@@ -2452,6 +2631,8 @@ void GraphPrepare::serialize_opdef(Serializer& ser, const OpDef& opdef) const {
         std::memcpy(buf.data() + off, extra.data(), extra.size());
         off += extra.size();
     }
+    w32(static_cast<uint32_t>(opdef.tensor_param_ids.size()));
+    for (op_id_t tpid : opdef.tensor_param_ids) w64(tpid);
 
     // Serialize op_data blob: per-op scalar params (e.g., has_bias for FC)
     w32(static_cast<uint32_t>(opdef.op_data.size()));
@@ -2533,7 +2714,19 @@ static void rebuild_op_data_from_extra(OpDef* od) {
         ExtraMatMul e; std::memcpy(&e, ex.data(), sizeof e);
         num("transpose_in1", (double)e.transpose_in1);
     } else {
-        return;
+        /* 004 T018: decode 状态族 5×u32 定长 extra(与
+         * extract_decode_state_extra 同构回读) */
+        const char* dk[5];
+        if (getenv("GEHTP_DBG_T18"))
+            std::fprintf(stderr, "[t18-rb] %s id=%llu ex=%zu match=%d\n", nm,
+                         (unsigned long long)od->op_id, ex.size(),
+                         decode_state_keys(nm, dk));
+        if (decode_state_keys(nm, dk) && ex.size() >= 20) {
+            uint32_t v[5];
+            std::memcpy(v, ex.data(), sizeof v);
+            for (int i = 0; i < 5; i++)
+                if (dk[i][0]) num(dk[i], (double)v[i]);
+        }
     }
     if (!sp.empty()) od->op_data = pack_scalar_params(sp);
 }
@@ -2783,6 +2976,16 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
                 if (elen > 0 && rr.remaining() >= elen) {
                     opdef->serialized_extra.resize(elen);
                     rr.read(opdef->serialized_extra.data(), elen);
+                }
+            }
+            /* T018d: 尾随 tensor_param_ids(axes/perm/ranges const 挂靠表;
+             * 旧流无尾段跳过)。上界守卫防误读越界。 */
+            if (rr.remaining() >= 4) {
+                uint32_t ntp = rr.r32();
+                if (ntp > 0 && ntp <= 64 && rr.remaining() >= (size_t)ntp * 8) {
+                    opdef->tensor_param_ids.reserve(ntp);
+                    for (uint32_t k = 0; k < ntp; k++)
+                        opdef->tensor_param_ids.push_back((op_id_t)rr.r64());
                 }
             }
             // 尾随 op_data blob(向后兼容: 旧流无此字段 → remaining < 4)

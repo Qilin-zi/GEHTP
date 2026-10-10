@@ -307,66 +307,173 @@ struct Emitter {
     const std::vector<uint8_t>* gguf_bytes = nullptr;
     bool use_gguf = false;
     uint32_t gguf_hits = 0, gguf_miss = 0;
+    /* 007 US2 (T013): 权重域报告。domain w4/f16; reason 枚举 = none |
+     * shape_misalign | source_missing | consumer_gate(对齐 Q4 但非 matmul
+     * 消费者/batched → by-design f16, spec 三枚举的扩展, 见
+     * evidence/us2_route_recon.md)。 */
+    struct W4DomainRecord {
+        std::string layer, gguf_name;
+        const char* domain, *reason;
+        uint64_t size_bytes;
+    };
+    std::vector<W4DomainRecord> w4_records;
+    std::vector<std::string> w4_missing;   // FR-003: matmul 权重 miss 名单(收尾硬错误)
+    std::map<uint64_t, bool> wslot_is_q4;  // const op_id → w4 tile 槽(复用冲突防护)
+    /* tie 权重槽去重: GGUF 张量身份(file_offset,nbytes) → slot。embed Gather 与
+     * lm_head MatMul 是不同图 const 但同一 GGUF 张量(token_embd tie), tile 字节
+     * 只由源决定 → 共槽(0.8B 省 2×151.5MB, SC-003 预算的关键) */
+    std::map<std::pair<uint64_t, uint64_t>, uint32_t> gguf_w4_dedup;
 
-    // GGUF Q4_0 → tile-major repack(tile 契约 = 例15 ref_dequant_q4_0_tile):
-    // tile 640B = [4×128B 列对 quants][32 fp16 scales@+512][pad];
-    // 列对(c,c+1) 32B: byte r = lo(列c nib r) | hi(列c+1 nib r)<<4;
-    // GGUF 块(n 列, kt)= 18B [2B d][16B nibbles: 元素0..15=lo, 16..31=hi]。
-    // tile 的 per-row scale 与 GGUF per-block d 分组不同 → 反量化 f32 后按行重量化。
+    // GGUF Q4_0 → 640B/tile 纯重排(007 US2 Route A; payload 576B 零重量化,
+    // 量化 nibble 与 per-block d 数值原样保留 — 仅做 nibble 面序置换; +64B
+    // pad 对齐 hvhx_v2_weight_aligned_tile_size(Q4_0)=640, 保 HVX 反量化
+    // 128B scale 读不越界)。
+    // nibble 面序仲裁(007 US2 实测, token_embd 行 0 对拍 HF F32 embed):
+    //   本 GGUF = 平面序(B): qs[j] lo=值 j(0..15), hi=值 j+16 → cos 0.996;
+    //   对偶序(A) 解读 cos 0.0066 = 乱码。HVX dequant task(ggml 移植)按
+    //   对偶序(A)解读 tile 字节: byte[i] lo=值 2i, hi=值 2i+1 → repack 做
+    //   B→A nibble 置换, 消费端(matmul HVX/gather 标量)统一 A 序。
+    // tile(ct,kt) @ (ct*n_k + kt)*640:
+    //   quants byte[i*32 + n] = [值(2i) | 值(2i+1)<<4] (A 序, i=k/2);
+    //   scales = 块 d f16 原样 @ tile+512+2n (32 个, 后 64B pad 0)。
+    // 设备侧消费 = oplist_exec.c exec_matmul_f16_hmx(HVX 反量化) /
+    // exec_gather(行级 dequant), 槽长判别 len == (K/32)*(N/32)*640。
     static std::vector<uint8_t> repack_q4_0_tiles(const uint8_t* src, size_t nbytes,
                                                   size_t K, size_t N) {
-        size_t n_k_tiles = K / 32, n_col_tiles = N / 32;
-        std::vector<float> w(K * N);
-        for (size_t b = 0; b < nbytes / 18; b++) {
-            uint16_t d_raw;
-            std::memcpy(&d_raw, src + b * 18, 2);
-            float d = f16_to_f32(d_raw);
-            const uint8_t* nib = src + b * 18 + 2;
-            for (int j = 0; j < 16; j++) {
-                w[(b * 32) + j] = d * ((nib[j] & 0xF) - 8);
-                w[(b * 32) + 16 + j] = d * ((nib[j] >> 4) - 8);
-            }
-        }
-        std::vector<uint8_t> out(n_col_tiles * n_k_tiles * 640, 0);
-        for (size_t ct = 0; ct < n_col_tiles; ct++)
-            for (size_t kt = 0; kt < n_k_tiles; kt++) {
-                uint8_t* tile = out.data() + (ct * n_k_tiles + kt) * 640;
+        (void)nbytes;
+        size_t n_k = K / 32, n_ct = N / 32;
+        std::vector<uint8_t> out(n_ct * n_k * 640, 0);
+        for (size_t ct = 0; ct < n_ct; ct++)
+            for (size_t kt = 0; kt < n_k; kt++) {
+                uint8_t* tile = out.data() + (ct * n_k + kt) * 640;
                 for (size_t r = 0; r < 32; r++) {
-                    float mx = 0.0f;
-                    for (size_t c = 0; c < 32; c++)
-                        mx = std::max(mx, std::fabs(w[(kt * 32 + r) * N + ct * 32 + c]));
-                    float d = mx / 7.0f;
-                    uint16_t d16 = f32_to_f16_rne(d);
-                    std::memcpy(tile + 512 + r * 2, &d16, 2);
-                    for (size_t c = 0; c < 32; c++) {
-                        float v = w[(kt * 32 + r) * N + ct * 32 + c];
-                        int q = (int)std::lround(v / d) + 8;
-                        if (q < 0) q = 0;
-                        if (q > 15) q = 15;
-                        uint8_t& byte = tile[(c / 2) * 32 + r];
-                        if (c & 1) byte |= (uint8_t)(q << 4);
-                        else byte = (uint8_t)q;
+                    const uint8_t* blk = src + ((ct * 32 + r) * n_k + kt) * 18;
+                    std::memcpy(tile + 512 + 2 * r, blk, 2);  // d 原样
+                    const uint8_t* qs = blk + 2;
+                    for (size_t i = 0; i < 8; i++) {          // 值 2i/2i+1 在 lo 面
+                        uint8_t lo = qs[2 * i] & 0xFu;
+                        uint8_t hi = qs[2 * i + 1] & 0xFu;
+                        tile[i * 32 + r] = lo | (uint8_t)(hi << 4);
+                    }
+                    for (size_t i = 8; i < 16; i++) {         // 值 2i/2i+1 在 hi 面
+                        uint8_t lo = qs[2 * i - 16] >> 4;
+                        uint8_t hi = qs[2 * i + 1 - 16] >> 4;
+                        tile[i * 32 + r] = lo | (uint8_t)(hi << 4);
                     }
                 }
             }
         return out;
     }
 
+    // GGUF Q4_0 → f16 槽反量化(T014 兜底: 形状未对齐 / 非 Q4 消费者)。
+    // 平面序(B, 见 repack_q4_0_tiles 面序仲裁): qs[j] lo=值 j, hi=值 j+16。
+    static std::vector<uint8_t> dequant_q4_0_f16(const uint8_t* src, size_t nbytes) {
+        std::vector<uint16_t> w16(nbytes / 18 * 32);
+        for (size_t b = 0; b < nbytes / 18; b++) {
+            uint16_t d_raw;
+            std::memcpy(&d_raw, src + b * 18, 2);
+            float d = f16_to_f32(d_raw);
+            const uint8_t* nib = src + b * 18 + 2;
+            for (int j = 0; j < 16; j++) {
+                w16[b * 32 + j] = f32_to_f16_rne(d * ((nib[j] & 0xF) - 8));
+                w16[b * 32 + 16 + j] = f32_to_f16_rne(d * ((nib[j] >> 4) - 8));
+            }
+        }
+        std::vector<uint8_t> wb(w16.size() * 2);
+        std::memcpy(wb.data(), w16.data(), wb.size());
+        return wb;
+    }
+
+    /* ggml 2-D 张量内存序 (ne[0] 最快维) 与图 row-major (末维最快) 的关系按
+     * 消费者分两族 (T016 双向实锤, 勿一刀切):
+     *   Conv2d 族: 图权重 = [ne0, ne1] (kw×out) — 需转置 out[i0*d1+i1]=in[i0+d0*i1]。
+     *     依据: 18 个 ssm_conv1d.weight ne=[4,6144] 转置后与 v4 图真值位级吻合
+     *     24576/24576; 转置前板上 logits cos≈0。
+     *   MatMul/FullyConnected 族: 图权重 = ONNX [N,K] row-major = GGUF 线性序
+     *     原样, 不转置。依据: 36 个 in_proj_a/b (Q4 反量化槽) 与 v4 相关性
+     *     raw 序 0.9623 vs 转置序 0.6887 (0.96 = Q4 量化噪声水位, 方向裁决)。
+     * 仅 conv 消费者调用 (调用点判 consumer 名)。 */
+    static void gguf_transpose_2d(std::vector<uint8_t>& wb,
+                                  const std::vector<uint64_t>& dims) {
+        if (dims.size() != 2 || dims[0] < 2 || dims[1] < 2) return;
+        size_t d0 = (size_t)dims[0], d1 = (size_t)dims[1];
+        size_t n = wb.size() / 2;
+        if (d0 * d1 != n) return;
+        std::vector<uint8_t> t(wb.size());
+        const uint16_t* in = reinterpret_cast<const uint16_t*>(wb.data());
+        uint16_t* out = reinterpret_cast<uint16_t*>(t.data());
+        for (size_t i1 = 0; i1 < d1; i1++)
+            for (size_t i0 = 0; i0 < d0; i0++)
+                out[i0 * d1 + i1] = in[i0 + d0 * i1];
+        wb.swap(t);
+    }
+
+    // 007 US2 Route A 准入门: 返回 0=否 / 1=Gather(embed 表, 设备 exec_gather
+    // 行级 dequant 消费) / 2=对齐非 batched FullyConnected/MatMul(设备
+    // exec_matmul_f16_hmx Q4 分支消费, 标量路=硬错误)。
+    static int q4_consumer_kind(const OpDef* consumer) {
+        if (!consumer || !consumer->name_tag || !consumer->name_tag->name()) return 0;
+        const char* n = consumer->name_tag->name();
+        if (!std::strcmp(n, "Gather")) return 1;
+        if (std::strcmp(n, "FullyConnected") && std::strcmp(n, "MatMul")) return 0;
+        uint32_t m = 0, k = 0, nn = 0, batched = 0;
+        if (n[0] == 'F') {
+            ExtraFc ef{};
+            if (consumer->serialized_extra.size() < sizeof(ef)) return 0;
+            std::memcpy(&ef, consumer->serialized_extra.data(), sizeof(ef));
+            m = ef.m; k = ef.k; nn = ef.n;
+        } else {
+            ExtraMatMul em2{};
+            if (consumer->serialized_extra.empty()) return 0;
+            size_t c = std::min(consumer->serialized_extra.size(), sizeof(em2));
+            std::memcpy(&em2, consumer->serialized_extra.data(), c);
+            m = em2.m; k = em2.k; nn = em2.n; batched = em2.batched;
+        }
+        if (m && k && nn && !batched &&
+            (m % 32u == 0u) && (k % 32u == 0u) && (nn % 32u == 0u)) return 2;
+        return 0;
+    }
+
     // 权重消费 op 的 const 输入 → 权重槽(按 const id 去重; GGUF 供给优先)
-    // consumer_grp = 消费节点的原始名(loader 只给计算 op 设 grouping,
-    // 权重 const 自身没有; TSV 键 = 消费节点名)
+    // consumer = 消费节点(Q4 准入按消费者类型/形状裁决; loader 只给计算 op
+    // 设 grouping, 权重 const 自身没有; TSV 键 = 消费节点名)
     uint32_t ensure_weight_slot(GraphPrepare& gp, const OpDef* w,
                                 std::map<uint64_t, uint32_t>& wslots,
-                                const std::string& consumer_grp = "") {
+                                const OpDef* consumer = nullptr,
+                                bool consumer_name_fallback = true) {
+        const std::string consumer_grp = consumer ? consumer->grouping : "";
+        const int q4k = q4_consumer_kind(consumer);
+        /* 2-D 布局族判别 (gguf_transpose_2d 注释): 仅 conv 族图布局是
+         * [ne0,ne1] 转置序; matmul 族 [N,K] = GGUF 线性序原样 */
+        const char* cons_nm =
+            (consumer && consumer->name_tag && consumer->name_tag->name())
+                ? consumer->name_tag->name() : nullptr;
+        const bool conv_wgt = cons_nm &&
+            (!std::strcmp(cons_nm, "Conv2d") || !std::strcmp(cons_nm, "DepthWiseConv2d"));
         auto it = wslots.find(w->op_id);
-        if (it != wslots.end()) return it->second;
+        if (it != wslots.end()) {
+            /* 已建 w4 tile 槽又被非 Q4 消费者复用(tie 权重 M 不齐等) → 设备侧
+             * 该消费者无 Q4 路径, 编译期即报(同 wt_parse rc 纪律, 不等上板死) */
+            if (q4k == 0 && wslot_is_q4.count(w->op_id) && wslot_is_q4[w->op_id]) {
+                std::fprintf(stderr,
+                             "error: Q4 tile 槽 (op %llu) 被非 Q4 消费者 %s 复用, "
+                             "需拆分权重 const\n",
+                             (unsigned long long)w->op_id, consumer_grp.c_str());
+                std::exit(4);
+            }
+            return it->second;
+        }
         /* 路线B: 外置模式权重进 ext_weight_area(addr=EXT_WGT), 内置进 blob */
         auto slot_for = [&](uint32_t len, uint32_t cnt, const uint8_t* d) {
             return ext_weights ? add_ext_slot(len, cnt, d) : add_slot(len, cnt, d);
         };
         if (use_gguf && gguf_tab && gguf_bytes) {
             auto mit = gguf_tab->find(w->grouping);
-            if (mit == gguf_tab->end() && !consumer_grp.empty())
+            /* consumer 名回退仅限消费者主权重(TSV 一行一主权重)。次级 const
+             * (norm bias / fc bias / conv bias) 回退到消费者名会把主权重的
+             * GGUF 张量灌进 bias 槽 —— 0.8B q4 blob 79 个 RMSNORM2 bias 全
+             * 变 gamma 字节(rms +1.24 基线偏置)的根因, T016。 */
+            if (mit == gguf_tab->end() && consumer_name_fallback && !consumer_grp.empty())
                 mit = gguf_tab->find(consumer_grp);
             if (mit != gguf_tab->end()) {
                 const GgufEntry& e = mit->second;
@@ -375,41 +482,59 @@ struct Emitter {
                     uint32_t id;
                     size_t K = e.dims[0], NN = 1;
                     for (size_t i = 1; i < e.dims.size(); i++) NN *= e.dims[i];
-                    if (e.type == 2 && K % 32 == 0 && NN % 32 == 0) {
-                        // Q4_0 → tile-major(32×32 tile 契约)
+                    const std::string layer =
+                        consumer_grp.empty() ? w->grouping : consumer_grp;
+                    if (e.type == 2 && q4k != 0 && K % 32 == 0 && NN % 32 == 0) {
+                        /* 007 US2: Q4_0 → 640B/tile 纯重排(量化零损); 设备
+                         * exec_matmul_f16_hmx / exec_gather 的 Q4 分支按槽长
+                         * 判别消费。tie(同 GGUF 张量多图 const)共槽 */
+                        const auto dkey = std::make_pair(e.file_offset, e.nbytes);
+                        auto dit = gguf_w4_dedup.find(dkey);
+                        if (dit != gguf_w4_dedup.end()) {
+                            wslots[w->op_id] = dit->second;
+                            wslot_is_q4[w->op_id] = true;
+                            w4_records.push_back({layer, mit->first, "w4", "dedup", 0});
+                            gguf_hits++;
+                            return dit->second;
+                        }
                         auto tile = repack_q4_0_tiles(src, e.nbytes, K, NN);
                         id = slot_for((uint32_t)tile.size(), (uint32_t)(K * NN), tile.data());
+                        gguf_w4_dedup[dkey] = id;
+                        w4_records.push_back({layer, mit->first, "w4", "none", tile.size()});
+                        wslot_is_q4[w->op_id] = true;
                     } else if (e.type == 2) {
-                        // 小维度(<32)不走 tile: 反量化 f16 直存
-                        std::vector<float> wf2(K * NN);
-                        for (size_t b = 0; b < e.nbytes / 18; b++) {
-                            uint16_t d_raw;
-                            std::memcpy(&d_raw, src + b * 18, 2);
-                            float d = f16_to_f32(d_raw);
-                            const uint8_t* nib = src + b * 18 + 2;
-                            for (int j = 0; j < 16; j++) {
-                                wf2[(b * 32) + j] = d * ((nib[j] & 0xF) - 8);
-                                wf2[(b * 32) + 16 + j] = d * ((nib[j] >> 4) - 8);
-                            }
-                        }
-                        std::vector<uint16_t> w16(K * NN);
-                        for (size_t i = 0; i < K * NN; i++) w16[i] = f32_to_f16_rne(wf2[i]);
-                        std::vector<uint8_t> wb(K * NN * 2);
-                        std::memcpy(wb.data(), w16.data(), wb.size());
+                        /* Q4_0 但非 tile 候选(形状未对齐/非 Q4 消费者/batched)
+                         * → 反量化 f16 槽(T014 兜底, 报告列名) */
+                        auto wb = dequant_q4_0_f16(src, e.nbytes);
+                        if (conv_wgt) gguf_transpose_2d(wb, e.dims);
                         id = slot_for((uint32_t)wb.size(), (uint32_t)(K * NN), wb.data());
-                    } else {  // F32 → f16
+                        w4_records.push_back({layer, mit->first, "f16",
+                                              (K % 32 == 0 && NN % 32 == 0)
+                                                  ? "consumer_gate" : "shape_misalign",
+                                              wb.size()});
+                    } else {  // F32 → f16 (by-design, 非 Q4 候选)
                         size_t n4 = e.nbytes / 4;
                         std::vector<uint16_t> w16(n4);
                         const float* wf = reinterpret_cast<const float*>(src);
                         for (size_t i = 0; i < n4; i++) w16[i] = f32_to_f16_rne(wf[i]);
                         std::vector<uint8_t> wb(n4 * 2);
                         std::memcpy(wb.data(), w16.data(), wb.size());
+                        if (conv_wgt) gguf_transpose_2d(wb, e.dims);
                         id = slot_for((uint32_t)wb.size(), (uint32_t)n4, wb.data());
+                        w4_records.push_back({layer, mit->first, "f16", "none", wb.size()});
                     }
                     wslots[w->op_id] = id;
                     gguf_hits++;
                     return id;
                 }
+            }
+            /* FR-003: matmul(准入门=2) 权重不在匹配表 = 表不全/GGUF 不配套,
+             * 硬错误; 其余消费者 miss 走 const_pool f16(数值正确, 仅体积回退)
+             * 并记录 source_missing 供报告点名 */
+            if (q4k == 2) {
+                w4_missing.push_back(consumer_grp.empty() ? w->grouping : consumer_grp);
+                w4_records.push_back({consumer_grp.empty() ? w->grouping : consumer_grp,
+                                      "-", "f16", "source_missing", 0});
             }
             gguf_miss++;
         }
@@ -492,9 +617,13 @@ struct Emitter {
             if (isl != input_slots.end()) return 0x8000u | isl->second;
         }
         const OpDef* p = gp.get_op_at(op_id);
-        // 有池数据即按 const 槽(is_const 标志对 loader 的 tensor_param const 不可靠)
+        // 有池数据即按 const 槽(is_const 标志对 loader 的 tensor_param const 不可靠)。
+        // consumer = cur_op(主循环发射位上的消费 op): q4 准入/复用防护按真实
+        // 消费者裁决 —— 不带 consumer 会被判 kind 0, 把 Gather(embed 表) 等
+        // 合法 w4 消费误杀在复用防护门上
         if (p && (p->is_const() || p->const_data_size > 0)) {
-            uint32_t s = ensure_weight_slot(gp, p, wslots);
+            const OpDef* cons = cur_op && cur_op != op_id ? gp.get_op_at(cur_op) : nullptr;
+            uint32_t s = ensure_weight_slot(gp, p, wslots, cons);
             return 0x8000u | s;
         }
         bool param_const_name = false;
@@ -673,7 +802,56 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
 struct WtopEmitShared {
     uint32_t H = 1, W = 1, C = 1;
     uint32_t w_slot = 0, b_slot = 0;
+    /* T018 decode 图: 合并 EXT_IN 面内 faces 区 u16 位移(前置输入字节数/2)
+     * 与面总 u16 长(op15 rank1 切片的 b0 基移/d0); 非 decode 图均为 0 */
+    uint32_t face_u16_shift = 0;
+    uint32_t dyn_in_u16_total = 0;
 };
+
+/* 007 US1: broadcast 形态判定(孪生) — 正典 = specs/007-perf-sprint-1/evidence/
+ * broadcast_census.md "判定规则"节; 设备侧孪生 = kernels/src/runtime/
+ * oplist_exec.c broadcast_shape_class (判据互指, 勿单边改)。
+ * 1=整块(重复/铺标量) 2=行循环(拷行/铺行) 3=通用退化(strided)。
+ * 输入 = emit 进 args 的 fold4 后 4D in_d/out_d(与设备读到的完全同一数组)。 */
+inline int broadcast_shape_class(const uint32_t in_d[4], const uint32_t out_d[4])
+{
+    uint32_t r = 4;
+    while (r > 0 && out_d[r - 1] == 1) r--;
+    if (r == 0) r = 1;
+    uint32_t ir = 4;
+    if (ir > r) ir = r;
+    if (in_d[ir - 1] != out_d[r - 1] && in_d[ir - 1] != 1) return 3; /* 末轴 wrap */
+    uint32_t lead = r - ir;
+    int outer_bcast = 1;
+    for (uint32_t d = 0; d + 1 < ir; d++) {
+        if (in_d[d] == 1) continue;               /* 外轴广播 */
+        if (in_d[d] != out_d[d + lead]) return 3; /* 外轴 wrap */
+        outer_bcast = 0;
+    }
+    return outer_bcast ? 1 : 2;
+}
+
+/* 注入的 OP_BROADCAST_F16 子 op 引擎注解 (007 P1 修正: 父 op assign_engine
+ * 的 n%32 判据看不见 broadcast 自身形状 —— 按形态分派: 类 1/2 → HVX 纯搬运,
+ * 类 3 → scalar 计划(合法非回落, dev=0); fb_allowed 恒 1 沿 003 契约)。 */
+inline uint32_t broadcast_engine_annot(const uint32_t in_d[4], const uint32_t out_d[4])
+{
+    return wt_annot_pack(broadcast_shape_class(in_d, out_d) == 3 ? 0u : 1u, 1u, 0u);
+}
+
+/* T018: decode 状态全局槽映射。surgery 脚本按类型命名空间分配 state_idx
+ * (kv 0..5 / conv 0..17 / delta 0..17), 设备 wt_exec_load_states 扁平表
+ * 需全局唯一 → kv→0..5, conv→6..23, delta→24..41。
+ * 与 host_decode_state.hpp 的 N_KV=6/N_CONV=18/N_DELTA=18 对齐;
+ * host 侧(execute_host)保持 per-type 命名空间不受此映射影响。 */
+inline uint32_t decode_state_gid(const std::string& nm, uint32_t si) {
+    const char* n = nm.c_str();
+    if (!std::strcmp(n, "KvAppendF16") || !std::strcmp(n, "KvGatherKT") ||
+        !std::strcmp(n, "KvGatherV"))
+        return si;                                  // kv:   0..5
+    if (!std::strcmp(n, "Conv1dSsmStepF16")) return 6u + si;    // conv: 6..23
+    return 24u + si;                                // delta: 24..41
+}
 
 /* ===================== 算子发射注册表 =====================
  * 每 op 一个 handler(QNN OpPackage 同构): 从 IR OpDef 读语义(serialized_extra/

@@ -87,7 +87,7 @@ int main(void) {
             float* S1 = calloc(D * D, 4);
             rec_state_t rk = { 1, D, S1 };
             int16_t* y16 = malloc(TOK * D * 2);
-            delta_chunk_f16(&rk, k16, v16, q16, be16, g16, y16, TOK, TOK);
+            delta_chunk_f16(&rk, k16, v16, q16, be16, g16, y16, TOK, TOK, 0);
             for (int i = 0; i < TOK * D; i++) yf[i] = gdn_f16_to_f32(y16[i]);
 
             float* S2 = calloc(D * D, 4);
@@ -126,13 +126,13 @@ int main(void) {
         float* Sa = calloc(D * D, 4);
         rec_state_t ra = { 1, D, Sa };
         int16_t* ya = malloc(TOK * D * 2);
-        delta_chunk_f16(&ra, k16, v16, q16, be16, g16, ya, TOK, TOK);
+        delta_chunk_f16(&ra, k16, v16, q16, be16, g16, ya, TOK, TOK, 0);
         float* Sb = calloc(D * D, 4);
         rec_state_t rb = { 1, D, Sb };
         int16_t* yb = malloc(TOK * D * 2);
-        delta_chunk_f16(&rb, k16, v16, q16, be16, g16, yb, CK, TOK);
+        delta_chunk_f16(&rb, k16, v16, q16, be16, g16, yb, CK, TOK, 0);
         delta_chunk_f16(&rb, k16 + CK * D, v16 + CK * D, q16 + CK * D,
-                        be16 + CK, g16 + CK, yb + CK * D, CK, TOK - CK);
+                        be16 + CK, g16 + CK, yb + CK * D, CK, TOK - CK, 0);
         float *yaf = malloc(TOK * D * 4), *ybf = malloc(TOK * D * 4);
         for (int i = 0; i < TOK * D; i++) {
             yaf[i] = gdn_f16_to_f32(ya[i]); ybf[i] = gdn_f16_to_f32(yb[i]);

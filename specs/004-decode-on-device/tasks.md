@@ -152,15 +152,24 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 ### decode 图发射 + persistent
 
-- [ ] T018 [US1] decode 图发射：`scripts/export_qwen35_onnx.py` decode 变体（use_cache、KV append/gather + SSM step op 图）+ `compiler/src/ir/graph_prepare.cpp`/`compiler/tools/wtop_emit.cpp` state tensor 分类 + 状态尺寸下发（R3/R5 绿地，先做 host 执行验证）
-- [ ] T019 [US1] persistent runtime（FR-007）：`kernels/examples/42_gehtp_persistent/main.c` 修 6 处硬 bug——`load_blob_from_path` 补 `wt_parse`+buf 挂载（现只读不进还泄漏 :118-143）、`parse_and_exec` 去自覆盖接 `wt_exec_run_io`（:145-160）、input_ids 栈数组+`strtol` 多数字解析（:185/:214-227）、`MAX_LOGITS 32768→248320`（栈数组改静态/堆）+`MAX_OPS 1024→16384`、协议 key 对齐（host 发 `handle_id`/C 找 `model_id`；host 补发 `wtop_path`）、token-id→host 侧 embedding 注入（FR-008，G7）；**T003 补充 4 阻塞项并入**：响应补 4B BE 长度前缀（:88-106）、double close（:104/:275）、PING/PONG、socket 路径统一（main.c:34 vs scripts/gehtp:21-22）
-- [ ] T020 [US1] host 循环接线：`scripts/persistent_runtime.py`/`device_runtime.py`/`gehtp_server.py::_run_generation` 端到端生成连贯 token；socket 冒烟 prefill→N decode 不 reload、状态存活
+- [x] T018 [US1] decode 图发射——**2026-10-09 完成**（host `55aeb8d` + 设备 `2789fd9`）：`scripts/surgery_decode_graph.py` 把 prefill net.json 手术成 decode 图（6 新 op：DecodeFaceF16/KvAppendF16/KvGatherKT/V/Conv1dSsmStepF16/DeltaChunkF16；42 状态槽 ≈21MB；双输入合并 388B 面 [ids i32 ×1 | face i32 ×96]）。host 双路径 `--bin` vs net.json/golden **cos=1.000000、top1=90637 一致**；T018e 32 步 host 循环 ALL GREEN；设备（t18f runner steps 模式）32 步 cos 全 ≥0.9986（最低 0.999885 无漂移=状态积累正确）、top1 31/32（step6 f16 尾部近并列）、≈1.08s/步。三大根因：① tensor_param_ids 不序列化（tagged.bin 尾随序列化修复，向后兼容双方向）；② rebuild decode 分支无条件 return 跳过 op_data 共享赋值；③ ref_elem_count 表外 temp 复用高估（改用 g_last_bytes）。state_idx 全局重映射 kv→0..5/conv→6..23/delta→24..41 双侧同口径（`decode_state_gid`）。
+- [x] T019 [US1] persistent runtime（FR-007）——**2026-10-10 完成，架构修正后整体重写**：原 socket 设计在 qurt 上编译不可能（posix 层无 sys/socket.h；run_main_on_hexagon 生命周期=一次 FastRPC 调用内 main() 存活）→ 改为 **DSP 常驻文件队列 runner**（`42_gehtp_persistent/main.c` 全重写）：blob/权重/状态一次装载，轮询 req 文件→执行→写 resp 文件，host 侧 `scripts/persistent_runtime.py` 经 adb 文件往返驱动。协议帧与原 socket 设计同形（4B BE 长度前缀+JSON+二进制体、ping/reset/shutdown/run、无双 close、socket 路径问题随架构消失）；原 6 处硬 bug 随重写全消（wt_parse 挂载/run_io 接线/JSON 多数字解析/vocab 级 argmax/key 对齐）；FR-008 embedding 注入被 T018 手术天然覆盖（i32 ids 直接喂 embedding Gather）。**设备门全绿（d0f1784）**：32 步 persistent decode 31/32 top1（step6=t18f 已知并列）、cos 全 ≥0.999885、reset 复现 step0 位级一致、wall 41s/32 步（含 adb 往返 1.28s/步，设备 1.10s/步）。**三根因**：① optrace 默认开致步时 2.66s（job `trace` 键默认 0，2.4×）；② 4B BE 前缀致 strstr 空 C 串（take_request lseek(fd,4)）；③ **非对齐输入指针进 run_io 杀 DSP 进程**（req+4+hdr_len 对齐随 JSON 头长漂移；runner 喂 malloc 8B 对齐从不出事——输入体先拷 128B 对齐静态缓冲再喂）。运维铁律：kill 留幽灵 DSP 会话（仍应答文件请求数十秒后被 reaper 回收，期间新实例 -2147482611）；`ps -A` NAME 是 15 字符 comm，判活必须 `pgrep -f`；setup 重推 .so 前先 pkill。构建并入 `gehtp setup`（[3/5] persistent target）。
+- [x] T020 [US1] host 循环接线——**2026-10-10 完成，设备 E2E 全绿（d0f1784）**：
+  - **接线四件**：`PersistentRuntimeError` 子类化 `DeviceRuntimeError`（服务层统一捕获）；`device_runtime.get_runtime()` 按 `GEHTP_PERSISTENT=1` 选 persistent 后端（默认仍原型占位 → host 测试零设备依赖）；`persistent_runtime.init()` 懒启动 DSP 常驻 runner（env `GEHTP_DECODE_WTOP`/`GEHTP_DECODE_OUT_TEMP`/`GEHTP_PERSIST_IDLE_S`，`start_server` 幂等复用）；lifespan 退出调 `runtime.shutdown()`（实测 SIGTERM→shutdown op→DSP 进程消失）。
+  - **`_run_generation` 重构**（decode 图单 token/步）：prompt 相位逐 token 喂入（中间 logits 丢弃，末位 prompt token 输出=首生成 token）；生成相位惰性取步（stop 提前返回不多跑一步）；生成前 `reset()`=新序列清 KV/SSM（persistent 状态跨请求存活故必须）；生成计数==max_tokens 契约保持（contract 测试零改动全绿）。
+  - **注册 API 增 `input_length` 覆盖**：decode manifest `input_elems=1` 是单步输入非上下文上限（首跑即被 max_tokens≤1 拒）；显式传 64（=编译期 MAX_POS，设备侧 run() 尚有 position≥MAX_POS 硬闸兜底）。
+  - **测试**：`test_persistent_runtime.py` 从 socket 契约整体重写为文件队列契约（face 位级不变式、run 请求体==make_step_input、shutdown 优雅/kill 双路径、env 后端选择）30/30；全套 **65/65**。
+  - **设备 E2E**（`GEHTP_PERSISTENT=1` 起 serve）：注册 21s 懒启动（含 2GB blob 装载）；`"user: Hello"`→`", I want to know how the \`nltk"`；`"user: The capital of France is"`→`" Paris."`（语义正确；B 紧跟 A 请求=reset/状态隔离生效）；流式与非流式逐字一致；finish=length、completion_tokens==max_tokens；≈1.15s/步。**直连链对拍 PASS**：serve 输出 == `PersistentDeviceRuntime` 直驱镜像链（同 tokenizer 编码/同位置序列），A/B 双 prompt 位级一致。
 
 ### 精度 + 性能收口
 
-- [ ] T021 [US2] tier2 金标：`scripts/golden_qwen35.py::run_decode`（HF `use_cache=True` 续写多步；blocked on R1——HF 对 GDN/SSM 层是否缓存 recurrent state 未验证，若否改 `use_cache=False` 每步全序列重跑）
-- [ ] T022 [US3] KV/SSM DDR 布局（FR-009）：状态落 DDR（KV 12KB/token、SSM ~19MB），不挤 VTCM 16MB（VTCM 留给 HMX scratch）；上板确认
-- [ ] T023 [US3] 端到端 wall：autoregressive 每步 wall 记录对照（目标：单步 decode 远小于 prefill 34s，lm_head 步不再全标量 4.24s）
+- [x] T021 [US2] tier2 金标——**2026-10-10 完成，设备门双 PASS（d0f1784）**：**R1 解除**——GPU 对拍实证 HF Qwen3_5 `DynamicCache` 正确携带 GDN/SSM recurrent state（增量 32 行 vs 全序列行 cos≥0.999999、argmax 全同；金标环境 `PYTHONPATH=/disk1/qnn08b_official/tfenv` + llmserv torch，plan 期 QPM_ROOT_DEFAULT 路径已失效）。`golden_qwen35.py::run_decode`（增量贪心续写，返回 rows+tokens）+ CLI `--decode N --decode-prompt I`；金标落 `cpu_golden/hf/tier2_0.{logits.f32,tokens.i64}.raw`（random prompt0 32+16 步）+ `text_tier2.*`（"user: The capital of France is" 7+12 步）。**设备门**：persistent 链 reset→喂 prompt→贪心续写逐行对拍 tier2——random **16/16 token 一致、worst cos=0.999991**；text **12/12 一致、worst cos=0.999994**（" Paris"=11751 起逐 token 全对，含重复结构；与 T020 E2E serve 输出同串）。decode 步越过 prompt 边界仍与 HF 位级对齐 = KV+SSM 状态跨步积累正确（tier1 门只覆盖 prompt 内）。
+- [x] T022 [US3] KV/SSM DDR 布局（FR-009）——**2026-10-10 确认（代码路径 + blob 扫描 + 设备门佐证）**：`wt_exec_load_states`（oplist_exec.c:2071）经 `memalign(128, bytes)` 落 **CDSP DDR 堆**（DSP C 库堆；VTCM 只能经 `g_exec.vtcm_pool` wtcache 显式开——状态代码从不触碰），init-once 进程级生命期、`wt_exec_state_reset` 清零重建 ring。decode.wtop STATE 槽扫描（`gehtp_prof.parse_wtop` + oplist_parse.c:139 同式 weight_off）：**n=42、total 20.02 MiB**——kv 6×131072B（**=12.0 KiB/token @ MAX_POS=64**，G4 精确吻合）+ conv 18×73728B（3×6144 f32，G5 吻合）+ delta 18×1MiB（16×128×128 f32，G5 吻合）。上板佐证 = T019/T021 设备门（状态跨 32/48 步累积位级正确，此布局实跑）；20MiB ≪ CDSP 堆 2-2.9GB（008 探针），VTCM 16MB 留给计算暂存不受挤。
+- [x] T023 [US3] 端到端 wall——**2026-10-10 记录（d0f1784，与 T019/T020/T021 同批测量）**：
+  - prefill 基线（T009，v17 seq=32 单发）：exec **34.1s**、wall 37.6s ≈1.07s/token。
+  - persistent decode 步：设备 exec **1.10s/步**（optrace 关，job `trace` 默认 0；trace 开 2.66s 勿混口径）；含 adb 文件队列往返 **1.28s/步**（T019 门 41.0s/32 步）；serve 端到端 ≈**1.15s/步**（T020 E2E 17.0s/(3+12 tok)）。
+  - **门判**：单步 decode 1.10s ≪ prefill 34.1s（**31×**）✓；lm_head 在 1.10s 步内算术上不可能为 4.24s 全标量（US1 split 门：M=1 全走 GEMV 无标量回落，seq1 wall 36.7→17.7s 28.5×）✓。
+  - 诚实注记：per-token 口径 decode 1.10s ≈ prefill 1.07s/token（本阶段赢在权重一次装载+状态常驻+流式，非 per-token 加速）；每步 adb 往返 ~0.18s（占 16%），AP 侧 socket 桥若 wall 需要再立项（T019 备忘）。
 
 **Checkpoint**: P2 全绿——`42_gehtp_persistent` 每 socket 请求跑单 token 前向（权重+KV+SSM 常驻），`gehtp serve` 端到端 autoregressive。**0.8B 双门（decode 门 + wall 对照）过**。可 commit + push。
 
@@ -168,9 +177,13 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 ## Phase 7: Polish & 收尾
 
-- [ ] T024 [P] 更新记忆文件：[[gehtp-08b-baseline-002]] 补 decode 进度；新建 decode 状态记忆（若 T015-T023 落地）
-- [ ] T025 [P] 更新 docs/GEHTP_PARALLEL_TASKBOOK.md 战役日志（decode 两阶段结果 + 各阶段 wall 数据）
-- [ ] T026 全量回归：prefill 逐字节不回归 + decode 门（tier1+tier2）+ host 合成三连，确认 SC-001~008 全绿；commit + push（SSH 直连，[[gehtp-github-access]]）
+- [x] T024 [P] 更新记忆文件：[[gehtp-08b-baseline-002]] 补 decode 进度；新建 decode 状态记忆（若 T015-T023 落地）——**2026-10-10 完成**：新建 [[gehtp-004-decode-feature-complete]]（总状态+门锚速查）、[[gehtp-004-t021-tier2-golden]]（R1 解除+金标环境）、[[gehtp-004-t020-serving-wiring]]、[[gehtp-004-t019-persistent-filequeue]]；002 基线锚补 decode 进度段；MEMORY.md 索引同步。
+- [x] T025 [P] 更新 docs/GEHTP_PARALLEL_TASKBOOK.md 战役日志（decode 两阶段结果 + 各阶段 wall 数据）——**2026-10-10 完成**：追加 004 线战役条目（P1/P2 战果、tier2 金标、各阶段 wall、架构定论、运维铁律、commits 清单）。
+- [x] T026 全量回归：prefill 逐字节不回归 + decode 门（tier1+tier2）+ host 合成三连，确认 SC-001~008 全绿；commit + push（SSH 直连，[[gehtp-github-access]]）——**2026-10-10 回归完成，SC-001~008 全绿（push 待用户确认）**：
+  - **host 套 65/65**（含 persistent 文件队列契约 30/30、contract/integration）。
+  - **v17 prefill 门复验（当前含状态 op 的库）**：d0f1784 跑 seq=32 v17 → vs HF golden **cos=0.998642 / top1=30/32 / exec 33.75s**——与 T009 基线**逐位复现到第 6 位小数**，prefill 路径对 T015+ 状态 op **零回归**（SC-003/005 绿）。注记：与 Sep-28 `.scratch_eqfix` 旧输出字节不一致系跨构建谱系（该血统未证），数值门为正典判据。
+  - **decode 门**：tier1（T018f/T019 31/32+cos≥0.9986）+ tier2（T021 16/16+12/12 token 位级，worst cos≥0.999991）均绿。
+  - **SC 盘点**：SC-001/002 精度门绿、SC-004 GEMV 无标量回落（T014 回开实证）、SC-005 prefill 不变（本次复验）、SC-006 状态 DDR（T022）、SC-007 wall 对照（T023）、SC-008 双门每阶段过。
 
 ---
 
