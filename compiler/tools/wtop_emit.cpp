@@ -480,6 +480,9 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 std::fprintf(stderr, "error: GdnBlock vtcm_budget_bytes=0 (extractor 未跑?)\n");
                 return 3;
             }
+            /* 009 T020: 几何尾挂 footer 登记 (无条件 — 设备内核 H/D/d_conv/
+             * chunk/T 全靠它; carve 才需 VTCM 池)。op_index = 刚发射 op 下标。 */
+            em.gdn_extras.push_back({(uint32_t)(em.ops.size() - 1), eg});
             if (em.ddr_static && em.ddr_vtcm_cap > 0) {
                 if (em.gdn_scratch_off == 0xFFFFFFFFu) {
                     int stg = em.alloc_vtcm_stage(eg.vtcm_budget_bytes, &em.gdn_scratch_off);
@@ -778,6 +781,32 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 put32(c.size_bytes);
                 put32(c.residency_start);
                 put32(c.residency_end);
+            }
+        }
+        /* 009 T020: 可选 per-op GDN 几何尾挂 footer — [magic][count][count ×
+         * {op_index, 40B ExtraGdnBlock}], 位于 carve footer 之后、weight 128B
+         * 对齐之前。字段序与 ExtraGdnBlock 逐一对应, 全小端 (put32)。 */
+        if (!em.gdn_extras.empty()) {
+            auto put32 = [&](uint32_t v) {
+                size_t old = em.blob.size();
+                em.blob.resize(old + 4);
+                std::memcpy(em.blob.data() + old, &v, 4);
+                p += 4;
+            };
+            put32(WT_GDN_EXTRA_MAGIC);
+            put32((uint32_t)em.gdn_extras.size());
+            for (const auto& ge : em.gdn_extras) {
+                put32(ge.first);               /* op_index */
+                put32(ge.second.t);
+                put32(ge.second.ntok);
+                put32(ge.second.c);
+                put32(ge.second.h);
+                put32(ge.second.d);
+                put32(ge.second.d_conv);
+                put32(ge.second.chunk);
+                put32(ge.second.vtcm_budget_bytes);
+                put32(ge.second.state_idx);
+                put32(ge.second.contract_ver);
             }
         }
         size_t woff = (p + 127) & ~(size_t)127;

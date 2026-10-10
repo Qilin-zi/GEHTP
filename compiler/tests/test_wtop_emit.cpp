@@ -579,6 +579,62 @@ int main() {
             CHECK(w3->ops[0].args[1] == (0x8000u | 0u) && w3->ops[0].args[0] == 5u,
                   "gdn: 线格式 [xqkv_t, 0x8000|conv_w_s, beta_t, g_t, y_t]");
         }
+        /* 009 T020d 正例: GDN 几何尾挂 footer 往返 (emit 线格式 → wt_parse 读回)。
+         * 手组 v3 blob = header + 24B 槽 + op 表 + 注解 footer + gdn footer
+         * (magic/count/44B 记录) + weight 128B 对齐。断言 wt_parse 命中 n_gdn=1
+         * 且逐字段读回几何与写入一致 (字段序 = ExtraGdnBlock 十元组)。 */
+        {
+            std::vector<uint8_t> b;
+            auto w16 = [&b](uint16_t v) { b.push_back((uint8_t)(v & 0xff)); b.push_back((uint8_t)(v >> 8)); };
+            auto w32 = [&b](uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((uint8_t)(v >> (8 * i))); };
+            b.insert(b.end(), {'W', 'T', 'O', 'P'});
+            w16(WT_BLOB_VER_3); w16(WT_ENDIAN_CHK);
+            w32(1); w32(1);                        // 1 slot, 1 op
+            // slot0 (24B v2/v3): len, count, offset lo/hi, addr, rsv(4B)
+            w32(128); w32(64); w32(0); w32(0); w32(0); w32(0);
+            // op0: OP_GDN_BLOCK_F16 arity 5 [xqkv_t, 0x8000|conv_w_s, beta_t, g_t, y_t]
+            w16(OP_GDN_BLOCK_F16); w16(5);
+            w32(5); w32(0x8000u | 0u); w32(6); w32(7); w32(8);
+            // 注解 footer (v3, n_ops × u32)
+            w32(0);
+            // gdn footer: [magic][count=1][op_index + 10 字段]
+            const uint32_t rec[11] = {0u /*op_index*/, 16u /*t*/, 16u /*ntok*/, 32u /*c*/,
+                                      16u /*h*/, 128u /*d*/, 4u /*d_conv*/, 32u /*chunk*/,
+                                      3024896u /*vtcm_budget_bytes*/, 0xFFFFFFFFu /*state_idx*/,
+                                      1u /*contract_ver*/};
+            w32(WT_GDN_EXTRA_MAGIC); w32(1);
+            for (uint32_t v : rec) w32(v);
+            while (b.size() % 128) b.push_back(0);
+            b.resize(b.size() + 128, 0);           // weight 区 (slot0 len=128)
+            CHECK(wt_parse(b.data(), b.size(), w3) == WT_OK, "gdn: v3 blob w/ footer wt_parse OK");
+            CHECK(w3->ver == WT_BLOB_VER_3 && w3->n_gdn == 1 && w3->gdn_base != NULL,
+                  "gdn: footer 命中 n_gdn=1");
+            if (w3->gdn_base) {
+                const uint8_t* p = w3->gdn_base;
+                bool ok = (wt_rd_u32(p + 0) == rec[0]) && (wt_rd_u32(p + 4) == rec[1]) &&
+                          (wt_rd_u32(p + 8) == rec[2]) && (wt_rd_u32(p + 12) == rec[3]) &&
+                          (wt_rd_u32(p + 16) == rec[4]) && (wt_rd_u32(p + 20) == rec[5]) &&
+                          (wt_rd_u32(p + 24) == rec[6]) && (wt_rd_u32(p + 28) == rec[7]) &&
+                          (wt_rd_u32(p + 32) == rec[8]) && (wt_rd_u32(p + 36) == rec[9]) &&
+                          (wt_rd_u32(p + 40) == rec[10]);
+                CHECK(ok, "gdn: 10 字段 + op_index 逐字段读回一致 (ExtraGdnBlock 序)");
+            }
+            /* 负例: gdn footer count 越出缓冲 → OP_TRUNC (确定性拒绝) */
+            {
+                std::vector<uint8_t> bad;
+                auto w16b = [&bad](uint16_t v) { bad.push_back((uint8_t)(v & 0xff)); bad.push_back((uint8_t)(v >> 8)); };
+                auto w32b = [&bad](uint32_t v) { for (int i = 0; i < 4; i++) bad.push_back((uint8_t)(v >> (8 * i))); };
+                bad.insert(bad.end(), {'W', 'T', 'O', 'P'});
+                w16b(WT_BLOB_VER_3); w16b(WT_ENDIAN_CHK); w32b(1); w32b(1);
+                w32b(128); w32b(64); w32b(0); w32b(0); w32b(0); w32b(0);
+                w16b(OP_GDN_BLOCK_F16); w16b(5);
+                w32b(5); w32b(0x8000u | 0u); w32b(6); w32b(7); w32b(8);
+                w32b(0);                               // annot
+                w32b(WT_GDN_EXTRA_MAGIC); w32b(7);     // count=7 但无记录体
+                CHECK(wt_parse(bad.data(), bad.size(), w3) == WT_ERR_OP_TRUNC,
+                      "gdn neg: footer count 越界 → OP_TRUNC");
+            }
+        }
         delete w3;
         /* --dma-runlist 不扰动默认形态: conv_add (无溢出计划) 两次发射逐字节一致 */
         {
@@ -1099,6 +1155,22 @@ int main() {
                   "gdn: opcode=37 / arity=5 线格式");
             CHECK((gw2->ops[0].args[1] & 0x8000u) != 0,
                   "gdn: args[1] = 0x8000|conv_w 槽位");
+            /* T020d: 几何尾挂 footer 往返 (emit 写 → wt_parse 读回)。
+             * 字段序 = ExtraGdnBlock 十元组 (t,ntok,c,h,d,d_conv,chunk,
+             * vtcm_budget_bytes,state_idx,contract_ver), op_index 前导。 */
+            CHECK(gw2->n_gdn == 1 && gw2->gdn_base != NULL,
+                  "gdn: footer 命中 n_gdn=1 (emit 写侧)");
+            if (gw2->gdn_base) {
+                const uint8_t* p = gw2->gdn_base;
+                bool ok = (wt_rd_u32(p + 0) == 0u) && (wt_rd_u32(p + 4) == 32u) &&
+                          (wt_rd_u32(p + 8) == 32u) && (wt_rd_u32(p + 12) == 32u) &&
+                          (wt_rd_u32(p + 16) == 16u) && (wt_rd_u32(p + 20) == 128u) &&
+                          (wt_rd_u32(p + 24) == 4u) && (wt_rd_u32(p + 28) == 32u) &&
+                          (wt_rd_u32(p + 32) == 3024896u) &&
+                          (wt_rd_u32(p + 36) == 0xFFFFFFFFu) &&
+                          (wt_rd_u32(p + 40) == 1u);
+                CHECK(ok, "gdn: footer 几何逐字段读回一致 (emit→parse)");
+            }
             delete gw2;
         }
     }

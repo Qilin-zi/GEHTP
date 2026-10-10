@@ -165,3 +165,141 @@ int delta_chunk_f16(rec_state_t* st, const int16_t* k, const int16_t* v,
     free(T); free(kf); free(vf); free(qf); free(G); free(bf); free(u); free(bmat); free(Lh);
     return 0;
 }
+
+/* ================= 009 整块单发射: B1 conv+SiLU → B2 delta chunk 级联 =================
+ * 逐字镜像 compiler ops.cpp GdnBlock 分支 (numerics-contract ver=1, B1-B5):
+ *   B2 conv 门 SiLU 后 yc 保 f32 (不落 f16); B3 delta 块内全程 f32, S 原地;
+ *   B4 出口 y 取 f16 RNE (gdn_f32_to_f16 与 host 位级同)。 */
+int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
+                  const int16_t* g, int16_t* y, float* S,
+                  int T, int H, int D, int d_conv, int chunk) {
+    if (T <= 0 || H <= 0 || D <= 0 || d_conv < 2 || chunk <= 0 || chunk > GDN_C_MAX)
+        return 1;
+    const int hd = H * D, DI = 3 * hd;   /* 局部 hd 避开文件顶 HD=128 宏 */
+    const float scale = 1.0f / sqrtf((float)D);
+
+    float* yc  = malloc((size_t)T * DI * 4);
+    float* win = calloc((size_t)(d_conv - 1) * DI, 4);
+    float* kf  = malloc((size_t)chunk * D * 4);
+    float* vf  = malloc((size_t)chunk * D * 4);
+    float* qf  = malloc((size_t)chunk * D * 4);
+    float* Gc  = malloc((size_t)chunk * 4);
+    float* L   = calloc((size_t)chunk * chunk, 4);
+    float* Tm  = calloc((size_t)chunk * chunk, 4);
+    float* bmat = malloc((size_t)chunk * D * 4);
+    float* u    = malloc((size_t)chunk * D * 4);
+    float* bf   = malloc((size_t)D * 4);
+    if (!yc || !win || !kf || !vf || !qf || !Gc || !L || !Tm || !bmat || !u || !bf) {
+        free(yc); free(win); free(kf); free(vf); free(qf); free(Gc);
+        free(L); free(Tm); free(bmat); free(u); free(bf);
+        return 2;
+    }
+
+    /* B2: conv1d + SiLU, 滑窗零起, 推窗在算后 (conv_f16 同式, 出 f32 yc) */
+    for (int t = 0; t < T; t++) {
+        const int16_t* xr = xqkv + (size_t)t * DI;
+        float* yr = yc + (size_t)t * DI;
+        for (int ch = 0; ch < DI; ch++) {
+            float s = 0.0f;
+            for (int i = 0; i < d_conv - 1; i++)
+                s += gdn_f16_to_f32(cw[(size_t)i * DI + ch]) * win[(size_t)i * DI + ch];
+            s += gdn_f16_to_f32(cw[(size_t)(d_conv - 1) * DI + ch]) * gdn_f16_to_f32(xr[ch]);
+            yr[ch] = s / (1.0f + expf(-s));
+        }
+        memmove(win, win + DI, (size_t)(d_conv - 2) * DI * sizeof(float));
+        /* 新样本入窗需先 f16→f32 (xqkv 是 f16) */
+        for (int ch = 0; ch < DI; ch++)
+            win[(size_t)(d_conv - 2) * DI + ch] = gdn_f16_to_f32(xr[ch]);
+    }
+
+    /* B3: delta 块内全 f32; state S f32 原地 (prefill 零起), chunk 跨块携带 */
+    for (int h = 0; h < H; h++) {
+        float* Sh = S + (size_t)h * D * D;
+        for (int base = 0; base < T; base += chunk) {
+            const int c = (T - base < chunk) ? (T - base) : chunk;
+            float acc = 0.0f;
+            for (int t = 0; t < c; t++) {
+                acc += gdn_f16_to_f32(g[(base + t) * H + h]);
+                Gc[t] = acc;
+            }
+            for (int t = 0; t < c; t++) {
+                const float* yrow = yc + (size_t)(base + t) * DI + (size_t)h * D;
+                for (int nn = 0; nn < D; nn++) {
+                    kf[(size_t)t * D + nn] = yrow[hd + nn];        /* q|k|v 三段 (c1b 口径) */
+                    vf[(size_t)t * D + nn] = yrow[2 * hd + nn];
+                    qf[(size_t)t * D + nn] = yrow[nn] * scale;
+                }
+            }
+            for (int j = 0; j < c; j++) {
+                float bj = gdn_f16_to_f32(beta[(base + j) * H + h]);
+                for (int i = 0; i < j; i++) {
+                    float s = 0.0f;
+                    for (int nn = 0; nn < D; nn++)
+                        s += kf[(size_t)j * D + nn] * kf[(size_t)i * D + nn];
+                    L[(size_t)j * c + i] = expf(Gc[j] - Gc[i]) * s * bj;
+                }
+                for (int i = j; i < c; i++) L[(size_t)j * c + i] = 0.0f;
+            }
+            for (int r = 0; r < c; r++)                            /* Tm=(I+L)^{-1}, ref_solve_tri 同式 */
+                for (int j = 0; j < c; j++) {
+                    float s = (r == j) ? 1.0f : 0.0f;
+                    for (int i = 0; i < r; i++)
+                        s -= L[(size_t)r * c + i] * Tm[(size_t)i * c + j];
+                    Tm[(size_t)r * c + j] = s;
+                }
+            for (int j = 0; j < c; j++) {
+                float ej = expf(Gc[j]);
+                float bj = gdn_f16_to_f32(beta[(base + j) * H + h]);
+                for (int m = 0; m < D; m++) {
+                    float sk = 0.0f;
+                    for (int nn = 0; nn < D; nn++)
+                        sk += Sh[(size_t)m * D + nn] * kf[(size_t)j * D + nn];
+                    bmat[(size_t)j * D + m] = bj * (vf[(size_t)j * D + m] - ej * sk);
+                    u[(size_t)j * D + m] = 0.0f;
+                }
+                for (int i = 0; i <= j; i++) {
+                    float tij = Tm[(size_t)j * c + i];
+                    if (tij == 0.0f) continue;
+                    for (int m = 0; m < D; m++)
+                        u[(size_t)j * D + m] += tij * bmat[(size_t)i * D + m];
+                }
+            }
+            for (int t = 0; t < c; t++) {
+                float et = expf(Gc[t]);
+                for (int m = 0; m < D; m++) {
+                    float s = 0.0f;
+                    for (int nn = 0; nn < D; nn++)
+                        s += Sh[(size_t)m * D + nn] * qf[(size_t)t * D + nn];
+                    bf[m] = et * s;
+                }
+                for (int i = 0; i <= t; i++) {
+                    float qk = 0.0f, w = expf(Gc[t] - Gc[i]);
+                    for (int nn = 0; nn < D; nn++)
+                        qk += qf[(size_t)t * D + nn] * kf[(size_t)i * D + nn];
+                    qk *= w;
+                    if (qk == 0.0f) continue;
+                    for (int m = 0; m < D; m++) bf[m] += qk * u[(size_t)i * D + m];
+                }
+                for (int m = 0; m < D; m++)                         /* B4: 出口 f16 RNE */
+                    y[(size_t)(base + t) * hd + (size_t)h * D + m] = gdn_f32_to_f16(bf[m]);
+            }
+            float eC = expf(Gc[c - 1]);
+            for (size_t z = 0; z < (size_t)D * D; z++) Sh[z] *= eC;
+            for (int i = 0; i < c; i++) {
+                float w = expf(Gc[c - 1] - Gc[i]);
+                const float* ui = u + (size_t)i * D;
+                const float* ki = kf + (size_t)i * D;
+                for (int m = 0; m < D; m++) {
+                    float wu = w * ui[m];
+                    if (wu == 0.0f) continue;
+                    float* row = Sh + (size_t)m * D;
+                    for (int nn = 0; nn < D; nn++) row[nn] += wu * ki[nn];
+                }
+            }
+        }
+    }
+
+    free(yc); free(win); free(kf); free(vf); free(qf); free(Gc);
+    free(L); free(Tm); free(bmat); free(u); free(bf);
+    return 0;
+}

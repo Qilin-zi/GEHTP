@@ -49,6 +49,18 @@ int delta_chunk_f16(rec_state_t* st, const int16_t* k, const int16_t* v,
                     const int16_t* q, const int16_t* beta, const int16_t* g,
                     int16_t* y, int c, int ntok);
 
+/* ---- 009 整块单发射 (B1 conv+SiLU → B2 delta chunk 级联) ----
+ * 数学逐字镜像 compiler ops.cpp GdnBlock 分支 + numerics-contract (B1-B5):
+ *   B2: conv 门 SiLU 后 yc 保 f32 不落 f16 (VTCM 私有 scratch);
+ *   B3: delta 块内全程 f32, state S 原地; B4: 出口 y 取 f16 (RNE)。
+ * 输入: xqkv [T, 3HD] f16 (in_proj 出值, q|k|v 三段); cw [d_conv, 3HD] f16;
+ *       beta [T,H] f16; g [T,H] f16 (负 log decay)。
+ * 输出: y [T, HD] f16 token-major。state S [H*D*D] f32 外置原地 (prefill 零起)。
+ * 返回 0; 1 = 参数非法; 2 = 中间缓冲分配失败。 */
+int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
+                  const int16_t* g, int16_t* y, float* S,
+                  int T, int H, int D, int d_conv, int chunk);
+
 /* ---- 标量 f32 oracle (host/device 同源, 判定真值) ---- */
 void ref_conv_step (conv_state_t* st, const float* w, const float* x, float* y);
 void ref_conv_block(conv_state_t* st, const float* w, const float* x, float* y, int m);

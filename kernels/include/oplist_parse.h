@@ -104,6 +104,17 @@ extern "C" {
  * The header makes the optional region distinguishable from alignment padding. */
 #define WT_CARVE_MAGIC 0x43524156u /* "VARC" little-endian */
 #define WT_CARVE_REC_SIZE 20u
+/* 009 GDN 块融合 (2026-10-10): 可选 per-op 几何尾挂 footer, 位于 carve footer
+ * 之后、weight 128B 对齐之前:
+ *   [magic u32 = WT_GDN_EXTRA_MAGIC][count u32][count × {op_index u32, 40B extra}]
+ * 40B extra = 10×u32 (struct wt_gdn_extra), 字段序与 compiler ExtraGdnBlock
+ * (op_extra.hpp) 逐一对应: t/ntok/c/h/d/d_conv/chunk/vtcm_budget_bytes/
+ * state_idx/contract_ver。仅含 OP_GDN_BLOCK 的 blob 写此项; 无融合层则此处
+ * 是 128B 对齐填充(全 0), magic 探测永不误判(同 carve 逻辑)。 */
+#define WT_GDN_EXTRA_MAGIC 0x584E4447u /* "GNDX" little-endian */
+#define WT_GDN_EXTRA_WORDS 10u
+#define WT_GDN_EXTRA_BYTES (WT_GDN_EXTRA_WORDS * 4u) /* 40 */
+#define WT_GDN_EXTRA_REC   (4u + WT_GDN_EXTRA_BYTES) /* op_index + 40B = 44 */
 #define WT_ENG_ACT 0u
 #define WT_ENG_OUT 1u
 #define WT_ENG_WT 2u
@@ -290,6 +301,21 @@ struct wt_op {
     uint32_t args[WT_MAX_ARGS];
 };
 
+/* 009 GDN 块融合: OP_GDN_BLOCK 的几何 (ExtraGdnBlock 设备侧同构镜像)。
+ * 字段序与 compiler ExtraGdnBlock 逐一对应 (勿动); 全 u32 小端。 */
+struct wt_gdn_extra {
+    uint32_t t;                 /* 序列全长 (prefill = 输入 token 数) */
+    uint32_t ntok;              /* 本块 token 跨度 (prefill 单发射 = T) */
+    uint32_t c;                 /* 本 chunk 实际 token 数 (≤ GDN_C_MAX=64) */
+    uint32_t h;                 /* 头数 (生产 16) */
+    uint32_t d;                 /* 头维 (生产 128; conv 通道 3HD) */
+    uint32_t d_conv;            /* conv 窗长 (生产 4) */
+    uint32_t chunk;             /* delta 名义分块 (生产 32) */
+    uint32_t vtcm_budget_bytes; /* 闭式预算 (128 对齐, FR-004) */
+    uint32_t state_idx;         /* US5 decode 状态槽 idx; prefill=0xFFFFFFFF */
+    uint32_t contract_ver;      /* numerics-contract.md 版本 */
+};
+
 struct wt_blob {
     uint16_t ver;
     uint32_t n_slots;
@@ -302,6 +328,8 @@ struct wt_blob {
     const uint8_t* annot_base;  /* v3: 引擎注解表 (n_ops 条 u32); ver<3 = NULL */
     const uint8_t* carve_base;  /* v3: optional VTCM carve footer records */
     uint32_t n_carve;           /* number of entries in carve_base */
+    const uint8_t* gdn_base;    /* 009: optional per-op GDN 几何 footer (records) */
+    uint32_t n_gdn;             /* number of gdn extra records */
 };
 
 enum {

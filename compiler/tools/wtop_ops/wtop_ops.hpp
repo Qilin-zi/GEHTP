@@ -154,6 +154,10 @@ struct Emitter {
      * 预算一致 3024896, 若未来层间几何分化需按 max 重分配, T025 复核)。 */
     uint32_t gdn_scratch_off = 0xFFFFFFFFu;
     uint32_t gdn_scratch_size = 0;
+    /* 009 T020: GdnBlock 几何尾挂 footer — 每融合 op 一条 {op_index, ExtraGdnBlock}
+     * (设备侧 exec_gdn_block 按 g_current_op_global 查几何)。与 carve 解耦:
+     * 无 VTCM 池时也登记 (内核仍需 H/D/d_conv/chunk/T 跑数值), carve 才需池。 */
+    std::vector<std::pair<uint32_t, ExtraGdnBlock>> gdn_extras;
     // 池内 bump 一块 staging 区, 登记为静态 VTCM temp, 返回 temp id (失败 -1:
     // 无 mem plan / 无 VTCM 池 / 池放不下 / temp id 耗尽)。基线取 ddr_op_map
     // 全量计划态上沿 (非物化态: 首个 W4A16 到达时高偏移驻留 temp 可能尚未物化)。

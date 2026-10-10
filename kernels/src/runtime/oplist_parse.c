@@ -102,6 +102,8 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
     out->annot_base = NULL;
     out->carve_base = NULL;
     out->n_carve = 0;
+    out->gdn_base = NULL;
+    out->n_gdn = 0;
 
     /* v1: 16B 槽记录 {len,count,offset32,addr}; v2: 24B {len,count,off64,addr,rsv} */
     const uint32_t slot_rec = (out->ver >= WT_BLOB_VER_2) ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE;
@@ -167,6 +169,18 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
                 out->n_carve = 0;
                 p += 8u;
             }
+        }
+
+        /* 009: 可选 per-op GDN 几何尾挂 footer — [magic][count][count × 44B],
+         * 位于 carve footer 之后、weight 128B 对齐之前。无融合层的 blob 此处
+         * 是 128B 对齐填充(全 0), magic 探测确定性(同 carve 逻辑)。 */
+        if (size >= p + 8u && wt_rd_u32(buf + p) == WT_GDN_EXTRA_MAGIC) {
+            uint32_t ng = wt_rd_u32(buf + p + 4u);
+            if (size < p + 8u + (size_t)ng * WT_GDN_EXTRA_REC)
+                return WT_ERR_OP_TRUNC;
+            out->gdn_base = buf + p + 8u;
+            out->n_gdn = ng;
+            p += 8u + (size_t)ng * WT_GDN_EXTRA_REC;
         }
     }
 
