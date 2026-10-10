@@ -28,6 +28,7 @@ add_library(htp_core STATIC
     src/opt/pass_fc_bias.cpp
     src/opt/pass_view_fold.cpp
     src/opt/pass_eltwise_const.cpp
+    src/opt/pass_gdn_block.cpp
     src/cost/cost_model.cpp
     src/vtcm/fancy_allocator.cpp
     src/vtcm/runtime_alloc.cpp
