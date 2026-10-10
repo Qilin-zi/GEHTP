@@ -2373,6 +2373,32 @@ static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
         istr[i] = istr[i + 1] * dd[i + 1];
         ostr[i] = ostr[i + 1] * od[i + 1];
     }
+    /* 008 US3 T018: 最内轴 stride==1 → 输出每行是输入的连续字节段, 可 HVX
+     * 块拷贝 (007 P1 broadcast 行循环范式; 判据与 emit 侧 op_strided_slice
+     * 引擎注解孪生 ns[nrk-1]==1)。逐行 odometer 免 div/mod。 */
+    uint32_t row_elems = od[rk - 1];
+    if (b->annot_base && g_planned_engine == WT_ENG_HVX && ss[rk - 1] == 1 && row_elems > 0) {
+        uint32_t rows = n_out / row_elems;
+        uint32_t oc[2] = {0, 0};            /* 外轴里程计 (rk<=3 → 外轴至多 2) */
+        for (uint32_t row = 0; row < rows; row++) {
+            uint32_t in_off = bb[rk - 1];   /* 最内轴 begin = 行内起始偏移 */
+            for (uint32_t ax = 0; ax + 1 < rk; ax++)
+                in_off += (bb[ax] + oc[ax] * ss[ax]) * istr[ax];
+            hvhx_v2_copy_f16(y + (size_t)row * row_elems, x + in_off, row_elems);
+            for (int ax = (int)rk - 2; ax >= 0; ax--) {
+                if (++oc[ax] < od[ax]) break;
+                oc[ax] = 0;
+            }
+        }
+        g_last_engine = WT_ENG_HVX;  /* 实跑即计划 (dev=0) */
+        return 0;
+    }
+    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
+        engine_fallback_or_die(g_planned_engine,
+                               ss[rk - 1] == 1 ? "slice row_elems==0"
+                                               : "slice innermost stride>1",
+                               err, errn) != 0)
+        return -1;
     for (uint32_t i = 0; i < n_out; i++) {
         uint32_t rem = i, in_lin = 0;
         for (uint32_t ax = 0; ax < rk; ax++) {

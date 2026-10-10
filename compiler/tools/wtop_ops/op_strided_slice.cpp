@@ -51,6 +51,13 @@ static int op_strided_slice(Emitter& em, GraphPrepare& gp, const OpDef* od, std:
             if (ar == 1) { d2 = srcp->output_def.dims[0]; d1 = 1; }
         }
         args.push_back(d0); args.push_back(d1); args.push_back(d2);
+        /* 008 US3 T018: 最内轴 stride==1 → 输出每行是输入连续字节段, 可 HVX
+         * 块拷贝 (设备孪生 exec_slice ss[rk-1]==1)。否则保持 assign_engine
+         * 默认 scalar (跨步最内轴不可块拷贝, 勿虚报 HVX 致运行期回落)。 */
+        {
+            uint32_t in_stride = (rk == 3) ? s2 : (rk == 2) ? s1 : s0;
+            if (in_stride == 1) em.cur_engine = wt_annot_pack(1u, 1u, 0u);
+        }
         em.add_op(OP_STRIDED_SLICE_F16, args);
         return 0;
     }
@@ -139,6 +146,8 @@ static int op_strided_slice(Emitter& em, GraphPrepare& gp, const OpDef* od, std:
     args.push_back(ne[0]); args.push_back(ne[1]); args.push_back(ne[2]);
     args.push_back(ns[0]); args.push_back(ns[1]); args.push_back(ns[2]);
     args.push_back(nd[0]); args.push_back(nd[1]); args.push_back(nd[2]);
+    /* 008 US3 T018: 最内轴 stride==1 → 行连续可 HVX (设备孪生 exec_slice)。 */
+    if (ns[nrk - 1] == 1) em.cur_engine = wt_annot_pack(1u, 1u, 0u);
     em.add_op(OP_STRIDED_SLICE_F16, args);
     return 0;
 }
