@@ -194,23 +194,14 @@ int collapse_layer(OpDef* entry, GraphPrepare* gp) {
             bool is_conv = name_is(f, "DepthWiseConv2d") ||
                            f->grouping.find("/conv1d") != std::string::npos;
             if (!is_conv) continue;
-            if (getenv("GEHTP_GDN_DBG")) {
-                std::fprintf(stderr,"[conv-dbg] op=%u name=%s n_in=%zu\n", f->op_id,
-                             f->name_tag?f->name_tag->name():"(null)", f->inputs.size());
-                for (size_t k = 0; k < f->inputs.size(); k++) {
-                    OpDef* q = gp->get_op_at(f->inputs[k].src_id);
-                    std::fprintf(stderr,"  in%zu: id=%u name=%s const=%d sz=%llu grp=%.60s\n", k,
-                                 f->inputs[k].src_id, (q&&q->name_tag)?q->name_tag->name():"(-)",
-                                 q?(int)q->is_const():-1, q?(unsigned long long)q->const_data_size:0ull,
-                                 q?q->grouping.c_str():"-");
-                }
-            }
             for (size_t k = 1; k < f->inputs.size(); k++) {
                 OpDef* p = gp->get_op_at(f->inputs[k].src_id);
                 if (!p || p->is_dead() || !p->is_const()) continue;
                 // 注入参数 const 名 = ".../Conv_2d_stride|pad_amount|dilation";
-                // 权重 const(kind==1) 名是通用 "$Const" 且尺寸最大 —— 排除
-                // 参数后取最大者(1010 实测: w=49152B, bias=24576B)。
+                // 权重 const(kind==1) 名 "$Const" 无 grouping; wscale/iscale
+                // (inject_htp_prepare_inputs 的 per-axis scale)同名 "$Const", 但
+                // 权重尺寸最大 —— 跳参数名取最大(1010 实测: 权重 49152B=
+                // [1,4,1,6144]f16 > wscale 24576B > stride/pad/dilation 8/16/8B)。
                 const char* pn = p->name_tag ? p->name_tag->name() : nullptr;
                 if (pn && std::strstr(pn, "Conv_2d_")) continue;
                 if (!convw || p->const_data_size > convw->const_data_size) convw = p;
