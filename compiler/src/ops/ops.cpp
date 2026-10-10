@@ -1114,6 +1114,45 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             else for (uint32_t i = 0; i + 2 < ork && batched; i++)
                 if (out_def.dims[i] != in_defs[1].dims[i]) batched = false;
         }
+        /* FC bias 折叠(pass_fc_bias)配套: op_data scalar "has_bias"==1 且
+         * inputs[2] 元素数 == nn 时按列加 bias, 与设备 exec_matmul_f16 标量
+         * 路径(f32 累加器加 bias)同口径 —— host/device 数值一致。
+         * 只认 scalar 标记: 注入形态下 inputs[2] 常是 N 元素 wscale const,
+         * 形状启发会误加(test_wtop_emit US1 实锤)。host_run --bin 路径
+         * op_data 不落盘, 标记丢失则按无 bias 跑(与折叠前行为一致)。
+         * 注意: 4D 填充(FC 输出 [1,1,m,n])使 ork>=3 误入 batched 分支, 而
+         * batched BMM 原本不套 bias —— dt_bias 就是被这条路径丢的(0.8B
+         * 实测: 全 FC ork>=3 → else 分支零命中)。故 mm_bias 须在 batched/
+         * else 分流前判定, 两分支都套(真实 attention BMM 无 has_bias 标记,
+         * mm_bias 恒 null, 零行为变化)。 */
+        const float* mm_bias = nullptr;
+        {
+            const ScalarParam* hb = scalar_get(sp, "has_bias");
+            if (hb && hb->is_numeric && hb->value_num != 0 &&
+                inputs.size() > 2 && inputs[2] && in_defs.size() > 2) {
+                size_t bn = 1;
+                for (uint32_t i = 0; i < in_defs[2].rank && i < 5; ++i) bn *= in_defs[2].dims[i];
+                if (bn == nn) mm_bias = reinterpret_cast<const float*>(inputs[2]);
+            }
+            if (getenv("GEHTP_MMBIAS_DBG")) {
+                size_t bn = 1;
+                for (uint32_t i = 0; in_defs.size() > 2 && i < in_defs[2].rank && i < 5; ++i)
+                    bn *= in_defs[2].dims[i];
+                std::fprintf(stderr,
+                    "[mmbias] oid=%llu m=%zu nn=%zu k=%zu ork=%u batched=%d ins=%zu indefs=%zu "
+                    "hb=%d in2set=%d in2rank=%u in2d0=%llu bn=%zu mmbias=%d in2[0]=%g\n",
+                    (unsigned long long)op_id,
+                    m, nn, k, ork, (int)batched, inputs.size(), in_defs.size(),
+                    (hb && hb->is_numeric && hb->value_num != 0) ? 1 : 0,
+                    (inputs.size() > 2 && inputs[2]) ? 1 : 0,
+                    (in_defs.size() > 2) ? in_defs[2].rank : 999,
+                    (in_defs.size() > 2 && in_defs[2].rank > 0) ?
+                        (unsigned long long)in_defs[2].dims[0] : 0ULL,
+                    bn, mm_bias ? 1 : 0,
+                    (inputs.size() > 2 && inputs[2]) ?
+                        reinterpret_cast<const float*>(inputs[2])[0] : -999.f);
+            }
+        }
         if (batched) {
             size_t Bn = 1;
             for (uint32_t i = 0; i + 2 < ork; i++) Bn *= out_def.dims[i];
@@ -1127,37 +1166,22 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                             float bv = t1 ? B[(b * N2 + j) * k + p] : B[(b * k + p) * N2 + j];
                             acc += av * bv;
                         }
+                        if (mm_bias) acc += mm_bias[j];
                         out[(b * M2 + i) * N2 + j] = acc;
                     }
         } else {
-        /* FC bias 折叠(pass_fc_bias)配套: op_data scalar "has_bias"==1 且
-         * inputs[2] 元素数 == nn 时按列加 bias, 与设备 exec_matmul_f16 标量
-         * 路径(f32 累加器加 bias)同口径 —— host/device 数值一致。
-         * 只认 scalar 标记: 注入形态下 inputs[2] 常是 N 元素 wscale const,
-         * 形状启发会误加(test_wtop_emit US1 实锤)。host_run --bin 路径
-         * op_data 不落盘, 标记丢失则按无 bias 跑(与折叠前行为一致)。 */
-        const float* mm_bias = nullptr;
-        {
-            const ScalarParam* hb = scalar_get(sp, "has_bias");
-            if (hb && hb->is_numeric && hb->value_num != 0 &&
-                inputs.size() > 2 && inputs[2] && in_defs.size() > 2) {
-                size_t bn = 1;
-                for (uint32_t i = 0; i < in_defs[2].rank && i < 5; ++i) bn *= in_defs[2].dims[i];
-                if (bn == nn) mm_bias = reinterpret_cast<const float*>(inputs[2]);
-            }
-        }
-        for (size_t i = 0; i < m; ++i) {
-            for (size_t j = 0; j < nn; ++j) {
-                float acc = 0.0f;
-                for (size_t p = 0; p < k; ++p) {
-                    float av = t0 ? A[(size_t)p * m + i] : A[i * k + p];
-                    float bv = t1 ? B[j * k + p] : B[p * nn + j];
-                    acc += av * bv;
+            for (size_t i = 0; i < m; ++i) {
+                for (size_t j = 0; j < nn; ++j) {
+                    float acc = 0.0f;
+                    for (size_t p = 0; p < k; ++p) {
+                        float av = t0 ? A[(size_t)p * m + i] : A[i * k + p];
+                        float bv = t1 ? B[j * k + p] : B[p * nn + j];
+                        acc += av * bv;
+                    }
+                    if (mm_bias) acc += mm_bias[j];
+                    out[i * nn + j] = acc;
                 }
-                if (mm_bias) acc += mm_bias[j];
-                out[i * nn + j] = acc;
             }
-        }
         }
     } else if (op_type_name == "Conv" || op_type_name == "Conv2d"
                || op_type_name == "DepthWiseConv2d") {
