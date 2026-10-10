@@ -41,6 +41,10 @@
 #include "internal/hvx-base.h"  /* GEMV 向量体: hvx_vmemu / hvx_vec_mpyacc_f32_f16 / hvx_vec_f32_to_f16 */
 #include "internal/hvx-fa-kernels.h"  /* HVX_OP_ADD_F32 (vec_dot 收尾通道加) */
 #include "internal/hvx-reduce.h"      /* hvx_vec_reduce_sum_f32 (水平归约) */
+#if defined(__hexagon__)
+#include <hexagon_types.h>          /* HMX Q6_* intrinsic 依赖 (Address/UWord32/Word32) */
+#include <hmx_hexagon_protos.h>     /* Q6_mxclracc_hf / Q6_bias_mxmem2_A / Q6_activation_hf_mxmem_RR_deep / Q6_mxmem_AR_after_hf */
+#endif
 #endif
 
 #define MAX_TEMPS 16384  /* VTCM 驻留默认开: 静态登记限制 temp id 回收, 0.8B 水位逼近全体 op 数(~14k), 4096 不够。上限=TEMPOFF tid 14 位编码(0x3FFF), 与 WT_EXEC_MAX_TEMPS 同步 */
@@ -894,22 +898,16 @@ static int exec_conv2d_hmx(const uint16_t* cols, const uint16_t* wm,
             uint16_t* out_tile = out_cr + ((size_t)r * n_col + c) * 1024u;
             hmx_enable_execution();
             hmx_unit_acquire();
-            asm volatile("mxclracc.hf" ::: "memory");
-            asm volatile("bias = mxmem2(%0)" :: "r"(sca) : "memory");
+            Q6_mxclracc_hf();
+            Q6_bias_mxmem2_A((void *)sca);
             for (uint32_t kt = 0; kt < n_dot; ++kt) {
                 const uint16_t* act_tile = act_cr + ((size_t)r * n_dot + kt) * 1024u;
                 const uint16_t* wgt_tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
-                asm volatile(
-                    "{ activation.hf = mxmem(%0, %1):deep\n"
-                    "  weight.hf = mxmem(%2, %3) }\n"
-                    :: "r"(act_tile), "r"(0x7FFu),
-                       "r"(wgt_tile), "r"(0x7FFu) : "memory");
+                Q6_activation_hf_mxmem_RR_deep((uintptr_t)act_tile, 0x7FFu);
+                Q6_weight_hf_mxmem_RR((uintptr_t)wgt_tile, 0x7FFu);
             }
             memset(out_tile, 0, 2048u);
-            asm volatile(
-                "cvt.hf = acc(%0)\n"
-                "mxmem(%1, %2) = cvt\n"
-                :: "r"(2), "r"(out_tile), "r"(0) : "memory");
+            Q6_mxmem_AR_after_hf((void *)out_tile, 0u);
             hmx_unit_release();
             hmx_disable_execution();
         }
@@ -2022,9 +2020,12 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
     }
 
     /* HMX GEMM: 复刻 hmx_convf16.c convf16_hmx_multi 已验证路径
-     * (crouton pair-interleave + mxmem:deep 累加 + cvt.hf=acc(2) 写回)。
+     * (crouton pair-interleave + mxmem:deep 累加)。写回由 cvt.hf=acc(2)
+     * (mode 0) 改为 Q6_mxmem_AR_after_hf (:after.hf, mode 4) —— 同
+     * hmx_convf16.c 诊断 mode 4; 上板 bit-exact 已验证 (mm32 matmul
+     * 1024/1024, conv_add 32768/32768 对替换前裸 asm 基线)。
      * 勿用 hvhx_v2_hmx_gemm_dot_fp16 — 那是 ggml core_dot 移植路径, 布局
-     * (row-major pair) 与写回 (:after.hf) 都不同, 未上板验证。 */
+     * (row-major pair) 不同, 未上板验证。 */
     for (uint32_t r = 0; r < n_row; ++r) {
         for (uint32_t c = 0; c < n_col; ++c) {
             uint16_t* out_tile = out_cr + ((size_t)r * n_col + c) * 1024u;
@@ -2037,22 +2038,16 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                     sca[2u * n + 1u] = bias[n0 + c * 32u + n];
             hmx_enable_execution();
             hmx_unit_acquire();
-            asm volatile("mxclracc.hf" ::: "memory");
-            asm volatile("bias = mxmem2(%0)" :: "r"(sca) : "memory");
+            Q6_mxclracc_hf();
+            Q6_bias_mxmem2_A((void *)sca);
             for (uint32_t kt = 0; kt < n_dot; ++kt) {
                 const uint16_t* act_tile = act_cr + ((size_t)r * n_dot + kt) * 1024u;
                 const uint16_t* wgt_tile = wgt_cr + ((size_t)c * n_dot + kt) * 1024u;
-                asm volatile(
-                    "{ activation.hf = mxmem(%0, %1):deep\n"
-                    "  weight.hf = mxmem(%2, %3) }\n"
-                    :: "r"(act_tile), "r"(0x7FFu),
-                       "r"(wgt_tile), "r"(0x7FFu) : "memory");
+                Q6_activation_hf_mxmem_RR_deep((uintptr_t)act_tile, 0x7FFu);
+                Q6_weight_hf_mxmem_RR((uintptr_t)wgt_tile, 0x7FFu);
             }
             memset(out_tile, 0, 2048u);
-            asm volatile(
-                "cvt.hf = acc(%0)\n"
-                "mxmem(%1, %2) = cvt\n"
-                :: "r"(2), "r"(out_tile), "r"(0) : "memory");
+            Q6_mxmem_AR_after_hf((void *)out_tile, 0u);
             hmx_unit_release();
             hmx_disable_execution();
         }
