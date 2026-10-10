@@ -105,7 +105,7 @@ description: "Task list for feature implementation"
 
 - [X] T024 冲刺总门：三方向叠加全链 wall ≤20s（SC-002 总门）+ op 数对照 ≤9000 参照 → `evidence/sprint_gate.md`（depends T011, T017, T023）→ **门未达**: wall 27.4s (>20s) + op 14188 (>9000), 根因 US3 融合 NO-GO + Q4 dequant 标量; US1 超交付 -7.7s
 - [X] T025 [P] 003 契约回归：blob-v3 五场景验收（devA/devB 回落取证、carve footer、ver1 legacy 逐字节）+ ctest 47/47 终局（SC-006，FR-006）→ **PASS**: ctest 48/48 + diff 证明 12 文件未触序列化/opcode/slot/carve/回落/legacy + 改动面由 T011/T017 设备门复验（evidence/t025_contract_regression.md）
-- [ ] T026 quickstart.md 全流程验证跑一遍（含三条逃生门：emit 回旧判据 / 去 --gguf--match / --no-pass）
+- [X] T026 quickstart.md 全流程验证跑一遍（含三条逃生门：emit 回旧判据 / 去 --gguf--match / --no-pass）→ **PASS**: 五段全在 T010-T025 跑通; 门1=git revert ab73491 自包含; 门2=v4 无 gguf blob 上板; 门3=--no-pass 端到端编译通过（evidence/t026_quickstart_flow.md）
 - [ ] T027 [P] 协调收尾：跨会话协调表登记（worktree/分支/设备库指纹变化如重推）/ 结论写回 memory；006 目录改名协调（specs/006-perf-sprint-1 名不副实，与归档的 006 会话或用户确认）
 
 ---
