@@ -119,7 +119,7 @@ description: "Task list: 全图 VTCM 驻留 + 显式 DMA 流水（008 中期性�
 
 ## Phase 7: Polish & 收口
 
-- [ ] T023 终局板跑：SC-003 总门 ≤8s（007 锚口径；007 未交卷按 v4 35.31s 回退等比重校并登记）+ 双口径判分登记（`scripts/judge_logits.py` f16/W4 双列，沿 007 冻结值）
+- [x] T023 终局板跑：SC-003 总门 ≤8s（007 锚口径；007 未交卷按 v4 35.31s 回退等比重校并登记）+ 双口径判分登记（`scripts/judge_logits.py` f16/W4 双列，沿 007 冻结值）— **exec 6.31s ≤8s PASS（3.84× 于 007 锚 24.24s）；f16 位级 md5 f87461e2 恒等 + cos 0.998642/top1 30/32 不回归；W4 列沿 007 冻结门 0.98/20 未消费（Phase 1 纯 f16）**。证据 `evidence/t023-final-board-gate.md`
 - [ ] T024 [P] 003 blob-v3 五场景 + ctest 全绿复验（devA/devB/w4v3/t2l/ver1-legacy；证据入库不入 /tmp）
 - [ ] T025 [P] quickstart.md 四场景全复跑 + evidence 归档收口（specs/008 目录内）
 - [ ] T026 跨会话协调表 + memory 回写：BudgetReport 口径向 009 GDN 融合线交接（窗口=009 US3 前）、004 reconcile 面终态、库指纹变更登记
