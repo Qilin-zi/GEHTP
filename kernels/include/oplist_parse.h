@@ -226,6 +226,17 @@ enum {
                                状态 S = [H*D*D] f32 外置原地更新;
                                c = 本 chunk token 数 (decode 步 c=1);
                                q 的 1/√D 缩放在 kernel 内。 */
+    /* 009 GDN 块融合 (2026-10-10): linear_attn 整块单发射 op。
+       [xqkv_t, conv_w_s, beta_t, g_t, y_t] arity 5。
+       几何 (T/ntok/C/H/D/d_conv/chunk/vtcm_budget_bytes/state_idx/
+       contract_ver) 全走 serialized_extra (ExtraGdnBlock 尾挂
+       [u32 len][bytes]), 不占 args (args≤16 硬约束下几何外置)。
+       ref 四套编码: 0x8000|slot 权重槽 (仅 idx1) / 裸 temp id /
+       0x4000|temp VTCM 驻留 / 0x6000|idx 状态槽 (US5 decode 步形,
+       prefill 态 state_idx=0xFFFFFFFF 瞬态 carve 哨兵, 在 extra 不在 args)。
+       xqkv_t = in_proj 出值 f16 [ntok, 3C]; conv_w_s = [d_conv, C] f16
+       同 op19 布局; beta/g_t = [C] 门控向量; y_t = 块出口 f16。 */
+    OP_GDN_BLOCK_F16 = 37,
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -264,6 +275,7 @@ enum {
 #define WT_ARITY_MATMUL_F16_BIAS 8
 #define WT_ARITY_CONV1D_SSM_STEP_F16 6
 #define WT_ARITY_DELTA_CHUNK_F16 11
+#define WT_ARITY_GDN_BLOCK_F16 5
 
 struct wt_slot {
     uint32_t len;

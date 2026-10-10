@@ -4,6 +4,7 @@
 // 二进制 → wt_parse 校验 blob → 断言 op/slot 契约 → 负例(截断/坏 magic/
 // 坏 arity)返回期望错误码。
 #include "hnnx/ir/graph_prepare.hpp"
+#include "hnnx/ir/op_extra.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
 #include "hnnx/ir/types.hpp"
 #include "hnnx/ir/scalar_params.hpp"
@@ -351,6 +352,35 @@ int main() {
             std::memcpy(bad.data() + op0 + 2, &wrong, 2);
         }
         CHECK(wt_parse(bad.data(), bad.size(), wb) == WT_ERR_ARITY, "neg: 坏 arity -> ARITY");
+        // 009 T017 登记后契约: 37 (GdnBlock) 合法, 本 blob 首 op n_args 未改
+        // (≠5) -> ARITY; 未知 opcode 200 接管 FR-003 OPCODE 负例。
+        // (登记前取证: 同一 37 补丁在 T017 前的树上断言 OPCODE, 2026-10-10
+        //  实跑 OK + 全套 ALL PASS, 证据 specs/009-gdn-block-fusion/
+        //  evidence-t017-opcode.md。)
+        bad = blob;
+        {
+            wt_blob* wb2 = new wt_blob{};
+            wt_parse(blob.data(), blob.size(), wb2);
+            uint32_t n_slots2 = wb2->n_slots;
+            size_t op0b = 16 + (size_t)n_slots2 *
+                ((wb2->ver >= WT_BLOB_VER_2) ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE);
+            uint16_t gdn_op = 37;
+            std::memcpy(bad.data() + op0b, &gdn_op, 2);
+        }
+        CHECK(wt_parse(bad.data(), bad.size(), wb) == WT_ERR_ARITY,
+              "gdn: opcode 37 登记后 n_args 不匹配 -> ARITY");
+        bad = blob;
+        {
+            wt_blob* wb2 = new wt_blob{};
+            wt_parse(blob.data(), blob.size(), wb2);
+            uint32_t n_slots2 = wb2->n_slots;
+            size_t op0b = 16 + (size_t)n_slots2 *
+                ((wb2->ver >= WT_BLOB_VER_2) ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE);
+            uint16_t unk = 200;
+            std::memcpy(bad.data() + op0b, &unk, 2);
+        }
+        CHECK(wt_parse(bad.data(), bad.size(), wb) == WT_ERR_OPCODE,
+              "neg: 未知 opcode 200 -> OPCODE (FR-003 显式失败, 接管 37 前身)");
     }
 
     /* 5b. 烘焙输入槽防静默零填充门(缺文件曾是 v3f 事故根因):
@@ -536,6 +566,18 @@ int main() {
             std::vector<uint8_t> bad = build_blob(OP_PIN, {WT_REF_ENG_FLAG | WT_ENG_OUT});
             CHECK(wt_parse(bad.data(), bad.size(), w3) == WT_ERR_BAD_REF,
                   "P5 neg: PIN 带 0xC000 -> BAD_REF (豁免仅 OP_DMA)");
+        }
+        /* 009 T017 正例: OP_GDN_BLOCK_F16=37 arity 5 手组 blob 解析契约
+         * (emit 工厂完整断言 = T019 落地后补 emit 侧用例) */
+        {
+            std::vector<uint8_t> gdn = build_blob(OP_GDN_BLOCK_F16,
+                {5u, 0x8000u | 0u, 6u, 7u, 8u});
+            CHECK(wt_parse(gdn.data(), gdn.size(), w3) == WT_OK,
+                  "gdn: OP_GDN_BLOCK_F16 arity 5 wt_parse OK");
+            CHECK(w3->ops[0].opcode == 37 && w3->ops[0].n_args == 5,
+                  "gdn: opcode=37 / arity=5 契约");
+            CHECK(w3->ops[0].args[1] == (0x8000u | 0u) && w3->ops[0].args[0] == 5u,
+                  "gdn: 线格式 [xqkv_t, 0x8000|conv_w_s, beta_t, g_t, y_t]");
         }
         delete w3;
         /* --dma-runlist 不扰动默认形态: conv_add (无溢出计划) 两次发射逐字节一致 */
@@ -967,6 +1009,97 @@ int main() {
             err.push_back(0);
             CHECK(std::strstr((const char*)err.data(), "carve") != nullptr,
                   "T022: 错误信息指向 carve 不变量");
+        }
+    }
+
+    /* 11. 009 T015/T016/T019: GdnBlock emit 契约 — ExtraGdnBlock extra
+     * (T016 extractor, 即时绿) + opcode 37 / arity 5 (T019 emit 工厂, 工厂
+     * 落地前 emit 硬错误 = RED 取证)。 */
+    {
+        GraphPrepare g;
+        auto od2 = [](uint64_t d0, uint64_t d1, uint32_t es, uint32_t dt) {
+            OutputDef od{};
+            od.rank = 2; od.dims[0] = d0; od.dims[1] = d1;
+            od.element_size = es; od.dtype = dt;
+            return od;
+        };
+        const uint32_t dt_f32 = static_cast<uint32_t>(DType::Float32);
+        const uint32_t dt_f16 = static_cast<uint32_t>(DType::Float16);
+        OutputDef in_od = od2(32, 6144, 2, dt_f16);
+        g.append_node("Input", 10, nullptr, 0, &in_od, 1, nullptr);
+        OutputDef cw_od = od2(4, 6144, 4, dt_f32);
+        std::vector<float> cwv(4 * 6144, 0.25f);
+        g.append_const_node(2, cw_od,
+                            reinterpret_cast<const uint8_t*>(cwv.data()), cwv.size() * 4);
+        g.get_op_at(2)->name_tag = string_tag_t::map_str("conv_w");
+        OutputDef b_od = od2(32, 16, 4, dt_f32);
+        std::vector<float> bv(32 * 16, 0.5f), gv(32 * 16, -0.1f);
+        g.append_const_node(3, b_od,
+                            reinterpret_cast<const uint8_t*>(bv.data()), bv.size() * 4);
+        g.get_op_at(3)->name_tag = string_tag_t::map_str("beta");
+        g.append_const_node(4, b_od,
+                            reinterpret_cast<const uint8_t*>(gv.data()), gv.size() * 4);
+        g.get_op_at(4)->name_tag = string_tag_t::map_str("g");
+        std::vector<ScalarParam> sps = {
+            {"H", true, 16.0, ""}, {"D", true, 128.0, ""},
+            {"d_conv", true, 4.0, ""}, {"chunk", true, 32.0, ""},
+            {"T", true, 32.0, ""},
+        };
+        auto spd = pack_scalar_params(sps);
+        InputDef gin[4] = {{10, 0}, {2, 0}, {3, 0}, {4, 0}};
+        OutputDef y_od = od2(32, 2048, 2, dt_f16);
+        g.append_node("GdnBlock", 20, gin, 4, &y_od, 1, spd.data(), spd.size());
+        InputDef oin[1] = {{20, 0}};
+        g.append_node("Output", 40, oin, 1, nullptr, 0, nullptr);
+        CHECK(g.prepare(env) == GraphStatus::Success, "gdn: prepare");
+        std::vector<uint8_t> gb(1u << 20, 0);
+        size_t gbn = 0;
+        CHECK(g.serialize(gb.data(), gb.size(), gbn) && gbn > 0, "gdn: serialize");
+        gb.resize(gbn);
+        /* T016: ExtraGdnBlock extractor 经注册表落 serialized_extra 尾挂
+         * (serialize 只写流不回填字段 → deserialize 回读断言, 走真实线格式) */
+        GraphPrepare g2;
+        CHECK(g2.deserialize(gb.data(), gb.size()), "gdn: deserialize round-trip");
+        OpDef* gn = g2.get_op_at(20);
+        CHECK(gn && gn->serialized_extra.size() == sizeof(ExtraGdnBlock),
+              "gdn: serialized_extra == sizeof(ExtraGdnBlock)(40B)");
+        if (gn && gn->serialized_extra.size() == sizeof(ExtraGdnBlock)) {
+            ExtraGdnBlock e{};
+            std::memcpy(&e, gn->serialized_extra.data(), sizeof(e));
+            CHECK(e.t == 32 && e.ntok == 32 && e.c == 32, "gdn: extra T/ntok/c = 32");
+            CHECK(e.h == 16 && e.d == 128 && e.d_conv == 4 && e.chunk == 32,
+                  "gdn: extra H/D/d_conv/chunk 生产形");
+            CHECK(e.state_idx == 0xFFFFFFFFu && e.contract_ver == 1u,
+                  "gdn: extra prefill 哨兵 + contract_ver=1");
+            /* 闭式预算 (extractor 注释同式): state 1048576 + conv窗 73728 +
+             * yc 393216 + y 131072 + beta/g 2048 + L/T 65536 + chunk f32 1310720
+             * = 3024896 (已 128 对齐) */
+            CHECK(e.vtcm_budget_bytes == 3024896u, "gdn: extra 闭式预算 3024896");
+        }
+        const std::string gdir2 = dir + "gdn/";
+        std::system(("mkdir -p " + gdir2).c_str());
+        const std::string gbp2 = gdir2 + "gdn.bin";
+        CHECK(write_file(gbp2, gb.data(), gb.size()), "gdn: write .bin");
+        std::vector<uint8_t> gin16((size_t)32 * 6144 * 2, 0);
+        CHECK(write_file(gdir2 + "x.f16.raw", gin16.data(), gin16.size()),
+              "gdn: write input f16");
+        std::string gcmd = std::string(WTOP_EMIT_PATH) + " --bin " + gbp2 +
+                           " --input-f16 " + gdir2 + "x.f16.raw --out " + gdir2 +
+                           "gdn.wtop --manifest " + gdir2 + "gdn.manifest.json 2>" +
+                           gdir2 + "gdn.err";
+        int grc = std::system(gcmd.c_str());
+        CHECK(grc == 0, "gdn: wtop_emit exit 0 (T019 工厂)");
+        if (grc == 0) {
+            std::vector<uint8_t> gbl;
+            CHECK(load_file(gdir2 + "gdn.wtop", gbl), "gdn: read blob");
+            wt_blob* gw2 = new wt_blob{};
+            CHECK(wt_parse(gbl.data(), gbl.size(), gw2) == WT_OK, "gdn: wt_parse OK");
+            CHECK(gw2->n_ops == 1 && gw2->ops[0].opcode == 37 &&
+                  gw2->ops[0].n_args == 5,
+                  "gdn: opcode=37 / arity=5 线格式");
+            CHECK((gw2->ops[0].args[1] & 0x8000u) != 0,
+                  "gdn: args[1] = 0x8000|conv_w 槽位");
+            delete gw2;
         }
     }
 
