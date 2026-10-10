@@ -20,6 +20,7 @@
 #include "hnnx/opt/optimization_passes.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/ir/scalar_params.hpp"
+#include "hnnx/ir/op_extra.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -440,6 +441,11 @@ void dump_view_census(GraphPrepare* gp, std::FILE* out) {
     uint32_t n_ss = 0, n_rs = 0, n_tp = 0;
     uint32_t r1 = 0, r2 = 0, r3 = 0, ss_ident = 0;
     uint32_t eb_pair = 0;
+    /* 008 US3 T017: 切片 stride 分解 —— 连续(stride==1 全轴, 可引用消除) vs
+     * 跨步(任一 stride>1, 必须物理搬运)。再分连续里的全区间(可别名)与子区间
+     * (偏移视图)。字节按输出 elems 近似(输出 dims = cnt 每轴积)。 */
+    uint32_t ss_contig_full = 0, ss_contig_sub = 0, ss_strided = 0;
+    uint64_t cfull_elems = 0, csub_elems = 0, str_elems = 0;
     std::map<int64_t, uint32_t> eb_hist;
 
     gp->for_each_op([&](OpDef* od) {
@@ -450,7 +456,62 @@ void dump_view_census(GraphPrepare* gp, std::FILE* out) {
             SliceSpec m; bool idn = false; OpDef* o = nullptr;
             if (r1_pair(gp, od, o, m, idn)) r1++;
             SliceSpec sp;
-            if (parse_slice(gp, od, sp) && sp.full_identity()) ss_ident++;
+            bool have_sp = parse_slice(gp, od, sp);
+            /* emit 期(deserialize) ranges const 数据已入 serialized_extra.ranges_offset,
+             * parse_slice 走 const 节点 const_data_size 会失败 → 回退读 serialized_extra
+             * (与 op_strided_slice.cpp 同口径)。 */
+            int32_t e_rg[MAX_AXES * 3];
+            uint32_t e_rank = 0;
+            if (!have_sp && od->serialized_extra.size() >= sizeof(ExtraStridedSlice)) {
+                ExtraStridedSlice e{};
+                std::memcpy(&e, od->serialized_extra.data(), sizeof(e));
+                const auto& pool = gp->const_pool();
+                if (e.rank && e.rank <= MAX_AXES &&
+                    e.ranges_offset + (uint64_t)e.rank * 12 <= pool.size()) {
+                    const int32_t* p = reinterpret_cast<const int32_t*>(pool.data() + e.ranges_offset);
+                    for (uint32_t ax = 0; ax < e.rank; ax++)
+                        for (uint32_t k = 0; k < 3; k++) e_rg[ax * 3 + k] = p[ax * 3 + k];
+                    e_rank = e.rank;
+                    have_sp = true;
+                }
+            }
+            if (have_sp) {
+                /* 折叠判据(单一连续字节段 = 设备 temp 模型 {offset,size} 可表示):
+                 * 全轴 stride==1, 且部分(非全区间)轴至多一个且不得是最内轴
+                 * (最内轴部分 → 每行有洞 → 非连续)。rank==1 恒连续。 */
+                const OpDef* srcp = od->inputs.empty() ? nullptr : gp->get_op_at(od->inputs[0].src_id);
+                uint32_t in_rank = srcp ? srcp->output_def.rank : 0;
+                uint64_t in_dims[MAX_AXES] = {1, 1, 1, 1, 1};
+                if (srcp) for (uint32_t i = 0; i < in_rank && i < MAX_AXES; i++)
+                    in_dims[i] = srcp->output_def.dims[i];
+                uint32_t rr = (e_rank > 0) ? e_rank : sp.rank;
+                int64_t B[MAX_AXES] = {0}, E[MAX_AXES] = {0}, S[MAX_AXES] = {1,1,1,1,1};
+                for (uint32_t i = 0; i < in_rank && i < MAX_AXES; i++) {
+                    if (e_rank > 0) {
+                        if (i < in_rank - rr) { B[i] = 0; E[i] = (int64_t)in_dims[i]; S[i] = 1; }
+                        else { uint32_t j = i - (in_rank - rr);
+                               B[i] = e_rg[j*3+0]; E[i] = e_rg[j*3+1]; S[i] = e_rg[j*3+2]; }
+                    } else {
+                        B[i] = sp.b[i]; E[i] = sp.e[i]; S[i] = sp.s[i];
+                    }
+                }
+                bool contig_run = true, all_full = true;
+                uint32_t n_partial = 0, partial_ax = 0;
+                for (uint32_t i = 0; i < in_rank && i < MAX_AXES; i++) {
+                    if (S[i] != 1) contig_run = false;
+                    if (B[i] != 0 || E[i] != (int64_t)in_dims[i]) {
+                        all_full = false; n_partial++; partial_ax = i;
+                    }
+                }
+                if (n_partial > 1) contig_run = false;
+                else if (n_partial == 1 && in_rank >= 2 && partial_ax == in_rank - 1)
+                    contig_run = false;   /* 最内轴部分 → 行间洞 */
+                if (e_rank == 0 && sp.full_identity()) ss_ident++;
+                uint64_t el = dims_elems(od->output_def, od->output_def.rank);
+                if (!contig_run) { ss_strided++; str_elems += el; }
+                else if (all_full) { ss_contig_full++; cfull_elems += el; }
+                else { ss_contig_sub++; csub_elems += el; }
+            }
         } else if (nm == "Reshape") {
             n_rs++;
             SliceSpec m; bool idn = false; OpDef* o = nullptr;
@@ -489,6 +550,10 @@ void dump_view_census(GraphPrepare* gp, std::FILE* out) {
     std::fprintf(out, "[view-census] ss=%u reshape=%u transpose=%u\n", n_ss, n_rs, n_tp);
     std::fprintf(out, "[view-census] r1_ss_ss=%u r2_reshape_absorb=%u r3_tt_ident=%u ss_identity=%u\n",
                  r1, r2, r3, ss_ident);
+    std::fprintf(out, "[view-census] ss_contig_full=%u(%llu) ss_contig_sub=%u(%llu) ss_strided=%u(%llu)\n",
+                 ss_contig_full, (unsigned long long)cfull_elems,
+                 ss_contig_sub, (unsigned long long)csub_elems,
+                 ss_strided, (unsigned long long)str_elems);
     std::fprintf(out, "[view-census] eb_same_type_pair=%u", eb_pair);
     for (auto& [k, v] : eb_hist) std::fprintf(out, " op%lld=%u", (long long)k, v);
     std::fprintf(out, "\n");

@@ -18,6 +18,7 @@
 #include "hnnx/ir/op_extra.hpp"
 #include "hnnx/ir/types.hpp"
 #include "hnnx/serialize/serializer.hpp"
+#include "hnnx/opt/pass_view_fold.hpp"   // 008 US3 T017: dump_view_census 切片 stride 分解
 
 #include <cstdio>
 #include <cstdint>
@@ -83,6 +84,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     if (!load_file(bin_path, bin)) { std::fprintf(stderr, "error: cannot open %s\n", bin_path.c_str()); return 2; }
     GraphPrepare gp;
     if (!gp.deserialize(bin.data(), bin.size())) { std::fprintf(stderr, "error: deserialize failed\n"); return 2; }
+    if (getenv("GEHTP_DUMP_VIEWS")) {          /* 008 US3 T017: emit 前切片 stride 分解 */
+        std::fprintf(stderr, "[view-census EMIT]\n");
+        dump_view_census(&gp, stderr);
+    }
 
     // 1b. 第7步阶段一: 静态 DDR 偏移(编译期生命期分配, 打包进 TEMPOFF 槽)。
     //     compute 在 Emitter em 声明后执行(见下方 ddr_static 块)。

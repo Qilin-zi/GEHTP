@@ -85,7 +85,8 @@ description: "Task list: 全图 VTCM 驻留 + 显式 DMA 流水（008 中期性�
 
 ### Implementation for User Story 3
 
-- [ ] T016 [US3] US1 落地后重跑 census（`scripts/gehtp_prof.py --csv`）→ `evidence/census-digest.md`（三族新盘子；spec 表内 7-8s 投影作废，以实测为准）
+- [x] T016 [US3] US1 落地后重跑 census（`scripts/gehtp_prof.py --csv`）→ `evidence/census-digest.md`（三族新盘子；spec 表内 7-8s 投影作废，以实测为准）
+  **PASS（1010）**：wall 13.04s 实测，三族合计 **7.246s = 55.6%**（STRIDED_SLICE 3.06s/UNARY 2.90s/TRANSPOSE 1.28s）。有效带宽 ~20MB/s = 标量非线性爬行（峰值 0.03%）。UNARY 92.3% 是 Reshape（2.594s 可折叠）；TRANSPOSE 恒改字节序全归 HVX。≤2s 门取决于 STRIDED_SLICE stride 分解（T017 第一步补 contiguous 计数）。证据 `evidence/census-digest.md`
 - [ ] T017 [US3] 驻留面零拷贝折叠：纯 reshape/slice（不改字节序）→ emit 期引用消除（opt-stats 计数，op 消失；位级一致）
 - [ ] T018 [US3] 剩余物理搬运 HVX 化：`kernels/src/runtime/oplist_exec.c`（`hvx_copy_f16_uu`/分段 memcpy，007 P1 broadcast 三形态范式：块拷贝循环+尾部标量；emit assign_engine 计划=实际，dev=0）
 - [ ] T019 [US3] 板跑：三族合计 ≤2s + digest 归档；不达标则 digest 指认残余根因（不硬凑门，FR-006）
