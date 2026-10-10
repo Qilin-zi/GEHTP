@@ -87,10 +87,13 @@ description: "Task list: 全图 VTCM 驻留 + 显式 DMA 流水（008 中期性�
 
 - [x] T016 [US3] US1 落地后重跑 census（`scripts/gehtp_prof.py --csv`）→ `evidence/census-digest.md`（三族新盘子；spec 表内 7-8s 投影作废，以实测为准）
   **PASS（1010）**：wall 13.04s 实测，三族合计 **7.246s = 55.6%**（STRIDED_SLICE 3.06s/UNARY 2.90s/TRANSPOSE 1.28s）。有效带宽 ~20MB/s = 标量非线性爬行（峰值 0.03%）。UNARY 92.3% 是 Reshape（2.594s 可折叠）；TRANSPOSE 恒改字节序全归 HVX。≤2s 门取决于 STRIDED_SLICE stride 分解（T017 第一步补 contiguous 计数）。证据 `evidence/census-digest.md`
-- [ ] T017 [US3] 驻留面零拷贝折叠：纯 reshape/slice（不改字节序）→ emit 期引用消除（opt-stats 计数，op 消失；位级一致）
-- [ ] T018 [US3] 剩余物理搬运 HVX 化：`kernels/src/runtime/oplist_exec.c`（`hvx_copy_f16_uu`/分段 memcpy，007 P1 broadcast 三形态范式：块拷贝循环+尾部标量；emit assign_engine 计划=实际，dev=0）
+- [x] T017 [US3] 驻留面零拷贝折叠：纯 reshape/slice（不改字节序）→ emit 期引用消除（opt-stats 计数，op 消失；位级一致）
+  **已收口（1010, commit b630974/422ab5a, 板跑 md5 f87461e2 PASS）**：Reshape 引用消除零拷贝折叠 + slice stride 分解 census。exec wall 13.04s → 10.40s（UNARY 92.3% Reshape 折叠后 2.594s 归零）。T018 起盘三族 = SLICE 3.05s / TRANSPOSE 1.28s / UNARY 0.34s。
+- [x] T018 [US3] 剩余物理搬运 HVX 化：`kernels/src/runtime/oplist_exec.c`（`hvx_copy_f16_uu`/分段 memcpy，007 P1 broadcast 三形态范式：块拷贝循环+尾部标量；emit assign_engine 计划=实际，dev=0）
   **STRIDED_SLICE 已收口（1010, 板跑 md5 f87461e2 PASS）**：`exec_slice` 最内轴 stride==1 → 逐行 `hvhx_v2_copy_f16` 块拷贝（odometer 免 div/mod）；emit 侧 `op_strided_slice` 双分支对 `ns[nrk-1]==1` 置 HVX 注解（孪生判据）。板跑 code=15 **3.05s → 0.082s（37×）**，三族合计 **1.69s ≤2s 门已达**（TRANSPOSE 1.28s + UNARY 0.33s 待 T018b/c 继续）。exec wall 10.40 → 7.42s。不变量 PASS（按计划 11399/允许回落 105=UNARY 预置虚报/中止 0，无 slice 回落）。
-- [ ] T019 [US3] 板跑：三族合计 ≤2s + digest 归档；不达标则 digest 指认残余根因（不硬凑门，FR-006）
+  **TRANSPOSE 已收口（1010, commit 425a04d/eaa9a72, 板跑 md5 f87461e2 PASS）**：`exec_transpose_gen` 最内轴固定（p[rk-1]==rk-1，96/175 op）→ 逐块 `hvhx_v2_copy_f16`（pinv 映回输入坐标，odometer 免 div/mod）；emit 侧 `op_transpose` 对 `np[nrk-1]==nrk-1` 置 HVX 注解（孪生）。最内轴真置换（64↔128 36op）走通用标量回落 odometer 化（输出线性连续写+跨步读，免 per-element 4 div+4 mod）。板跑 code=27 **1.28s → 0.143s（9×）**。三族合计 0.56s。exec wall 7.42 → 6.31s。UNARY 0.33s 残留（SQRT 36/SOFTPLUS 18 为 NaN 守卫/公式差异刻意标量，NEG 30 可 HVX 但收益 ~0.04s 忽略）记 T018c 残留。
+- [x] T019 [US3] 板跑：三族合计 ≤2s + digest 归档；不达标则 digest 指认残余根因（不硬凑门，FR-006）
+  **PASS（1010, 板跑 md5 f87461e2）**：三族合计 **0.560s ≤ 2s**（STRIDED_SLICE 0.082s + TRANSPOSE 0.143s + UNARY 0.335s）。exec wall **6.31s ≤ 8s**（007 锚 24.24s → 6.31s，3.84×）。不变量 rc=0（无未裁决引擎偏差）。digest `evidence/t018-three-family-digest.md`。
 
 **Checkpoint**: SC-005 前半达成
 
