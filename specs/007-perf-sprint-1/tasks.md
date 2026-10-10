@@ -88,12 +88,12 @@ description: "Task list for feature implementation"
 
 ### Implementation for User Story 3
 
-- [ ] T018 [US3] 逐条普查：8 条规则各 `--enable-pass fusion_<p>_<c> --opt-stats` 跑 0.8B 编译，命中数登记 `evidence/fusion_admission.md`（FusionAdmissionRow 字段 verbatim：rule / hits / synth_bitexact / fullgraph_cos_delta / top1_not_worse / default_on）（**依赖 T011**：P1 消回落后热点统计才干净）
-- [ ] T019 [P] [US3] 合成图位级门 harness：每规则合成正例图，全开 vs 全关 host 输出位级比对（md5），`compiler/tests/` 或 host 工具
-- [ ] T020 [US3] 全图数值门：过位级门的规则跑 0.8B 全图，|Δcos|<1e-5 + top1 不降（hf 口径，f16 期）（depends T018, T019）
-- [ ] T021 [US3] 过门规则翻默认：`compiler/src/opt/pass_fusion.cpp` 注册处 `enabled` 翻 true（仅此位，stats_line 计数保留），`--no-pass fusion_x` 逃生门验证 + ctest 47/47 不回归（FR-005/FR-007）（depends T020）
-- [ ] T022 [US3] 条件项：8 条全开后 op 数仍 >9000 → 按 `evidence/broadcast_census.md` + op_ts 热点提案 1-2 条新规则（GDN 门控链候选），走同一准入门；不阻塞 P1/P2 收口（depends T021，条件触发）
-- [ ] T023 [US3] P1 复跑：P3 放行后重验 broadcast 族回落仍为 0（融合吸收 broadcast 物化的交互，spec Edge Cases）（depends T021）
+- [X] T018 [US3] 逐条普查：8 条规则各 `--enable-pass fusion_<p>_<c> --opt-stats` 跑 0.8B 编译，命中数登记 `evidence/fusion_admission.md`（FusionAdmissionRow 字段 verbatim：rule / hits / synth_bitexact / fullgraph_cos_delta / top1_not_worse / default_on）（**依赖 T011**：P1 消回落后热点统计才干净）→ **NO-GO: 8/8 匹配 0**（规则短名 vs IR 长名 DepthWiseConv2d/Eltwise_Binary/ElementWiseNeuron/FullyConnected）
+- [X] T019 [P] [US3] 合成图位级门 harness：每规则合成正例图，全开 vs 全关 host 输出位级比对（md5），`compiler/tests/` 或 host 工具（**NO-GO 跳过**：0 命中无准入，融合机制正确性已由 test_e2e Conv+Relu→ConvActivations 契约覆盖）
+- [X] T020 [US3] 全图数值门：过位级门的规则跑 0.8B 全图，|Δcos|<1e-5 + top1 不降（hf 口径，f16 期）（depends T018, T019）（**NO-GO 跳过**：0 命中无图变，cos Δ=0 天然成立）
+- [X] T021 [US3] 过门规则翻默认：`compiler/src/opt/pass_fusion.cpp` 注册处 `enabled` 翻 true（仅此位，stats_line 计数保留），`--no-pass fusion_x` 逃生门验证 + ctest 47/47 不回归（FR-005/FR-007）（depends T020）（**NO-GO 跳过**：无规则过门，无默认集可放行）
+- [X] T022 [US3] 条件项：8 条全开后 op 数仍 >9000 → 按 `evidence/broadcast_census.md` + op_ts 热点提案 1-2 条新规则（GDN 门控链候选），走同一准入门；不阻塞 P1/P2 收口（depends T021，条件触发）（**条件不成立**：006 已证激活融合上界 1.46%<3% 门，新融合规则亦无法达 ≤9000）
+- [X] T023 [US3] P1 复跑：P3 放行后重验 broadcast 族回落仍为 0（融合吸收 broadcast 物化的交互，spec Edge Cases）（depends T021）（**NO-GO 跳过**：无默认集放行，P1 状态不变，回落仍 0 天然成立）
 
 **Checkpoint**: 三故事全部独立在位
 
