@@ -101,7 +101,16 @@ int GraphPrepare::compute_ddr_offsets(uint64_t budget,
             else
                 spill_reqs.push_back(&r);
         }
-        *cap_out = cap;
+        if (budget == 0) {
+            /* ddr 预算缺省(仅 vtcm 池开): cap 记生命期打包实际水位而非 Σ全量
+             * 尺寸 —— 运行时按 blob cap memalign, Σ口径会虚耗数百 MB DDR */
+            uint64_t hw = 0;
+            for (const auto& e : *entries)
+                if (!e.in_vtcm) hw = std::max<uint64_t>(hw, e.offset + e.size);
+            *cap_out = hw;
+        } else {
+            *cap_out = cap;
+        }
         finalize_spills(spill_reqs, spilled_out, spill_total_out, total);
         return 0;
     }

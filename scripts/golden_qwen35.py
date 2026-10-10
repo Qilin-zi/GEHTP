@@ -21,13 +21,14 @@ import json
 import os
 import struct
 import sys
+import time
 
 import numpy as np
-import torch
 
-from export_qwen35_onnx import QPM_ROOT, load_remapped
-
-sys.path.insert(0, QPM_ROOT)
+# torch / modeling 类仅金标生成路径需要(重 import); --cut-row 切行 helper
+# 在裸环境(numpy only)可用。export_qwen35_onnx 转用 transformers>=4.57 内建
+# Qwen3_5 类后已无 QPM_ROOT 常量, 旧 QPM 路径留 compat 缺省。
+QPM_ROOT_DEFAULT = "/disk2/Qwen35dev/qwen3.5_4b_base/example1"
 
 
 # --------------------------------------------------------------------------
@@ -210,8 +211,14 @@ def gguf_to_state_dict(gguf_path, text_cfg):
 
 def build_model(model_dir, weights):
     """weights: 'hf' | ('gguf', path)。返回 (model, cfg)。"""
-    from huggingface.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-    from huggingface.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+    import torch
+    try:
+        from transformers import Qwen3_5Config, Qwen3_5ForCausalLM
+    except ImportError:  # 旧环境: QPM modeling 包
+        sys.path.insert(0, QPM_ROOT_DEFAULT)
+        from huggingface.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+        from huggingface.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+    from export_qwen35_onnx import load_remapped
 
     cfg = Qwen3_5Config.from_pretrained(model_dir).text_config
     model = Qwen3_5ForCausalLM(cfg).to(torch.float32).eval()
@@ -231,6 +238,7 @@ def build_model(model_dir, weights):
 
 
 def run_prompts(model, cfg, seq, n_prompts, seed=42):
+    import torch
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n_prompts):
@@ -247,9 +255,61 @@ def run_prompts(model, cfg, seq, n_prompts, seed=42):
     return out
 
 
+def run_decode(model, prompt_ids, n_steps):
+    """tier2 金标: 贪心续写 n_steps 步 (增量 use_cache=True)。
+
+    R1 已实证 (2026-10-10, GPU 对拍): Qwen3_5 的 DynamicCache 正确携带
+    GDN/SSM recurrent state — 增量行 vs 全序列行 cos≥0.999999、argmax 全同,
+    故增量续写即真 decode 语义, 无需每步全序列重跑 (原 R1 风险解除)。
+
+    返回 (rows [n_steps, V] f32, tokens [n_steps] i64):
+    rows[k] = 喂入 prompt+已生成前 k 个 token 后的 logits (rows[0]=prompt 末位行),
+    tokens[k] = argmax(rows[k])。
+    """
+    import torch
+    dev = next(model.parameters()).device
+    ids = torch.tensor([list(prompt_ids)], dtype=torch.long, device=dev)
+    n = len(prompt_ids)
+    with torch.no_grad():
+        out = model(
+            input_ids=ids,
+            attention_mask=torch.ones(1, n, dtype=torch.long, device=dev),
+            position_ids=torch.arange(n, device=dev).unsqueeze(0),
+            use_cache=True,
+        )
+        pkv = out.past_key_values
+        rows = [out.logits[0, -1].float().cpu().numpy()]
+        tokens = []
+        for k in range(n_steps):
+            tokens.append(int(rows[k].argmax()))
+            if k + 1 < n_steps:
+                out = model(
+                    input_ids=torch.tensor([[tokens[k]]], dtype=torch.long, device=dev),
+                    past_key_values=pkv,
+                    use_cache=True,
+                )
+                pkv = out.past_key_values
+                rows.append(out.logits[0, -1].float().cpu().numpy())
+    return np.stack(rows).astype(np.float32), np.asarray(tokens, dtype=np.int64)
+
+
+def load_golden_row(out_dir, prompt_idx, row=-1, seq=32):
+    """T010: 从 cpu_golden 的 logits_{i}.f32.raw [seq,V] 切单行 [V](默认末行)。
+
+    P1 无 KV 时 row=0(SC-001 锚: seq=1 blob @ pos0 == prefill 首位);
+    P2 KV 接线后 row=-1(SC-002 锚: 真 decode 步 == prefill 末位 == 第 seq token)。
+    """
+    a = np.fromfile(os.path.join(out_dir, f"logits_{prompt_idx}.f32.raw"), dtype=np.float32)
+    vocab = a.size // seq if seq else 0
+    if vocab == 0 or a.size != seq * vocab:
+        raise ValueError(f"logits_{prompt_idx}: {a.size} elems 非 [{seq},V]")
+    r = row if row >= 0 else seq + row
+    return a.reshape(seq, vocab)[r]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--model-dir", default=None)
     ap.add_argument("--gguf", default=None)
     ap.add_argument("--seq", type=int, default=32)
     ap.add_argument("--n-prompts", type=int, default=4)
@@ -257,7 +317,45 @@ def main():
     ap.add_argument("--text", action="append", default=None,
                     help="真实文本(可多次),编码后跑 top-1 一致性判据")
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--cut-row", type=int, default=None, metavar="R",
+                    help="切行模式(无需模型环境): 从 out-dir/hf/logits_{i}.f32.raw 切第 R 行"
+                         "(负数从未尾数, -1=末位)落 logits_{i}_row{R}.f32.raw, 配 --n-prompts/--seq")
+    ap.add_argument("--decode", type=int, default=None, metavar="N",
+                    help="tier2 贪心续写 N 步 (从 out-dir/hf/input_{i} 起; R1 已证增量 cache 真)")
+    ap.add_argument("--decode-prompt", type=int, default=0, metavar="I",
+                    help="续写起点 prompt 序号 (配 --decode)")
     args = ap.parse_args()
+
+    if args.cut_row is not None:
+        sub = os.path.join(args.out_dir, "hf")
+        r = args.cut_row if args.cut_row >= 0 else args.seq + args.cut_row
+        for i in range(args.n_prompts):
+            row = load_golden_row(sub, i, args.cut_row, args.seq)
+            outp = os.path.join(sub, f"logits_{i}_row{r}.f32.raw")
+            row.tofile(outp)
+            print(f"[cut-row] prompt{i} row{r} -> {outp} top1={int(row.argmax())}")
+        return
+    if args.decode is not None:
+        import torch
+        if not args.model_dir:
+            ap.error("--decode 需 --model-dir")
+        sub = os.path.join(args.out_dir, "hf")
+        ids = np.fromfile(os.path.join(sub, f"input_{args.decode_prompt}.i64.raw"),
+                          dtype=np.int64)
+        model, cfg = build_model(args.model_dir, "hf")
+        if torch.cuda.is_available():
+            model = model.cuda()
+        t0 = time.time()
+        rows, tokens = run_decode(model, ids, args.decode)
+        dt = time.time() - t0
+        rows.tofile(os.path.join(sub, f"tier2_{args.decode_prompt}.logits.f32.raw"))
+        tokens.tofile(os.path.join(sub, f"tier2_{args.decode_prompt}.tokens.i64.raw"))
+        print(f"[decode] prompt{args.decode_prompt} ({len(ids)} tok) + {args.decode} 步 "
+              f"{dt:.1f}s → tier2_{args.decode_prompt}.{{logits.f32,tokens.i64}}.raw")
+        print(f"[decode] tokens: {tokens.tolist()}")
+        return
+    if not args.model_dir:
+        ap.error("金标生成需 --model-dir (切行模式用 --cut-row)")
 
     os.makedirs(args.out_dir, exist_ok=True)
     results = {}
@@ -290,6 +388,7 @@ def main():
 
     # 真实文本 top-1 一致性(量化语义级判据)
     if args.text and len(results) == 2:
+        import torch
         from tokenizers import Tokenizer
         tok = Tokenizer.from_file(os.path.join(args.model_dir, "tokenizer.json"))
         sub = os.path.join(args.out_dir, "text")
@@ -314,7 +413,6 @@ def main():
             agree = (tops["hf"] == tops["q4_0"]).sum()
             print(f"[text] prompt{ti} top-1 agreement: {agree}/{len(ids)}")
             assert agree / len(ids) >= 0.8, f"text{ti} top-1 一致性过低: {agree}/{len(ids)}"
-    print("done")
 
     with open(os.path.join(args.out_dir, "manifest.json"), "w") as f:
         json.dump({"seq": args.seq, "n_prompts": args.n_prompts, "modes": list(results)}, f, indent=2)

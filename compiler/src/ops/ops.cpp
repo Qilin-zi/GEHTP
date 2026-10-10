@@ -3,6 +3,7 @@
 #include "hnnx/ir/op_registry.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/cost/cost_model.hpp"
+#include "hnnx/host_decode_state.hpp"
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -158,6 +159,14 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? std::max(0.0f, in0[i]) : 0.0f;
     } else if (op_type_name == "Add" || op_type_name == "ElementWiseBinary") {
         for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) + in_bc(1, i);
+    } else if (op_type_name == "IsNan" || op_type_name == "IsInf") {
+        const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
+        const bool isnan = (op_type_name == "IsNan");
+        for (size_t i = 0; i < n; ++i) {
+            float v = in0 ? in0[i] : 0.0f;
+            if (isnan) out[i] = (v != v) ? 1.0f : 0.0f;
+            else out[i] = (v == v && (v > 3.4e38f || v < -3.4e38f)) ? 1.0f : 0.0f;
+        }
     } else if (op_type_name == "Eltwise_Binary") {
         /* QNN 2.48 枚举: ADD=0 AND=1 DIVIDE=2 ... MULTIPLY=13 ...
          * SUBTRACT=18 POWER=16(与旧版 0/1/2/3=ADD/SUB/MUL/DIV 不同 —
@@ -198,6 +207,11 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
              * Equal; int 0 的位模式即 0.0f) */
             for (size_t i = 0; i < n; ++i)
                 out[i] = (in_bc(0, i) == in_bc(1, i)) ? 1.0f : 0.0f;
+        } else if (oper == 1) {
+            /* AND: bool 语义(0.0f/1.0f), 与设备 OP_BINARY_F16 subtype 5 同款。
+             * 走 float 缓冲: 非 0 即真(NaN 也算真) */
+            for (size_t i = 0; i < n; ++i)
+                out[i] = (in_bc(0, i) != 0.0f && in_bc(1, i) != 0.0f) ? 1.0f : 0.0f;
         } else {
             for (size_t i = 0; i < n; ++i) out[i] = in_bc(0, i) + in_bc(1, i);
         }
@@ -783,7 +797,6 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             uint32_t td[5], xd[5], od[5];
             uint32_t irank = in_defs.empty() ? out_def.rank : compact(in_defs[0], td);
             uint32_t xrank = in_defs.size() > 1 ? compact(in_defs[1], xd) : 1;
-            compact(out_def, od);
             int axis = 0;
             auto sp2 = unpack_scalar_params(params);
             if (const ScalarParam* p = scalar_get(sp2, "axis"))
@@ -798,6 +811,19 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                                ? (int)in_defs[0].rank - (int)irank : 0;
             axis -= stripped;
             if (axis < 0 || axis >= (int)irank) axis = 0;
+            /* 输出坐标框架 = 表前段 ++ indices ++ 表后段(Gather 语义), 不能
+             * compact(out_def): indices 块全 1 时(0.8B seq=1 embedding
+             * idx [1,1,1,1])会连 indices 槽一起剥掉, 列维左移进 indices
+             * 坐标(mod 1 恒 0)→ 整行复制首元素, 下游全 decorrelate 实锤。
+             * 框架积 != n 时回退旧 compact 路径。 */
+            for (uint32_t d = 0; d < 5; d++) od[d] = 1;
+            uint32_t flen = 0;
+            for (uint32_t d = 0; d < (uint32_t)axis && flen < 5; d++) od[flen++] = td[d];
+            for (uint32_t k = 0; k < xrank && flen < 5; k++) od[flen++] = xd[k];
+            for (uint32_t d = (uint32_t)axis + 1; d < irank && flen < 5; d++) od[flen++] = td[d];
+            size_t fprod = 1;
+            for (uint32_t d = 0; d < 5; d++) fprod *= od[d];
+            if (fprod != n) compact(out_def, od);
             size_t ts[5] = {1, 1, 1, 1, 1}, os[5] = {1, 1, 1, 1, 1}, xs[5] = {1, 1, 1, 1, 1};
             for (int d = 3; d >= 0; d--) {
                 ts[d] = ts[d + 1] * td[d + 1];
@@ -986,17 +1012,28 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
     } else if (op_type_name == "Softmax") {
         const float* in0 = inputs.empty() ? nullptr : reinterpret_cast<const float*>(inputs[0]);
         if (!in0) { for (size_t i=0;i<n;++i) out[i]=0; return; }
-        /* per-row softmax: 行宽 = axis(缺省末维)维长; 行数 = n/行宽 */
+        /* per-row softmax: 行宽 = axis(缺省末维)维长; 行数 = n/行宽。
+         * 显式 axis 按 net.json 原 rank 计([1,8,1,1] axis=3); 运行时
+         * OutputDef 剥前导 1 维(→[8,1,1]), 尾维身份不变 → 越界钳末维。
+         * 旧 trailing-1 剥除启发在 seq=1 把轴错移到 heads 维(softmax 宽 8,
+         * 应为 1; layer3 首发散 cos 0.485 实锤), 仅无 axis 参数时保留。 */
         auto sp4 = unpack_scalar_params(params);
+        bool have_axis = false;
         int axis = -1;
-        if (const ScalarParam* p = scalar_get(sp4, "axis"))
+        if (const ScalarParam* p = scalar_get(sp4, "axis")) {
             axis = (int)(p->is_numeric ? p->value_num
                                        : std::strtol(p->value_str.c_str(), nullptr, 10));
+            have_axis = true;
+        }
         uint32_t rk = out_def.rank;
-        while (rk > 0 && out_def.dims[rk - 1] == 1) rk--;
         int ax = axis;
         if (ax < 0) ax += (int)rk;
         if (ax < 0 || ax >= (int)rk) ax = (int)rk - 1;
+        if (!have_axis) {
+            uint32_t rk2 = rk;
+            while (rk2 > 0 && out_def.dims[rk2 - 1] == 1) rk2--;
+            if (ax >= (int)rk2) ax = (int)rk2 - 1;
+        }
         size_t row_w = (rk > 0) ? out_def.dims[ax] : 1;
         if (row_w == 0) row_w = 1;
         size_t rows = n / row_w;
@@ -1133,7 +1170,38 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         const float* inp    = inputs.size() > 0 ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
         const float* weight = inputs.size() > 1 ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
         const float* bias   = inputs.size() > 2 ? reinterpret_cast<const float*>(inputs[2]) : nullptr;
-        if (!inp || !weight) {
+        /* QNN depthwise conv1d(GDN causal conv)参数驱动路径: converter 把
+         * stride/pad_amount/dilation 发成尾部 tensor_param(in3 [2]/in4 [2,2]/
+         * in5 [2], pad 行序=轴1/轴2, 时间轴=行1)。旧代码自造"居中"pad 推断,
+         * T=1 时取错 tap(实锤 host 用 w0, ONNX pads [3,3]+T=1 语义应为 w3)
+         * → seq=1 全链 decorrelate。data [1,1,T,C], weight [1,K,1,C](k-major)。 */
+        auto numel = [](const OutputDef& d) {
+            size_t v = 1;
+            for (uint32_t i = 0; i < d.rank && i < 5; ++i) v *= d.dims[i];
+            return v;
+        };
+        if (op_type_name == "DepthWiseConv2d" && inp && weight &&
+            in_defs.size() >= 6 && in_defs[0].rank >= 4 && in_defs[1].rank >= 4 &&
+            numel(in_defs[3]) == 2 && numel(in_defs[4]) == 4 && numel(in_defs[5]) == 2) {
+            const int32_t* st_ = reinterpret_cast<const int32_t*>(inputs[3]);
+            const int32_t* pd_ = reinterpret_cast<const int32_t*>(inputs[4]);
+            const int32_t* dl_ = reinterpret_cast<const int32_t*>(inputs[5]);
+            const size_t T_in = in_defs[0].dims[2], C = in_defs[0].dims[3];
+            const size_t T_out = out_def.dims[2], K = in_defs[1].dims[1];
+            const int64_t pb = pd_[2];
+            const int64_t st = st_[1] ? st_[1] : 1;
+            const int64_t dl = dl_[1] ? dl_[1] : 1;
+            for (size_t t = 0; t < T_out; t++)
+                for (size_t c = 0; c < C; c++) {
+                    float acc = bias ? bias[c] : 0.0f;
+                    for (size_t k = 0; k < K; k++) {
+                        int64_t st_t = (int64_t)t * st + (int64_t)k * dl - pb;
+                        if (st_t >= 0 && st_t < (int64_t)T_in)
+                            acc += weight[k * C + c] * inp[st_t * C + c];
+                    }
+                    out[t * C + c] = acc;
+                }
+        } else if (!inp || !weight) {
             for (size_t i = 0; i < n; ++i) out[i] = 0.0f;
         } else {
             // Extract shapes from in_defs and out_def (rank-4 NHWC)
@@ -1198,6 +1266,93 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         }
         const int32_t* i32 = reinterpret_cast<const int32_t*>(in0);
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? (float)i32[i] : 0.0f;
+    } else if (op_type_name == "KvAppendF16" || op_type_name == "KvGatherKT"
+               || op_type_name == "KvGatherV" || op_type_name == "Conv1dSsmStepF16"
+               || op_type_name == "DeltaChunkF16" || op_type_name == "DecodeFaceF16") {
+        /* 004 T018 decode 图状态 op — host 参考执行 (host_decode_state f32 镜像;
+         * 设备侧对应 oplist_exec.c op22/23/29/30 + op15 rank1 u16 视图) */
+        auto sp5 = unpack_scalar_params(params);
+        auto dnum = [&](const char* k, double def) -> double {
+            const ScalarParam* p = scalar_get(sp5, k);
+            return p ? (p->is_numeric ? p->value_num
+                                      : std::strtod(p->value_str.c_str(), nullptr))
+                     : def;
+        };
+        const float* fi0 = (inputs.size() > 0 && inputs[0])
+                               ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
+        const float* fi1 = (inputs.size() > 1 && inputs[1])
+                               ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
+        if (op_type_name == "KvAppendF16") {
+            /* in: k[512] v[512]; out = k 直通(活性锚, 保证 append 先于 gather 拓扑序) */
+            int si = (int)dnum("state_idx", -1);
+            if (!fi0 || !fi1)
+                std::fprintf(stderr, "[hostdec] kv append state %d missing input\n", si);
+            else if (!host_decode_kv_append(si, fi0, fi1, (int)n))
+                std::fprintf(stderr, "[hostdec] kv append state %d full/bad (n=%zu)\n", si, n);
+            if (fi0 && n) std::memcpy(out, fi0, n * 4);
+        } else if (op_type_name == "KvGatherKT" || op_type_name == "KvGatherV") {
+            int face = (op_type_name == "KvGatherKT") ? 0 : 1;
+            int hd = (int)dnum("head_dim", 256);
+            int max_pos = 1;
+            if (out_def.rank >= 3) {
+                /* kt [1,nh,hd,mp] vs v [1,nh,mp,hd] — 末维==hd 即 v 面 */
+                max_pos = (out_def.rank >= 4 && out_def.dims[3] == (uint32_t)hd)
+                              ? (int)out_def.dims[2] : (int)out_def.dims[3];
+            }
+            host_decode_kv_gather((int)dnum("state_idx", -1), face,
+                                  (int)dnum("n_heads", 8), (int)dnum("kv_heads", 2),
+                                  hd, max_pos, out);
+        } else if (op_type_name == "Conv1dSsmStepF16") {
+            /* in: x[C] w[dc*C](const f16 已物化 f32, [tap][ch] flat); kernel 含 SiLU */
+            int c = (int)dnum("C", 6144), dc = (int)dnum("d_conv", 4);
+            if (!fi0 || !fi1 || (int)n != c)
+                std::fprintf(stderr, "[hostdec] conv step bad (n=%zu C=%d)\n", n, c);
+            else
+                host_decode_conv_step((int)dnum("state_idx", -1), c, dc, fi1, fi0, out);
+        } else if (op_type_name == "DeltaChunkF16") {
+            /* in: k[H*D] v[H*D] q[H*D] beta[H] g[H] (q̂ 直喂 → q_raw=1 免 1/√D) */
+            auto fg = [&](size_t i) -> const float* {
+                return (i < inputs.size() && inputs[i])
+                           ? reinterpret_cast<const float*>(inputs[i]) : nullptr;
+            };
+            const float* k_ = fg(0), *v_ = fg(1), *q_ = fg(2), *be = fg(3), *g_ = fg(4);
+            int H = (int)dnum("H", 16), D = (int)dnum("D", 128);
+            if (!k_ || !v_ || !q_ || !be || !g_ || (int)n != H * D)
+                std::fprintf(stderr, "[hostdec] delta bad (n=%zu H*D=%d)\n", n, H * D);
+            else
+                host_decode_delta_step((int)dnum("state_idx", -1), H, D,
+                                       (int)dnum("q_raw", 0), k_, v_, q_, be, g_, out);
+        } else {
+            /* DecodeFaceF16: decode_in i32 字流 u16 视图, f16 位级 → f32
+             * (ids|cos|sin|mask 单输入面, u16_begin 按布局定) */
+            auto f16_bits = [](uint16_t h) -> float {
+                uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+                uint32_t e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, bits;
+                if (e == 0) {
+                    if (m == 0) bits = sign;
+                    else {   /* 次正规: 规格化到 [1,2) 尾数 */
+                        int s = -1;
+                        while (!(m & 0x400u)) { m <<= 1; s--; }
+                        bits = sign | ((uint32_t)(113 + s) << 23) | ((m & 0x3FFu) << 13);
+                    }
+                } else if (e == 31) {
+                    bits = sign | 0x7F800000u | ((uint32_t)m << 13);
+                } else {
+                    bits = sign | ((e - 15u + 127u) << 23) | ((uint32_t)m << 13);
+                }
+                float f;
+                std::memcpy(&f, &bits, 4);
+                return f;
+            };
+            const uint32_t* w32 = reinterpret_cast<const uint32_t*>(fi0);
+            int beg = (int)dnum("u16_begin", 0);
+            if (!w32) { for (size_t i = 0; i < n; i++) out[i] = 0.0f; }
+            else for (size_t i = 0; i < n; i++) {
+                uint32_t u = (uint32_t)(beg + (int)i);
+                out[i] = f16_bits((uint16_t)((u & 1u) ? (w32[u >> 1] >> 16)
+                                                      : (w32[u >> 1] & 0xFFFFu)));
+            }
+        }
     } else {
         /* A6 静默直通治理: 未知 op 型不再静默拷贝第一输入 (对拍假绿源)。
          * 每次直通登记; GEHTP_HOST_PASSTHRU=error 立即 abort, =off 旧静默。 */
@@ -1556,6 +1711,14 @@ void register_all_ops() {
         reg.register_op_fn("Conditional", ConditionalOp::construct);
         reg.register_op_fn("ConditionalAdd", ConditionalAddOp::construct);
         reg.register_op_fn("Switched", SwitchedOp::construct);
+        // 004 T018 decode 图状态 op (execute 按 op_type_name 分派; generate 会
+        // 设 op_type_name, construct 只需产出 TypicalOp 载 params)
+        reg.register_op_fn("KvAppendF16", AddOp::construct);
+        reg.register_op_fn("KvGatherKT", GatherOp::construct);
+        reg.register_op_fn("KvGatherV", GatherOp::construct);
+        reg.register_op_fn("Conv1dSsmStepF16", DepthWiseConvOp::construct);
+        reg.register_op_fn("DeltaChunkF16", MulOp::construct);
+        reg.register_op_fn("DecodeFaceF16", CastOp::construct);
 
     // HLX/HMX ops
     register_hlx_hmx_ops();

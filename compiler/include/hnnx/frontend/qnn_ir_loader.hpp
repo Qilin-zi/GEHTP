@@ -79,6 +79,7 @@ public:
 private:
     GraphPrepare& gp_;
     std::map<std::string, QnnTensorInfo> tensors_;
+    std::vector<op_id_t> input_decl_json_;  // type==0 张量按 JSON 键序(声明序)
     std::vector<QnnNodeInfo> nodes_;
     std::map<std::string, op_id_t> tensor_opids_; // tensor name -> REQNN op_id
     std::map<std::string, std::vector<uint8_t>> weights_; // var_name -> bytes

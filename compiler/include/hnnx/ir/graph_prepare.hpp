@@ -55,6 +55,10 @@ public:
     // Accessors for execution
     op_id_t get_input_node_id() const { return input_node_id_; }
     op_id_t get_output_node_id() const { return output_node_id_; }
+    // 图输入绑定的槽位序(声明序优先, 见 host_input_order())
+    void set_input_decl_order(std::vector<op_id_t> v) { input_decl_order_ = std::move(v); }
+    const std::vector<op_id_t>& input_decl_order() const { return input_decl_order_; }
+    std::vector<op_id_t> host_input_order();
     const std::vector<op_id_t>& get_ordering() const { return ordering_; }
     // Scheduler(ST-Cut)计划执行序: do_prepare2 计算, do_serialize 按此发射 op 记录
     const std::vector<op_id_t>& plan_order() const { return plan_order_; }
@@ -380,6 +384,9 @@ public:
         plan_ddr_budget_ = ddr;
         plan_vtcm_budget_ = vtcm;
     }
+    // --plan-vtcm-budget 缺省哨兵: do_prepare2_late step6 解析为 auto 池
+    // (16MB − HMX scratch 峰值 − 余量); 显式值(含 0=关)不经过它
+    static constexpr uint64_t kVtcmPlanAuto = ~uint64_t(0);
     bool has_mem_plan() const { return has_mem_plan_; }
     const MemPlan& mem_plan() const { return mem_plan_; }
     // 路线B(4B 权重外置): true 时 do_serialize 跳过 0xCF56 常量数据块
@@ -494,6 +501,7 @@ private:
     int construction_state_ = 0;  // +0x45dc: 0=init, 1=CONSTRUCTION, 2=PREPARE, 3=COMPILED
     op_id_t input_node_id_ = 0;   // +0x5340
     op_id_t output_node_id_ = 0;  // +0x5348
+    std::vector<op_id_t> input_decl_order_;  // net.json 张量字典插入序(loader 填)
     std::vector<op_id_t> ordering_;  // topological ordering of ops
     std::vector<op_id_t> plan_order_;  // ST-Cut 计划执行序(do_prepare2; 空 = 未调度)
     TilingConfig tiling_cfg_;          // 单算子分块配置(阶段6)

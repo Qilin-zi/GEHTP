@@ -69,6 +69,7 @@ add_library(htp_core STATIC
     src/api/hexagon_nn_env.cpp
     src/frontend/qnn_ir_loader.cpp
     src/ops/ops.cpp
+    src/ops/host_decode_state.cpp
     src/ops/hlx_hmx.cpp
     src/ops/quantize.cpp
     src/ops/weights.cpp
@@ -257,6 +258,8 @@ add_executable(wtop_emit tools/wtop_emit.cpp
                tools/wtop_ops/op_split.cpp
                tools/wtop_ops/op_reduce.cpp
                tools/wtop_ops/op_cumsum.cpp
+               tools/wtop_ops/op_isnan.cpp
+               tools/wtop_ops/op_decode_state.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
 target_link_libraries(wtop_emit htp_core)
 target_include_directories(wtop_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
@@ -315,6 +318,17 @@ target_compile_definitions(test_static_input PRIVATE
     HNNX_COMPILE_PATH="${CMAKE_BINARY_DIR}/hnnx_compile")
 add_dependencies(test_static_input wtop_emit hnnx_compile)
 add_test(NAME test_static_input COMMAND test_static_input)
+
+# VTCM 驻留缺省 auto (--plan-vtcm-budget 三态: auto/显式/0=关)
+add_executable(test_vtcm_auto tests/test_vtcm_auto.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/src/runtime/oplist_parse.c)
+target_link_libraries(test_vtcm_auto htp_core)
+target_include_directories(test_vtcm_auto PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/include)
+target_compile_definitions(test_vtcm_auto PRIVATE
+    WTOP_EMIT_PATH="${CMAKE_BINARY_DIR}/wtop_emit"
+    HNNX_COMPILE_PATH="${CMAKE_BINARY_DIR}/hnnx_compile")
+add_dependencies(test_vtcm_auto wtop_emit hnnx_compile)
+add_test(NAME test_vtcm_auto COMMAND test_vtcm_auto)
 
 # M1: Qwen3.5 IR 摄取 + scalar_params + 往返
 add_executable(test_qwen35_ir tests/test_qwen35_ir.cpp)

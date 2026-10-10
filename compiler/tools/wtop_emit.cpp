@@ -16,6 +16,7 @@
 // --input-f16 提供(Level 1 外部槽: 阶段 9 引擎把该槽标为 external)。
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/ir/op_extra.hpp"
+#include "hnnx/ir/scalar_params.hpp"
 #include "hnnx/ir/types.hpp"
 #include "hnnx/serialize/serializer.hpp"
 
@@ -111,6 +112,19 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     uint32_t W = input_op->output_def.rank >= 4 ? (uint32_t)input_op->output_def.dims[2] : 1;
     uint32_t C = input_op->output_def.rank >= 4 ? (uint32_t)input_op->output_def.dims[3] : 1;
 
+    // T018 decode 图检测: 含 DecodeFaceF16 节点 → 双输入合并单 EXT_IN 面
+    // (ids i32[1] | faces i32[96]); face_in_id = 该节点输入的 Input 节点
+    bool decode_faces = false;
+    uint64_t face_in_id = 0;
+    uint32_t face_u16_shift = 0, dyn_in_u16_total = 0;
+    gp.for_each_op([&](OpDef* od) {
+        if (decode_faces || !od || !od->name_tag || !od->name_tag->name()) return;
+        if (std::string(od->name_tag->name()) == "DecodeFaceF16" && !od->inputs.empty()) {
+            face_in_id = od->inputs[0].src_id;
+            decode_faces = true;
+        }
+    });
+
     Emitter em;
     em.ext_weights = ext_weights;  // 路线B: 权重外置(ensure_weight_slot → ext_weight_area)
     em.dma_runlist = dma_runlist;  // 003 T015: 搬移显式化模式(W4A16 act DDR→VTCM 预置)
@@ -157,6 +171,38 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         em.main_input_id = in_ids[0];
         if (getenv("GEHTP_DEBUG_INPUTS"))
             std::fprintf(stderr, "[inputs] in_ids=%zu in_paths=%zu\n", in_ids.size(), in_paths.size());
+        if (decode_faces) {
+            /* T018: 各 Input 原样 i32 4B/元素按 in_ids 序拼接成单 EXT_IN 槽,
+             * 驱动每步注入整包 [ids|faces]; faces Input 槽位别名槽 0,
+             * 切片 b0 由 face_u16_shift 位移(见 op_decode_state.cpp)。
+             * prefill 多输入仍走下面烘焙路径。 */
+            std::vector<uint8_t> merged;
+            size_t total_elems = 0;
+            for (size_t k = 0; k < in_ids.size(); k++) {
+                const OpDef* iop = gp.get_op_at(in_ids[k]);
+                if (!iop) continue;
+                size_t elems = 1;
+                for (uint32_t i = 0; i < iop->output_def.rank && i < 5; ++i)
+                    elems *= (size_t)iop->output_def.dims[i];
+                std::vector<uint8_t> d;
+                if (!(k < in_paths.size() && load_file(in_paths[k], d) &&
+                      d.size() == elems * 4))
+                    d.assign(elems * 4, 0);
+                if (in_ids[k] == face_in_id) face_u16_shift = (uint32_t)(merged.size() / 2);
+                merged.insert(merged.end(), d.begin(), d.end());
+                total_elems += elems;
+            }
+            dyn_in_u16_total = (uint32_t)(merged.size() / 2);
+            if (merged.empty() || merged.size() % 2 || face_in_id == 0) {
+                std::fprintf(stderr, "error: decode 合并输入面异常 (%zu B)\n", merged.size());
+                return 4;
+            }
+            uint32_t sid = em.add_slot((uint32_t)merged.size(), (uint32_t)total_elems, merged.data());
+            em.slots[sid].addr = WT_SLOT_EXT_IN;
+            for (size_t k = 0; k < in_ids.size(); k++) em.input_slots[in_ids[k]] = sid;
+            std::fprintf(stderr, "[decode-in] %zu 输入合并槽 %u: %zu B (face u16 shift %u, total %u u16)\n",
+                         in_ids.size(), sid, merged.size(), face_u16_shift, dyn_in_u16_total);
+        } else {
         for (size_t k = 0; k < in_ids.size(); k++) {
             const OpDef* iop = gp.get_op_at(in_ids[k]);
             if (!iop) continue;
@@ -245,6 +291,72 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 em.slots[sid].addr = WT_SLOT_EXT_IN;  // 主输入: run_io 注入
             }
             em.input_slots[in_ids[k]] = sid;
+        }
+        }
+    }
+
+    // T018 状态槽: decode 图状态节点族 → 状态描述符槽
+    // (addr=WT_SLOT_STATE; 字节 = [n u32][n×bytes u32]; 设备 wt_exec_load_states
+    //  init-once 物化 DDR 状态缓冲, KV ring 几何按 bytes 反推 nslots)
+    {
+        std::map<uint32_t, uint32_t> st_bytes;
+        for (op_id_t id : gp.plan_order()) {
+            const OpDef* od = gp.get_op_at(id);
+            if (!od || !od->name_tag || !od->name_tag->name()) continue;
+            std::string snm = od->name_tag->name();
+            bool is_st = (snm == "KvGatherKT" || snm == "KvGatherV" ||
+                          snm == "Conv1dSsmStepF16" || snm == "DeltaChunkF16");
+            if (!is_st) continue;
+            auto spv = unpack_scalar_params(od->op_data);
+            auto gi = [&](const char* k, uint32_t def) -> uint32_t {
+                const ScalarParam* p = scalar_get(spv, k);
+                return p ? (uint32_t)p->as_int() : def;
+            };
+            uint32_t si = gi("state_idx", 0xFFFFFFFFu);
+            if (si == 0xFFFFFFFFu) {
+                std::fprintf(stderr, "error: %s (op %llu) 缺 state_idx\n", snm.c_str(),
+                             (unsigned long long)id);
+                return 4;
+            }
+            /* per-type 命名空间 → 设备扁平表全局槽(kv 0..5/conv 6..23/delta 24..41);
+             * op 发射侧(op_decode_state.cpp)同一 decode_state_gid 映射 */
+            uint32_t gid = decode_state_gid(snm, si);
+            uint32_t b = 0;
+            if (snm == "KvGatherKT" || snm == "KvGatherV") {
+                uint32_t hd = gi("head_dim", 256), kvh = gi("kv_heads", 2);
+                uint32_t mp = (od->output_def.rank >= 4 &&
+                               od->output_def.dims[3] == hd)
+                                  ? od->output_def.dims[2] : od->output_def.dims[3];
+                b = kvh * hd * 2 * 2 * mp;
+            } else if (snm == "Conv1dSsmStepF16") {
+                b = (gi("d_conv", 4) - 1) * gi("C", 6144) * 4;
+            } else {  // DeltaChunkF16
+                b = gi("H", 16) * gi("D", 128) * gi("D", 128) * 4;
+            }
+            auto it = st_bytes.find(gid);
+            if (it != st_bytes.end() && it->second != b) {
+                std::fprintf(stderr, "error: 状态 %u 尺寸冲突 %u vs %u\n", gid, it->second, b);
+                return 4;
+            }
+            st_bytes[gid] = b;
+        }
+        if (!st_bytes.empty()) {
+            for (uint32_t i = 0; i < st_bytes.size(); i++)
+                if (!st_bytes.count(i)) {
+                    std::fprintf(stderr, "error: 状态 idx 序列缺口 @%u (n=%zu)\n", i, st_bytes.size());
+                    return 4;
+                }
+            std::vector<uint8_t> desc(4 + st_bytes.size() * 4, 0);
+            uint32_t n = (uint32_t)st_bytes.size();
+            std::memcpy(desc.data(), &n, 4);
+            for (auto& [i, b] : st_bytes)
+                std::memcpy(desc.data() + 4 + (size_t)i * 4, &b, 4);
+            uint32_t sid = em.add_slot((uint32_t)desc.size(), n, desc.data());
+            em.slots[sid].addr = WT_SLOT_STATE;
+            uint64_t tot = 0;
+            for (auto& [i, b] : st_bytes) tot += b;
+            std::fprintf(stderr, "[state-slot] n=%u total=%llu B (slot %u)\n",
+                         n, (unsigned long long)tot, sid);
         }
     }
 
@@ -411,7 +523,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     }
     // spill/fill 不钉 temp: 0.8B 默认预算下全图溢出 → 上千 spill 记录,
     // 钉住会把整个活跃集抬到 16879。(M3: 旧 spill 段已删, 溢出走 TAG_MEM_PLAN 阶段二)
-    WtopEmitShared sh{H, W, C, w_slot, b_slot};
+    WtopEmitShared sh{H, W, C, w_slot, b_slot, face_u16_shift, dyn_in_u16_total};
     std::vector<uint32_t> emit_boundary(order.size() + 1, 0);
     for (size_t pos = 0; pos < order.size(); pos++) {
         emit_boundary[pos] = (uint32_t)em.ops.size();

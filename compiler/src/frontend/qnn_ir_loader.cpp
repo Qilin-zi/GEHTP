@@ -106,6 +106,7 @@ void QnnIRLoader::parse_tensors(const JsonValue& graph_json) {
         const JsonValue& dims_arr = tjson.at("dims");
         for (size_t i = 0; i < dims_arr.size(); ++i)
             ti.dims.push_back(static_cast<uint32_t>(dims_arr.at(i).as_int()));
+        if (ti.type == 0) input_decl_json_.push_back(ti.id);
         tensors_[name] = std::move(ti);
     }
 }
@@ -425,6 +426,12 @@ uint32_t QnnIRLoader::build_graph() {
             break;
         }
     }
+
+    /* 输入绑定声明序: JSON 键序 ≠ tensor id 序(tensors_ 是 std::map 无序,
+     * 须在 parse_tensors 捕获)。0.8B: input_ids=1, attention_mask=2,
+     * position_ids=3 — 按 id 排序会把 position/attention_mask 槽对调,
+     * host rotary 拿到 mask 值实锤。 */
+    if (!input_decl_json_.empty()) gp_.set_input_decl_order(input_decl_json_);
 
     // Rebuild consumer lists: param const nodes (high IDs) were created
     // after the ops that reference them, so append_node's consumer

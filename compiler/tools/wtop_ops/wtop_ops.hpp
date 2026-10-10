@@ -249,8 +249,10 @@ struct Emitter {
                     ddr_temp_vtcm[t] = true;
             }
         }
-        if (next_temp > 32768) {
-            std::fprintf(stderr, "error: >32768 live temps (live=%zu free=%zu released=%llu calls=%llu miss=%llu kept=%llu)\n",
+        /* 上限 16384 = 运行时 WT_EXEC_MAX_TEMPS, 也是 TEMPOFF tid 的 14 位编码
+         * 上限(tid|0x4000 后 & 0x3FFF)—— 超过即无法在 blob 里表达, 编译期拒 */
+        if (next_temp > 16384) {
+            std::fprintf(stderr, "error: >16384 temps (WT_EXEC_MAX_TEMPS/TEMPOFF tid 14-bit 上限; live=%zu free=%zu released=%llu calls=%llu miss=%llu kept=%llu)\n",
                          op_temp.size(), free_temps.size(),
                          (unsigned long long)dbg_released, (unsigned long long)dbg_calls,
                          (unsigned long long)dbg_miss, (unsigned long long)dbg_kept);
@@ -782,6 +784,10 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
 struct WtopEmitShared {
     uint32_t H = 1, W = 1, C = 1;
     uint32_t w_slot = 0, b_slot = 0;
+    /* T018 decode 图: 合并 EXT_IN 面内 faces 区 u16 位移(前置输入字节数/2)
+     * 与面总 u16 长(op15 rank1 切片的 b0 基移/d0); 非 decode 图均为 0 */
+    uint32_t face_u16_shift = 0;
+    uint32_t dyn_in_u16_total = 0;
 };
 
 /* 007 US1: broadcast 形态判定(孪生) — 正典 = specs/007-perf-sprint-1/evidence/
@@ -813,6 +819,20 @@ inline int broadcast_shape_class(const uint32_t in_d[4], const uint32_t out_d[4]
 inline uint32_t broadcast_engine_annot(const uint32_t in_d[4], const uint32_t out_d[4])
 {
     return wt_annot_pack(broadcast_shape_class(in_d, out_d) == 3 ? 0u : 1u, 1u, 0u);
+}
+
+/* T018: decode 状态全局槽映射。surgery 脚本按类型命名空间分配 state_idx
+ * (kv 0..5 / conv 0..17 / delta 0..17), 设备 wt_exec_load_states 扁平表
+ * 需全局唯一 → kv→0..5, conv→6..23, delta→24..41。
+ * 与 host_decode_state.hpp 的 N_KV=6/N_CONV=18/N_DELTA=18 对齐;
+ * host 侧(execute_host)保持 per-type 命名空间不受此映射影响。 */
+inline uint32_t decode_state_gid(const std::string& nm, uint32_t si) {
+    const char* n = nm.c_str();
+    if (!std::strcmp(n, "KvAppendF16") || !std::strcmp(n, "KvGatherKT") ||
+        !std::strcmp(n, "KvGatherV"))
+        return si;                                  // kv:   0..5
+    if (!std::strcmp(n, "Conv1dSsmStepF16")) return 6u + si;    // conv: 6..23
+    return 24u + si;                                // delta: 24..41
 }
 
 /* ===================== 算子发射注册表 =====================
@@ -858,6 +878,7 @@ inline uint32_t qnn_binary_to_sub(uint32_t op) {
     case 13: return 2;   /* MULTIPLY */
     case 2:  return 3;   /* DIVIDE */
     case 3:  return 4;   /* EQUAL → bool 0/1 (0.8B pad 掩码; 静默 ADD 兜底=设备全 -inf 实锤) */
+    case 1:  return 5;   /* AND → bool 0/1 */
     default: return 0xFFFFFFFFu;
     }
 }

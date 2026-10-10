@@ -22,7 +22,7 @@ extern "C" {
 
 /* 0.8B 全模型 blob temp id 实测至 1403+(输出 temp 1401), 256 会死在首个
  * temp≥256 的 op (broadcast ref fail, 2026-09-22 v3 复跑实锤) → 4096 对齐 WT_MAX_SLOTS */
-#define WT_EXEC_MAX_TEMPS 4096
+#define WT_EXEC_MAX_TEMPS 16384  /* TEMPOFF tid 14 位(0x3FFF)上限; 静态登记限制 id 回收后 0.8B 水位~14k */
 
 /* 顺序执行 b->ops。engine_m 回填引擎形状 (0=无 MATMUL op)。
  * op_us (可 NULL) 回填每 op 耗时表数组 (长度必须 >= n_ops)。
@@ -37,8 +37,15 @@ uint32_t  wt_exec_temp_bytes(uint32_t id);
 /* 每 temp 最后写入字节数 (temp_bytes=分配大小, 复用只扩不缩可能大于实际) */
 uint32_t  wt_exec_temp_last_bytes(uint32_t id);
 
-/* 收尾: wtcache_close + temps 释放。任何路径退出前必须调。 */
+/* 收尾: wtcache_close + temps 释放。任何路径退出前必须调。
+ * 持久状态 (WT_SLOT_STATE) 不在此回收 —— 生命期 = 进程级, 跨 run_io
+ * 存活 (persistent decode 语义); 新序列用 wt_exec_state_reset 清零。 */
 void wt_exec_shutdown(void);
+
+/* 004 P2: 持久状态表全量清零 (KV ring 槽失效 + SSM 面归零)。
+ * 新序列(prefill 重来)前由 persistent runner 调用; 单测/合成 blob
+ * 每进程一次亦可不调。 */
+void wt_exec_state_reset(void);
 
 /* 第7步阶段一插槽: 编译期静态 temp 池 + 偏移表。
  * base=NULL && offsets=NULL 恢复运行时 bump 路径(默认)。

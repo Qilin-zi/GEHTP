@@ -56,7 +56,8 @@ static void usage() {
         "  --opt-stats         打印各 pass 匹配/折叠统计与前后条目数\n"
         "  --ddr-offsets <tsv> 第7步阶段一: 导出静态 DDR 偏移表 TSV(check_offsets 消费)\n"
         "  --ddr-budget <n>    DDR 池字节(0=不规划; M2 起喂 TAG_MEM_PLAN)\n"
-        "  --plan-vtcm-budget <n>  M2: VTCM 驻留池字节(静态规划用, 0=无驻留)\n"
+        "  --plan-vtcm-budget <n>  M2: VTCM 驻留池字节(缺省=auto: 16MB−HMX scratch 峰值\n"
+        "                       −余量, 仅纯默认编译且无 W4A16; 0=关(debug/旧口径))\n"
         "  --verbose           Print detailed compilation info\n"
         "  --help              Show this help\n");
 }
@@ -297,7 +298,7 @@ int main(int argc, char** argv) {
     bool opt_stats = false;             // --opt-stats: prepare 后打印 pass 统计
     std::string ddr_offsets_path;       // --ddr-offsets: 第7步阶段一静态偏移表 TSV
     uint64_t ddr_budget = 0;            // --ddr-budget: DDR 池字节(0=不规划; M2 起喂 TAG_MEM_PLAN)
-    uint64_t plan_vtcm_budget = 0;      // --plan-vtcm-budget: M2 VTCM 驻留池字节(静态规划用)
+    uint64_t plan_vtcm_budget = GraphPrepare::kVtcmPlanAuto;  // 缺省 auto(step6 解析); 显式 0=关
     bool external_weights = false;      // --external-weights: 路线B 权重外置(跳过 0xCF56)
     std::vector<std::pair<std::string, std::string>> static_inputs;  // --static-input name=file
 

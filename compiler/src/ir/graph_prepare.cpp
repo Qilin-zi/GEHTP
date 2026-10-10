@@ -12,6 +12,7 @@
 #include "hnnx/dma/spill_fill.hpp"
 #include "hnnx/cost/cost_model.hpp"
 #include "hnnx/ops/ops.hpp"
+#include "hnnx/host_decode_state.hpp"
 #include "hnnx/mcast/mcast_optimizer.hpp"
 #include "hnnx/scheduler/dp_sequencer.hpp"
 #include "hnnx/vtcm/dp_group_graph.hpp"
@@ -270,6 +271,13 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     // quant_marker/scale/output_rank 并把 tensor_param(perm 等)追加到 inputs。
     // 注入在 DCE 之前, 这样 DCE 不会误删被引用的 tensor_param const。
     inject_htp_prepare_inputs();
+    if (getenv("GEHTP_DBG_T18"))
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-inj] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     // 1. Set construction state
     construction_state_ = 1; // +0x45dc = 1 (construction phase)
@@ -282,6 +290,13 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     if (dce_result > 0) {
         std::fprintf(stderr, "do_prepare1: initial DCE removed %d ops\n", dce_result);
     }
+    if (getenv("GEHTP_DBG_T18"))
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-dce] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     // 1c. Split 消除已禁用: eliminate_split_nodes() 是 REQNN 逆向对拍实现,
     // 把 Split 消费者重定向到 dims=[1] 占位 const(模仿 QNN before_graph
@@ -419,6 +434,13 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     // (M01 实证 do_prepare1 @0xf66550 调用序)。pass 使能统一由
     // PassManager 管理(--no-pass 关单 pass); 结构不匹配 = 图不动。
     run_optimize_passes(env);
+    if (getenv("GEHTP_DBG_T18"))
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-opt] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     // 4. Initial node ordering
     order_nodes(true);
@@ -432,6 +454,14 @@ GraphStatus GraphPrepare::do_prepare1(HexagonNNEnv& env, VtcmCacheInstance& vtcm
 
     // 7. Mark construction complete
     construction_state_ = 2; // +0x45dc = 2 (optimization phase)
+
+    if (getenv("GEHTP_DBG_T18"))   /* T018d 探针: do_prepare1 尾 */
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-p1] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     return GraphStatus::Success;
 }
@@ -534,8 +564,46 @@ GraphStatus GraphPrepare::do_prepare2(HexagonNNEnv& env, VtcmCacheInstance& vtcm
     // Source: do_prepare2 completion sets +0x45dc = 3
     construction_state_ = 3;
 
+    if (getenv("GEHTP_DBG_T18")) {  /* T018d 探针: do_prepare2 尾 */
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-p2] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
+        if (getenv("GEHTP_DBG_T18_L3"))
+            for (auto& [id, od] : opdef_map_) {
+                if (!od) continue;
+                const char* gn = od->grouping.c_str();
+                if (std::strstr(gn, "layers.3/self_attn/Slice") ||
+                    std::strstr(gn, "layers.3/self_attn/Concat") ||
+                    std::strstr(gn, "layers.3/self_attn/kv_append") ||
+                    std::strstr(gn, "layers.3/self_attn/Transpose"))
+                    std::fprintf(stderr, "[t18-l3] id=%llu name=%s grp=%s flags=0x%x csize=%llu odata=%zu\n",
+                                 (unsigned long long)id,
+                                 od->name_tag ? od->name_tag->name() : "?", gn,
+                                 od->flags, (unsigned long long)od->const_data_size,
+                                 od->op_data.size());
+            }
+    }
+
     return GraphStatus::Success;
 }
+// ---- --plan-vtcm-budget 缺省(auto)解析用: HMX scratch 峰值普查 ----
+// need 公式与 op_matmul.cpp 的 US1 分块 lambda / wtop_ops.hpp assign_engine
+// 三处同口径拷贝, 改一处必同步三处(test_vtcm_auto 用大 matmul 锚住)。
+// vtcm_auto_scan 定义在匿名 ns 之后(extract_fc_extra 是匿名 ns 成员、
+// extract_matmul_extra 是 hnnx 域定义, 两名都在那里才可见; 此处只声明)。
+static uint64_t mm_scratch_need(uint32_t m, uint32_t k, uint32_t n) {
+    size_t a = (size_t)m * k * 2u, w = (size_t)n * k * 2u, o = (size_t)m * n * 2u;
+    size_t off_w = (a + 2047u) & ~(size_t)2047u;
+    size_t off_o = (off_w + w + 2047u) & ~(size_t)2047u;
+    size_t off_s = (off_o + o + 2047u) & ~(size_t)2047u;
+    return off_s + 2048u;
+}
+struct VtcmAutoScan { bool w4 = false; bool conv = false; uint64_t scratch_max = 0; };
+static VtcmAutoScan vtcm_auto_scan(const GraphPrepare& gp);
+
 // Source: graph_prepare.cc, 2329 bytes at 0xF71F00
 GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) {
     // 1. Final optimization passes
@@ -543,6 +611,14 @@ GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) 
 
     // 2. Re-order nodes (ensures ordering_ is populated for execution)
     order_nodes(false);
+
+    if (getenv("GEHTP_DBG_T18"))   /* T018d 探针: do_prepare2_late CSE 后 */
+        for (auto& [id, od] : opdef_map_)
+            if (od && od->name_tag && od->name_tag->name() &&
+                std::strstr(od->name_tag->name(), "KvAppend"))
+                std::fprintf(stderr, "[t18-p2l] %s id=%llu op_data=%zu\n",
+                             od->name_tag->name(), (unsigned long long)id,
+                             od->op_data.size());
 
     // 3. Runlist generation
     // Source: runlist_info.cc, run_order_to_alloc_info.cc
@@ -588,15 +664,45 @@ GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) 
     //    ddr 预算 0 = 不规划(与 emit --ddr-budget 缺省同语义)。
     has_mem_plan_ = false;
     mem_plan_ = MemPlan{};
-    if (plan_ddr_budget_ > 0) {
+    /* --plan-vtcm-budget 缺省 = auto: 纯默认编译(无 --ddr-budget、权重内嵌)
+     * 且图内无 W4A16 matmul 时, 驻留池 = 16MB − HMX scratch 峰值(镜像发射侧
+     * N 分块口径, 既有分块全部放得下 → op 流与关池一致, 运行时零新增回落)
+     * − 余量(运行时 attach 下界 align2048(wtcache pin_cap) + 杂项)。
+     * 显式传值(含 0)一律照用; 0 = 关(debug/旧口径)。 */
+    uint64_t vtcm_eff = plan_vtcm_budget_;
+    if (vtcm_eff == kVtcmPlanAuto) {
+        vtcm_eff = 0;
+        if (plan_ddr_budget_ > 0) {
+            std::fprintf(stderr, "[memplan] vtcm auto off: --ddr-budget 显式(旧口径, 要池请显式 --plan-vtcm-budget)\n");
+        } else if (const_pool_external_) {
+            std::fprintf(stderr, "[memplan] vtcm auto off: 权重外置路线B(池内字节不可判 W4)\n");
+        } else {
+            VtcmAutoScan vas = vtcm_auto_scan(*this);
+            constexpr uint64_t kVtcmTotal = 16ull << 20;  // 设备 A2 query; 发射侧 kVTCMTotal 同源
+            const uint64_t head = (vas.conv ? (2ull << 20) : 0ull) + (512ull << 10);
+            if (vas.w4) {
+                std::fprintf(stderr, "[memplan] vtcm auto off: 图含 W4A16 matmul (carve/池预算统一另线收口)\n");
+            } else if (vas.scratch_max + head < kVtcmTotal) {
+                vtcm_eff = (kVtcmTotal - vas.scratch_max - head) & ~uint64_t(1023u);
+                std::fprintf(stderr, "[memplan] vtcm auto: scratch_max=%llu conv=%d head=%llu → pool=%llu (%.2fMB)\n",
+                             (unsigned long long)vas.scratch_max, (int)vas.conv,
+                             (unsigned long long)head,
+                             (unsigned long long)vtcm_eff, vtcm_eff / 1048576.0);
+            } else {
+                std::fprintf(stderr, "[memplan] vtcm auto off: scratch_max=%llu + head=%llu ≥ VTCM 16MB\n",
+                             (unsigned long long)vas.scratch_max, (unsigned long long)head);
+            }
+        }
+    }
+    if (plan_ddr_budget_ > 0 || vtcm_eff > 0) {
         std::vector<DdrTempEntry> entries;
         std::vector<DdrSpillEntry> spills;
         uint64_t cap = 0, spill_total = 0, vcap = 0;
         if (compute_ddr_offsets(plan_ddr_budget_, &entries, &cap,
                                 &spills, &spill_total,
-                                plan_vtcm_budget_, &vcap) == 0) {
+                                vtcm_eff, &vcap) == 0) {
             mem_plan_.ddr_cap = cap;
-            mem_plan_.vtcm_cap = plan_vtcm_budget_ ? vcap : 0;
+            mem_plan_.vtcm_cap = vtcm_eff ? vcap : 0;
             mem_plan_.bump_reserve = std::max<uint64_t>(4u << 20, cap / 4);
             for (const auto& e : entries)
                 mem_plan_.entries.push_back({e.op_id, 0, e.offset, e.size, e.in_vtcm});
@@ -629,19 +735,98 @@ std::vector<const OpDef*> GraphPrepare::get_sorted_opdefs() const {
 }
 
 // Host-side reference execute: float buffers, topo order, tensor map.
+/* 多输入绑定的槽位序: 声明序(loader 记录的 net.json 张量字典插入序)优先,
+ * 无记录(旧 bin 反序列化)时回退 op_id 升序(=基线行为)。声明序条目须
+ * 与当前图 Input 节点集合一致(DCE 可能裁输入), 不一致同样回退。 */
+std::vector<op_id_t> GraphPrepare::host_input_order() {
+    std::vector<op_id_t> in_ids;
+    for (auto& [id, opdef] : opdef_map_)
+        if (opdef && opdef->name_tag && opdef->name_tag->name() &&
+            std::string(opdef->name_tag->name()) == "Input")
+            in_ids.push_back(id);
+    std::sort(in_ids.begin(), in_ids.end());
+    if (input_decl_order_.size() == in_ids.size() && !in_ids.empty()) {
+        bool ok = true;
+        for (op_id_t d : input_decl_order_)
+            if (!std::binary_search(in_ids.begin(), in_ids.end(), d)) { ok = false; break; }
+        if (ok) return input_decl_order_;
+    }
+    return in_ids;
+}
+
 GraphPrepare::ExecResult GraphPrepare::execute_host(
         const std::vector<float>& input,
         const std::vector<std::vector<float>>* multi_inputs) {
     ExecResult ret{};
     ops_passthru_reset();   /* A6: 每次 host 执行前清零直通计数 */
+    /* 004 T018c: decode 持久状态落盘协议 — GEHTP_HOST_STATE=<path>:
+     * 进程首步装载(不存在=零态新序列), 末尾覆写。多步驱动 = 逐进程串跑。 */
+    static const char* hstate_path = std::getenv("GEHTP_HOST_STATE");
+    if (hstate_path && *hstate_path) {
+        int rc = host_decode_state_load(hstate_path);
+        if (rc < 0)
+            std::fprintf(stderr, "[hostdec] state file %s corrupt, starting fresh\n",
+                         hstate_path);
+    }
 
     /* ops_ 在 do_prepare2 的 prepare_op 填充后, Phase7 fixpoint 的 DCE 仍会
      * 改 opdef_map_(删 op)——ops_ 保持陈旧(probe: Slice 被删但 TypicalOp
      * 照跑, tensor_param 注入/输入链全断)。以 opdef_map_ 为准重建。 */
     ops_.clear();
+    /* T018d: GEHTP_DBG_T18_IDS="153,155" 打指定 op 的执行期输入边(名字+源) */
+    const char* dbg_ids = std::getenv("GEHTP_DBG_T18_IDS");
     for (auto& [id, opdef] : opdef_map_) {
         if (!opdef || !opdef->is_enabled() || opdef->is_dead()) continue;
         if (!opdef->name_tag || !opdef->name_tag->name()) continue;
+        if (dbg_ids && *dbg_ids) {
+            char pat[32];
+            std::snprintf(pat, sizeof pat, ",%llu,", (unsigned long long)id);
+            std::string hay = std::string(",") + dbg_ids + ",";
+            if (std::strstr(hay.c_str(), pat)) {
+                std::fprintf(stderr, "[t18-edge] %s id=%llu n_in=%zu odata=%zu",
+                             opdef->name_tag->name(), (unsigned long long)id,
+                             opdef->inputs.size(), opdef->op_data.size());
+                {
+                    auto pv = unpack_scalar_params(opdef->op_data);
+                    for (const auto& p2 : pv)
+                        std::fprintf(stderr, " %s=%s", p2.name.c_str(),
+                                     p2.is_numeric ? std::to_string(p2.value_num).c_str()
+                                                   : p2.value_str.c_str());
+                }
+                for (const auto& c : opdef->inputs) {
+                    OpDef* s = get_op_at(c.src_id);
+                    std::fprintf(stderr, " <-%llu:%s(r%u,%u,%u,%u)",
+                                 (unsigned long long)c.src_id,
+                                 s && s->name_tag && s->name_tag->name()
+                                     ? s->name_tag->name() : "MISSING",
+                                 s ? s->output_def.dims[0] : 0,
+                                 s ? s->output_def.dims[1] : 0,
+                                 s ? s->output_def.dims[2] : 0,
+                                 s ? s->output_def.dims[3] : 0);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        if (getenv("GEHTP_DBG_T18")) {
+            const char* dn = opdef->name_tag->name();
+            if (std::strstr(dn, "KvAppend") || std::strstr(dn, "KvGather") ||
+                std::strstr(dn, "Conv1dSsmStep") || std::strstr(dn, "DeltaChunk") ||
+                std::strstr(dn, "DecodeFace")) {
+                std::fprintf(stderr, "[t18-ex] %s id=%llu op_data=%zu", dn,
+                             (unsigned long long)id, opdef->op_data.size());
+                auto spv = unpack_scalar_params(opdef->op_data);
+                for (const auto& pv : spv)
+                    std::fprintf(stderr, " %s=%g", pv.name.c_str(),
+                                 pv.is_numeric ? pv.value_num
+                                               : std::strtod(pv.value_str.c_str(), nullptr));
+                for (const auto& c : opdef->inputs) {
+                    OpDef* s = get_op_at(c.src_id);
+                    std::fprintf(stderr, " <-%llu%s", (unsigned long long)c.src_id,
+                                 s ? "" : "(MISSING)");
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
         OpIoPtrs io{};
         io.graph_prepare = this;
         io.opdef_ptr = opdef.get();
@@ -685,14 +870,9 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
 
     // tensor_map: op_id -> float buffer
     std::unordered_map<op_id_t, std::vector<float>> tensor_map;
-    /* 多输入: 所有 Input 节点按 op_id 升序 = net.json 图输入声明序;
+    /* 多输入: Input 槽位序 = host_input_order()(声明序优先, id 序回退);
      * multi 为空时单 input 喂第一个 Input(向后兼容)。 */
-    std::vector<op_id_t> in_ids;
-    for (auto& [id, opdef] : opdef_map_)
-        if (opdef && opdef->name_tag && opdef->name_tag->name() &&
-            std::string(opdef->name_tag->name()) == "Input")
-            in_ids.push_back(id);
-    std::sort(in_ids.begin(), in_ids.end());
+    std::vector<op_id_t> in_ids = host_input_order();
     if (in_ids.empty()) in_ids.push_back(input_id);
     if (getenv("GEHTP_EXDIAG")) {
         std::fprintf(stderr, "[mdiag] in_ids:");
@@ -1017,6 +1197,10 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
     }
 
     ops_passthru_report("execute_host");   /* A6: 直通 N≠0 即假绿报警 */
+    if (hstate_path && *hstate_path) {
+        if (host_decode_state_save(hstate_path) != 0)
+            std::fprintf(stderr, "[hostdec] state save to %s failed\n", hstate_path);
+    }
     return ret;
 }
 
@@ -2132,6 +2316,47 @@ std::vector<uint8_t> extract_split_extra(const GraphPrepare& gp, const OpDef& op
     return raw_extra(&e, sizeof(e));
 }
 
+// 004 T018 decode 状态族: 5×u32 定长 extra 的 per-type 键表(extractor 与
+// rebuild_op_data_from_extra 双侧共用; 键域与 ops.cpp dnum / wtop_emit 一一对应)
+bool decode_state_keys(const char* nm, const char* (&keys)[5]) {
+    const char* kt[6][6] = {
+        {"DecodeFaceF16", "u16_begin", "u16_len", "", "", ""},
+        {"KvAppendF16", "state_idx", "kv_heads", "head_dim", "", ""},
+        {"KvGatherKT", "state_idx", "n_heads", "kv_heads", "head_dim", ""},
+        {"KvGatherV", "state_idx", "n_heads", "kv_heads", "head_dim", ""},
+        {"Conv1dSsmStepF16", "state_idx", "C", "d_conv", "", ""},
+        {"DeltaChunkF16", "state_idx", "H", "D", "q_raw", ""},
+    };
+    for (auto& row : kt)
+        if (!std::strcmp(nm, row[0])) {
+            for (int i = 0; i < 5; i++) keys[i] = row[i + 1];
+            return true;
+        }
+    return false;
+}
+
+// op_data(scalar_params, net.json loader 写入) → 5×u32 extra
+std::vector<uint8_t> extract_decode_state_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    (void)gp;
+    const char* nm = opdef.name_tag ? opdef.name_tag->name() : "";
+    const char* keys[5];
+    if (!decode_state_keys(nm, keys)) return {};
+    auto sp = unpack_scalar_params(opdef.op_data);
+    uint32_t v[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < 5; i++) {
+        if (!keys[i][0]) continue;
+        const ScalarParam* p = scalar_get(sp, keys[i]);
+        if (p) v[i] = (uint32_t)p->as_int();
+    }
+    if (getenv("GEHTP_DBG_T18"))
+        std::fprintf(stderr, "[t18-ext] %s id=%llu op_data=%zu -> [%u,%u,%u,%u,%u]\n", nm,
+                     (unsigned long long)opdef.op_id, opdef.op_data.size(),
+                     v[0], v[1], v[2], v[3], v[4]);
+    std::vector<uint8_t> out(sizeof v);
+    std::memcpy(out.data(), v, sizeof v);
+    return out;
+}
+
 std::map<std::string, ExtraInfoFn>& extra_info_registry() {
     static std::map<std::string, ExtraInfoFn> reg = [] {
         std::map<std::string, ExtraInfoFn> m;
@@ -2156,6 +2381,13 @@ std::map<std::string, ExtraInfoFn>& extra_info_registry() {
         m["Pad"] = extract_pad_extra;
         m["ScatterNd"] = extract_scatternd_extra;
         m["Split"] = extract_split_extra;
+        // 004 T018: decode 图状态族(net.json loader op_data → extra 尾随)
+        m["DecodeFaceF16"] = extract_decode_state_extra;
+        m["KvAppendF16"] = extract_decode_state_extra;
+        m["KvGatherKT"] = extract_decode_state_extra;
+        m["KvGatherV"] = extract_decode_state_extra;
+        m["Conv1dSsmStepF16"] = extract_decode_state_extra;
+        m["DeltaChunkF16"] = extract_decode_state_extra;
         return m;
     }();
     return reg;
@@ -2207,6 +2439,64 @@ std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& o
     return raw_extra(&e, sizeof(e));
 }
 
+/* --plan-vtcm-budget auto 解析用的全图扫描: HMX scratch 峰值(镜像 op_matmul
+ * US1 分块口径) + conv 存在性 + W4A16 存在性(auto 池与 carve footer 的
+ * VTCM 布局未对齐, 混跑即拒)。M/K/N 取法镜像 serialize_opdef:
+ * serialized_extra 非空复用(回读 .bin 场景), 空则调注册表 extractor 现算
+ * (全新编译场景 —— serialized_extra 要到 serialize 阶段才落, step6 时恒空)。 */
+static VtcmAutoScan vtcm_auto_scan(const GraphPrepare& gp) {
+    constexpr uint64_t kVtcmTotal = 16ull << 20;
+    VtcmAutoScan r;
+    for (const OpDef* od : gp.get_sorted_opdefs()) {
+        if (!od->name_tag || !od->name_tag->name()) continue;
+        const char* nm = od->name_tag->name();
+        if (std::strcmp(nm, "MatMul") != 0 && std::strcmp(nm, "FullyConnected") != 0) {
+            if (std::strcmp(nm, "Conv2d") == 0 || std::strcmp(nm, "DepthWiseConv2d") == 0)
+                r.conv = true;
+            continue;
+        }
+        uint32_t m = 0, k = 0, n = 0, has_bias = 0, batched = 0;
+        std::vector<uint8_t> xb = od->serialized_extra;
+        if (std::strcmp(nm, "FullyConnected") == 0) {
+            if (xb.empty()) xb = extract_fc_extra(gp, *od);
+            ExtraFc ef{};
+            if (xb.size() >= sizeof(ef))
+                std::memcpy(&ef, xb.data(), sizeof(ef));
+            m = ef.m; k = ef.k; n = ef.n; has_bias = ef.has_bias;
+        } else {
+            if (xb.empty()) xb = extract_matmul_extra(gp, *od);
+            ExtraMatMul em{};
+            if (!xb.empty()) {   // min-size: 旧 bin 24B 无 has_bias/batched
+                size_t c = std::min(xb.size(), sizeof(em));
+                std::memcpy(&em, xb.data(), c);
+            }
+            m = em.m; k = em.k; n = em.n; has_bias = em.has_bias; batched = em.batched;
+        }
+        if (!m || !k || !n) continue;
+        // W4A16 判定(发射侧 slots.len==k*n/2 的编译期同口径): Q4 权重池字节数减半
+        if (od->inputs.size() > 1) {
+            const OpDef* w = gp.get_op_at(od->inputs[1].src_id);
+            if (w && w->const_data_size > 0 &&
+                (uint64_t)w->const_data_size * 2u == (uint64_t)k * n) { r.w4 = true; continue; }
+        }
+        // 可分块性镜像(op_matmul: !has_bias && !batched && 32 对齐 && 整 op 超界);
+        // 二分循环逐字照抄发射侧, 保证 N_chunk 一致 → scratch 峰值一致
+        uint64_t need = mm_scratch_need(m, k, n);
+        if (!has_bias && !batched && (m % 32u) == 0u && (k % 32u) == 0u && (n % 32u) == 0u &&
+            need > kVtcmTotal) {
+            uint32_t N_chunk = 0, lo = 32u, hi = n;
+            while (lo <= hi) {
+                uint32_t mid = lo + ((hi - lo) / 64u) * 32u;
+                if (mm_scratch_need(m, k, mid) <= kVtcmTotal) { N_chunk = mid; lo = mid + 32u; }
+                else { hi = mid - 32u; }
+            }
+            if (N_chunk != 0u) need = mm_scratch_need(m, k, N_chunk);
+            // N_chunk==0: 维持整 op(发射侧同款 warn 路径), need 不缩
+        }
+        r.scratch_max = std::max(r.scratch_max, need);
+    }
+    return r;
+}
 
 // serialize_opdef: write a single op's structural record (TAG_OP_RECORD).
 //   [uint32 name_len][char[] name, 4-aligned][uint64 op_id][uint16 flags]
@@ -2248,6 +2538,11 @@ void GraphPrepare::serialize_opdef(Serializer& ser, const OpDef& opdef) const {
     uint32_t grp_padded = (grp_len + 3) & ~uint32_t(3);
 
     // Compute total payload size for the tagged record header word count.
+    /* T018d: tensor_param_ids(axes/perm/ranges const 的挂靠表, loader 写入、
+     * execute_host 按 od2->tensor_param_ids 追加输入)此前不序列化 → --bin
+     * 路径 ReduceSum 退化 reduce-all、Transpose 丢 perm 全图发散(cos 0.08)。
+     * 尾随 [u32 n_tp][ids u64×n](恒写, 空=0 — 与 op_data 同为自描述尾段,
+     * 否则空 tp 的 op 反序列化会把 op_data 首 4B 误读成 n_tp 破坏字节全同) */
     size_t payload =
         4 + name_padded +            // name_len + name
         4 + grp_padded +             // grp_len + grouping(M2c)
@@ -2256,6 +2551,7 @@ void GraphPrepare::serialize_opdef(Serializer& ser, const OpDef& opdef) const {
         sizeof(OutputDef) +           // output_def
         8 + 8 +                       // const_data_offset, const_data_size
         4 + extra.size() +            // 尾随 [u32 extra_len][extra bytes]
+        4 + opdef.tensor_param_ids.size() * 8 +  // 尾随 [u32 n_tp][ids u64×n](恒写, 空=0)
         4 + opdef.op_data.size();     // 尾随 [u32 op_data_len][op_data bytes]
     payload = (payload + 3) & ~size_t(3);  // 4B 对齐，匹配 tagged record 的 word_count
 
@@ -2291,6 +2587,8 @@ void GraphPrepare::serialize_opdef(Serializer& ser, const OpDef& opdef) const {
         std::memcpy(buf.data() + off, extra.data(), extra.size());
         off += extra.size();
     }
+    w32(static_cast<uint32_t>(opdef.tensor_param_ids.size()));
+    for (op_id_t tpid : opdef.tensor_param_ids) w64(tpid);
 
     // Serialize op_data blob: per-op scalar params (e.g., has_bias for FC)
     w32(static_cast<uint32_t>(opdef.op_data.size()));
@@ -2314,6 +2612,80 @@ struct BinReader {
     uint16_t r16() { uint16_t v = 0; std::memcpy(&v, p, 2); p += 2; return v; }
     void read(void* dst, size_t n) { if (dst) std::memcpy(dst, p, n); p += n; }
 };
+
+/* M2d: --bin 反序列化路径重建 op_data(execute_host 的 ops.cpp 算子读
+ * scalar params; serialize_opdef 只写 serialized_extra 尾随段不写 op_data
+ * → Eltwise operation 退化 ADD(0)、Gather/Softmax/Concat axis 退化 0 —
+ * 0.8B seq=1 --bin cos 0.076 实锤: Expand(Mul) 变 Add、And 变 Add(1+1=2.0f))。
+ * 从 serialized_extra 反向 pack, 键域与 ops.cpp scalar_get 一一对应;
+ * extra 缺失/长度不足的 op 不动(保持 loader 语义: 无参数走各算子启发)。 */
+static void rebuild_op_data_from_extra(OpDef* od) {
+    if (!od || od->serialized_extra.empty()) return;
+    const char* nm = od->name_tag ? od->name_tag->name() : nullptr;
+    if (!nm) return;
+    const auto& ex = od->serialized_extra;
+    std::vector<ScalarParam> sp;
+    auto num = [&](const char* k, double v) {
+        ScalarParam q; q.name = k; q.is_numeric = true; q.value_num = v;
+        sp.push_back(q);
+    };
+    auto str = [&](const char* k, const char* v) {
+        ScalarParam q; q.name = k; q.is_numeric = false; q.value_str = v;
+        sp.push_back(q);
+    };
+    const bool eltwise = !std::strcmp(nm, "Eltwise_Binary") ||
+                         !std::strcmp(nm, "Eltwise_Unary") ||
+                         !std::strcmp(nm, "ElementWiseNeuron") ||
+                         !std::strcmp(nm, "Eltwise_Ternary");
+    if (eltwise) {
+        if (ex.size() < sizeof(ExtraEltwise)) return;
+        ExtraEltwise e; std::memcpy(&e, ex.data(), sizeof e);
+        num("operation", (double)e.operation);
+        if (e.eltwise_type == 0) str("eltwise_type", "SELECT");
+    } else if (!std::strcmp(nm, "Softmax") || !std::strcmp(nm, "Gather") ||
+               !std::strcmp(nm, "Concat") || !std::strcmp(nm, "CumulativeSum")) {
+        if (ex.size() < sizeof(ExtraAxis)) return;
+        ExtraAxis e; std::memcpy(&e, ex.data(), sizeof e);
+        num("axis", (double)e.axis);
+    } else if (!std::strcmp(nm, "Reduce")) {
+        if (ex.size() < sizeof(ExtraAxis)) return;
+        ExtraAxis e; std::memcpy(&e, ex.data(), sizeof e);
+        switch (e.reduce_type) {
+        case 1: str("reduce_type", "ReduceMean"); break;
+        case 2: str("reduce_type", "ReduceMax"); break;
+        case 3: str("reduce_type", "ReduceMin"); break;
+        default: break;  // 0(Sum)/未知: ops.cpp 缺省 ReduceSum
+        }
+    } else if (!std::strcmp(nm, "Split")) {
+        if (ex.size() < sizeof(ExtraSplit)) return;
+        ExtraSplit e; std::memcpy(&e, ex.data(), sizeof e);
+        num("split_index", (double)e.split_index);
+    } else if (!std::strcmp(nm, "Pad")) {
+        if (ex.size() < sizeof(ExtraPad)) return;
+        ExtraPad e; std::memcpy(&e, ex.data(), sizeof e);
+        num("scheme", (double)e.scheme);
+        num("pad_constant_value", e.constant_value);
+    } else if (!std::strcmp(nm, "MatMul")) {
+        if (ex.size() < sizeof(ExtraMatMul)) return;
+        ExtraMatMul e; std::memcpy(&e, ex.data(), sizeof e);
+        num("transpose_in1", (double)e.transpose_in1);
+    } else {
+        /* 004 T018: decode 状态族 5×u32 定长 extra(与
+         * extract_decode_state_extra 同构回读) */
+        const char* dk[5];
+        if (getenv("GEHTP_DBG_T18"))
+            std::fprintf(stderr, "[t18-rb] %s id=%llu ex=%zu match=%d\n", nm,
+                         (unsigned long long)od->op_id, ex.size(),
+                         decode_state_keys(nm, dk));
+        if (decode_state_keys(nm, dk) && ex.size() >= 20) {
+            uint32_t v[5];
+            std::memcpy(v, ex.data(), sizeof v);
+            for (int i = 0; i < 5; i++)
+                if (dk[i][0]) num(dk[i], (double)v[i]);
+        }
+    }
+    if (!sp.empty()) od->op_data = pack_scalar_params(sp);
+}
 
 // deserialize: rebuild the graph from a buffer produced by serialize().
 // Round-trips the structural records written by do_serialize/serialize_opdef.
@@ -2562,14 +2934,28 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
                     rr.read(opdef->serialized_extra.data(), elen);
                 }
             }
-            // 尾随 op_data blob(向后兼容: 旧流无此字段 → remaining < 4)
+            /* T018d: 尾随 tensor_param_ids(axes/perm/ranges const 挂靠表;
+             * 旧流无尾段跳过)。上界守卫防误读越界。 */
             if (rr.remaining() >= 4) {
+                uint32_t ntp = rr.r32();
+                if (ntp > 0 && ntp <= 64 && rr.remaining() >= (size_t)ntp * 8) {
+                    opdef->tensor_param_ids.reserve(ntp);
+                    for (uint32_t k = 0; k < ntp; k++)
+                        opdef->tensor_param_ids.push_back((op_id_t)rr.r64());
+                }
+            }
+            // 尾随 op_data blob(向后兼容: 旧流无此字段 → remaining < 4)
+            bool has_od_field = rr.remaining() >= 4;
+            if (has_od_field) {
                 uint32_t od_len = rr.r32();
                 if (od_len > 0 && rr.remaining() >= od_len) {
                     opdef->op_data.resize(od_len);
                     rr.read(opdef->op_data.data(), od_len);
                 }
             }
+            // 004 线旧流无尾随 op_data 字段 → 从 serialized_extra 重建;
+            // 新流以写出侧原字节为准(空 op_data 也是合法态, 勿重建覆盖)。
+            if (!has_od_field) rebuild_op_data_from_extra(opdef.get());
 
             if (name == "Input") input_node_id_ = op_id;
             else if (name == "Output") output_node_id_ = op_id;
