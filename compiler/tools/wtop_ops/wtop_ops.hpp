@@ -166,6 +166,16 @@ struct Emitter {
     std::vector<StageRec> pending_stages;
     size_t stage_mark = 0;                 /* 主循环已回填 end_pos 的水位 */
     uint32_t vtcm_stage_top = 0xFFFFFFFFu; /* 惰性: staging 起点 (planner 驻留区上沿对齐 2048) */
+
+    /* 008 T012: f16 权重编译期 crouton 预打包 (--dma-runlist)。探针定谳
+     * (evidence/vtcm-access-probe.txt): pack_wgt 标量散写 = 66.4% wall,
+     * GEMM 驱留后 119µs → 权重静态, pack 成本编译期一次性归零: 发射期按
+     * exec_matmul_f16_hmx pack 公式镜像打包进新槽, op flags 置 bit3
+     * (wgt_prepacked); 运行期 HMX 路径 DMA DDR→VTCM 线性预取, pack 循环
+     * 跳过。pp_recs 线性查重(同权重多 chunk/多 op 共槽); 被替换的行主序
+     * 源槽若无其他引用者, emit 末尾条件 GC 剥除(blob 不双存权重)。 */
+    struct PpRec { uint64_t w_op_id; uint32_t k, nn, n0, t1; uint32_t pp_slot; };
+    std::vector<PpRec> pp_recs;
     // 池内 bump 一块 staging 区, 登记为静态 VTCM temp, 返回 temp id (失败 -1:
     // 无 mem plan / 无 VTCM 池 / 池放不下 / temp id 耗尽)。基线取 ddr_op_map
     // 全量计划态上沿 (非物化态: 首个 W4A16 到达时高偏移驻留 temp 可能尚未物化)。

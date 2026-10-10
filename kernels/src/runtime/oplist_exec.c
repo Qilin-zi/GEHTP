@@ -1720,7 +1720,7 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                                uint32_t M, uint32_t K, uint32_t N,
                                uint32_t n0, uint32_t N_full,
                                int t0, int t1, char* err, size_t errn,
-                               const uint16_t* bias) {
+                               const uint16_t* bias, int w_pp) {
     /* 003 T014 attach: 同 exec_conv2d_hmx —— wtcache 持 VTCM 时挂共享 scratch
      * 区, 不再整体放弃 (旧行为=静默回落标量)。scratch 覆盖 W4A16 arena →
      * matmul_carved 清零, 下一个 W4A16 op 重 carve。 */
@@ -1782,6 +1782,31 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                 }
         }
 
+    if (w_pp) {
+        /* 008 T012: 预打包权重 (emit 期镜像打包, flags bit3) — 线性 DMA
+         * DDR→VTCM 替代标量散写 pack (探针 48_vtcm_access: 散写 39.85ms/op
+         * = 66.4% wall → DMA 后 ~0.3ms 量级)。src = blob 权重区 (loader
+         * CPU 写) → 铁律① FC_CPU→FC_DMA clean; dst = VTCM wgt_cr →
+         * DMA→HMX INVALIDATE (fence.c 决策表; T011 47_fence_conc G2 同栈
+         * 已验)。阻塞 dc_dma_once ~700µs 固定开销 v1 认 (T013 链式 submit
+         * 消化)。UserDMA 累加器 (run_range per-op) 自动计入本流。 */
+        if (fence_handoff((void*)w, (uint32_t)w_bytes, FC_CPU, FC_DMA, FM_DDR) != FENCE_OK) {
+            snprintf(err, errn, "matmul_f16 pp fence src combo"); return -1;
+        }
+        static dc_mutex_t pp_mu;
+        static int pp_mu_ready;
+        if (!pp_mu_ready) { dc_mutex_init(&pp_mu); pp_mu_ready = 1; }
+        struct dc_dma d;
+        if (dc_dma_init(&d, (uint8_t*)w, (uint8_t*)wgt_cr, (uint32_t)w_bytes, &pp_mu) != 0) {
+            snprintf(err, errn, "matmul_f16 pp dma init"); return -1;
+        }
+        int drc = dc_dma_once(&d);
+        dc_dma_destroy(&d);
+        if (drc != 0) { snprintf(err, errn, "matmul_f16 pp dma 0x%X", drc); return -1; }
+        if (fence_handoff((uint8_t*)wgt_cr, (uint32_t)w_bytes, FC_DMA, FC_HMX, FM_VTCM) != FENCE_OK) {
+            snprintf(err, errn, "matmul_f16 pp fence dst combo"); return -1;
+        }
+    } else
     /* pack wgt: B[K,N] (或 t1 转置) → crouton[(c*n_dot+kt)*1024] (row=ic=k, col=oc=n)。
      * 002 US1: 全局列号 = n0 + c*32 + n, 行主 [K,N_full] 布局 stride=N_full
      * (n0=0/N_full=N 时与整 op 逐字节同公式) */
@@ -1860,10 +1885,27 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
     }
     int t0 = (int)(flags & 1u), t1 = (int)(flags & 2u);
     int batched = (int)(flags & 4u);
+    int w_pp = (int)((flags >> 3) & 1u);   /* 008 T012: wgt 预打包 (emit 镜像) */
     uint32_t Bn = flags >> 16;
     if (Bn == 0) Bn = 1;
     /* FC bias (opcode 36) 仅非 batched 整 op (emit 侧保证; 手构图违禁硬错) */
     if (bias && batched) { snprintf(err, errn, "matmul_f16_bias 不支持 batched"); return -1; }
+    /* 008 T012: 预打包槽约束 — emit 仅非 batched 发 bit3, 手构图违禁硬错;
+     * w 必须 slot 引用且 len ≥ N_chunk*K*2 (越界 = emit/手构 bug, 不静默)。 */
+    if (w_pp) {
+        if (batched) { snprintf(err, errn, "matmul_f16 pp+batched 违禁"); return -1; }
+        if (!(op->args[1] & 0x8000u)) {
+            snprintf(err, errn, "matmul_f16 pp w 非 slot ref (0x%X)", op->args[1]);
+            return -1;
+        }
+        uint32_t pps = op->args[1] & 0x7FFFu;
+        if (pps >= b->n_slots || b->slots[pps].len < (size_t)N * K * 2u) {
+            snprintf(err, errn, "matmul_f16 pp slot bad (s=%u len=%llu need=%u)",
+                     (unsigned)pps, (unsigned long long)(pps < b->n_slots ? b->slots[pps].len : 0),
+                     (unsigned)(N * K * 2u));
+            return -1;
+        }
+    }
     const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
     /* w 可为 slot(权重)或 temp(运行时 B, 如 attention q·kᵀ) */
     const uint16_t* w = (const uint16_t*)ref_ptr(b, op->args[1]);
@@ -1898,8 +1940,12 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
     if (bias && g_force_bias_scalar) want_hmx = 0;
     if (want_hmx) {
         int engine = 0;
+        /* 008 T012: 预打包 chunk 各持独立打包槽 (chunk 布局非全局 tile 子区,
+         * w_s 必异) → bit3 chunk 的续判键放宽为 (a_t, out_t) (out_t 每逻辑
+         * matmul 唯一, 判别性不降; 非 bit3 维持原三键零扰动)。 */
         if (op->opcode == OP_MATMUL_F16_SPLIT &&
-            g_split_prev.out_t == out_t && g_split_prev.a_t == a_t && g_split_prev.w_s == w_s)
+            g_split_prev.out_t == out_t && g_split_prev.a_t == a_t &&
+            (w_pp || g_split_prev.w_s == w_s))
             engine = g_split_prev.engine;  /* 续 chunk: 沿用已定引擎 */
         if (engine == 0) {
             if (batched) {
@@ -1912,19 +1958,19 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
                     const uint16_t* wb = w + (size_t)bb * K * N_full;
                     uint16_t* yb = y + (size_t)bb * M * N_full;
                     if (exec_matmul_f16_hmx(ab, wb, yb, M, K, N, 0, N_full, t0, t1,
-                                            err, errn, NULL) != 0) {
+                                            err, errn, NULL, 0) != 0) {
                         engine = -1;
                         break;
                     }
                 }
             } else {
                 engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
-                                              bias) == 0)
+                                              bias, w_pp) == 0)
                              ? 1 : -1;
             }
         } else if (engine == 1) {
             if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
-                                     bias) != 0) {
+                                     bias, w_pp) != 0) {
                 snprintf(err, errn, "matmul_f16 split 混合路径 (FR-013 ④ 违禁): 前 chunk HMX 本 chunk 失败");
                 return -1;
             }
@@ -1947,6 +1993,37 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
         }
     }
 #endif
+    /* 008 T012: bit3 回落标量 — 打包槽解包到临时 chunk 局部行主面 (槽保持
+     * 打包态, 后继 bit3 op 的 HMX DMA 预取不受扰, 无脏槽集)。列号局部化:
+     * 全局列 n0+n → 局部 n; 偏差路径低频, 一次性 malloc 可接受。 */
+    if (w_pp) {
+        uint32_t n_col = N / 32u, n_dot = K / 32u;
+        uint16_t* tmp = (uint16_t*)malloc((size_t)N * K * 2u);
+        if (!tmp) { snprintf(err, errn, "matmul_f16 pp fallback alloc"); return -1; }
+        for (uint32_t c = 0; c < n_col; ++c)
+            for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                const uint16_t* tile = w + ((size_t)c * n_dot + kt) * 1024u;
+                for (uint32_t k = 0; k < 32u; ++k)
+                    for (uint32_t n = 0; n < 32u; ++n) {
+                        size_t dst = t1 ? ((size_t)(c * 32u + n) * K + (kt * 32u + k))
+                                        : ((size_t)(kt * 32u + k) * N + (c * 32u + n));
+                        tmp[dst] = tile[hmx_crouton_pos(k, n)];
+                    }
+            }
+        for (uint32_t m = 0; m < M; m++)
+            for (uint32_t n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (uint32_t k = 0; k < K; k++) {
+                    float av = f16_to_f32(a[t0 ? (size_t)k * M + m : (size_t)m * K + k]);
+                    float wv = f16_to_f32(tmp[t1 ? (size_t)n * K + k : (size_t)k * N + n]);
+                    acc += av * wv;
+                }
+                if (bias) acc += f16_to_f32(bias[n0 + n]);
+                y[(size_t)m * N_full + (n0 + n)] = f32_to_f16(acc);
+            }
+        free(tmp);
+        return 0;
+    }
     /* 标量路径: 列号 = n0 + n, 行主 stride = N_full (n0=0/N_full=N 即旧公式) */
     if (batched) {
         for (uint32_t bb = 0; bb < Bn; bb++)

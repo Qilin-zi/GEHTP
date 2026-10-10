@@ -6,6 +6,26 @@ using namespace wtop;
 
 namespace {
 
+/* 008 T012: 权重 crouton 预打包 — 逐字节镜像 exec_matmul_f16_hmx 的 pack_wgt
+ * 循环(oplist_exec.c)。SPLIT chunk = 独立紧凑布局 tile[(c*n_dot+kt)*1024]
+ * (c 为 chunk 内列 tile 序), 源列号 = n0 + c*32 + n; 行主 [K,N_full] stride
+ * = N_full。bit3 op 运行期按 DMA 线性搬此槽即得 wgt_cr。 */
+static void pack_wgt_crouton_f16(const uint16_t* w, uint16_t* dst,
+                                 uint32_t K, uint32_t N_full, uint32_t n0,
+                                 uint32_t N_chunk, int t1) {
+    uint32_t n_col = N_chunk / 32u, n_dot = K / 32u;
+    for (uint32_t c = 0; c < n_col; ++c)
+        for (uint32_t kt = 0; kt < n_dot; ++kt) {
+            uint16_t* tile = dst + ((size_t)c * n_dot + kt) * 1024u;
+            for (uint32_t k = 0; k < 32u; ++k)
+                for (uint32_t n = 0; n < 32u; ++n) {
+                    size_t src = t1 ? ((size_t)(n0 + c * 32u + n) * K + (kt * 32u + k))
+                                    : ((size_t)(kt * 32u + k) * N_full + (n0 + c * 32u + n));
+                    tile[(k / 2u) * 64u + 2u * n + (k & 1u)] = w[src];
+                }
+        }
+}
+
 static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string& nm, const WtopEmitShared&) {
     uint32_t a_t = em.src_ref(od->inputs[0], gp.get_input_node_id(), gp, wslots);
     uint32_t out_t = em.fresh_temp(gp, od->op_id);
@@ -117,6 +137,42 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             for (uint32_t i = 0; i + 2 < rk; i++) bn *= od->output_def.dims[i];
             flags |= ((uint32_t)bn & 0xFFFFu) << 16;
         }
+        /* 008 T012: f16 权重编译期 crouton 预打包。条件: --dma-runlist +
+         * const 权重真槽 + 非 batched + M/K/N_chunk 32 全对齐 + 槽字节 =
+         * K*N_full*2(f16 满形)。命中 → 镜像打包新槽 + flags bit3
+         * (wgt_prepacked), 运行期 HMX 路径 DMA DDR→VTCM 线性预取替代
+         * 标量散写 pack(探针: 39.85ms/op → ~0.3ms)。SPLIT 逐 chunk 独立
+         * 打包(chunk 布局非全局 tile 子区); 查重键 = (权重 op_id,K,N_full,
+         * n0,t1)。未命中静默维持原路径(零回归)。 */
+        auto try_prepack = [&](uint32_t n0, uint32_t nc) -> uint32_t {
+            if (!em.dma_runlist || !w_is_const || em2.batched) return 0;
+            if (!(w_s & 0x8000u)) return 0;
+            uint32_t src = w_s & 0x7FFFu;
+            if (src == em.dummy_slot_id || src >= em.slots.size()) return 0;
+            if ((m % 32u) || (k % 32u) || (nc % 32u)) return 0;
+            const wt_slot& s = em.slots[src];
+            if (s.len != k * nn * 2u) return 0;
+            uint32_t t1 = (flags >> 1) & 1u;
+            for (const auto& r : em.pp_recs)
+                if (r.w_op_id == w->op_id && r.k == k && r.nn == nn && r.n0 == n0 && r.t1 == t1)
+                    return r.pp_slot;
+            const uint16_t* wbytes;
+            if (s.addr == WT_SLOT_EXT_WGT) {
+                if (s.offset + s.len > em.ext_weight_area.size()) return 0;
+                wbytes = (const uint16_t*)(em.ext_weight_area.data() + s.offset);
+            } else {
+                if (s.offset + s.len > em.weight_area.size()) return 0;
+                wbytes = (const uint16_t*)(em.weight_area.data() + s.offset);
+            }
+            std::vector<uint16_t> packed((size_t)nc * k);
+            pack_wgt_crouton_f16(wbytes, packed.data(), k, nn, n0, nc, (int)t1);
+            uint32_t pp = (s.addr == WT_SLOT_EXT_WGT)
+                              ? em.add_ext_slot(nc * k * 2u, nc * k, (const uint8_t*)packed.data())
+                              : em.add_slot(nc * k * 2u, nc * k, (const uint8_t*)packed.data());
+            em.pp_recs.push_back({w->op_id, k, nn, n0, t1, pp});
+            return pp;
+        };
+        const uint32_t kFlagWgtPP = 8u;  /* flags bit3 = wgt_prepacked */
         /* 002 US1: 超 VTCM 界的 f16 matmul 编译期 N 分块 (OP_MATMUL_F16_SPLIT)。
          * need 公式与 exec_matmul_f16_hmx 逐字节同口径; US2 前预算 = 运行时
          * VTCM total (16MB = 16777216, 设备 A2 query_VTCM 实锤), US2 后换
@@ -163,7 +219,10 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
                 em.cur_engine = wt_annot_pack(2u, 1u, 0u);  /* HMX, 可回落 */
                 for (uint32_t n0 = 0; n0 < nn; n0 += N_chunk) {
                     uint32_t nc = (N_chunk < nn - n0) ? N_chunk : (nn - n0);
-                    em.add_op(OP_MATMUL_F16_SPLIT, {a_t, w_s, out_t, m, k, nn, n0, nc, flags});
+                    uint32_t w_use = w_s, fl = flags;
+                    uint32_t pp = try_prepack(n0, nc);
+                    if (pp) { w_use = 0x8000u | pp; fl |= kFlagWgtPP; }
+                    em.add_op(OP_MATMUL_F16_SPLIT, {a_t, w_use, out_t, m, k, nn, n0, nc, fl});
                 }
                 return 0;
             }
@@ -174,10 +233,18 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
              * SC-005 三判据 0 违例), 32 对齐形默认走 HMX —— US3a 的
              * 对齐硬报错已随 pass 门一并移除。 */
             uint32_t bias_s = 0x8000u | em.ensure_weight_slot(gp, bias_op, wslots, od->grouping);
-            em.add_op(OP_MATMUL_F16_BIAS, {a_t, w_s, out_t, m, k, nn, flags, bias_s});
+            uint32_t w_use = w_s, fl = flags;
+            uint32_t pp = try_prepack(0u, nn);
+            if (pp) { w_use = 0x8000u | pp; fl |= kFlagWgtPP; }
+            em.add_op(OP_MATMUL_F16_BIAS, {a_t, w_use, out_t, m, k, nn, fl, bias_s});
             return 0;
         }
-        em.add_op(OP_MATMUL_F16, {a_t, w_s, out_t, m, k, nn, flags});
+        {
+            uint32_t w_use = w_s, fl = flags;
+            uint32_t pp = try_prepack(0u, nn);
+            if (pp) { w_use = 0x8000u | pp; fl |= kFlagWgtPP; }
+            em.add_op(OP_MATMUL_F16, {a_t, w_use, out_t, m, k, nn, fl});
+        }
     }
     return 0;
 }

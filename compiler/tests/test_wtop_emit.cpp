@@ -1079,6 +1079,156 @@ int main() {
               "T008d: --vtcm-budget 取缺省值(16777216) 与无旗标产物逐字节同");
     }
 
+    /* 12. 008 T012: f16 权重编译期 crouton 预打包 (--dma-runlist)。
+     * 探针定谳 pack_wgt 标量散写 = 66.4% wall → 权重按 exec pack 公式编译期
+     * 打包进新槽, flags 置 bit3 (wgt_prepacked); 源行主槽无引用者 GC 置
+     * len=0 哨兵 (槽 id 稳定)。判据:
+     *   ① 惰性: 无旗标 → OP_MATMUL_F16 flags=2 (t1) 原样;
+     *   ② 有旗标 → flags=2|8, w 指向打包槽, 字节 == 独立重算置换
+     *     (t1: src=(n0+c*32+n)*K+(kt*32+k), tile[hmx_crouton_pos(k,n)]);
+     *   ③ GC: 源槽 len=0, n_slots +1, blob 尺寸差 = 24B (权重区不双存);
+     *   ④ SPLIT 大 N: 逐 chunk 独立打包槽 (n0 异 → 槽异), 首 chunk 对拍。 */
+    {
+        const uint32_t M = 32, K = 64, N = 32;
+        auto emit_pp = [&](bool runlist, const char* tag) -> int {
+            GraphPrepare g;
+            build_matmul(g, M, K, N);
+            if (g.prepare(env) != GraphStatus::Success) return -1;
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) return -1;
+            const std::string bp = dir + std::string(tag) + ".bin";
+            const std::string ip = dir + std::string(tag) + ".f16.raw";
+            const std::string op2 = dir + std::string(tag) + ".wtop";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint8_t> in16((size_t)M * K * 2, 0);
+            write_file(ip, in16.data(), in16.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2;
+            if (runlist) c2 += " --dma-runlist";
+            c2 += " 2>/dev/null";
+            return std::system(c2.c_str());
+        };
+        /* 期望 crouton 置换 (t1=1, FC [N,K] 行主): W 值 = r_f32_to_f16((i%37)-18) */
+        auto expected_pack = [&](uint32_t n0, uint32_t nc, uint32_t Kf,
+                                 std::vector<uint16_t>& out) {
+            out.assign((size_t)nc * Kf, 0);
+            uint32_t n_col = nc / 32, n_dot = Kf / 32;
+            for (uint32_t c = 0; c < n_col; c++)
+                for (uint32_t kt = 0; kt < n_dot; kt++) {
+                    uint16_t* tile = out.data() + ((size_t)c * n_dot + kt) * 1024;
+                    for (uint32_t k = 0; k < 32; k++)
+                        for (uint32_t n = 0; n < 32; n++) {
+                            size_t src = (size_t)(n0 + c * 32 + n) * Kf + (kt * 32 + k);
+                            tile[(k / 2) * 64 + 2 * n + (k & 1)] =
+                                r_f32_to_f16((float)((int)(src % 37) - 18));
+                        }
+                }
+        };
+        CHECK(emit_pp(false, "ppA") == 0, "T012: 无旗标 emit exit 0");
+        CHECK(emit_pp(true, "ppB") == 0, "T012: --dma-runlist emit exit 0");
+        std::vector<uint8_t> ba, bb;
+        wt_blob* wa = new wt_blob{};
+        wt_blob* wb = new wt_blob{};
+        CHECK(load_file(dir + "ppA.wtop", ba) && load_file(dir + "ppB.wtop", bb) &&
+              wt_parse(ba.data(), ba.size(), wa) == WT_OK &&
+              wt_parse(bb.data(), bb.size(), wb) == WT_OK, "T012: 双 blob wt_parse OK");
+        if (wa->n_ops == 1 && wb->n_ops == 1 &&
+            wa->ops[0].opcode == OP_MATMUL_F16 && wb->ops[0].opcode == OP_MATMUL_F16) {
+            CHECK(wa->ops[0].n_args == 7 && (wa->ops[0].args[6] & ~1u) == 2u &&
+                  !(wa->ops[0].args[6] & 8u),
+                  "T012: 惰性门 — 无旗标 flags=2 (t1) 无 bit3");
+            CHECK((wb->ops[0].args[6] & 0xBu) == 0xAu,
+                  "T012: 有旗标 flags = 2|8 (t1 + wgt_prepacked)");
+            /* A: matmul w 引用 = 行主 W 槽 (M*K*2 == K*N*2 时与输入槽同尺寸,
+             * 不能按 len 扫, 直接取 op arg) */
+            uint32_t wA = wa->ops[0].args[1] & 0x7FFFu;
+            CHECK((wa->ops[0].args[1] & 0x8000u) && wA < wa->n_slots && wA != 0u &&
+                  wa->slots[wA].len == K * N * 2u,
+                  "T012: A matmul w → 行主 W 槽 (len=K*N*2)");
+            bool rowmajor_ok = false;
+            if (wA < wa->n_slots && wA != 0u) {
+                const uint16_t* wp = (const uint16_t*)(wa->weight_base + wa->slots[wA].offset);
+                rowmajor_ok = true;
+                for (uint32_t i = 0; i < K * N; i++)
+                    if (wp[i] != r_f32_to_f16((float)((int)(i % 37) - 18))) { rowmajor_ok = false; break; }
+            }
+            CHECK(rowmajor_ok, "T012: A 行主 W 字节期望值");
+            /* B: 源槽 (同 id) len=0 哨兵; 打包槽字节 == crouton 置换 */
+            CHECK(wA < wb->n_slots && wb->slots[wA].len == 0u,
+                  "T012: GC — 源行主槽置 len=0 哨兵");
+            CHECK(wb->n_slots == wa->n_slots + 1u &&
+                  (bb.size() - wb->weight_off) == (ba.size() - wa->weight_off),
+                  "T012: GC — n_slots +1 且权重区字节量与无旗标同 (不双存)");
+            uint32_t wB = wb->ops[0].args[1] & 0x7FFFu;
+            CHECK((wb->ops[0].args[1] & 0x8000u) && wB < wb->n_slots &&
+                  wb->slots[wB].len == K * N * 2u && wB != wA,
+                  "T012: B matmul w → 新打包槽");
+            bool pack_ok = false;
+            std::vector<uint16_t> exp;
+            if (wB < wb->n_slots) {
+                expected_pack(0u, N, K, exp);
+                pack_ok = std::memcmp(wb->weight_base + wb->slots[wB].offset,
+                                      exp.data(), exp.size() * 2) == 0;
+            }
+            CHECK(pack_ok, "T012: 打包槽字节 == crouton 置换 (t1 逐字节)");
+        } else {
+            CHECK(false, "T012: 双 blob 均单 op OP_MATMUL_F16");
+        }
+        delete wa;
+        delete wb;
+
+        /* SPLIT 大 N: 逐 chunk 独立打包 (n0 异 → 槽异), 首 chunk 字节对拍 */
+        {
+            const uint32_t SM = 32, SK = 1024, SN = 8192;
+            GraphPrepare g;
+            build_matmul(g, SM, SK, SN);
+            if (g.prepare(env) == GraphStatus::Success) {
+                std::vector<uint8_t> b2(1u << 27, 0);
+                size_t b2_size = 0;
+                if (g.serialize(b2.data(), b2.size(), b2_size) && b2_size) {
+                    const std::string bp = dir + "ppS.bin";
+                    const std::string ip = dir + "ppS.f16.raw";
+                    const std::string op2 = dir + "ppS.wtop";
+                    write_file(bp, b2.data(), b2_size);
+                    std::vector<uint8_t> in16((size_t)SM * SK * 2, 0);
+                    write_file(ip, in16.data(), in16.size());
+                    std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                                     " --input-f16 " + ip + " --out " + op2 +
+                                     " --dma-runlist 2>/dev/null";
+                    CHECK(std::system(c2.c_str()) == 0, "T012: SPLIT + --dma-runlist emit exit 0");
+                    std::vector<uint8_t> bs;
+                    wt_blob* ws = new wt_blob{};
+                    CHECK(load_file(op2, bs) && wt_parse(bs.data(), bs.size(), ws) == WT_OK &&
+                          ws->n_ops >= 2, "T012: SPLIT blob wt_parse OK (≥2 chunk)");
+                    if (ws->n_ops >= 2 && ws->ops[0].opcode == OP_MATMUL_F16_SPLIT) {
+                        bool all_pp = true, distinct_slots = true;
+                        std::vector<uint32_t> refs;
+                        for (uint32_t i = 0; i < ws->n_ops; i++) {
+                            if (!(ws->ops[i].args[8] & 8u)) all_pp = false;
+                            refs.push_back(ws->ops[i].args[1]);
+                        }
+                        std::sort(refs.begin(), refs.end());
+                        for (size_t i = 1; i < refs.size(); i++)
+                            if (refs[i] == refs[i - 1]) distinct_slots = false;
+                        CHECK(all_pp, "T012: SPLIT 全 chunk flags bit3");
+                        CHECK(distinct_slots, "T012: SPLIT 逐 chunk 独立打包槽 (n0 异 → 槽异)");
+                        const wt_op& c0 = ws->ops[0];
+                        uint32_t wS = c0.args[1] & 0x7FFFu;
+                        std::vector<uint16_t> expS;
+                        expected_pack(c0.args[6], c0.args[7], SK, expS);
+                        CHECK((c0.args[1] & 0x8000u) && wS < ws->n_slots &&
+                              ws->slots[wS].len == c0.args[7] * SK * 2u &&
+                              std::memcmp(ws->weight_base + ws->slots[wS].offset,
+                                          expS.data(), expS.size() * 2) == 0,
+                              "T012: SPLIT 首 chunk 打包字节 == crouton 置换 (n0/nc 口径)");
+                    }
+                    delete ws;
+                }
+            }
+        }
+    }
+
     std::printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASS", failed);
     return failed ? 1 : 0;
 }

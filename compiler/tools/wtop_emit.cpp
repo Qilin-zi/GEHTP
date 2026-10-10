@@ -753,6 +753,56 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         }
     }
 
+    // 5b. 008 T012: 预打包源槽条件 GC — 权重 crouton 预打包在场时, 被替换的
+    // 行主序源槽若无任何 op 引用 → 剥字节、置 len=0 哨兵(槽 id 恒稳, op args
+    // 零重写 — 非 slot arg 误携 bit15 时重映射会腐化, 哨兵法无此险), 压实
+    // weight/ext 区 → blob 不双存权重(打包=同字节量置换, 净增长≈0)。
+    // 无预打包零触碰(惰性门 md5 不动)。
+    if (!em.pp_recs.empty()) {
+        std::vector<uint8_t> refd(em.slots.size(), 0);
+        for (const auto& o : em.ops)
+            for (uint16_t ai = 0; ai < o.n_args; ai++) {
+                uint32_t a = o.args[ai];
+                if ((a & 0x8000u) && (a & 0x7FFFu) < em.slots.size()) refd[a & 0x7FFFu] = 1;
+            }
+        if (em.dummy_slot_id < em.slots.size()) refd[em.dummy_slot_id] = 1;
+        std::vector<wt_slot> nslots;
+        std::vector<uint8_t> narea, nextarea;
+        uint32_t dropped = 0;
+        for (uint32_t i = 0; i < em.slots.size(); i++) {
+            const wt_slot& s = em.slots[i];
+            if (!refd[i]) {
+                wt_slot dead{};
+                nslots.push_back(dead);
+                dropped++;
+                continue;
+            }
+            wt_slot ns = s;
+            if (s.addr == WT_SLOT_EXT_WGT) {
+                ns.offset = nextarea.size();
+                nextarea.insert(nextarea.end(), em.ext_weight_area.begin() + s.offset,
+                                em.ext_weight_area.begin() + s.offset + s.len);
+                while (nextarea.size() % 128 != 0) nextarea.push_back(0);
+            } else {
+                ns.offset = narea.size();
+                narea.insert(narea.end(), em.weight_area.begin() + s.offset,
+                             em.weight_area.begin() + s.offset + s.len);
+                while (narea.size() % 128 != 0) narea.push_back(0);
+            }
+            nslots.push_back(ns);
+        }
+        if (dropped) {
+            em.slots = std::move(nslots);
+            em.weight_area = std::move(narea);
+            em.ext_weight_area = std::move(nextarea);
+            std::fprintf(stderr,
+                         "[pp] T012 权重预打包 %zu 槽; GC 剥除 %u 未引用源槽 "
+                         "(weight=%zuB ext=%zuB)\n",
+                         em.pp_recs.size(), dropped, em.weight_area.size(),
+                         em.ext_weight_area.size());
+        }
+    }
+
     // 6. 组装 blob
     {
         uint32_t n_slots = (uint32_t)em.slots.size();
