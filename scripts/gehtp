@@ -251,10 +251,10 @@ cmd_setup() {
         echo "  补签后 md5=$(md5sum "$skel_push" | cut -c1-8) (期望 380f3cbf)"
     fi
 
-    echo "== [1/4] kernels lib =="
+    echo "== [1/5] kernels lib =="
     [ -f "$KD/lib/libhvxhmx_v23.signed.so" ] || (cd "$KD" && ./build_libs.sh >/dev/null)
 
-    echo "== [2/4] generic runner (42_gehtp_runner) =="
+    echo "== [2/5] generic runner (42_gehtp_runner) =="
     local INC_HEX="-I$HEX/incs -I$HEX/incs/stddef \
         -I$HEX/rtos/qurt/computev81/include -I$HEX/rtos/qurt/computev81/include/qurt"
     $CC -mv81 -O2 -mhvx -mhmx -shared -fPIC -std=gnu11 -Wall -mhvx-length=128B \
@@ -266,10 +266,23 @@ cmd_setup() {
     [ "$ng" = "0" ] || die "vgather 铁律违反 ($ng)"
     python3 "$SWIV" -i /tmp/gehtp_runner.so -o /tmp/gehtp_runner.so.signed 2>&1 | tail -1
 
-    echo "== [3/4] push to $device =="
+    echo "== [3/5] persistent runner (42_gehtp_persistent) =="
+    $CC -mv81 -O2 -mhvx -mhmx -shared -fPIC -std=gnu11 -Wall -mhvx-length=128B \
+        $INC_HEX -I"$KD/include" -I"$KD/examples/common" \
+        -o /tmp/gehtp_persistent.so "$KD/examples/42_gehtp_persistent/main.c" \
+        "$KD/examples/common/example_util.c" -L"$KD/lib" -lhvxhmx_v23 -lc -ldl -lgcc
+    ng=$("$HT/Tools/bin/hexagon-llvm-objdump" -d /tmp/gehtp_persistent.so | grep -c vgather || true)
+    [ "$ng" = "0" ] || die "vgather 铁律违反 ($ng)"
+    python3 "$SWIV" -i /tmp/gehtp_persistent.so -o /tmp/gehtp_persistent.so.signed 2>&1 | tail -1
+
+    echo "== [4/5] push to $device =="
     adb -s "$device" shell "mkdir -p $GDIR" >/dev/null
     adb -s "$device" push "$KD/lib/libhvxhmx_v23.signed.so" "$DEVROOT/libhvxhmx_v23.so" >/dev/null
     adb -s "$device" push /tmp/gehtp_runner.so.signed "$DEVROOT/gehtp_runner.so" >/dev/null
+    # persistent: 若板上实例在跑先关 (推映射中的 .so 会留幽灵会话 → 下次启动 -2147482611)
+    adb -s "$device" shell "pgrep -f gehtp_persistent.so >/dev/null && \
+        pkill -f gehtp_persistent.so && sleep 3" >/dev/null 2>&1 || true
+    adb -s "$device" push /tmp/gehtp_persistent.so.signed "$DEVROOT/gehtp_persistent.so" >/dev/null
     # skel: 治理后推送 + 读回 SWIV 段校验 (覆盖即治好; 旧流程盲推是毒化源头)
     adb -s "$device" push "$skel_push" "$DEVROOT/librun_main_on_hexagon_skel.so" >/dev/null
     adb -s "$device" shell "strings $DEVROOT/librun_main_on_hexagon_skel.so | grep -q SWIV" \
@@ -281,8 +294,8 @@ cmd_setup() {
         adb -s "$device" shell "chmod 755 $DEVROOT/run_main_on_hexagon"
     fi
 
-    echo "== [4/4] done =="
-    echo "device side ready: $DEVROOT/{libhvxhmx_v23.so, gehtp_runner.so, run_main_on_hexagon, librun_main_on_hexagon_skel.so(SWIV✓)}"
+    echo "== [5/5] done =="
+    echo "device side ready: $DEVROOT/{libhvxhmx_v23.so, gehtp_runner.so, gehtp_persistent.so, run_main_on_hexagon, librun_main_on_hexagon_skel.so(SWIV✓)}"
 }
 
 case "${1:-}" in

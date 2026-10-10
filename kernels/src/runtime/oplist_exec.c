@@ -78,6 +78,7 @@ struct wt_exec {
     uint32_t n_states;
     uint8_t* st_buf[WT_MAX_STATES];
     uint32_t st_bytes[WT_MAX_STATES];
+    uint32_t st_count[WT_MAX_STATES];   /* KV 自增位置计数器 (WT_KV_POS_AUTO) */
     struct kvc st_kvc[WT_MAX_STATES];   /* KV 状态的 ring 描述 (惰性 init) */
     uint32_t* st_posmap[WT_MAX_STATES]; /* ring posmap (首用时 malloc) */
     int st_kvc_ready[WT_MAX_STATES];
@@ -270,11 +271,14 @@ static const uint8_t* ref_ptr(const struct wt_blob* b, uint32_t arg) {
     return (arg < MAX_TEMPS) ? g_exec.temps[arg] : NULL;
 }
 
-/* 引用元素数(f16 元素): slot → count; temp → temp_bytes/2; VTCM 未跟踪=0 */
+/* 引用元素数(f16 元素): slot → count; temp → g_last_bytes/2; VTCM 未跟踪=0。
+ * temp 用 g_last_bytes(最后写入字节)而非 temp_bytes(历史最大分配): 表外 temp
+ * 在 bump 路径"只增不缩", 复用为更小张量时 temp_bytes 残留旧大值, 会高估
+ * 元素数 (decode kv_append 的 k[512] 复用 3584 旧槽 → geometry 误判实锤)。 */
 static uint32_t ref_elem_count(const struct wt_blob* b, uint32_t arg) {
     if (arg & 0x8000u) { uint32_t s = arg & 0x7FFFu; return (s < b->n_slots) ? b->slots[s].count : 0; }
     if (arg & 0x4000u) return 0;
-    return (arg < MAX_TEMPS) ? g_exec.temp_bytes[arg] / 2u : 0;
+    return (arg < MAX_TEMPS) ? g_last_bytes[arg] / 2u : 0;
 }
 
 uint8_t* wt_exec_temp(uint32_t id) {
@@ -2527,6 +2531,7 @@ static int wt_exec_load_states(const struct wt_blob* b, char* err, size_t errn) 
 void wt_exec_state_reset(void) {
     for (uint32_t i = 0; i < g_exec.n_states; i++) {
         memset(g_exec.st_buf[i], 0, g_exec.st_bytes[i]);
+        g_exec.st_count[i] = 0;
         if (g_exec.st_kvc_ready[i]) {
             kvc_init(&g_exec.st_kvc[i], g_exec.st_buf[i],
                      g_exec.st_kvc[i].slot_bytes, g_exec.st_kvc[i].nslots,
@@ -2582,7 +2587,18 @@ static int exec_kv_append(const struct wt_blob* b, const struct wt_op* op,
     if (!k || !v || !kn || kn != vn) { snprintf(err, errn, "kv append ref fail"); return -1; }
     struct kvc* c = state_kvc(op->args[2], kn, err, errn);
     if (!c) return -1;
-    if (kvc_append(c, k, v, op->args[3]) < 0) { snprintf(err, errn, "kvc_append"); return -1; }
+    /* T018: pos 哨兵 = 状态内自增计数器 (append 写当前值后 +1) */
+    uint32_t si = op->args[2] & 0x1FFFu;
+    uint32_t pos = op->args[3];
+    if (pos == WT_KV_POS_AUTO) {
+        if (g_exec.st_count[si] >= c->nslots) {
+            snprintf(err, errn, "kv append state %u count=%u >= nslots=%u (ctx 太长)",
+                     si, g_exec.st_count[si], c->nslots);
+            return -1;
+        }
+        pos = g_exec.st_count[si]++;
+    }
+    if (kvc_append(c, k, v, pos) < 0) { snprintf(err, errn, "kvc_append"); return -1; }
     return 0;
 }
 
@@ -2601,9 +2617,28 @@ static int exec_kv_gather(const struct wt_blob* b, const struct wt_op* op,
     }
     struct kvc* c = state_kvc(op->args[0], kv_heads * hd, err, errn);
     if (!c) return -1;
-    uint16_t* kT = (uint16_t*)temp_get(op->args[1], (size_t)n_heads * hd * n_kv * 2u);
-    uint16_t* vo = (uint16_t*)temp_get(op->args[2], (size_t)n_heads * n_kv * hd * 2u);
-    if (!kT || !vo) { snprintf(err, errn, "kv gather out alloc"); return -1; }
+    /* T018: n_kv 哨兵 = 计数器当前值 (append 先行, 已含本 token);
+     * kT/v 槽 0 = 该面跳过 (KT/V 拆两节点单输出形态, 只走一面写)。
+     * AUTO 输出 = nslots 宽定布局 (图内 kT/v 槽形状固定 [..,max_pos]),
+     * 尾位零填 — mask 面 -inf 湮灭尾位, 但 NaN 位型会穿 +(-inf), 必须清零。 */
+    uint32_t pstride = n_kv;
+    if (n_kv == WT_KV_POS_AUTO) {
+        uint32_t si = op->args[0] & 0x1FFFu;
+        if (g_exec.st_count[si] == 0u || g_exec.st_count[si] > c->nslots) {
+            snprintf(err, errn, "kv gather state %u count=%u bad (append 先行?)",
+                     si, g_exec.st_count[si]);
+            return -1;
+        }
+        n_kv = g_exec.st_count[si];
+        pstride = c->nslots;
+    }
+    uint16_t* kT = op->args[1] ? (uint16_t*)temp_get(op->args[1], (size_t)n_heads * hd * pstride * 2u) : NULL;
+    uint16_t* vo = op->args[2] ? (uint16_t*)temp_get(op->args[2], (size_t)n_heads * pstride * hd * 2u) : NULL;
+    if ((!kT && op->args[1]) || (!vo && op->args[2])) { snprintf(err, errn, "kv gather out alloc"); return -1; }
+    if (pstride > n_kv) {
+        if (kT) memset(kT, 0, (size_t)n_heads * hd * pstride * 2u);
+        if (vo) memset(vo, 0, (size_t)n_heads * pstride * hd * 2u);
+    }
     uint32_t rep = n_heads / kv_heads;
     for (uint32_t p = 0; p < n_kv; p++) {
         int slot = kvc_lookup(c, p);
@@ -2613,10 +2648,10 @@ static int exec_kv_gather(const struct wt_blob* b, const struct wt_op* op,
         for (uint32_t h = 0; h < n_heads; h++) {
             const uint16_t* ksrc = kf + (h / rep) * hd;
             const uint16_t* vsrc = vf + (h / rep) * hd;
-            uint16_t* kdst = kT + ((size_t)h * hd) * n_kv;
-            uint16_t* vdst = vo + (size_t)h * n_kv * hd;
-            for (uint32_t d = 0; d < hd; d++) kdst[(size_t)d * n_kv + p] = ksrc[d];
-            memcpy(vdst + (size_t)p * hd, vsrc, hd * 2u);
+            uint16_t* kdst = kT ? kT + ((size_t)h * hd) * pstride : NULL;
+            uint16_t* vdst = vo ? vo + (size_t)h * pstride * hd : NULL;
+            for (uint32_t d = 0; d < hd; d++) if (kdst) kdst[(size_t)d * pstride + p] = ksrc[d];
+            if (vdst) memcpy(vdst + (size_t)p * hd, vsrc, hd * 2u);
         }
     }
     return 0;
@@ -2648,7 +2683,7 @@ static int exec_conv1d_ssm_step(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
-/* OP_DELTA_CHUNK_F16: [k,v,q,beta,g,y_t,state_ref,c,ntok,H,D]
+/* OP_DELTA_CHUNK_F16: [k,v,q,beta,g,y_t,state_ref,c,ntok,H,D,q_raw]
  * 缓冲 [H][ntok][D] / [H][ntok]; 状态 S=[H*D*D] f32 原地; q/√D 在 kernel。 */
 static int exec_delta_chunk(const struct wt_blob* b, const struct wt_op* op,
                             char* err, size_t errn) {
@@ -2672,7 +2707,8 @@ static int exec_delta_chunk(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "delta state %u too small", si); return -1;
     }
     rec_state_t st = { (int)H, (int)D, (float*)g_exec.st_buf[si] };
-    if (delta_chunk_f16(&st, k, v, q, beta, g, y, (int)c, (int)ntok) != 0) {
+    uint32_t q_raw = op->args[11];
+    if (delta_chunk_f16(&st, k, v, q, beta, g, y, (int)c, (int)ntok, (int)q_raw) != 0) {
         snprintf(err, errn, "delta_chunk_f16"); return -1;
     }
     return 0;

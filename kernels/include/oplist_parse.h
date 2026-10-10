@@ -97,6 +97,9 @@ extern "C" {
 #define WT_SLOT_STATE 0xFFFFFFFBu
 #define WT_REF_STATE_FLAG 0x6000u
 #define WT_MAX_STATES 64u
+/* T018 (004 decode): KV op 的 pos/n_kv 哨兵 —— 状态内自增计数器驱动
+ * (图静态、位置动态的折中)。值域避开全部 WT_SLOT_*(FF..FB)。 */
+#define WT_KV_POS_AUTO 0xFFFFFFFAu
 /* P5: 引擎面引用编码(0xC000|surface_id), 仅 OP_DMA 的 src/dst 可用。
  * 0=e.act, 1=e.out, 2=e.wt, 3=e.bias。 */
 #define WT_REF_ENG_FLAG 0xC000u
@@ -159,13 +162,19 @@ enum {
     OP_KV_APPEND_F16 = 22,  /* [k_t,v_t,state_ref,pos] (004 P2 实义化)
                                k/v 各 [kv_heads*head_dim] f16 (ref: temp/
                                0x8000|slot); state_ref=0x6000|idx; pos 为
-                               绝对位置 —— 写 ring 槽 pos%nslots (kvcache.h) */
+                               绝对位置 —— 写 ring 槽 pos%nslots (kvcache.h);
+                               T018: pos==WT_KV_POS_AUTO → 取状态内自增计数器
+                               (append 后 +1; 首步=0), 计数器由
+                               wt_exec_state_reset 清零, 满 nslots=硬错 */
     OP_KV_GATHER_F16 = 23,  /* [state_ref,kT_out,v_out,n_kv,n_heads,kv_heads,
                                head_dim] arity 7 (004 P2 实义化)。读位置
                                [0,n_kv) 出 GQA repeat_interleave 展开的双面:
                                kT_out [n_heads, head_dim, n_kv] (per-head Kᵀ,
                                供 batched scores matmul 的 W=[K,N]),
                                v_out [n_heads, n_kv, head_dim] (供 probs·V)。
+                               T018: n_kv==WT_KV_POS_AUTO → 读计数器当前值
+                               (append 后调用 = 已含本 token); kT_out/v_out
+                               为 0 = 该面跳过 (KT/V 拆两节点单输出形态)。
                                槽 miss (posmap 不符) = 硬错误, 状态 bug 必炸 */
     OP_MATMUL_F16 = 24,     /* [a_ref,w_s,out_t,M,K,N,flags] f16×f16→f16 (f32 累加)
                                flags bit0=转置 a(存[K,M]) bit1=转置 w(存[N,K]);
@@ -219,13 +228,15 @@ enum {
                                分解) 不同, decode 图发射端不再接 Sigmoid/Mul。
                                w 槽 [d_conv, C] f16 同 op 19 布局。 */
     OP_DELTA_CHUNK_F16 = 30,     /* [k_ref,v_ref,q_ref,beta_ref,g_ref,y_t,
-                               state_ref,c,ntok,H,D] arity 11。
+                               state_ref,c,ntok,H,D,q_raw] arity 12 (T018)。
                                状态机 B2 gated delta rule chunk 更新:
                                k/v/q/beta/g 输入, y 输出; 缓冲布局
                                [H][ntok][D] (k/v/q/y) 与 [H][ntok] (beta/g);
                                状态 S = [H*D*D] f32 外置原地更新;
                                c = 本 chunk token 数 (decode 步 c=1);
-                               q 的 1/√D 缩放在 kernel 内。 */
+                               q_raw=0: q 的 1/√D 缩放在 kernel 内;
+                               q_raw=1: q 原样 (0.8B decode 图 chunk 机器
+                               契约无此 scale, q̂ 直喂)。 */
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -263,7 +274,7 @@ enum {
 #define WT_ARITY_MATMUL_F16_SPLIT 9
 #define WT_ARITY_MATMUL_F16_BIAS 8
 #define WT_ARITY_CONV1D_SSM_STEP_F16 6
-#define WT_ARITY_DELTA_CHUNK_F16 11
+#define WT_ARITY_DELTA_CHUNK_F16 12
 
 struct wt_slot {
     uint32_t len;

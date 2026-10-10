@@ -3,6 +3,7 @@
 #include "hnnx/ir/op_registry.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/cost/cost_model.hpp"
+#include "hnnx/host_decode_state.hpp"
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -1265,6 +1266,93 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         }
         const int32_t* i32 = reinterpret_cast<const int32_t*>(in0);
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? (float)i32[i] : 0.0f;
+    } else if (op_type_name == "KvAppendF16" || op_type_name == "KvGatherKT"
+               || op_type_name == "KvGatherV" || op_type_name == "Conv1dSsmStepF16"
+               || op_type_name == "DeltaChunkF16" || op_type_name == "DecodeFaceF16") {
+        /* 004 T018 decode 图状态 op — host 参考执行 (host_decode_state f32 镜像;
+         * 设备侧对应 oplist_exec.c op22/23/29/30 + op15 rank1 u16 视图) */
+        auto sp5 = unpack_scalar_params(params);
+        auto dnum = [&](const char* k, double def) -> double {
+            const ScalarParam* p = scalar_get(sp5, k);
+            return p ? (p->is_numeric ? p->value_num
+                                      : std::strtod(p->value_str.c_str(), nullptr))
+                     : def;
+        };
+        const float* fi0 = (inputs.size() > 0 && inputs[0])
+                               ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
+        const float* fi1 = (inputs.size() > 1 && inputs[1])
+                               ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
+        if (op_type_name == "KvAppendF16") {
+            /* in: k[512] v[512]; out = k 直通(活性锚, 保证 append 先于 gather 拓扑序) */
+            int si = (int)dnum("state_idx", -1);
+            if (!fi0 || !fi1)
+                std::fprintf(stderr, "[hostdec] kv append state %d missing input\n", si);
+            else if (!host_decode_kv_append(si, fi0, fi1, (int)n))
+                std::fprintf(stderr, "[hostdec] kv append state %d full/bad (n=%zu)\n", si, n);
+            if (fi0 && n) std::memcpy(out, fi0, n * 4);
+        } else if (op_type_name == "KvGatherKT" || op_type_name == "KvGatherV") {
+            int face = (op_type_name == "KvGatherKT") ? 0 : 1;
+            int hd = (int)dnum("head_dim", 256);
+            int max_pos = 1;
+            if (out_def.rank >= 3) {
+                /* kt [1,nh,hd,mp] vs v [1,nh,mp,hd] — 末维==hd 即 v 面 */
+                max_pos = (out_def.rank >= 4 && out_def.dims[3] == (uint32_t)hd)
+                              ? (int)out_def.dims[2] : (int)out_def.dims[3];
+            }
+            host_decode_kv_gather((int)dnum("state_idx", -1), face,
+                                  (int)dnum("n_heads", 8), (int)dnum("kv_heads", 2),
+                                  hd, max_pos, out);
+        } else if (op_type_name == "Conv1dSsmStepF16") {
+            /* in: x[C] w[dc*C](const f16 已物化 f32, [tap][ch] flat); kernel 含 SiLU */
+            int c = (int)dnum("C", 6144), dc = (int)dnum("d_conv", 4);
+            if (!fi0 || !fi1 || (int)n != c)
+                std::fprintf(stderr, "[hostdec] conv step bad (n=%zu C=%d)\n", n, c);
+            else
+                host_decode_conv_step((int)dnum("state_idx", -1), c, dc, fi1, fi0, out);
+        } else if (op_type_name == "DeltaChunkF16") {
+            /* in: k[H*D] v[H*D] q[H*D] beta[H] g[H] (q̂ 直喂 → q_raw=1 免 1/√D) */
+            auto fg = [&](size_t i) -> const float* {
+                return (i < inputs.size() && inputs[i])
+                           ? reinterpret_cast<const float*>(inputs[i]) : nullptr;
+            };
+            const float* k_ = fg(0), *v_ = fg(1), *q_ = fg(2), *be = fg(3), *g_ = fg(4);
+            int H = (int)dnum("H", 16), D = (int)dnum("D", 128);
+            if (!k_ || !v_ || !q_ || !be || !g_ || (int)n != H * D)
+                std::fprintf(stderr, "[hostdec] delta bad (n=%zu H*D=%d)\n", n, H * D);
+            else
+                host_decode_delta_step((int)dnum("state_idx", -1), H, D,
+                                       (int)dnum("q_raw", 0), k_, v_, q_, be, g_, out);
+        } else {
+            /* DecodeFaceF16: decode_in i32 字流 u16 视图, f16 位级 → f32
+             * (ids|cos|sin|mask 单输入面, u16_begin 按布局定) */
+            auto f16_bits = [](uint16_t h) -> float {
+                uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+                uint32_t e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, bits;
+                if (e == 0) {
+                    if (m == 0) bits = sign;
+                    else {   /* 次正规: 规格化到 [1,2) 尾数 */
+                        int s = -1;
+                        while (!(m & 0x400u)) { m <<= 1; s--; }
+                        bits = sign | ((uint32_t)(113 + s) << 23) | ((m & 0x3FFu) << 13);
+                    }
+                } else if (e == 31) {
+                    bits = sign | 0x7F800000u | ((uint32_t)m << 13);
+                } else {
+                    bits = sign | ((e - 15u + 127u) << 23) | ((uint32_t)m << 13);
+                }
+                float f;
+                std::memcpy(&f, &bits, 4);
+                return f;
+            };
+            const uint32_t* w32 = reinterpret_cast<const uint32_t*>(fi0);
+            int beg = (int)dnum("u16_begin", 0);
+            if (!w32) { for (size_t i = 0; i < n; i++) out[i] = 0.0f; }
+            else for (size_t i = 0; i < n; i++) {
+                uint32_t u = (uint32_t)(beg + (int)i);
+                out[i] = f16_bits((uint16_t)((u & 1u) ? (w32[u >> 1] >> 16)
+                                                      : (w32[u >> 1] & 0xFFFFu)));
+            }
+        }
     } else {
         /* A6 静默直通治理: 未知 op 型不再静默拷贝第一输入 (对拍假绿源)。
          * 每次直通登记; GEHTP_HOST_PASSTHRU=error 立即 abort, =off 旧静默。 */
@@ -1623,6 +1711,14 @@ void register_all_ops() {
         reg.register_op_fn("Conditional", ConditionalOp::construct);
         reg.register_op_fn("ConditionalAdd", ConditionalAddOp::construct);
         reg.register_op_fn("Switched", SwitchedOp::construct);
+        // 004 T018 decode 图状态 op (execute 按 op_type_name 分派; generate 会
+        // 设 op_type_name, construct 只需产出 TypicalOp 载 params)
+        reg.register_op_fn("KvAppendF16", AddOp::construct);
+        reg.register_op_fn("KvGatherKT", GatherOp::construct);
+        reg.register_op_fn("KvGatherV", GatherOp::construct);
+        reg.register_op_fn("Conv1dSsmStepF16", DepthWiseConvOp::construct);
+        reg.register_op_fn("DeltaChunkF16", MulOp::construct);
+        reg.register_op_fn("DecodeFaceF16", CastOp::construct);
 
     // HLX/HMX ops
     register_hlx_hmx_ops();

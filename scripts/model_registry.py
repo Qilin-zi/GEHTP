@@ -101,11 +101,14 @@ class ModelRegistry:
         *,
         weights_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        input_length: Optional[int] = None,
     ) -> Model:
         """Create a model entry in ``loading`` state.
 
         Validation of request fields happens here so the API can fail fast;
         the heavy load (manifest parse + device init) is done by :meth:`load`.
+        ``input_length`` overrides the manifest-derived context limit — decode
+        graphs report per-step ``input_elems`` (1), not the context window.
         """
         if not model_id:
             raise ModelError(
@@ -145,6 +148,7 @@ class ModelRegistry:
                 manifest_path=manifest_path,
                 weights_path=weights_path,
                 tokenizer_path=tokenizer_path,
+                input_length=input_length or 0,
                 compiled_at=datetime.now(timezone.utc),
                 slot_id=self._next_slot_id,
             )
@@ -177,18 +181,19 @@ class ModelRegistry:
             model.status = ModelStatus.LOADING
             model.error = None
 
-        try:
-            model.input_length = self._parse_manifest_input_length(model.manifest_path)
-        except Exception as exc:
-            with self._lock:
-                model.status = ModelStatus.ERROR
-                model.error = f"failed to parse manifest: {exc}"
-            raise ModelError(
-                model.error,
-                status_code=400,
-                code="invalid_manifest",
-                param="manifest_path",
-            ) from exc
+        if not model.input_length:
+            try:
+                model.input_length = self._parse_manifest_input_length(model.manifest_path)
+            except Exception as exc:
+                with self._lock:
+                    model.status = ModelStatus.ERROR
+                    model.error = f"failed to parse manifest: {exc}"
+                raise ModelError(
+                    model.error,
+                    status_code=400,
+                    code="invalid_manifest",
+                    param="manifest_path",
+                ) from exc
 
         kv_budget = max(kv_max, model.input_length + 1024)
 
