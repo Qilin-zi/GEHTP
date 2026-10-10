@@ -49,3 +49,23 @@
   （含 004 `steps` 循环码）+ decode 图 blob + 多步输入序列。007 旧 runner 不含 `steps` 码，
   只能跑 prefill（n_steps=1），decode 无法经它触达。属 004 域，合并前 004 会话已自验 decode；
   合并为 clean auto-merge（唯一冲突 wtop_ops.hpp 两独立 helper 并存），kernel 运行时零冲突。
+
+## 追加：reconcile d3d984d（asm→intrinsic 写回 mode0→mode4）
+
+主线在 dd2462d 之后又进一笔 `d3d984d refactor(runtime): oplist_exec.c 裸 HMX asm 换成 Q6_* intrinsic`
+（8 处裸 asm → Q6_mxclracc_hf/Q6_bias_mxmem2_A/Q6_activation_hf_mxmem_RR_deep/Q6_mxmem_AR_after_hf，
+写回 `cvt.hf=acc(2)` mode0 → `Q6_mxmem_AR_after_hf` mode4）。该 refactor 落在 `exec_conv2d_hmx` + `exec_matmul_f16_hmx`，
+**后者正是 007 Q4 LUT 的落点**（lm_head code=35 走 exec_matmul_f16_hmx 写回），而 d3d984d 自验只覆盖
+mm32 matmul + conv_add、未覆盖 Q4 LUT 路径。
+
+**clean merge**（`6437002`，d3d984d 父=dd2462d 已含 007 改动，证据 commit 仅加 md，无冲突）→ 重编 lib
+（283888B/vgather=0/signed md5 **2b01f2f6**，板上私有名 libhvxhmx_007.so 6ebf39fa→4b1711ab→**2b01f2f6**）→
+两 prefill 复验：
+
+| prefill | 输出 md5（refactor 后） | 判 |
+|---|---|---|
+| f16 v4 | `f87461e2…` | **仍位级一致** |
+| Q4（lm_head 走 mode4 写回） | `d4b96641…` | **仍位级一致** |
+
+→ **d3d984d 的写回 mode0→mode4 对 007 Q4 LUT 位级无差**，补上了原 refactor 未验的 Q4 LUT 空白。
+两分支 `007-perf-sprint-1` / `task/prof-wp` 均指向 `6437002`。
