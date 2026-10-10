@@ -1,0 +1,58 @@
+== run 分段 (设备) ==
+[run] seg_us read=2993665 parse=19224 wgt=26730 exec=13384639 write=25842 wall=17042686
+
+== GEHTP prof: .scratch_008/qwen35_08b_008t12.wtop ==
+blob_ver=3 ops=14188 ts_ops=14188 wall=13384.6ms Σdur=13363.8ms 缝隙=20.9ms (0.2%)
+三分账: 算 20.6% | 搬 40.1% | 其他 39.1% | 缝隙 0.2%
+标定: peak_flops=12.34TFLOPS f16 peak_bw=59.9GB/s (源: V81HexSim 器件权威行; --peak-* 可覆盖)
+DMA 搬运实测: Σdma_us=22.53ms Σdma=1.4GB 有效带宽=66.7GB/s (111%峰值) 占wall=0.17% (T013 双缓冲可隐藏上界)
+
+== 偏差报告 (planned vs actual) ==
+按计划 14083 | 允许回落 105 | 已中止 0
+不变量: PASS
+  HVX→scalar dev=1: 105
+  [回落热点] idx=13399 Eltwise_Unary dur=4050us opcode=11 planned=HVX
+  [回落热点] idx=8709 Eltwise_Unary dur=3873us opcode=11 planned=HVX
+  [回落热点] idx=4820 Eltwise_Unary dur=3857us opcode=11 planned=HVX
+  [回落热点] idx=1650 Eltwise_Unary dur=3852us opcode=11 planned=HVX
+  [回落热点] idx=11879 Eltwise_Unary dur=3763us opcode=11 planned=HVX
+
+== top 15 by dur ==
+   idx    dur_us   dma_us  %wall        bytes    GB/s  GFLOP/s opcode             eng     name                                     verdict
+  1598     20982        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+ 12603     20977        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  6304     20965        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  5544     20948        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  3191     20947        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+    78     20943        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  4784     20938        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  8657     20937        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+ 10250     20923        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  7897     20902        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  2431     20896        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+ 13363     20895        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+ 11843     20891        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  3951     20888        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+  9490     20888        0   0.2%      768.0KB     0.0        - STRIDED_SLICE_F16  scalar  StridedSlice                             搬运 bw=0.0GB/s (0%峰值)
+
+== per-opcode 聚合 ==
+opcode                 n   total_us  %wall    avg_us    max_us    tot_bytes   Σdma_us dma/cpt
+STRIDED_SLICE_F16   2373    3350672  25.0%    1412.0     20982      119.3MB         0       -
+UNARY_F16           2909    2961199  22.1%    1017.9      6949      149.4MB         0       -
+MATMUL_F16           325    2427863  18.1%    7470.3     12299        1.5GB     15018    0.6%
+TRANSPOSE_GEN_F16    175    1275192   9.5%    7286.8     16113       41.3MB         0       -
+BINARY_F16          1655    1086201   8.1%     656.3     11390      347.3MB         0       -
+GATHER_F16          1192     651767   4.9%     546.8     18125     2313.5GB         0       -
+OP35                  32     432892   3.2%   13527.9     13781           0B      7509    1.7%
+REDUCE_F16          1170     337960   2.5%     288.9      1207       52.5MB         0       -
+CONV1D_SSM_F16        18     331915   2.5%   18439.7     18640       15.6MB         0       -
+RMSNORM2_F16          79     244285   1.8%    3092.2      5283       12.6MB         0       -
+SCATTER_ND_F16      1154     140589   1.1%     121.8       658      309.2MB         0       -
+BROADCAST_F16       1622      81373   0.6%      50.2      4366      106.3MB         0       -
+ADD_F16             1291      26090   0.2%      20.2       696       33.7MB         0       -
+SPLIT_F16             54       8473   0.1%     156.9       192      432.0KB         0       -
+OP34                  90       5767   0.0%      64.1       109           0B         0       -
+CONCAT_F16            25        715   0.0%      28.6        95        2.4MB         0       -
+CUMSUM_F32            18        463   0.0%      25.7        27      144.0KB         0       -
+SOFTMAX_F16            6        372   0.0%      62.0        63      192.0KB         0       -
+

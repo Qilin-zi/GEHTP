@@ -67,9 +67,12 @@ description: "Task list: 全图 VTCM 驻留 + 显式 DMA 流水（008 中期性�
 - [x] T011 [US2] **fence 并发 micro-test（硬前置闸）**：设备端 HMX matmul 与 `dc_dma` 搬运并发 ≥100 轮、双向 fence（fence.c 决策表：DMA→HMX@VTCM=INVALIDATE / HMX→DMA=FLUSH），输出逐字节比对 + 超时看护 → `evidence/fence-microtest.txt`（含库指纹）。**未过门 T012-T015 一律不上板**（V81 不背书此竞态）
   **PASS（1009, d0f1784, libhvxhmx_007 md5 5a023fbb）**：`kernels/examples/47_fence_conc` 1000 轮 7/7 门×4 复跑全绿——逐字节==串行参考、看护 max_poll 16µs、overlap 31µs ≤ 0.9×(hmx 28+dma 14) 真并发实证（DMA 全隐藏，链 ~55GB/s）。**附带定谳：阻塞 `dc_dma_once` 每调用 ~700µs 固定开销 → T012/T013 发射器必须用 desc 链一次 submit+晚 poll 范式**（见 evidence 判读 4）
 - [x] T012 [US2] `--dma-runlist` 扩全图：`compiler/tools/wtop_emit.cpp` + `compiler/tools/wtop_ops/op_matmul.cpp` 主力 HMX 族（in_proj/out_proj/lm_head chunk）权重/激活按执行序预取发射；staging 槽在 T008 预算表内分配（不得与驻留激活争额）。**探针修正（1009，`evidence/vtcm-access-probe.txt`）**：DMA 非瓶颈（55GB/s），pack_wgt 标量散写=66.4% wall → 机制改 **f16 权重编译期预打包 crouton 进 blob（W4A16 预置发射同款）+ 运行期 DMA DDR→VTCM 线性预取**（7MB≈130µs 藏进前一 op 计算）；unpack 标量散读 5.59ms/op 并档 HVX 化（007 P1 范式，G7 已证 HVX 线性读 VTCM=快侧 9.4×）
-- [ ] T013 [US2] 双缓冲轮换：DmaStreamDesc `buf_slot 0/1` + 发射序「tile i+1 搬运发射 → tile i invoke → completion poll」；任一环失败回落串行 + deviation 记录（003「允许回落+上报」契约，绝不静默）
-- [ ] T014 [P] [US2] op_ts 双时间轴报告：`kernels/examples/42_gehtp_runner/main.c`（dma_us 落盘已有 ver3）+ `scripts/gehtp_prof.py` 加 HMX 族重叠率列（dma 在途 ÷ compute dur）
-- [ ] T015 [US2] 板跑（quickstart 场景 3）：dma_us>0 ／ SC-002 HMX 族 dur ≤ 50% 锚 ／ 位级 md5 同 ／ 构造 staging 失败 → deviation=1 + 串行继续（偏差报告不变量 PASS）
+- [x] T013 [US2] 双缓冲轮换：DmaStreamDesc `buf_slot 0/1` + 发射序「tile i+1 搬运发射 → tile i invoke → completion poll」；任一环失败回落串行 + deviation 记录（003「允许回落+上报」契约，绝不静默）
+  **数据裁决 NO-GO（1010）**：T012 板跑实测 Σdma_us=22.53ms = **0.17% wall**（完美双缓冲的收益上界）；MATMUL dma/cpt 0.6%、SPLIT 1.7%（T014 重叠率列）；「~700µs/调用固定开销」在真图不成立（22.53ms 已含全部阻塞开销，325 matmul 均 69µs）。回落+上报义务由 T015 搬运面回落兑现。证据 `evidence/t013-dmapipe-datadriven-nogo.md`（006 census 同款先例）
+- [x] T014 [P] [US2] op_ts 双时间轴报告：`kernels/examples/42_gehtp_runner/main.c`（dma_us 落盘已有 ver3）+ `scripts/gehtp_prof.py` 加 HMX 族重叠率列（dma 在途 ÷ compute dur）
+  **PASS（1010）**：prof per-opcode 聚合表加 Σdma_us + dma/cpt 列，DMA 实测行加「占wall=T013 可隐藏上界」；ver3 旧档解析回归 PASS。顺带 ver=4（+stg_fb，T015 三腿不变量）。证据 `evidence/t014-dual-timeline-overlap.txt`
+- [x] T015 [US2] 板跑（quickstart 场景 3）：dma_us>0 ／ SC-002 HMX 族 dur ≤ 50% 锚 ／ 位级 md5 同 ／ 构造 staging 失败 → deviation=1 + 串行继续（偏差报告不变量 PASS）
+  **PASS（1010, d0f1784, libhvxhmx_008t15 signed md5 8fcf91b9）**：双跑四门全绿——A(fault=0) Σdma 22.74ms/0 搬运面回落/不变量 PASS/md5 f87461e2/wall 13.04s；B(fault=1) [fault] mask=1 + [stg] 搬运面回落 182 次 dev=1/md5 同/不变量 PASS。op_ts 记录升 ver=4（+stg_fb 三腿不变量 `dev==0 ⟺ planned==actual ∧ stg_fb==0`）。证据 `evidence/t015-staging-fallback-boardrun.txt`（含三元 init 反转 bug 教训）
 
 **Checkpoint**: SC-002 + FR-004/005 达成
 

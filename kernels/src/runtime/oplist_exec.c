@@ -76,6 +76,7 @@ static FILE* g_rtrace = NULL;  /* 统一 trace 句柄(同路径双 FILE* 在 DSP
  * 新 runner 按 job.txt trace 键显式 set_trace(0/1) 拿净测量/取证两态) */
 static int g_trace_on = 1;
 void wt_exec_set_trace(int on) { g_trace_on = on ? 1 : 0; }
+
 /* 005 US3b (T019): bias 默认走 HMX (SC-005 已过: cos=1.0, 三判据 0 违例,
  * 2026-10-08, 46 号例)。wt_exec_force_bias_scalar 仅供测试例造标量参照,
  * 生产恒 0; qurt 无 env, 走显式 API。 */
@@ -100,6 +101,11 @@ static uint32_t g_planned_fb_engine = WT_ENG_SCALAR;
  * 仅 v3 分发路径会置位 (engine_fallback_or_die); ver<3 无计划语义恒 0。
  * 中止态由 run_range 填充点按 rc!=0 统一置 2, 各 die 分支无需重复设。 */
 static uint32_t g_op_deviation = 0;
+static uint32_t g_op_stg_fb = 0;      /* 008 T015: 本 op 搬运面回落次数 */
+static uint32_t g_fault_mask = 0;     /* 008 T015: 测试故障注入 (生产恒 0) */
+void wt_exec_set_fault(uint32_t mask) {
+    g_fault_mask = mask;
+}
 static uint32_t g_current_op = 0xFFFFFFFFu;
 static uint32_t g_current_op_global = 0xFFFFFFFFu;
 static uint32_t g_current_opcode = 0u;
@@ -1790,21 +1796,46 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
          * DMA→HMX INVALIDATE (fence.c 决策表; T011 47_fence_conc G2 同栈
          * 已验)。阻塞 dc_dma_once ~700µs 固定开销 v1 认 (T013 链式 submit
          * 消化)。UserDMA 累加器 (run_range per-op) 自动计入本流。 */
-        if (fence_handoff((void*)w, (uint32_t)w_bytes, FC_CPU, FC_DMA, FM_DDR) != FENCE_OK) {
-            snprintf(err, errn, "matmul_f16 pp fence src combo"); return -1;
+        /* 008 T015: DMA 预取失败 (job fault 注入构造 / desc 资源失败) →
+         * CPU 线性拷贝串行回落: 预打包 crouton 字节线性, memcpy+FLUSH 与
+         * DMA 逐字节等价。dev=1 + stg_fb (003 允许回落+上报, 绝不静默)。 */
+        int pp_fb = (g_fault_mask & 1u) != 0;
+        int pp_iok = 0, pp_drc = 0;
+        if (!pp_fb) {
+            if (fence_handoff((void*)w, (uint32_t)w_bytes, FC_CPU, FC_DMA, FM_DDR) != FENCE_OK) {
+                snprintf(err, errn, "matmul_f16 pp fence src combo"); return -1;
+            }
+            static dc_mutex_t pp_mu;
+            static int pp_mu_ready;
+            if (!pp_mu_ready) { dc_mutex_init(&pp_mu); pp_mu_ready = 1; }
+            struct dc_dma d;
+            if (dc_dma_init(&d, (uint8_t*)w, (uint8_t*)wgt_cr,
+                            (uint32_t)w_bytes, &pp_mu) != 0) {
+                pp_iok = -1;              /* init 失败 → 串行回落 */
+                pp_fb = 1;
+            } else {
+                pp_drc = dc_dma_once(&d);
+                dc_dma_destroy(&d);
+                if (pp_drc != 0) pp_fb = 1;
+                else if (fence_handoff((uint8_t*)wgt_cr, (uint32_t)w_bytes,
+                                       FC_DMA, FC_HMX, FM_VTCM) != FENCE_OK) {
+                    snprintf(err, errn, "matmul_f16 pp fence dst combo"); return -1;
+                }
+            }
         }
-        static dc_mutex_t pp_mu;
-        static int pp_mu_ready;
-        if (!pp_mu_ready) { dc_mutex_init(&pp_mu); pp_mu_ready = 1; }
-        struct dc_dma d;
-        if (dc_dma_init(&d, (uint8_t*)w, (uint8_t*)wgt_cr, (uint32_t)w_bytes, &pp_mu) != 0) {
-            snprintf(err, errn, "matmul_f16 pp dma init"); return -1;
-        }
-        int drc = dc_dma_once(&d);
-        dc_dma_destroy(&d);
-        if (drc != 0) { snprintf(err, errn, "matmul_f16 pp dma 0x%X", drc); return -1; }
-        if (fence_handoff((uint8_t*)wgt_cr, (uint32_t)w_bytes, FC_DMA, FC_HMX, FM_VTCM) != FENCE_OK) {
-            snprintf(err, errn, "matmul_f16 pp fence dst combo"); return -1;
+        if (pp_fb) {
+            cpu_to_vtcm((uint8_t*)wgt_cr, (const uint8_t*)w, (uint32_t)w_bytes);
+            g_op_deviation = 1u;
+            g_op_stg_fb++;
+            if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
+            if (g_rtrace) {
+                fprintf(g_rtrace,
+                        "staging_fallback op=%u code=%u bytes=%lu fault=%u iok=%d drc=0x%X -> serial cpu copy\n",
+                        (unsigned)g_current_op, (unsigned)g_current_opcode,
+                        (unsigned long)w_bytes, (unsigned)(g_fault_mask & 1u),
+                        pp_iok, pp_drc);
+                fflush(g_rtrace);
+            }
         }
     } else
     /* pack wgt: B[K,N] (或 t1 转置) → crouton[(c*n_dot+kt)*1024] (row=ic=k, col=oc=n)。
@@ -2705,6 +2736,7 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         dc_dma_reset();                 /* W-P3: 每 op 前清 UserDMA 累加器 */
         g_last_engine = WT_ENG_SCALAR;  /* W-P3: 默认标量, exec_* 内部覆盖 */
         g_op_deviation = 0;             /* 003 T018: 偏差标志逐 op 复位 */
+        g_op_stg_fb = 0;                /* 008 T015: 搬运面回落逐 op 复位 */
         g_current_op = ii;              /* 回退日志上下文: 段内 op 序号 (与 optrace 行一致) */
         g_current_op_global = i;        /* 003 P2: carve 记录键 = 全局 op 序号 */
         g_current_opcode = op->opcode;
@@ -2776,6 +2808,7 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                  * 中止 op 的 engine = 默认 SCALAR (exec 未及覆盖)。 */
                 g_ts_buf[i].planned_engine = g_planned_engine;
                 g_ts_buf[i].deviation = rc ? 2u : g_op_deviation;
+                g_ts_buf[i].stg_fb = g_op_stg_fb;
             }
         }
         if (g_trace_on) {
