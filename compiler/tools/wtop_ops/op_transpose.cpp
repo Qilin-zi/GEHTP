@@ -97,6 +97,11 @@ static int op_transpose(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map
     uint32_t out_t = em.fresh_temp(gp, od->op_id);
     /* 统一走通用 N-D 转置(形状全参数化); opcode 10 的 4D NCHW
      * 契约(H/W/C 源自图输入)对 transformer 张量全错(probe 实锤) */
+    /* 008 US3 T018: 最内轴固定 (np[nrk-1]==nrk-1) → 每个"外块"是输入的
+     * 连续段, 可 HVX 块拷贝 (设备孪生 exec_transpose_gen p[rk-1]==rk-1)。
+     * 否则保持 assign_engine 默认 scalar (最内轴真置换需 tile 转置, 无
+     * 通用 HVX 助手, 勿虚报 HVX 致运行期回落)。 */
+    if (np[nrk - 1] == (int32_t)(nrk - 1)) em.cur_engine = wt_annot_pack(1u, 1u, 0u);
     em.add_op(OP_TRANSPOSE_GEN_F16,
               {src_t, out_t, nrk, nd[0], nd[1], nd[2], nd[3], perm});
     return 0;

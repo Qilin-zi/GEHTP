@@ -2329,6 +2329,35 @@ static int exec_transpose_gen(const struct wt_blob* b, const struct wt_op* op,
     }
     uint32_t out_dims[4];
     for (uint32_t i = 0; i < rk; i++) out_dims[i] = dims[p[i]];
+    /* 008 US3 T018: 最内轴固定 (p[rk-1]==rk-1) → 转置只在更外轴间置换, 每个
+     * "外块"是输入的连续 inner 个 f16, 可 HVX 块拷贝 (007 P1 broadcast 行循环
+     * 范式; 判据与 emit 侧 op_transpose 孪生 np[nrk-1]==nrk-1)。逐块 odometer
+     * 免 div/mod; pinv 把外输出坐标映回输入坐标。 */
+    uint32_t inner = dims[rk - 1];
+    if (b->annot_base && g_planned_engine == WT_ENG_HVX && p[rk - 1] == rk - 1 && inner > 0) {
+        uint32_t nblk = (uint32_t)n / inner;
+        uint32_t pinv[4] = {0, 0, 0, 0};
+        for (uint32_t j = 0; j < rk; j++) pinv[p[j]] = j;
+        uint32_t oc[4] = {0, 0, 0, 0};           /* 外输出坐标里程计 */
+        for (uint32_t b = 0; b < nblk; b++) {
+            uint32_t in_base = 0;
+            for (uint32_t j = 0; j + 1 < rk; j++)
+                in_base += oc[pinv[j]] * si[j];
+            hvhx_v2_copy_f16(dst + (size_t)b * inner, s16 + in_base, inner);
+            for (int ax = (int)rk - 2; ax >= 0; ax--) {
+                if (++oc[ax] < out_dims[ax]) break;
+                oc[ax] = 0;
+            }
+        }
+        g_last_engine = WT_ENG_HVX;  /* 实跑即计划 (dev=0) */
+        return 0;
+    }
+    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
+        engine_fallback_or_die(g_planned_engine,
+                               p[rk - 1] == rk - 1 ? "transpose inner==0"
+                                                   : "transpose innermost swapped",
+                               err, errn) != 0)
+        return -1;
     uint32_t idx[4] = {0, 0, 0, 0};
     for (size_t t = 0; t < n; t++) {
         /* 输入线性坐标 → 输入多维坐标(与 perm 对应)→ 输出坐标 */
