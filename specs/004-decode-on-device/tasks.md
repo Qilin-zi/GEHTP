@@ -177,9 +177,13 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 ## Phase 7: Polish & 收尾
 
-- [ ] T024 [P] 更新记忆文件：[[gehtp-08b-baseline-002]] 补 decode 进度；新建 decode 状态记忆（若 T015-T023 落地）
-- [ ] T025 [P] 更新 docs/GEHTP_PARALLEL_TASKBOOK.md 战役日志（decode 两阶段结果 + 各阶段 wall 数据）
-- [ ] T026 全量回归：prefill 逐字节不回归 + decode 门（tier1+tier2）+ host 合成三连，确认 SC-001~008 全绿；commit + push（SSH 直连，[[gehtp-github-access]]）
+- [x] T024 [P] 更新记忆文件：[[gehtp-08b-baseline-002]] 补 decode 进度；新建 decode 状态记忆（若 T015-T023 落地）——**2026-10-10 完成**：新建 [[gehtp-004-decode-feature-complete]]（总状态+门锚速查）、[[gehtp-004-t021-tier2-golden]]（R1 解除+金标环境）、[[gehtp-004-t020-serving-wiring]]、[[gehtp-004-t019-persistent-filequeue]]；002 基线锚补 decode 进度段；MEMORY.md 索引同步。
+- [x] T025 [P] 更新 docs/GEHTP_PARALLEL_TASKBOOK.md 战役日志（decode 两阶段结果 + 各阶段 wall 数据）——**2026-10-10 完成**：追加 004 线战役条目（P1/P2 战果、tier2 金标、各阶段 wall、架构定论、运维铁律、commits 清单）。
+- [x] T026 全量回归：prefill 逐字节不回归 + decode 门（tier1+tier2）+ host 合成三连，确认 SC-001~008 全绿；commit + push（SSH 直连，[[gehtp-github-access]]）——**2026-10-10 回归完成，SC-001~008 全绿（push 待用户确认）**：
+  - **host 套 65/65**（含 persistent 文件队列契约 30/30、contract/integration）。
+  - **v17 prefill 门复验（当前含状态 op 的库）**：d0f1784 跑 seq=32 v17 → vs HF golden **cos=0.998642 / top1=30/32 / exec 33.75s**——与 T009 基线**逐位复现到第 6 位小数**，prefill 路径对 T015+ 状态 op **零回归**（SC-003/005 绿）。注记：与 Sep-28 `.scratch_eqfix` 旧输出字节不一致系跨构建谱系（该血统未证），数值门为正典判据。
+  - **decode 门**：tier1（T018f/T019 31/32+cos≥0.9986）+ tier2（T021 16/16+12/12 token 位级，worst cos≥0.999991）均绿。
+  - **SC 盘点**：SC-001/002 精度门绿、SC-004 GEMV 无标量回落（T014 回开实证）、SC-005 prefill 不变（本次复验）、SC-006 状态 DDR（T022）、SC-007 wall 对照（T023）、SC-008 双门每阶段过。
 
 ---
 
