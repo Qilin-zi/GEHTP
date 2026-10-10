@@ -163,7 +163,7 @@ description: "Task list for 0.8B decode 上板（M=1 GEMV + 命名状态表 KV/S
 
 ### 精度 + 性能收口
 
-- [ ] T021 [US2] tier2 金标：`scripts/golden_qwen35.py::run_decode`（HF `use_cache=True` 续写多步；blocked on R1——HF 对 GDN/SSM 层是否缓存 recurrent state 未验证，若否改 `use_cache=False` 每步全序列重跑）
+- [x] T021 [US2] tier2 金标——**2026-10-10 完成，设备门双 PASS（d0f1784）**：**R1 解除**——GPU 对拍实证 HF Qwen3_5 `DynamicCache` 正确携带 GDN/SSM recurrent state（增量 32 行 vs 全序列行 cos≥0.999999、argmax 全同；金标环境 `PYTHONPATH=/disk1/qnn08b_official/tfenv` + llmserv torch，plan 期 QPM_ROOT_DEFAULT 路径已失效）。`golden_qwen35.py::run_decode`（增量贪心续写，返回 rows+tokens）+ CLI `--decode N --decode-prompt I`；金标落 `cpu_golden/hf/tier2_0.{logits.f32,tokens.i64}.raw`（random prompt0 32+16 步）+ `text_tier2.*`（"user: The capital of France is" 7+12 步）。**设备门**：persistent 链 reset→喂 prompt→贪心续写逐行对拍 tier2——random **16/16 token 一致、worst cos=0.999991**；text **12/12 一致、worst cos=0.999994**（" Paris"=11751 起逐 token 全对，含重复结构；与 T020 E2E serve 输出同串）。decode 步越过 prompt 边界仍与 HF 位级对齐 = KV+SSM 状态跨步积累正确（tier1 门只覆盖 prompt 内）。
 - [ ] T022 [US3] KV/SSM DDR 布局（FR-009）：状态落 DDR（KV 12KB/token、SSM ~19MB），不挤 VTCM 16MB（VTCM 留给 HMX scratch）；上板确认
 - [ ] T023 [US3] 端到端 wall：autoregressive 每步 wall 记录对照（目标：单步 decode 远小于 prefill 34s，lm_head 步不再全标量 4.24s）
 
