@@ -251,39 +251,56 @@ async def _run_generation(
     The prototype runtime returns a token id (already the device's sampling
     decision); a persistent runtime may return logits, in which case the host
     sampler applies temperature/top_p.
+
+    Decode 图单 token/步: prompt 相位逐 token 喂入 (中间 logits 丢弃, 末位
+    prompt token 的输出 = 首个生成 token), 生成相位惰性取步 (stop 提前返回
+    不多跑一步)。生成开始前 reset 设备状态 = 新序列语义 (persistent 后端清
+    KV/SSM; 原型仅清 cancel 标志)。
     """
     runtime = get_runtime()
+    slot = model.device_slot or ""
     stop = params["stop"]
     stop_sequences = stop if isinstance(stop, list) else ([stop] if stop else [])
     max_tokens = params["max_tokens"]
     sampler = Sampler(temperature=params["temperature"], top_p=params["top_p"])
     greedy = params["temperature"] == 0
 
+    if not input_ids:
+        session.fail()
+        yield {"type": "error", "message": "empty prompt (no input tokens)"}
+        return
+
+    try:
+        runtime.reset(slot)
+    except DeviceRuntimeError:
+        pass
+
     position = 0
     kv_position = 0
     generated_text = ""
     last_token_id: Optional[int] = None
+    result: Any = None
 
-    for _ in range(max_tokens):
+    async def _run_step(token_id: int) -> Any:
+        nonlocal position, kv_position
+        r = await asyncio.to_thread(runtime.run, slot, [token_id], position, kv_position)
+        position += 1
+        kv_position += 1
+        return r
+
+    # ---- prompt 相位 ----
+    for tok in input_ids:
         if await request.is_disconnected():
             try:
-                runtime.cancel(model.device_slot or "")
-                runtime.reset(model.device_slot or "")
+                runtime.cancel(slot)
+                runtime.reset(slot)
             except DeviceRuntimeError:
                 pass
             session.fail()
             yield {"type": "done", "finish_reason": "cancelled"}
             return
-
-        step_input = input_ids if last_token_id is None else [last_token_id]
         try:
-            result = await asyncio.to_thread(
-                runtime.run,
-                model.device_slot or "",
-                step_input,
-                position,
-                kv_position,
-            )
+            result = await _run_step(tok)
         except DeviceRuntimeError as exc:
             session.fail()
             yield {"type": "error", "message": f"device error: {exc}"}
@@ -292,6 +309,35 @@ async def _run_generation(
             session.fail()
             yield {"type": "error", "message": f"runtime error: {exc}"}
             return
+    try:
+        session.advance(len(input_ids))
+    except ValueError:
+        yield {"type": "done", "finish_reason": "length"}
+        return
+
+    # ---- 生成相位 ----
+    for _ in range(max_tokens):
+        if await request.is_disconnected():
+            try:
+                runtime.cancel(slot)
+                runtime.reset(slot)
+            except DeviceRuntimeError:
+                pass
+            session.fail()
+            yield {"type": "done", "finish_reason": "cancelled"}
+            return
+
+        if result is None:
+            try:
+                result = await _run_step(last_token_id)
+            except DeviceRuntimeError as exc:
+                session.fail()
+                yield {"type": "error", "message": f"device error: {exc}"}
+                return
+            except Exception as exc:  # noqa: BLE001 - host-side safety net
+                session.fail()
+                yield {"type": "error", "message": f"runtime error: {exc}"}
+                return
 
         if isinstance(result, (list, tuple)):
             logits = [float(x) for x in result]
@@ -303,6 +349,8 @@ async def _run_generation(
         else:
             # Token id from the device: already the sampling decision.
             token_id = int(result)
+        result = None
+        last_token_id = token_id
 
         try:
             token_text = tokenizer.decode([token_id])
@@ -317,7 +365,7 @@ async def _run_generation(
             emitted = merged[:stop_at][len(generated_text):]
             generated_text = merged[:stop_at]
             try:
-                session.advance(len(input_ids) if last_token_id is None else 1)
+                session.advance(1)
             except ValueError:
                 pass
             if emitted:
@@ -327,13 +375,10 @@ async def _run_generation(
 
         generated_text = merged
         try:
-            session.advance(len(input_ids) if last_token_id is None else 1)
+            session.advance(1)
         except ValueError:
             yield {"type": "done", "finish_reason": "length"}
             return
-        position += len(input_ids) if last_token_id is None else 1
-        kv_position += len(input_ids) if last_token_id is None else 1
-        last_token_id = token_id
         yield {"type": "token", "token_id": token_id, "text": token_text}
 
     yield {"type": "done", "finish_reason": "length"}
@@ -367,6 +412,10 @@ async def lifespan(app: FastAPI):
                 pass
             model.device_slot = None
             model.status = ModelStatus.UNAVAILABLE
+    try:
+        runtime.shutdown()
+    except DeviceRuntimeError:
+        pass
     logger.info("GEHTP server shutdown complete", extra={"status": "stopped"})
 
 
@@ -444,9 +493,18 @@ async def register_model(request: Request, background_tasks: BackgroundTasks) ->
     manifest_path = body.get("manifest_path")
     weights_path = body.get("weights_path")
     tokenizer_path = body.get("tokenizer_path")
+    input_length = body.get("input_length")
 
     if not model_id or not isinstance(model_id, str):
         raise ValidationError("model id required", param="id", code="model_id_required")
+    if input_length is not None and (
+        not isinstance(input_length, int) or isinstance(input_length, bool) or input_length <= 0
+    ):
+        raise ValidationError(
+            "input_length must be a positive integer",
+            param="input_length",
+            code="invalid_input_length",
+        )
     if not wtop_path or not isinstance(wtop_path, str):
         raise ValidationError("wtop_path is required", param="wtop_path", code="wtop_path_required")
     if not manifest_path or not isinstance(manifest_path, str):
@@ -460,6 +518,7 @@ async def register_model(request: Request, background_tasks: BackgroundTasks) ->
         manifest_path,
         weights_path=weights_path,
         tokenizer_path=tokenizer_path,
+        input_length=input_length,
     )
     background_tasks.add_task(_load_model_task, model.id)
     logger.info(

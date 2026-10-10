@@ -156,8 +156,21 @@ _default_runtime: Optional[DeviceRuntime] = None
 
 
 def get_runtime() -> DeviceRuntime:
-    """Return the process-wide runtime instance."""
+    """Return the process-wide runtime instance.
+
+    GEHTP_PERSISTENT=1 selects the DSP-resident persistent backend
+    (``persistent_runtime.get_persistent_runtime``, same public surface;
+    model load lazily boots the device-side file-queue runner). Default is
+    the prototype placeholder backend used by host-only tests.
+    """
     global _default_runtime
     if _default_runtime is None:
-        _default_runtime = DeviceRuntime()
+        if os.environ.get("GEHTP_PERSISTENT") == "1":
+            try:
+                from .persistent_runtime import get_persistent_runtime
+            except ImportError:  # pragma: no cover - script-mode import
+                from persistent_runtime import get_persistent_runtime
+            _default_runtime = get_persistent_runtime()  # type: ignore[assignment]
+        else:
+            _default_runtime = DeviceRuntime()
     return _default_runtime

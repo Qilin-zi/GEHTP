@@ -29,6 +29,11 @@ from typing import Any, Optional
 
 import numpy as np
 
+try:  # 与 gehtp_server 同款双路径导入; 持久错误归入设备错误族供服务层统一捕获
+    from .device_runtime import DeviceRuntimeError
+except ImportError:  # pragma: no cover - 直接以脚本/测试目录运行
+    from device_runtime import DeviceRuntimeError
+
 # decode 图几何 (surgery_decode_graph.py / model config 同源)
 VOCAB = 248320
 MAX_POS = 64          # surgery --max-pos
@@ -60,8 +65,8 @@ def make_step_input(token_id: int, position: int) -> bytes:
     return ids + make_face(position)
 
 
-class PersistentRuntimeError(RuntimeError):
-    """Raised when persistent runtime operations fail."""
+class PersistentRuntimeError(DeviceRuntimeError):
+    """Raised when persistent runtime operations fail (device error family)."""
 
 
 @dataclass
@@ -90,7 +95,8 @@ class PersistentDeviceRuntime:
         device: Optional[str] = None,
         timeout: float = 180.0,
     ) -> None:
-        self.device = device or os.environ.get("ANDROID_SERIAL", "52f67807")
+        self.device = (device or os.environ.get("GEHTP_DEVICE")
+                       or os.environ.get("ANDROID_SERIAL") or "d0f1784")
         self.timeout = timeout
         self._handles: dict[str, PersistentHandle] = {}
         self._cancelled: set[str] = set()
@@ -267,6 +273,18 @@ class PersistentDeviceRuntime:
         raise PersistentRuntimeError(f"rpc timeout after {timeout}s (op={hdr.get('op')})")
 
     # ---- public contract (原 socket 设计同名接口) ----
+    def _ensure_device_server(self) -> None:
+        """模型装载路径的懒启动: DSP 常驻 runner 不在则按环境配置拉起。
+
+        start_server 自带 reuse 分支 (在跑且 ping 通即接管), 幂等。
+        """
+        self.start_server(
+            blob=os.environ.get("GEHTP_DECODE_WTOP",
+                                f"{self.DEVROOT}/gehtp/decode.wtop"),
+            out_temp=int(os.environ.get("GEHTP_DECODE_OUT_TEMP", "149")),
+            idle_exit_s=int(os.environ.get("GEHTP_PERSIST_IDLE_S", "1800")),
+        )
+
     def init(
         self,
         model_id: str,
@@ -288,6 +306,7 @@ class PersistentDeviceRuntime:
         )
         with self._lock:
             self._handles[handle.handle_id] = handle
+        self._ensure_device_server()
         return handle
 
     def run(
