@@ -2734,9 +2734,11 @@ static int exec_gdn_block(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "gdn block w slot len mismatch");
         return -1;
     }
-    /* prefill 瞬态 state: f32 零起 (decode 步形 0x6000|idx 持久槽归 T027) */
-    float* S = (float*)calloc((size_t)H * D * D, 4u);
+    /* prefill 瞬态 state: f32 零起 (decode 步形 0x6000|idx 持久槽归 T027)。
+     * memalign(128) 供 gdn_block_f16 HVX matvec/外积对齐 (T022d)。 */
+    float* S = (float*)memalign(128, (size_t)H * D * D * 4u);
     if (!S) { snprintf(err, errn, "gdn block state alloc"); return -1; }
+    memset(S, 0, (size_t)H * D * D * 4u);
     int rc = gdn_block_f16((const int16_t*)xqkv, (const int16_t*)cw,
                            (const int16_t*)beta, (const int16_t*)g,
                            (int16_t*)y, S, (int)T, (int)H, (int)D,
