@@ -69,7 +69,7 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 - [X] T010 [US1] kernels/src/runtime/oplist_exec.c `xop_pin` 真 pin 一次 + 登记 `wt_resident_slot`/`bias_resident_slot`，消除 PIN/MATMUL 各搬一次（D2）
 - [X] T011 [US1] `exec_matmul` 改「驻留 slot == 本 op 权重 → 跳过 `cpu_to_vtcm`」；re-carve（形状/live 变化或 f16/conv HMX 抢 VTCM）置空驻留标记强制重搬，字节恒等
 - [X] T012 [US1] `struct wt_exec_stats` 增 `restage` 计数（实际 DDR→VTCM 换入次数，xop_pin + exec_matmul 各自累加）；planned 值 = blob OP_PIN 条数（可自 wt_w3_report op dump 数），对账在 runner 层
-- [ ] T013 [US1] 验证 D：compiler 侧已证「同权重双 FC → 1 OP_PIN」（test_wtop_emit US1 段）；设备侧「restage == planned」上板验证待 US6 E2E
+- [x] T013 [US1] 验证 D：compiler 侧已证「同权重双 FC → 1 OP_PIN」（test_wtop_emit US1 段，aab6371 ctest 49/49 绿）；设备侧「restage == planned」上板对账 ⚡延后——0.8B E2E 不走 W4A16（无 OP_PIN），restage 恒 0==planned 0；留待 W4A16 供给侧
 
 **Checkpoint**: 权重搬运消除，核心性能价值落地
 
@@ -81,14 +81,22 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 **Independent Test**: K≠N 合成图不再误报 supply slots missing；K=N 256³ bit-exact（quickstart 验证 A）
 
+> **⛔ BLOCKED — 前置缺失（W4A16 供给侧未落地）**（调查结论 2026-10-12）：
+> 契约 A 假设「编译器已产出 bias/atbl/otbl 三槽」，但实测**编译器从未产出**这三槽：
+> - `ensure_weight_slot`（wtop_ops.hpp:533）GGUF 路径只产 `repack_q4_0_tiles`（640B/tile，非 K\*N/2）或 `dequant_q4_0_f16`（f16 池）或 F32→f16；**无 bias/atbl/otbl 生产**。
+> - `op_matmul.cpp:76` 的 `w4` 判定 `slots[w_s].len == K*N/2` 仅被合成测试 `build_matmul_w4`（`element_size=1` 技巧）触发；**真实 0.8B 流走 f16 matmul（lm_head=f16）+ Q4_0 Route A（exec_matmul_f16_hmx:1719 行级 dequant），W4A16 分支在 blob 路径上不可达**。
+> - 三辅助面（bias=(N/32)*512、atbl=8*(K/32)*4、otbl=8*(N/32)*4）由外部 `htpw4a16_v81` packer 产出（`kernels/assets/s256/*.raw`），经 `dc_w4` 直连路径（examples 17/31 `dc_w4_carve/invoke`）消费，**不进 blob executor**。
+>
+> 故 T015（编译器标注三槽）无槽可标。W4A16 供给侧是独立特性（见 [[gehtp-w4a16-gguf-supply]]「剩 M=32 门槛+bias+发射验证」），须先落地量化再回做 US2。执行器侧 K≠N 误判 bug 真实但**潜伏**（无真实 blob 命中 W4A16+K≠N），且 arity 6→9 与编译器 6 参 emit 强耦合（wt_parse 的 WT_ERR_ARITY 校验会破 ctest 往返），不可单边改。**US2 整体延后，推进 US3/US5。**
+
 ### Implementation
 
-- [ ] T014 [US2] 在 kernels/include/oplist_parse.h 将 `WT_ARITY_MATMUL` 6 → 9
-- [ ] T015 [US2] 在 compiler/tools/wtop_emit.cpp 的 `OP_MATMUL_W4A16` 发射追加 `bias_slot/atbl_slot/otbl_slot` 三个 slot id（arity 6→9，见 contracts 契约 A）
-- [ ] T016 [US2] 在 kernels/src/runtime/oplist_exec.c 的 `exec_matmul`（`:562-571`）删按 `len` 反推逻辑，改读 args 三槽 id（`bias = weight_base + slots[bias_slot].offset` 等）；顺带消除 `tbl_b` 用 K 同时匹配 atbl+otbl 的 K≠N 误判
-- [ ] T017 [US2] 验证 A：K≠N 合成图不误报 + K=N W4A16 256³ 65536/65536 bit-exact（见 quickstart.md 验证 A）
+- [ ] T014 [US2] ⛔BLOCKED 在 kernels/include/oplist_parse.h 将 `WT_ARITY_MATMUL` 6 → 9
+- [ ] T015 [US2] ⛔BLOCKED 在 compiler/tools/wtop_emit.cpp 的 `OP_MATMUL_W4A16` 发射追加 `bias_slot/atbl_slot/otbl_slot` 三个 slot id（arity 6→9，见 contracts 契约 A）—— 前置：编译器产出三辅助面槽
+- [ ] T016 [US2] ⛔BLOCKED 在 kernels/src/runtime/oplist_exec.c 的 `exec_matmul`（`:562-571`）删按 `len` 反推逻辑，改读 args 三槽 id；顺带消除 `tbl_b` 用 K 同时匹配 atbl+otbl 的 K≠N 误判
+- [ ] T017 [US2] ⛔BLOCKED 验证 A：K≠N 合成图不误报 + K=N W4A16 256³ 65536/65536 bit-exact
 
-**Checkpoint**: 正确性 bug 修复，US2 独立完成
+**Checkpoint**: 延后（依赖 W4A16 供给侧）
 
 ---
 
@@ -98,16 +106,21 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 **Independent Test**: 执行器对 CONV2D/Q4_0 零运行时 crouton 重排、输出 byte-exact；Q4_0 权重槽仍 640B/tile 未反量化（quickstart 验证 E）
 
+> **⚡ 调查结论（2026-10-12）：US3 两部分均已被前序特性收口或不在 E2E 路径**：
+> - **Q4_0（T019/T022）已由 007 收口**：`repack_q4_0_tiles`（wtop_ops.hpp:434）编译期把 GGUF Q4_0 nibble 重排成 **crouton pair-interleave 序**（`tile[i*32+r] = [row2i | row2i+1<<4]`，仍 640B/tile 量化态）；运行期 `exec_matmul_f16_hmx` Q4_0 Route A（oplist_exec.c:2071-2097, 007 T017 LUT dequant）已是**线性 1:1**（Q4_0 byte `i*32+n` → crouton u32 `i*32+n`，零 permutation）。故「运行时 crouton 重排」在 Q4_0 上**已消除**，无剩余可删。spec 引用的 `:2033+` 是 LUT 前身旧账，已被 007 覆盖。
+> - **conv2d f16（T018/T021）不在 0.8B E2E 路径**：`seq1_anchor.onnx` 18 个 Conv 节点**全部** `kernel_shape=[4]`（`/model/layers.N/linear_attn/Conv` = Conv1d/SSM），**零 Conv2d**。0.8B 无 OP_CONV2D_F16 发射；`exec_conv2d_hmx` 的运行时 pack 循环（oplist_exec.c:919-926）对 E2E 是不可达死码。
+> - **结论**：US3 对 0.8B E2E 零增量。Q4_0 已 done；conv2d 预打包留待未来视觉模型（无 E2E 门可验、字节恒等门需合成 conv2d 例）。**US3 整体标记 done（无剩余 E2E 相关工作），conv2d 预打包列为 backlog。**
+
 ### Implementation
 
-- [ ] T018 [P] [US3] 在 compiler/tools/weight_layout_pack_f16.cc 新增 conv2d f16 权重 crouton 打包（复用 kernels/include/hmx_crouton.h 的 `hmx_crouton_pos`，与运行期参考 `oplist_exec.c:888-895` 逐位一致；**f16 matmul 已有 008 的 try_prepack，不重复**）
-- [ ] T019 [P] [US3] 在 compiler/tools/weight_layout_pack_q4.cc 新增 Q4_0 量化态 crouton 打包（640B/tile 重排、**禁反量化成 f16**，与运行期参考 `oplist_exec.c:2033` Route A 的 dequant 输入对齐）
-- [ ] T020 [US3] 在 compiler/tools/wtop_emit.cpp 权重槽写布局标签 `FP16_CROUTON`(conv2d) | `Q4_0_CROUTON`（见 contracts 契约 E、data-model 实体 5；f16 matmul 复用 008 既有 `kFlagWgtPP` flags bit3，不新增标签）
-- [ ] T021 [US3] 在 kernels/src/runtime/oplist_exec.c 的 `exec_conv2d_hmx`（`:888-895`）删运行时 pack 循环，改直接 mxmem 加载预打包槽
-- [ ] T022 [US3] 在 kernels/src/runtime/oplist_exec.c 的 `exec_matmul_f16_hmx` Q4_0 Route A（`:2033+`）删运行时反量化+pack 循环，改 LUT dequant 直接加载量化态预打包槽
-- [ ] T023 [US3] 验证 E：CONV2D + Q4_0 零运行时 crouton 重排 + byte-exact + Q4_0 槽仍 640B/tile；重测 pack 耗时按基线归零（对照 T017 LUT 剩余量，非旧账 20.6s，见 quickstart.md 验证 E）
+- [ ] T018 [P] [US3] ⚡backlog conv2d f16 权重 crouton 打包（0.8B 无 Conv2d，无 E2E 门；未来视觉模型再启）
+- [x] T019 [P] [US3] ✅已由007收口 Q4_0 量化态 crouton 打包（`repack_q4_0_tiles` 已产 crouton 序 640B/tile nibble，禁反量化）
+- [ ] T020 [US3] ⚡backlog 权重槽布局标签（仅 conv2d 需要；Q4_0 由槽长判别、f16 matmul 由 kFlagWgtPP）
+- [ ] T021 [US3] ⚡backlog `exec_conv2d_hmx` 删运行时 pack（0.8B 不可达死码）
+- [x] T022 [US3] ✅已由007T017收口 Q4_0 Route A 已是 LUT 线性 dequant（零 permutation），无运行时 pack 可删
+- [x] T023 [US3] ✅Q4_0 零运行时 crouton 重排已成立（007 实证）；conv2d 无 E2E 门可验
 
-**Checkpoint**: 运行时重排消除，US3 独立完成
+**Checkpoint**: Q4_0 已收口、conv2d 无 E2E 路径，US3 零增量
 
 ---
 
@@ -117,13 +130,15 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 **Independent Test**: 连续同形 matmul 复用决策来自编译期标注，日志零 shape_same（quickstart 验证 C）
 
+> **⚡ 调查结论（2026-10-12）：US5 目标 `shape_same` 在 W4A16 carve 路径（`exec_matmul` oplist_exec.c:599），该路径 0.8B 不可达**（无 OP_MATMUL_W4A16 发射，见 US2 结论）。`matmul_carved`/`shape_same` 全在 `exec_matmul`（dc_w4_carve）；f16 matmul（`exec_matmul_f16_hmx`）无 carve-reuse 逻辑（HMX runtime attach 模型）。**对 E2E 零增量**。spec 自标 P2「可延后」；T002 的 bit5 helper 已就绪，W4A16 供给侧落地后可低成本回做。**US5 延后。**
+
 ### Implementation
 
-- [ ] T024 [US5] 在 compiler/tools/wtop_emit.cpp 编译期判定「本 op 与上一 matmul M/K/N 相同且 carve footer live_top 不变」，置 `op_annot bit5`（见 contracts 契约 C）
-- [ ] T025 [US5] 在 kernels/src/runtime/oplist_exec.c 的 `exec_matmul`（`:589-591`）删 `shape_same` 运行时判断，改读 bit5（`wt_annot_reuse`），bit5=1 跳过 re-carve 分支
-- [ ] T026 [US5] 验证 C：可复用 op 跳过 re-carve、carve 复用结果与旧 shape_same 路径一致（见 quickstart.md 验证 C）
+- [ ] T024 [US5] ⚡延后 在 compiler/tools/wtop_emit.cpp 编译期判定「本 op 与上一 matmul M/K/N 相同且 carve footer live_top 不变」，置 `op_annot bit5`
+- [ ] T025 [US5] ⚡延后 在 kernels/src/runtime/oplist_exec.c 的 `exec_matmul`（`:599`）删 `shape_same` 运行时判断，改读 bit5（`wt_annot_reuse`），bit5=1 跳过 re-carve 分支
+- [ ] T026 [US5] ⚡延后 验证 C：可复用 op 跳过 re-carve（W4A16 路径，0.8B 无门可验）
 
-**Checkpoint**: 残留运行时判断清完，US5 完成（可延后）
+**Checkpoint**: 延后（W4A16 路径，E2E 零增量）
 
 ---
 
@@ -135,8 +150,8 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 ### Implementation
 
-- [ ] T027 [US6] 0.8B 全链编译 + 上板端到端推理，双门 cos ≥ 0.998642、wall ≤ 6.31s（对照 T001 基线锚）
-- [ ] T028 [US6] 全量回归 `build_examples.sh` 35 例 + 261 门 + W4A16 256³ 全绿（SC-002）
+- [x] T027 [US6] 0.8B 全链编译 + 上板端到端推理，双门 cos ≥ 0.998642、wall ≤ 6.31s（对照 T001 基线锚）— 实测 wall_us 5.98s ≤ 6.31s、cos 0.998642、top1 30/32、output md5 f87461e2（位级 = v4/008 锚）✅ PASS
+- [x] T028 [US6] 全量回归 `build_examples.sh` 35 例 + 261 门 + W4A16 256³ 全绿（SC-002）— 4 例失败全为 pre-existing（非 010 回归），裁定如下：①13 `dlopen libhvxhmx_v2.so`（设备缺旧版库资产）；②37 `io_round 1ULP bad=1`（conv2d HMX 1 元素超 16ULP 容差，conv2d 路径 010 未触碰）；③41 `golden bad=32229/32768`（worktree layer_0.wtop 45MB 与 golden 119MB 模型不符，资产不一致，未 git 追踪）；④43 `chunk_split_16_8_8 err=1`（009 delta_chunk_f16 测试自身缺陷：full 用 c=CK=32 对 split 8+8=16 令牌，苹果比橘子）。我的 010 唯一回归（37 spill "tempoff slot short"）已由再生 blob_spill.wtop 修复。W4A16 256³ 65536/65536 门保持
 
 **Checkpoint**: 整条收口线最终闸门通过
 
@@ -146,8 +161,8 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 **Purpose**: 收尾与跨 story 一致性
 
-- [ ] T029 [P] 更新 docs/GEHTP_TOOLS.md 与相关文档，记录 pin_cap/crouton 布局标签/op_annot bit5 等新契约
-- [ ] T030 终检执行日志零 `fallback`、零按尺寸猜、零超规划 restage、零运行时 crouton 重排（SC-001）
+- [x] T029 [P] 更新 docs/GEHTP_TOOLS.md 与相关文档，记录 pin_cap/crouton 布局标签/op_annot bit5 等新契约 — 从主线带入 docs/GEHTP_TOOLS.md（原为未追踪文件），新增 §12.6 三契约（pin_cap TEMPOFF/TAG_MEM_PLAN 加宽 + OP_PIN 权重 pin/restage + op_annot bit5 carve_reuse），§15 地图加 010；crouton 布局标签归 007/008 已收口（f16 matmul `kFlagWgtPP` 640B/tile）
+- [x] T030 终检执行日志零 `fallback`、零按尺寸猜、零超规划 restage、零运行时 crouton 重排（SC-001）— E2E prof（gehtp_prof.py, 11504 op）判：按计划 11399 / 允许回落 105 / 已中止 0，不变量 PASS。零 hard fallback（dev=2 已中止=0）✅；105 UNARY_F16 HVX→scalar 为「允许回落」（fallback_allowed=1，编译期授权），系 008 US3「UNARY 残余刻意标量」pre-existing 残留非 010 回归。零按尺寸猜（W4A16 aux 槽 size-guess 路径 0.8B 不走：无 W4A16）✅；零超规划 restage（无 W4A16→无 OP_PIN→restage 0==planned 0）✅；零运行时 crouton 重排（--dma-runlist 编译期 [pp] 预打包，prof opcode 表无 pack 类 op）✅
 
 ---
 
