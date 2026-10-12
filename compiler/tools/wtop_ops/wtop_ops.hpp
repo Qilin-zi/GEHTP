@@ -132,6 +132,10 @@ struct Emitter {
     uint64_t ddr_vtcm_cap = 0;     // VTCM 驻留池大小(0=无驻留)
     uint64_t bump_reserve = 0;     // 表外 bump 预留(字节; M2 起由 TAG_MEM_PLAN 供给)
     uint64_t pin_cap = 0;          // wtcache 常驻区容量(字节, 2048 对齐; 0=不 pin, 执行器回退 4096)
+    /* 010 US1: 已发射 OP_PIN 的 W4A16 权重槽集(去重: 同权重多 matmul 只 pin 一次,
+     * 运行期驻留追踪负责 matmul→matmul 复用)。planned restage 计数 = 本集大小
+     * (= blob 中 OP_PIN 条数, 供 SC-003 对账)。 */
+    std::map<uint32_t, bool> w4_pinned;
     /* 008 T010: 表外 temp 的运行期 bump 需求仿真(泄漏式, 与 temp_get 路径 2
      * 同语义: 同 id 够大即复用, 不够则新块不回收)。计划 bump=max(4MB,cap/4)
      * 与实际需求无关 — 广播物化 temp 恒 out_idx!=0 无静态项(p3 板跑实锤:

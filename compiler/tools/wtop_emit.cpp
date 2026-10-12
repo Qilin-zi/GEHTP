@@ -955,6 +955,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 return idx == 1 || idx == 2;
             case OP_MATMUL_W4A16: case OP_CONV1D_SSM_F16:
                 return idx == 1;
+            case OP_PIN:   /* 010 US1: pin 权重裸 slot (T009 发射) */
+                return idx == 0;
             case OP_FILL:
                 return idx == 0;
             case OP_SPILL:

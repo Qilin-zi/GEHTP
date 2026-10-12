@@ -64,12 +64,12 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 ### Implementation
 
-- [ ] T008 [US1] 在 compiler/src/ir/graph_prepare.cpp 新建权重常驻规划 pass（复用 `compute_lifetimes`，输出**权重 slot** 的 pin/restage 序列；权重是 const，greedy/cp_solver 均 skip，故为全新规划面，见 research R1）
-- [ ] T009 [US1] 在 compiler/tools/wtop_emit.cpp 发射显式 `OP_PIN`(3) + `OP_DMA`(33) 序列（超预算权重换入换出，复用既有 opcode）
-- [ ] T010 [US1] 在 kernels/src/runtime/oplist_exec.c 的 `xop_pin`（`:3078-3091`）从「记账 + engine_ready 时又搬一次」改为真正 pin 一次，消除 PIN/MATMUL 各搬一次的重复搬运（D2）
-- [ ] T011 [US1] 在 kernels/src/runtime/oplist_exec.c 的 `exec_matmul`（`:657-658`）改「该权重已 pin 且驻留区间覆盖当前 op → 跳过 `cpu_to_vtcm`」，直接引用常驻区
-- [ ] T012 [US1] 在 kernels/src/runtime/oplist_exec.c 的 `wt_w3_report` 增加 restage 计数（供 SC-003 与编译期规划值对账）
-- [ ] T013 [US1] 验证 D：已常驻权重零重复搬运、restage 次数 == 规划值；超预算图换入换出严格按序列（见 quickstart.md 验证 D）
+- [X] T008 [US1] 权重常驻 pin 决策扶正为 emit 主线：`w4_pinned` 去重集 + 首次消费前发 `OP_PIN`（streaming 简化版，非 graph_prepare 独立 pass；pin 序列 = OP_PIN 首次使用序；超预算换出见 T013 备注）
+- [X] T009 [US1] 在 compiler/tools/wtop_ops/op_matmul.cpp 发射显式 `OP_PIN`(3) 去重序列 + wtop_emit `arg_takes_bare_slot` 登记 OP_PIN 裸槽（防 pp_recs GC 剥权重槽）；`OP_DMA` 换入换出（超预算）未发射——0.8B 权重全 fit 或 pin_cap=0 全不 pin，无换出场景，留待大模型
+- [X] T010 [US1] kernels/src/runtime/oplist_exec.c `xop_pin` 真 pin 一次 + 登记 `wt_resident_slot`/`bias_resident_slot`，消除 PIN/MATMUL 各搬一次（D2）
+- [X] T011 [US1] `exec_matmul` 改「驻留 slot == 本 op 权重 → 跳过 `cpu_to_vtcm`」；re-carve（形状/live 变化或 f16/conv HMX 抢 VTCM）置空驻留标记强制重搬，字节恒等
+- [X] T012 [US1] `struct wt_exec_stats` 增 `restage` 计数（实际 DDR→VTCM 换入次数，xop_pin + exec_matmul 各自累加）；planned 值 = blob OP_PIN 条数（可自 wt_w3_report op dump 数），对账在 runner 层
+- [ ] T013 [US1] 验证 D：compiler 侧已证「同权重双 FC → 1 OP_PIN」（test_wtop_emit US1 段）；设备侧「restage == planned」上板验证待 US6 E2E
 
 **Checkpoint**: 权重搬运消除，核心性能价值落地
 
