@@ -654,6 +654,22 @@ struct Emitter {
                 return id;
             }
         }
+        /* int32 const (RoPE Expand=ones coef / position 链): 位模式 reinterpret 成
+         * f32 = subnormal → f32→f16 下溢全零 (0.8B slot 307 实锤)。按 int32 数值
+         * 转 f16 (小整数 ≤2048 精确可表: int32 值 1 → f16 1.0)。索引 const 不走此
+         * 路径 (Gather/ScatterNd 经 ensure_i32_slot 原样入槽)。 */
+        if (w->output_def.dtype == (uint32_t)DType::Int32) {
+            std::vector<uint16_t> w16(n);
+            const int32_t* wi = reinterpret_cast<const int32_t*>(
+                gp.const_pool().data() + w->const_data_offset);
+            for (size_t i = 0; i < n; i++)
+                w16[i] = f32_to_f16_rne(static_cast<float>(wi[i]));
+            std::vector<uint8_t> wbytes(n * 2);
+            std::memcpy(wbytes.data(), w16.data(), wbytes.size());
+            uint32_t id = slot_for((uint32_t)wbytes.size(), (uint32_t)n, wbytes.data());
+            wslots[w->op_id] = id;
+            return id;
+        }
         std::vector<uint16_t> w16(n);
         /* 权重字节源始终从 const_pool 读 (const_data_offset 是 const_pool 内偏移)。
          * 路线B 仅改变槽路由: slot_for 已按 ext_weights 选 add_ext_slot/add_slot。

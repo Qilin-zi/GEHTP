@@ -249,16 +249,17 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             std::vector<uint8_t> data;
             /* 主输入 dtype 跟随图输入节点: int32(ids/gather 索引)保持 4B/元素,
              * 不参与槽面 f16 化; 其余 f16 直塞 / f32 转 f16。
-             * 例外: .i32.raw 文件名显式声明 int32 原文 — tagged 输入节点
-             * dtype 全是 Float32(loader 口径), pos_arange.i32.raw 曾被
-             * f32→f16 洗成全零 (小整数当 denormal, RoPE/GDN 位置全灭)。 */
+             * .i32.raw 文件名显式声明 int32 原文 — 主输入(ids)保 int32 位模式
+             * (gather 索引), 但非主 .i32.raw (position 链) 必须按 int32 数值转
+             * f16: 消费 op 是 f16 broadcast/mul, int32 位模式按 f16 读 = 次正规
+             * ≈0 (RoPE 恒等根因之二, 与 ensure_weight_slot coef 洗白同源)。 */
             bool name_i32 = false;
             if (k < in_paths.size()) {
                 const std::string& fp = in_paths[k];
                 name_i32 = fp.size() >= 8 &&
                            fp.compare(fp.size() - 8, 8, ".i32.raw") == 0;
             }
-            bool is_i32_in = (k == 0 && iop->output_def.dtype == (uint32_t)DType::Int32) || name_i32;
+            bool is_i32_in = (k == 0 && iop->output_def.dtype == (uint32_t)DType::Int32);
             if (is_i32_in) {
                 if (k < in_paths.size()) {
                     if (!load_file(in_paths[k], data)) {
@@ -273,6 +274,29 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 } else {
                     data.assign(elems * 4, 0);
                 }
+            } else if (name_i32) {
+                /* 非主 .i32.raw 输入 (position 链): int32 数值 → f16。小整数 (0..seq)
+                 * 在 f16 精确可表, 值转无损; 保 int32 位模式反而被 f16 消费 op 读成
+                 * 次正规 ≈0。 */
+                if (k < in_paths.size()) {
+                    if (!load_file(in_paths[k], data)) {
+                        std::fprintf(stderr, "error: cannot open %s\n", in_paths[k].c_str());
+                        return 2;
+                    }
+                    if (data.size() != elems * 4) {
+                        std::fprintf(stderr, "error: input %zu size %zu != %zu*4 (int32, elems=%zu)\n",
+                                     k, data.size(), elems, elems);
+                        return 2;
+                    }
+                } else {
+                    data.assign(elems * 4, 0);
+                }
+                const int32_t* wi = reinterpret_cast<const int32_t*>(data.data());
+                std::vector<uint8_t> h(elems * 2);
+                uint16_t* d = reinterpret_cast<uint16_t*>(h.data());
+                for (size_t i = 0; i < elems; i++)
+                    d[i] = f32_to_f16_rne(static_cast<float>(wi[i]));
+                data = std::move(h);
             } else if (k < in_paths.size()) {
                 if (!load_file(in_paths[k], data)) {
                     std::fprintf(stderr, "error: cannot open %s\n", in_paths[k].c_str());
