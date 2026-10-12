@@ -32,7 +32,7 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 **Purpose**: 所有 story 共用的 op_annot 打包/解包 helper
 
-- [ ] T002 [P] 在 kernels/include/oplist_parse.h 新增 `wt_annot_set_reuse(u32*,int)` / `wt_annot_reuse(u32)` 打包/解包 helper（对称 `wt_annot_pack`，操作 bit5，`oplist_parse.h:54-58`），供 US1/US5 共用
+- [x] T002 [P] 在 kernels/include/oplist_parse.h 新增 `wt_annot_set_reuse(u32*,int)` / `wt_annot_reuse(u32)` 打包/解包 helper（对称 `wt_annot_pack`，操作 bit5，`oplist_parse.h:54-58`），供 US1/US5 共用
 
 **Checkpoint**: 共享注解 helper 就绪，各 story 可并行展开
 
