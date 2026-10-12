@@ -18,7 +18,7 @@
   - **B** pin_cap：执行器两处写死 4096（`oplist_exec.c:325,600`）；编译期 `MemPlan` 无 pin_cap 字段，只在 `vtcm_auto_scan` 当固定余量假设（`graph_prepare.cpp:670`）。**非「只差序列化」——须先补算**。
   - **C** carve 复用：`oplist_exec.c:589-591` 运行时 `shape_same` 判 M/K/N 决定重 carve；carve footer 已是 5×u32=20B 满（op_index/vtcm_offset/size_bytes/residency_start/residency_end）。
   - **D** 权重 restage：`oplist_exec.c:657-658` 每 MATMUL 无条件 `cpu_to_vtcm` 搬 wt+bias；`xop_pin`（`oplist_exec.c:3078-3091`）仅记账、engine_ready 时又搬一次 → **D2 PIN 与 MATMUL 各搬一次权重**。
-  - **E** 权重 crouton pack 运行时发生：`exec_matmul_f16_hmx`（`oplist_exec.c:1970-2020`）与 `exec_conv2d_hmx`（`oplist_exec.c:878-887`）在运行时做 fp16/Q4_0 权重的 crouton 重排；这是输入无关的纯重排，本应编译期一次性做掉。
+  - **E** 权重 crouton pack 运行时发生：**f16 matmul 已由 008 T012 收口**（emit `try_prepack`/`kFlagWgtPP`，exec `w_pp` DMA 线性预取，主路径零标量散写 pack）；剩余运行时 pack 在 `exec_conv2d_hmx`（`oplist_exec.c:888-895`，f16 conv）与 Q4_0 Route A（`oplist_exec.c:2033+`，运行时反量化+pack）。这是输入无关的纯重排，本应编译期一次性做掉。
 - **证据基线**：cos 锚 0.998642 / wall 6.31s（008 终态锚，lib `libhvxhmx_008t21.so` 签名 `e885485f`、commit `de5574a`；wall 口径 = `[timing] wall_us`，**非** `[run] seg wall` 11.44s——后者含 blob 冷读 4.47s 一次性 I/O）；byte-exact 回归门 = 35 例 + 261 门 + W4A16 256³ 65536/65536 bit-exact。
 - **源文档**：`static_mem_plan_gaps.md`（收口动作对照表与已确认结论）、`static_mem_plan_roadmap.md`（2026-10-12 行动计划，新增 E 并重排优先级）。
 - **量化口径警示**：roadmap 阶段 1 引用的「权重 pack 20.6s/全图」是**标量 pack 旧账**（`oplist_exec.c:1983` 自述「标量 pack 9.72s/20.6s → LUT 法」）；T017 已用 LUT 法优化过，LUT 后剩余 pack 耗时未重测。阶段 1 真实收益须以重测为准，非 20.6s → 0。
@@ -56,18 +56,18 @@
 
 ---
 
-### User Story 3 - 权重 crouton pack 编译期化 (Priority: P1)
+### User Story 3 - 权重 crouton pack 编译期化（conv2d + Q4_0 剩余）(Priority: P1)
 
-把 fp16/Q4_0 权重的 crouton 打包从执行器移到编译器：打包阶段直接产出 crouton 布局，执行器删运行时 pack 循环、改为直接加载 blob 里已打包的权重槽。
+f16 matmul 的 crouton 预打包已由 008 T012 收口（emit `try_prepack`/`kFlagWgtPP`，exec `w_pp` DMA 预取）。本 story 收口剩余两条运行时 pack 路径：conv2d f16 与 Q4_0 量化态。
 
-**Why this priority**: 权重 crouton 重排是输入无关的纯重排，运行时每跑一次白做一次。收益上界由重测决定（标量 pack 20.6s 已被 T017 LUT 优化，剩余量待重测）；是纯编译期可做掉的重活，方向确定性最高。
+**Why this priority**: 权重 crouton 重排是输入无关的纯重排，运行时每跑一次白做一次。f16 matmul 半壁已被 008 做掉，剩余 conv2d + Q4_0 是同一重排问题的收尾；收益上界由重测决定（标量 pack 20.6s 已被 T017 LUT 优化，剩余量待重测）。
 
-**Independent Test**: 编译期产出 crouton 布局的 blob，执行器对 MATMUL_F16/CONV2D 零运行时 crouton 重排，数值 byte-exact 不破。
+**Independent Test**: 编译期产出 conv2d f16 + Q4_0 crouton 布局的 blob，执行器对 CONV2D/Q4_0 matmul 零运行时 crouton 重排，数值 byte-exact 不破，Q4_0 槽仍 640B/tile 量化态。
 
 **Acceptance Scenarios**:
 
-1. **Given** 含 fp16/Q4_0 权重 matmul/conv 的图，**When** 编译并上板执行，**Then** 执行器不再做运行时 crouton 重排（直接读编译期打包槽），输出逐字节同旧行为。
-2. **Given** 全图回归集，**When** 收口后重跑，**Then** 权重 pack 运行时耗时按重测基线归零，byte-exact 门保持。
+1. **Given** 含 f16 conv2d 权重的图，**When** 编译并上板执行，**Then** `exec_conv2d_hmx` 不再做运行时 crouton 重排（直接读编译期打包槽），输出逐字节同旧行为。
+2. **Given** 含 Q4_0 权重 matmul 的图，**When** 编译并上板执行，**Then** Q4_0 Route A 不再运行时反量化+pack（改 LUT dequant 直接读量化态打包槽），槽仍 640B/tile，输出逐字节同旧行为。
 
 ---
 
@@ -131,7 +131,7 @@
 - **FR-002**: 执行器 MUST 按编译期下发的 pin/restage 序列执行，删除每 op 无条件 `cpu_to_vtcm` 搬权重与 PIN/MATMUL 重复搬运。
 - **FR-003**: 编译器 MUST 为每个 W4A16 matmul 在 blob 中显式标注 bias/atbl/otbl 三个辅助面的 slot 身份。
 - **FR-004**: 执行器 MUST 按标注取辅助面，删除按 len 反推（`oplist_exec.c:562-571`）；K≠N 不再误判。
-- **FR-005**: 编译器 MUST 在打包阶段直接产出 fp16/Q4_0 权重的 crouton 布局，执行器删除运行时 crouton 重排（`exec_matmul_f16_hmx` / `exec_conv2d_hmx` 的 pack 循环）。
+- **FR-005**: 编译器 MUST 在打包阶段直接产出 conv2d f16 与 Q4_0 权重的 crouton 布局（f16 matmul 已由 008 T012 的 `kFlagWgtPP` 收口），执行器删除剩余运行时 crouton 重排（`exec_conv2d_hmx` pack 循环 + Q4_0 Route A 反量化 pack）。
 - **FR-006**: 编译器 MUST 真正算出 pin_cap（`MemPlan` 新增字段）并序列化进 blob。
 - **FR-007**: 执行器 MUST 从 blob 读出 pin_cap 替代两处硬编码 4096（`oplist_exec.c:325,600`）。
 - **FR-008**: 编译器 MUST 预判连续 op 的 carve 复用并写入 blob，执行器删除 `shape_same` 运行时判断。
@@ -155,7 +155,7 @@
 - **SC-001**: 执行日志中零运行时决策——零 fallback、零按尺寸猜、零超出编译期规划的 restage、零运行时 crouton 重排。
 - **SC-002**: 全量回归 byte-exact——35 例 + 261 门全绿，W4A16 256³ 65536/65536 bit-exact 门保持。
 - **SC-003**: `wt_w3_report` 中 restage 次数 == 编译期规划值（可作为门）。
-- **SC-004**: 权重 crouton pack 运行时耗时按重测基线归零（上界 ≤ 重测后的 LUT 剩余 pack 量，非旧账 20.6s）。
+- **SC-004**: 剩余运行时 crouton pack（conv2d f16 + Q4_0）耗时按重测基线归零（上界 ≤ 重测后的 LUT 剩余 pack 量，非旧账 20.6s）。
 - **SC-005**: qwen3-0.8b 端到端编译上板，精度 cos ≥ 0.998642 且 wall-clock ≤ 6.31s（`[timing] wall_us` 口径，对照 008 终态锚不回退）。
 
 ## Assumptions

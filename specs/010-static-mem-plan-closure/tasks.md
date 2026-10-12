@@ -92,20 +92,20 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 ---
 
-## Phase 6: User Story 3 - 权重 crouton pack 编译期化 (Priority: P1)
+## Phase 6: User Story 3 - 权重 crouton pack 编译期化（conv2d + Q4_0 剩余）(Priority: P1)
 
-**Goal**: 编译期产出 crouton 布局权重槽，执行器删运行时 pack，Q4_0 内存守恒
+**Goal**: f16 matmul 已由 008 T012 收口（emit try_prepack/kFlagWgtPP + exec w_pp DMA 预取）；本 story 收口剩余 conv2d f16 与 Q4_0 量化态的运行时 crouton pack，Q4_0 内存守恒
 
-**Independent Test**: 执行器零运行时 crouton 重排、输出 byte-exact；Q4_0 权重槽仍 640B/tile 未反量化（quickstart 验证 E）
+**Independent Test**: 执行器对 CONV2D/Q4_0 零运行时 crouton 重排、输出 byte-exact；Q4_0 权重槽仍 640B/tile 未反量化（quickstart 验证 E）
 
 ### Implementation
 
-- [ ] T018 [P] [US3] 在 compiler/tools/weight_layout_pack_f16.cc 新增 f16 权重 crouton 打包（复用 kernels/include/hmx_crouton.h 的 `hmx_crouton_pos`，与运行期参考 `oplist_exec.c:2010-2019` 逐位一致）
-- [ ] T019 [P] [US3] 在 compiler/tools/weight_layout_pack_q4.cc 新增 Q4_0 量化态 crouton 打包（640B/tile 重排、**禁反量化成 f16**，与运行期参考 `oplist_exec.c:1982-2008` 的 dequant 输入对齐）
-- [ ] T020 [US3] 在 compiler/tools/wtop_emit.cpp 权重槽写布局标签 `FP16_CROUTON | Q4_0_CROUTON`（见 contracts 契约 E、data-model 实体 5）
-- [ ] T021 [US3] 在 kernels/src/runtime/oplist_exec.c 的 `exec_matmul_f16_hmx`（`:1970-2020`）删运行时 pack 循环，改直接 mxmem 加载预打包槽（Q4_0 保留 LUT dequant、仅删 permutation）
-- [ ] T022 [US3] 在 kernels/src/runtime/oplist_exec.c 的 `exec_conv2d_hmx`（`:878-887`）删运行时 pack 循环，改直接加载预打包槽
-- [ ] T023 [US3] 验证 E：零运行时 crouton 重排 + byte-exact + Q4_0 槽仍 640B/tile；重测 pack 耗时按基线归零（对照 T017 LUT 剩余量，非旧账 20.6s，见 quickstart.md 验证 E）
+- [ ] T018 [P] [US3] 在 compiler/tools/weight_layout_pack_f16.cc 新增 conv2d f16 权重 crouton 打包（复用 kernels/include/hmx_crouton.h 的 `hmx_crouton_pos`，与运行期参考 `oplist_exec.c:888-895` 逐位一致；**f16 matmul 已有 008 的 try_prepack，不重复**）
+- [ ] T019 [P] [US3] 在 compiler/tools/weight_layout_pack_q4.cc 新增 Q4_0 量化态 crouton 打包（640B/tile 重排、**禁反量化成 f16**，与运行期参考 `oplist_exec.c:2033` Route A 的 dequant 输入对齐）
+- [ ] T020 [US3] 在 compiler/tools/wtop_emit.cpp 权重槽写布局标签 `FP16_CROUTON`(conv2d) | `Q4_0_CROUTON`（见 contracts 契约 E、data-model 实体 5；f16 matmul 复用 008 既有 `kFlagWgtPP` flags bit3，不新增标签）
+- [ ] T021 [US3] 在 kernels/src/runtime/oplist_exec.c 的 `exec_conv2d_hmx`（`:888-895`）删运行时 pack 循环，改直接 mxmem 加载预打包槽
+- [ ] T022 [US3] 在 kernels/src/runtime/oplist_exec.c 的 `exec_matmul_f16_hmx` Q4_0 Route A（`:2033+`）删运行时反量化+pack 循环，改 LUT dequant 直接加载量化态预打包槽
+- [ ] T023 [US3] 验证 E：CONV2D + Q4_0 零运行时 crouton 重排 + byte-exact + Q4_0 槽仍 640B/tile；重测 pack 耗时按基线归零（对照 T017 LUT 剩余量，非旧账 20.6s，见 quickstart.md 验证 E）
 
 **Checkpoint**: 运行时重排消除，US3 独立完成
 

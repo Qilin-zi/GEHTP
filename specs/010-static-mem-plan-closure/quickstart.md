@@ -32,10 +32,10 @@
 
 **验收**: blob 携带 pin_cap + 执行器读它（spec Story 4）。
 
-## 验证 E — 权重 crouton pack 编译期化
+## 验证 E — 权重 crouton pack 编译期化（conv2d + Q4_0 剩余）
 
-1. 造含 fp16 matmul/conv 的图，编译期产出 crouton 布局权重槽。
-2. 上板执行：执行器不再做运行时 crouton 重排，输出与旧行为逐字节一致。
+1. 造含 f16 conv2d 的图，编译期产出 crouton 布局权重槽（f16 matmul 已由 008 T012 收口，不在本验证）。
+2. 上板执行：`exec_conv2d_hmx` 不再做运行时 crouton 重排，输出与旧行为逐字节一致。
 3. Q4_0 图：确认权重槽仍 640B/tile（量化态重排，未反量化成 f16）；LUT dequant 输出与旧路径逐位一致。
 4. 重测运行时权重 pack 耗时，确认按基线归零（对照 T017 LUT 后的剩余量，非旧账 20.6s）。
 

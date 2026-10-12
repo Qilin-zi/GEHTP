@@ -48,14 +48,14 @@
 
 ### 5. 预打包 crouton 权重槽（CroutonWeightSlot）
 
-- **归属**: 每个 fp16/Q4_0 权重 slot 一条，编译期打包进 blob（替代运行时 pack）。
-- **字段**: `layout: enum {FP16_RAW, FP16_CROUTON, Q4_0_CROUTON}`、`tile_bytes: u32`（每 32×32 tile 的字节：f16 crouton = 2048，Q4_0 crouton = 640）、`n_tiles: u32`（tile 数）。
+- **归属**: 每个 conv2d f16 / Q4_0 权重 slot 一条，编译期打包进 blob（替代运行时 pack）。**f16 matmul 不在本实体**（已由 008 T012 的 `kFlagWgtPP` + `w_pp` DMA 预取收口）。
+- **字段**: `layout: enum {FP16_RAW, FP16_CROUTON(conv2d), Q4_0_CROUTON}`、`tile_bytes: u32`（每 32×32 tile 的字节：f16 crouton = 2048，Q4_0 crouton = 640）、`n_tiles: u32`（tile 数）。
 - **关系**: 与权重 slot 数据同址；`hmx_crouton_pos`（`kernels/include/hmx_crouton.h`）是布局公式单一真值源。
 - **校验规则**:
-  - 编译期 pack 输出与运行期参考实现逐位一致（f16 参考 `oplist_exec.c:2010-2019`、Q4_0 参考 `:1982-2008`）。
+  - 编译期 pack 输出与运行期参考实现逐位一致（f16 conv 参考 `oplist_exec.c:888-895`、Q4_0 参考 `:2033+` Route A）。
   - **Q4_0 内存守恒**：pack 发生在量化态（640B/tile），不得反量化成 f16 存（否则 4× 膨胀，破坏 4.3× 内存收益）。
   - `tile_bytes` 与 `hmx_crouton_pos` 覆盖的 tile 数一致，缺 tile 编译期报错。
-- **取代**: 执行器 `exec_matmul_f16_hmx` / `exec_conv2d_hmx` 的运行时 pack 循环删除，改直接 mxmem 加载。
+- **取代**: 执行器 `exec_conv2d_hmx` 的 f16 conv pack 循环 + Q4_0 Route A 反量化 pack 删除，改直接 mxmem 加载。
 
 ## 实体关系图（文本）
 
@@ -64,7 +64,7 @@ MemoryConfig ──pin_cap──> 决定 WeightRestagePlan 的常驻预算
 AuxSurfaceAnnotation ──引用──> slot 表（bias/atbl/otbl 三个 id）
 CarveReuseFlag ──协同──> carve footer（reuse 仅当形状+live_top 不变）
 WeightRestagePlan ──依赖──> MemoryConfig.pin_cap
-CroutonWeightSlot ──替换──> 运行时 pack（f16/Q4_0 权重槽的编译期重排）
+CroutonWeightSlot ──替换──> 运行时 pack（conv2d f16/Q4_0 权重槽的编译期重排）
 ```
 
 ## 状态转换

@@ -63,21 +63,22 @@ OP_MATMUL_*                   → 若权重已 pin，跳过 cpu_to_vtcm，直接
 - `wt_w3_report` 增加 restage 计数，可与编译期规划值对账（SC-003）。
 - **前提**: 依赖契约 B（pin_cap）决定常驻预算；D 的时序生产者 = 默认 greedy 路径新建（见 research R1）。
 
-## 契约 E — 权重 crouton 编译期打包
+## 契约 E — 权重 crouton 编译期打包（conv2d + Q4_0 剩余）
 
-**现状**: 执行器 `exec_matmul_f16_hmx`（`oplist_exec.c:1970-2020`）与 `exec_conv2d_hmx`（`:878-887`）在运行时对 fp16/Q4_0 权重做 crouton 重排（`hmx_crouton_pos`）。
+**现状**: **f16 matmul 已由 008 T012 收口**（emit `try_prepack`/`kFlagWgtPP` flags bit3，exec `w_pp` DMA 线性预取，主路径零标量散写 pack）。剩余运行时 crouton 重排（`hmx_crouton_pos`）在 `exec_conv2d_hmx`（`oplist_exec.c:888-895`，f16 conv）与 `exec_matmul_f16_hmx` Q4_0 Route A（`oplist_exec.c:2033+`，运行时反量化+pack）。
 
-**改动**: 编译期打包权重槽为 crouton 布局，执行器删运行时 pack：
+**改动**: 编译期打包剩余权重槽为 crouton 布局，执行器删运行时 pack：
 
 ```
-权重槽布局标签（新注解字段）: FP16_RAW | FP16_CROUTON | Q4_0_CROUTON
+权重槽布局标签（新注解字段）: FP16_RAW | FP16_CROUTON(conv2d) | Q4_0_CROUTON
 FP16_CROUTON  tile = 2048B（32×32 f16，hmx_crouton_pos 序）
 Q4_0_CROUTON  tile = 640B（量化态重排，不反量化）
+f16 matmul 复用 008 既有 kFlagWgtPP（flags bit3），不新增标签
 ```
 
-- **Q4_0 内存守恒**：pack 发生在量化态（640B/tile），禁止先反量化成 f16（否则 4× 膨胀）。
+- **Q4_0 内存守恒**：pack 发生在量化态（640B/tile），禁止先反量化成 f16（否则 4× 膨胀，破坏 4.3× 内存收益）。
 - emit 侧新增 `weight_layout_pack`（net-new，`compiler/tools/`）；复用 `hmx_crouton_pos` 作为单一真值源。
-- 执行器 `exec_matmul_f16_hmx` / `exec_conv2d_hmx` 删 pack 循环，改直接 mxmem 加载预打包槽；Q4_0 保留 LUT dequant、仅删 permutation。
+- 执行器 `exec_conv2d_hmx`（`:888-895`）删 f16 conv pack 循环、Q4_0 Route A（`:2033+`）删反量化+pack，改直接 mxmem 加载预打包槽；Q4_0 保留 LUT dequant、仅删 permutation。
 - **byte-exact**：编译期 pack 输出与运行期参考实现逐位一致（黄金对拍）。
 
 ## 回归契约
