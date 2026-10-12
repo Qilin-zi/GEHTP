@@ -614,7 +614,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                     if (rend <= rstart) rend = rstart + 1u;  /* 输出到循环外: 至少存活 1 位 */
                     em.pending_carves.push_back({(uint32_t)(em.ops.size() - 1),
                                                  (uint32_t)pos, rend,
-                                                 dit->second.first, dit->second.second});
+                                                 dit->second.first, dit->second.second,
+                                                 tit->second});
                 }
             }
         }
@@ -650,7 +651,27 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
      * because they have no emitted op.  Resolve graph-order lifetimes after all
      * FILL/SPILL insertion so residency_end uses actual emitted indices. */
     emit_boundary[order.size()] = (uint32_t)em.ops.size();
+    /* 008 T017 别名延展: Reshape 引用消除使折叠节点按 op_temp 别名到生产者
+     * 同一 temp (alias_temp 取 last_use 并集), 折叠节点随后又按同一 temp 登记
+     * → 同 temp 双窗重叠假别名(真图 0.8B 再发射实锤: op 3 [512,896) 双窗
+     * [3,4)/[3,5) 同缓冲)。按 temp id 归并: 同 temp 只登记一条, 窗口取最早
+     * op_index .. 最晚 end 的并集。异 temp 即使同 offset(真图不可能, 规划器
+     * 保证异活张量异区)也不归并, 交给下方不变式自校验硬报错 (T022 负例)。 */
+    std::map<uint32_t, Emitter::PendingCarve> by_temp;
     for (const auto& pc : em.pending_carves) {
+        auto it = by_temp.find(pc.temp_id);
+        if (it == by_temp.end()) {
+            by_temp[pc.temp_id] = pc;
+        } else {
+            Emitter::PendingCarve& m = it->second;
+            if (pc.op_index < m.op_index) m.op_index = pc.op_index;
+            if (pc.producer_pos < m.producer_pos) m.producer_pos = pc.producer_pos;
+            if (pc.lifetime_end_pos > m.lifetime_end_pos)
+                m.lifetime_end_pos = pc.lifetime_end_pos;
+        }
+    }
+    for (const auto& kv : by_temp) {
+        const Emitter::PendingCarve& pc = kv.second;
         uint32_t end = pc.lifetime_end_pos <= order.size()
                            ? emit_boundary[pc.lifetime_end_pos]
                            : (uint32_t)em.ops.size();
@@ -1044,9 +1065,11 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                         uint64_t b0 = c->vtcm_offset, b1 = b0 + c->size_bytes;
                         if (a0 < b1 && b0 < a1) {
                             std::fprintf(stderr,
-                                "error: carve alias: op %u [%llu,%llu) vs op %u [%llu,%llu)\n",
+                                "error: carve alias: op %u [%llu,%llu) life[%u,%u) vs op %u [%llu,%llu) life[%u,%u)\n",
                                 o->op_index, (unsigned long long)a0, (unsigned long long)a1,
-                                c->op_index, (unsigned long long)b0, (unsigned long long)b1);
+                                o->residency_start, o->residency_end,
+                                c->op_index, (unsigned long long)b0, (unsigned long long)b1,
+                                c->residency_start, c->residency_end);
                             return 3;
                         }
                     }

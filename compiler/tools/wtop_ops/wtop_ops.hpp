@@ -107,6 +107,7 @@ struct Emitter {
         uint32_t lifetime_end_pos;
         uint32_t vtcm_offset;
         uint32_t size_bytes;
+        uint32_t temp_id;       // 008 T017: 物化 temp id (折叠 Reshape 别名同一 temp)
     };
     std::vector<PendingCarve> pending_carves; // graph-order lifetimes, resolved after emit
     std::vector<CarveEntry> carve_entries; // v3 optional VTCM carve footer
