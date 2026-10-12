@@ -97,14 +97,25 @@ struct wt_op_ts {
     uint32_t engine;      /* WT_ENG_* 主计算引擎 */
     uint32_t planned_engine; /* WT_ENG_* 编译期指派 (v3 footer; ver<3 恒 scalar) */
     uint32_t deviation;   /* 0=按计划 1=允许回落 2=已中止 (见上) */
+    uint32_t stg_fb;      /* 008 T015: 本 op 搬运面回落次数 (bit3 权重 DMA
+                             失败 → 串行 cpu_to_vtcm; engine 不变, dev=1 由
+                             此腿支撑 — 偏差不变量三腿: dev==0 ⟺
+                             planned==actual ∧ stg_fb==0) */
 };
 void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap);
+/* 008 T020 (US4): op_ts 抽样 — 每 k 个 op 填一条 ts (k=0/1 = 全量逐条, 旧行为)。
+ * 非采样槽保持零 (runner 侧 memset 保证), 采样序 = 全局 op 序号 i % k == 0。
+ * 偏差不变量/裁决逻辑不受影响 (仍逐 op 裁决, 只省 ts 落盘字段填充)。 */
+void wt_exec_set_ts_sample(uint32_t k);
 
 /* optrace 逐 op 行开关。默认开(=旧行为, 存量 runner 零回归); 性能测量前
  * 显式 set_trace(0) 关 = 无落盘污染。只控 run_range 内 per-op pre/post
  * fprintf; run 级 rtrace 里程碑常开 (M4.2 崩溃取证命脉)。句柄铁律不动:
  * 仍只有 g_rtrace 一个 FILE*, 开关只控 fopen 与否, 绝不新建路径。 */
 void wt_exec_set_trace(int on);
+/* 008 T015: 测试故障注入 (构造 staging 失败): bit0 = 强制 bit3 权重 DMA
+ * 走串行回落 (cpu_to_vtcm), dev=1 + stg_fb 计数。生产恒 0。 */
+void wt_exec_set_fault(uint32_t mask);
 /* 005 US3b (T019): bias 默认走 HMX (SC-005 已过); 本钩子仅测试例 (46) 强制
  * 标量参照, 生产恒 0 */
 void wt_exec_force_bias_scalar(int on);

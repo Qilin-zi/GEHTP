@@ -1,0 +1,40 @@
+# T012 板跑验收 — f16 权重编译期 crouton 预打包 (bit3) + DMA 预取 (1010)
+
+设备 d0f1784 / lib libhvxhmx_008t12.so (signed md5 81f034d333dbb57f7541416d570483cb,
+未签名 ecccb3236b97287a38fb9fd39c3d764f; worktree 全量 = 007 广播 HVX + T012 运行时)
+runner gehtp_runner_008t12.so (-l: 私有名, DT_NEEDED 已验)
+blob .scratch_008/qwen35_08b_008t12.wtop: md5 646ee1242e7d3b661922bbacd28be5d8,
+2041273344B, slots=2124 ops=14188; 发射 [pp] 预打包 182 槽 / GC 剥除 151 未引用源槽
+(v4 tagged + 3 输入 + --dma-runlist)
+
+## 四门 (T015 口径预演)
+1. 位级 md5: output_008t12.f16.raw == f87461e2a5089c48413e70463f4aa7dc (v4 锚) PASS
+   —— 打包公式镜像 + DMA 预取 + 槽 GC 压实 + len=0 哨兵解析 全链位级等价
+2. dma_us>0: Σdma_us=22.53ms Σdma=1.4GB 有效带宽 66.7GB/s PASS (gehtp_prof.py)
+3. 偏差不变量: 按计划 14083 | 允许回落 105 | 已中止 0, 不变量 PASS
+   (105 全为 Eltwise_Unary HVX→scalar 合法回落, 锚上同款; matmul 族零回落零中止)
+4. HMX 族占比: MATMUL_F16 325 op = 2.43s = 18.1% wall ≤ 50% 门 PASS
+   —— pack_wgt 标量散写 (探针 66.4% wall / 39.85ms/op) 已消失
+
+## 性能
+exec wall 24.24s (007 锚) → 13.38s, −44.8% (1.81×); 全程 wall 17.04s (含 2GB 读 3.0s)
+sum_op_us=13363788, ops/s=1060
+新前沿 (US3 靶): STRIDED_SLICE 25.0% | UNARY 22.1% | MATMUL 18.1% | TRANSPOSE_GEN 9.5%
+              | BINARY 8.1% | GATHER 4.9%
+GEMM 侧残留: MATMUL avg 7.47ms/op (v1 阻塞 dc_dma_once ~700µs/op 固定开销未消化 → T013 链式)
+
+## 过程翻车记录 (机制教训, 勿重蹈)
+1. GC 引用扫描只嗅 0x8000 位 → 裸槽 id 引用 (rmsnorm2 gamma/bias, conv w/b,
+   W4A16 w, conv1d_ssm w, SPILL/FILL 池) 全部漏标 → 活槽剥成 len=0 哨兵 →
+   板跑 rc=38 "rmsnorm2 shape n32768 rw0" (首发即撞)。
+2. 反向过度修正: 槽位上裸值一律当槽 → 裸 temp id (act/src, 数万处) 撞槽 id →
+   近全量双存, blob 2.04→2.89GB → 设备 read_file malloc 失败 "[FAIL] read blob/input"
+   (CDSP 堆上限介于 2.04-2.89GB)。
+   终态: 裸形态仅六发射位点白名单 (RMSNORM2{1,2} CONV2D{1,2} W4A16{1}
+   CONV1D_SSM{1} FILL{0} SPILL{1}), 其余槽位只认 0x8000 位 — 与发射器写形态
+   一一核实 (op_rmsnorm/op_conv2d/op_matmul/op_dwconv/wtop_emit spill 段)。
+3. 设备 lib 门指纹必须用 signed 副本 md5 (未签名与 signed 不同指纹)。
+
+## 回归
+ctest 48/48 全绿 (含 §12 新增: 裸引用 gamma 槽存活 GC 回归 + rmsnorm 图 FC bit3);
+惰性门: 无 --dma-runlist 发射位级不变 (v4 md5 9f358639, 1009 验)。

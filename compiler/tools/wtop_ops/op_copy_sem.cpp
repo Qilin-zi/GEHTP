@@ -44,6 +44,20 @@ static int op_copy_sem(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<
     return 0;
 }
 
+/* 008 US3 T017: Reshape 引用消除 —— Reshape 恒为同字节形状重解释(不改字节
+ * 序), 产出别名到输入 temp 即可, 无需 OP_UNARY_F16 COPY(2684 op/2.59s 归零)。
+ * 仅当源是真 temp(非 slot/输入/权重 const)时别名; 源是 slot 时回落拷贝。 */
+static int op_reshape(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint64_t, uint32_t>& wslots, const std::string&, const WtopEmitShared&) {
+    const InputConn& c = od->inputs[0];
+    uint32_t x_t = em.src_ref(c, gp.get_input_node_id(), gp, wslots);
+    if (em.alias_temp(od->op_id, 0, x_t, Emitter::tkey(c.src_id, c.out_idx)))
+        return 0;
+    /* 源是 slot/输入 → 保留 COPY (罕见, 忽略不计) */
+    uint32_t out_t = em.fresh_temp(gp, od->op_id);
+    em.add_op(OP_UNARY_F16, {x_t, out_t, (uint32_t)elems_of(od), 14});
+    return 0;
+}
+
 /* Pad 真物化 (M4.5): 恒等拷贝在 temp 复用下把 pad 区留成垃圾
  * (0.8B GDN op43: pad 区被 CumSum 累加 → 门控全链毒化, logits cos 0.15)。
  * 支持形态: 单维增长 + 常量填充 (0.8B 全部 Pad: pad_amount 每维 [before,after]
@@ -128,7 +142,7 @@ static int op_pad(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<uint6
 } // namespace
 
 static const wtop::OpRegistrar g_reg_op_copy_sem{
-    {"Reshape", op_copy_sem},
+    {"Reshape", op_reshape},
     {"Pad", op_pad},
     /* A3②: ScatterNd 已迁出 (op_scatter_nd.cpp 真语义发射, L0 cos 0.102 死刑判决) */
     {"Cast", op_copy_sem},

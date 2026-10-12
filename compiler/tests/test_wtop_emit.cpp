@@ -973,6 +973,338 @@ int main() {
         }
     }
 
+    /* 10. 008 US1 T008: 三方全局预算门(--vtcm-budget) + --residency-report。
+     *   (a) 纯 arena 负例: f16 matmul need≈0.3MB, --vtcm-budget 65536 → 硬错;
+     *       缺省预算(16MB)同图 exit 0 (正控制)。
+     *   (b) pool+arena 负例: w4 预置图 --vtcm-budget 4096 → 硬错, 错误文本
+     *       含 resident_pool/数值 (C1: 硬报错含三项数值)。
+     *   (c) 报告 round-trip: pool_reserve_rounded 与 TEMPOFF 槽 reserve
+     *       高 16 位(KB)一致; coverage ∈ [0,1] (TEMPOFF 唯一真相源)。
+     *   (d) 旗标缺省恒等: 无旗标 vs --vtcm-budget 16777216 产物逐字节同
+     *       (惰性门的 flag-at-default 面; v4 全量 md5 门在 evidence 流程)。 */
+    {
+        const uint32_t M = 32, K = 512, N = 256;
+        auto emit_mm = [&](const std::string& extra, const std::string& outs) -> int {
+            GraphPrepare g;
+            build_matmul(g, M, K, N);
+            if (g.prepare(env) != GraphStatus::Success) return -1;
+            std::vector<uint8_t> b2(1u << 24, 0);
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) return -1;
+            const std::string bp = dir + "gatemm.bin";
+            const std::string ip = dir + "gatemm.f16.raw";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint8_t> in16((size_t)M * K * 2, 0);
+            write_file(ip, in16.data(), in16.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + outs;
+            if (!extra.empty()) c2 += " " + extra;
+            c2 += " 2>" + dir + "gatemm.err";
+            return std::system(c2.c_str());
+        };
+        CHECK(emit_mm("", dir + "gatemm_ok.wtop") == 0,
+              "T008a: 缺省预算 f16 matmul emit exit 0");
+        CHECK(emit_mm("--vtcm-budget 65536", dir + "gatemm_bad.wtop") != 0,
+              "T008a: --vtcm-budget 65536 < arena → emit 硬错误退出");
+        std::vector<uint8_t> err;
+        load_file(dir + "gatemm.err", err);
+        err.push_back(0);
+        CHECK(std::strstr((const char*)err.data(), "hmx_arena") != nullptr &&
+              std::strstr((const char*)err.data(), "resident_pool") != nullptr,
+              "T008a: 错误文本含 resident_pool/hmx_arena 数值");
+
+        const uint32_t WM = 32, WK = 64, WN = 32;
+        auto emit_w4b = [&](const std::string& extra) -> int {
+            GraphPrepare g;
+            build_matmul_w4(g, WM, WK, WN);
+            g.set_plan_budgets(64u << 20, 1u << 20);
+            HexagonNNEnv env2;
+            env2.set_soc_type(75);
+            env2.set_num_nsps(1);
+            if (g.prepare(env2) != GraphStatus::Success) return -1;
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) return -1;
+            const std::string bp = dir + "gatew4.bin";
+            const std::string ip = dir + "gatew4.f16.raw";
+            const std::string op2 = dir + "gatew4.wtop";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint16_t> in16((size_t)WM * WK, 0x3C00);
+            write_file(ip, in16.data(), in16.size() * 2);
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 + " --dma-runlist";
+            if (!extra.empty()) c2 += " " + extra;
+            c2 += " 2>" + dir + "gatew4.err";
+            return std::system(c2.c_str());
+        };
+        CHECK(emit_w4b("") == 0, "T008b: 缺省预算 w4 预置图 emit exit 0");
+        CHECK(emit_w4b("--vtcm-budget 4096") != 0,
+              "T008b: --vtcm-budget 4096 < pool+arena → emit 硬错误退出");
+        err.clear();
+        load_file(dir + "gatew4.err", err);
+        err.push_back(0);
+        CHECK(std::strstr((const char*)err.data(), "resident_pool") != nullptr,
+              "T008b: 错误文本含 resident_pool 数值");
+
+        CHECK(emit_w4b("--residency-report " + dir + "gatew4.report") == 0,
+              "T008c: --residency-report emit exit 0");
+        std::vector<uint8_t> rpt;
+        CHECK(load_file(dir + "gatew4.report", rpt), "T008c: 报告落盘存在");
+        rpt.push_back(0);
+        const char* rp = (const char*)rpt.data();
+        unsigned long long pool_rr = 0;
+        double cov = -1.0;
+        std::sscanf(std::strstr(rp, "pool_reserve_rounded"), "pool_reserve_rounded %llu", &pool_rr);
+        std::sscanf(std::strstr(rp, "coverage"), "coverage %lf", &cov);
+        CHECK(cov >= 0.0 && cov <= 1.0, "T008c: coverage ∈ [0,1]");
+        std::vector<uint8_t> blr;
+        wt_blob* wr = new wt_blob{};
+        CHECK(load_file(dir + "gatew4.wtop", blr) &&
+              wt_parse(blr.data(), blr.size(), wr) == WT_OK, "T008c: wt_parse OK");
+        uint32_t temppool_kb = 0xFFFFFFFFu;
+        for (uint32_t s = 0; s < wr->n_slots; s++)
+            if (wr->slots[s].addr == WT_SLOT_TEMPOFF) {
+                uint32_t reserve;
+                std::memcpy(&reserve, wr->weight_base + wr->slots[s].offset + 4, 4);
+                temppool_kb = reserve >> 16;
+                break;
+            }
+        CHECK(temppool_kb != 0xFFFFFFFFu && pool_rr == (unsigned long long)temppool_kb * 1024ull,
+              "T008c: pool_reserve_rounded == TEMPOFF reserve 高16位(KB) — 唯一真相源");
+        delete wr;
+
+        CHECK(emit_mm("", dir + "gate_lazy1.wtop") == 0 &&
+              emit_mm("--vtcm-budget 16777216", dir + "gate_lazy2.wtop") == 0,
+              "T008d: 两次 emit exit 0");
+        std::vector<uint8_t> l1, l2;
+        CHECK(load_file(dir + "gate_lazy1.wtop", l1) && load_file(dir + "gate_lazy2.wtop", l2) &&
+              l1 == l2,
+              "T008d: --vtcm-budget 取缺省值(16777216) 与无旗标产物逐字节同");
+    }
+
+    /* 12. 008 T012: f16 权重编译期 crouton 预打包 (--dma-runlist)。
+     * 探针定谳 pack_wgt 标量散写 = 66.4% wall → 权重按 exec pack 公式编译期
+     * 打包进新槽, flags 置 bit3 (wgt_prepacked); 源行主槽无引用者 GC 置
+     * len=0 哨兵 (槽 id 稳定)。判据:
+     *   ① 惰性: 无旗标 → OP_MATMUL_F16 flags=2 (t1) 原样;
+     *   ② 有旗标 → flags=2|8, w 指向打包槽, 字节 == 独立重算置换
+     *     (t1: src=(n0+c*32+n)*K+(kt*32+k), tile[hmx_crouton_pos(k,n)]);
+     *   ③ GC: 源槽 len=0, n_slots +1, blob 尺寸差 = 24B (权重区不双存);
+     *   ④ SPLIT 大 N: 逐 chunk 独立打包槽 (n0 异 → 槽异), 首 chunk 对拍。 */
+    {
+        const uint32_t M = 32, K = 64, N = 32;
+        auto emit_pp = [&](bool runlist, const char* tag) -> int {
+            GraphPrepare g;
+            build_matmul(g, M, K, N);
+            if (g.prepare(env) != GraphStatus::Success) return -1;
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2_size = 0;
+            if (!g.serialize(b2.data(), b2.size(), b2_size) || b2_size == 0) return -1;
+            const std::string bp = dir + std::string(tag) + ".bin";
+            const std::string ip = dir + std::string(tag) + ".f16.raw";
+            const std::string op2 = dir + std::string(tag) + ".wtop";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint8_t> in16((size_t)M * K * 2, 0);
+            write_file(ip, in16.data(), in16.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2;
+            if (runlist) c2 += " --dma-runlist";
+            c2 += " 2>/dev/null";
+            return std::system(c2.c_str());
+        };
+        /* 期望 crouton 置换 (t1=1, FC [N,K] 行主): W 值 = r_f32_to_f16((i%37)-18) */
+        auto expected_pack = [&](uint32_t n0, uint32_t nc, uint32_t Kf,
+                                 std::vector<uint16_t>& out) {
+            out.assign((size_t)nc * Kf, 0);
+            uint32_t n_col = nc / 32, n_dot = Kf / 32;
+            for (uint32_t c = 0; c < n_col; c++)
+                for (uint32_t kt = 0; kt < n_dot; kt++) {
+                    uint16_t* tile = out.data() + ((size_t)c * n_dot + kt) * 1024;
+                    for (uint32_t k = 0; k < 32; k++)
+                        for (uint32_t n = 0; n < 32; n++) {
+                            size_t src = (size_t)(n0 + c * 32 + n) * Kf + (kt * 32 + k);
+                            tile[(k / 2) * 64 + 2 * n + (k & 1)] =
+                                r_f32_to_f16((float)((int)(src % 37) - 18));
+                        }
+                }
+        };
+        CHECK(emit_pp(false, "ppA") == 0, "T012: 无旗标 emit exit 0");
+        CHECK(emit_pp(true, "ppB") == 0, "T012: --dma-runlist emit exit 0");
+        std::vector<uint8_t> ba, bb;
+        wt_blob* wa = new wt_blob{};
+        wt_blob* wb = new wt_blob{};
+        CHECK(load_file(dir + "ppA.wtop", ba) && load_file(dir + "ppB.wtop", bb) &&
+              wt_parse(ba.data(), ba.size(), wa) == WT_OK &&
+              wt_parse(bb.data(), bb.size(), wb) == WT_OK, "T012: 双 blob wt_parse OK");
+        if (wa->n_ops == 1 && wb->n_ops == 1 &&
+            wa->ops[0].opcode == OP_MATMUL_F16 && wb->ops[0].opcode == OP_MATMUL_F16) {
+            CHECK(wa->ops[0].n_args == 7 && (wa->ops[0].args[6] & ~1u) == 2u &&
+                  !(wa->ops[0].args[6] & 8u),
+                  "T012: 惰性门 — 无旗标 flags=2 (t1) 无 bit3");
+            CHECK((wb->ops[0].args[6] & 0xBu) == 0xAu,
+                  "T012: 有旗标 flags = 2|8 (t1 + wgt_prepacked)");
+            /* A: matmul w 引用 = 行主 W 槽 (M*K*2 == K*N*2 时与输入槽同尺寸,
+             * 不能按 len 扫, 直接取 op arg) */
+            uint32_t wA = wa->ops[0].args[1] & 0x7FFFu;
+            CHECK((wa->ops[0].args[1] & 0x8000u) && wA < wa->n_slots && wA != 0u &&
+                  wa->slots[wA].len == K * N * 2u,
+                  "T012: A matmul w → 行主 W 槽 (len=K*N*2)");
+            bool rowmajor_ok = false;
+            if (wA < wa->n_slots && wA != 0u) {
+                const uint16_t* wp = (const uint16_t*)(wa->weight_base + wa->slots[wA].offset);
+                rowmajor_ok = true;
+                for (uint32_t i = 0; i < K * N; i++)
+                    if (wp[i] != r_f32_to_f16((float)((int)(i % 37) - 18))) { rowmajor_ok = false; break; }
+            }
+            CHECK(rowmajor_ok, "T012: A 行主 W 字节期望值");
+            /* B: 源槽 (同 id) len=0 哨兵; 打包槽字节 == crouton 置换 */
+            CHECK(wA < wb->n_slots && wb->slots[wA].len == 0u,
+                  "T012: GC — 源行主槽置 len=0 哨兵");
+            CHECK(wb->n_slots == wa->n_slots + 1u &&
+                  (bb.size() - wb->weight_off) == (ba.size() - wa->weight_off),
+                  "T012: GC — n_slots +1 且权重区字节量与无旗标同 (不双存)");
+            uint32_t wB = wb->ops[0].args[1] & 0x7FFFu;
+            CHECK((wb->ops[0].args[1] & 0x8000u) && wB < wb->n_slots &&
+                  wb->slots[wB].len == K * N * 2u && wB != wA,
+                  "T012: B matmul w → 新打包槽");
+            bool pack_ok = false;
+            std::vector<uint16_t> exp;
+            if (wB < wb->n_slots) {
+                expected_pack(0u, N, K, exp);
+                pack_ok = std::memcmp(wb->weight_base + wb->slots[wB].offset,
+                                      exp.data(), exp.size() * 2) == 0;
+            }
+            CHECK(pack_ok, "T012: 打包槽字节 == crouton 置换 (t1 逐字节)");
+        } else {
+            CHECK(false, "T012: 双 blob 均单 op OP_MATMUL_F16");
+        }
+        delete wa;
+        delete wb;
+
+        /* SPLIT 大 N: 逐 chunk 独立打包 (n0 异 → 槽异), 首 chunk 字节对拍 */
+        {
+            const uint32_t SM = 32, SK = 1024, SN = 8192;
+            GraphPrepare g;
+            build_matmul(g, SM, SK, SN);
+            if (g.prepare(env) == GraphStatus::Success) {
+                std::vector<uint8_t> b2(1u << 27, 0);
+                size_t b2_size = 0;
+                if (g.serialize(b2.data(), b2.size(), b2_size) && b2_size) {
+                    const std::string bp = dir + "ppS.bin";
+                    const std::string ip = dir + "ppS.f16.raw";
+                    const std::string op2 = dir + "ppS.wtop";
+                    write_file(bp, b2.data(), b2_size);
+                    std::vector<uint8_t> in16((size_t)SM * SK * 2, 0);
+                    write_file(ip, in16.data(), in16.size());
+                    std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                                     " --input-f16 " + ip + " --out " + op2 +
+                                     " --dma-runlist 2>/dev/null";
+                    CHECK(std::system(c2.c_str()) == 0, "T012: SPLIT + --dma-runlist emit exit 0");
+                    std::vector<uint8_t> bs;
+                    wt_blob* ws = new wt_blob{};
+                    CHECK(load_file(op2, bs) && wt_parse(bs.data(), bs.size(), ws) == WT_OK &&
+                          ws->n_ops >= 2, "T012: SPLIT blob wt_parse OK (≥2 chunk)");
+                    if (ws->n_ops >= 2 && ws->ops[0].opcode == OP_MATMUL_F16_SPLIT) {
+                        bool all_pp = true, distinct_slots = true;
+                        std::vector<uint32_t> refs;
+                        for (uint32_t i = 0; i < ws->n_ops; i++) {
+                            if (!(ws->ops[i].args[8] & 8u)) all_pp = false;
+                            refs.push_back(ws->ops[i].args[1]);
+                        }
+                        std::sort(refs.begin(), refs.end());
+                        for (size_t i = 1; i < refs.size(); i++)
+                            if (refs[i] == refs[i - 1]) distinct_slots = false;
+                        CHECK(all_pp, "T012: SPLIT 全 chunk flags bit3");
+                        CHECK(distinct_slots, "T012: SPLIT 逐 chunk 独立打包槽 (n0 异 → 槽异)");
+                        const wt_op& c0 = ws->ops[0];
+                        uint32_t wS = c0.args[1] & 0x7FFFu;
+                        std::vector<uint16_t> expS;
+                        expected_pack(c0.args[6], c0.args[7], SK, expS);
+                        CHECK((c0.args[1] & 0x8000u) && wS < ws->n_slots &&
+                              ws->slots[wS].len == c0.args[7] * SK * 2u &&
+                              std::memcmp(ws->weight_base + ws->slots[wS].offset,
+                                          expS.data(), expS.size() * 2) == 0,
+                              "T012: SPLIT 首 chunk 打包字节 == crouton 置换 (n0/nc 口径)");
+                    }
+                    delete ws;
+                }
+            }
+        }
+
+        /* 回归: 裸 slot 引用槽存活 GC。RmsNorm gamma/bias 裸 id 引用(无
+         * 0x8000 位) — 板跑 rc=38 "rmsnorm2 rw0" 实锤: 只嗅 bit15 的扫描把
+         * gamma 槽剥成 len=0 哨兵。图 = FC(预打包在场, GC 启动) → RmsNorm。 */
+        {
+            const uint32_t M = 32, K = 64, N = 32;
+            GraphPrepare g;
+            auto mk2 = [](uint64_t d0, uint64_t d1, uint32_t es, uint32_t dt) {
+                OutputDef od{};
+                od.rank = 2; od.dims[0] = d0; od.dims[1] = d1;
+                od.element_size = es; od.dtype = dt;
+                return od;
+            };
+            OutputDef w_od = mk2(N, K, 4, static_cast<uint32_t>(DType::Float32));
+            std::vector<uint8_t> W(N * K * 4, 0);
+            for (size_t i = 0; i < (size_t)N * K; i++) {
+                float v = (float)((int)(i % 37) - 18);
+                std::memcpy(W.data() + i * 4, &v, 4);
+            }
+            g.append_const_node(1, w_od, W.data(), W.size());
+            g.get_op_at(1)->name_tag = string_tag_t::map_str("W");
+            OutputDef in_od = mk2(M, K, 2, static_cast<uint32_t>(DType::Float16));
+            g.append_node("Input", 10, nullptr, 0, &in_od, 1, nullptr);
+            InputDef mm_in[2] = {{10, 0}, {1, 0}};
+            OutputDef mm_od = mk2(M, N, 2, static_cast<uint32_t>(DType::Float16));
+            g.append_node("FullyConnected", 20, mm_in, 2, &mm_od, 1, nullptr);
+            OutputDef gm_od = mk2(1, N, 4, static_cast<uint32_t>(DType::Float32));
+            std::vector<float> G(N, 0.5f);
+            g.append_const_node(21, gm_od, reinterpret_cast<const uint8_t*>(G.data()), G.size() * 4);
+            g.get_op_at(21)->name_tag = string_tag_t::map_str("gamma");
+            InputDef rn_in[2] = {{20, 0}, {21, 0}};
+            OutputDef rn_od = mk2(M, N, 2, static_cast<uint32_t>(DType::Float16));
+            g.append_node("RmsNorm", 22, rn_in, 2, &rn_od, 1, nullptr);
+            InputDef oin[1] = {{22, 0}};
+            g.append_node("Output", 40, oin, 1, nullptr, 0, nullptr);
+            CHECK(g.prepare(env) == GraphStatus::Success, "T012: rmsnorm 图 prepare");
+            std::vector<uint8_t> b2(1u << 20, 0);
+            size_t b2_size = 0;
+            CHECK(g.serialize(b2.data(), b2.size(), b2_size) && b2_size > 0, "T012: rmsnorm 图 serialize");
+            const std::string bp = dir + "ppRN.bin";
+            const std::string ip = dir + "ppRN.f16.raw";
+            const std::string op2 = dir + "ppRN.wtop";
+            write_file(bp, b2.data(), b2_size);
+            std::vector<uint8_t> in16((size_t)M * K * 2, 0);
+            write_file(ip, in16.data(), in16.size());
+            std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                             " --input-f16 " + ip + " --out " + op2 +
+                             " --dma-runlist 2>/dev/null";
+            CHECK(std::system(c2.c_str()) == 0, "T012: rmsnorm 图 --dma-runlist emit exit 0");
+            std::vector<uint8_t> br;
+            wt_blob* wr = new wt_blob{};
+            CHECK(load_file(op2, br) && wt_parse(br.data(), br.size(), wr) == WT_OK &&
+                  wr->n_ops == 2 && wr->ops[0].opcode == OP_MATMUL_F16 &&
+                  wr->ops[1].opcode == OP_RMSNORM2_F16,
+                  "T012: rmsnorm 图 ops = [MATMUL, RMSNORM2]");
+            if (wr->n_ops == 2 && wr->ops[1].opcode == OP_RMSNORM2_F16) {
+                CHECK(wr->ops[0].args[6] & 8u,
+                      "T012: rmsnorm 图 FC bit3 预打包在场 (GC 确在跑)");
+                uint32_t gs = wr->ops[1].args[1] & 0x7FFFu;   /* 裸 id 引用 */
+                CHECK(gs < wr->n_slots && !(wr->ops[1].args[1] & 0x8000u) &&
+                          wr->slots[gs].len == N * 2u && wr->slots[gs].count == N,
+                      "T012: 裸引用 gamma 槽存活 GC (len=N*2, 非 len=0 哨兵)");
+                bool gok = false;
+                if (gs < wr->n_slots && wr->slots[gs].len == N * 2u) {
+                    const uint16_t* gv = (const uint16_t*)(wr->weight_base + wr->slots[gs].offset);
+                    gok = true;
+                    for (uint32_t i = 0; i < N; i++)
+                        if (gv[i] != r_f32_to_f16(0.5f)) { gok = false; break; }
+                }
+                CHECK(gok, "T012: gamma 槽字节压实后完好 (0.5f → f16)");
+            }
+            delete wr;
+        }
+    }
+
     /* 11. 007 US1: 注入的 OP_BROADCAST_F16 子 op 引擎按形态分派契约。
      * 孪生判定 = wtop_ops.hpp broadcast_shape_class (emit 侧, 本测试直连) =
      * kernels oplist_exec.c broadcast_shape_class (设备侧, 板上 T010 验)。

@@ -1,0 +1,11 @@
+# BudgetReport (008 US1) blob=.scratch_008/qwen35_08b_008p1.wtop
+vtcm_budget 16777216
+resident_pool 4194304
+pool_reserve_rounded 4194304
+hmx_arena_max 12570624
+carve_peak 3082496
+staging_sum 0
+slack 12288
+coverage 0.840077
+n_temps 1675 n_resident 1674 n_spill 0
+uncovered_hmx_opcodes

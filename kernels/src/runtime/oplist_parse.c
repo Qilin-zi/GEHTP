@@ -117,7 +117,13 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
             out->slots[i].offset = wt_rd_u32(s + 8);
             out->slots[i].addr = wt_rd_u32(s + 12);
         }
-        if (out->slots[i].len == 0) return WT_ERR_WEIGHT_OVERRUN;
+        /* 008 T012: len=0 = 显式空哨兵槽 (权重预打包 GC 剥除的源行主槽,
+         * 槽 id 稳定不重排 — op args 零重写); 仅认 offset==0 && count==0
+         * 规范形, 其余 len=0 仍按损坏表拒绝。 */
+        if (out->slots[i].len == 0) {
+            if (out->slots[i].offset != 0 || out->slots[i].count != 0)
+                return WT_ERR_WEIGHT_OVERRUN;
+        }
         if (out->slots[i].offset % WT_WEIGHT_ALIGN != 0) return WT_ERR_ALIGN;
         /* v1 的 4GB 上限检查仅对 v1; v2 真实界由下方 end > weight_bytes 覆盖 */
         if (out->ver < WT_BLOB_VER_2 &&

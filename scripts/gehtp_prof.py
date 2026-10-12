@@ -52,7 +52,8 @@ ENGINE_NAMES = {0: "scalar", 1: "HVX", 2: "HMX"}
 class OpRec:
     __slots__ = ("idx", "opcode", "args", "name", "in_b", "w_b", "out_b",
                  "pool_b", "flops", "vtcm", "note", "start_us", "dur_us",
-                 "dma_us", "dma_bytes", "engine", "planned_engine", "deviation")
+                 "dma_us", "dma_bytes", "engine", "planned_engine", "deviation",
+                 "stg_fb")
 
     def __init__(self, idx, opcode, args):
         self.idx = idx
@@ -68,6 +69,7 @@ class OpRec:
         self.engine = 0
         self.planned_engine = 0
         self.deviation = 0
+        self.stg_fb = 0
 
     @property
     def total_b(self):
@@ -125,29 +127,34 @@ def parse_wtop(path):
 def parse_op_ts(path):
     """op_ts.bin (WTS1): magic|ver|n_ops|pad|wall_us u64|n×记录。
     ver=1: 每 op 8B {start,dur}; ver=2: 20B 加 dma_us/dma_bytes/engine;
-    ver=3: 28B 再加 planned_engine/deviation (003 T019 US3 报告契约)。
-    统一返回 7 元组 (start,dur,dma_us,dma_bytes,engine,planned,deviation),
-    低版本缺项补 0 (ver<3 planned=engine 口径: 无计划语义, 偏差恒 0)。"""
+    ver=3: 28B 再加 planned_engine/deviation (003 T019 US3 报告契约);
+    ver=4: 32B 再加 stg_fb (008 T015 搬运面回落次数)。
+    统一返回 8 元组 (start,dur,dma_us,dma_bytes,engine,planned,deviation,
+    stg_fb), 低版本缺项补 0 (ver<3 planned=engine 口径: 无计划语义, 偏差恒 0)。"""
     data = open(path, "rb").read()
     if data[:4] != b"WTS1":
         raise SystemExit(f"bad op_ts magic: {path}")
     ver, n_ops = struct.unpack_from("<II", data, 4)
-    if ver not in (1, 2, 3):
+    if ver not in (1, 2, 3, 4):
         raise SystemExit(f"unsupported op_ts ver {ver}")
+    (sample,) = struct.unpack_from("<I", data, 12)   # 008 T020: pad 承载抽样间隔 K (0=全量)
     (wall_us,) = struct.unpack_from("<Q", data, 16)
     ts = []
     off = 24
     for _ in range(n_ops):
         if ver == 1:
             s, d = struct.unpack_from("<II", data, off); off += 8
-            ts.append((s, d, 0, 0, 0, 0, 0))
+            ts.append((s, d, 0, 0, 0, 0, 0, 0))
         elif ver == 2:
             s, d, dus, db, eng = struct.unpack_from("<IIIII", data, off); off += 20
-            ts.append((s, d, dus, db, eng, 0, 0))
-        else:
+            ts.append((s, d, dus, db, eng, 0, 0, 0))
+        elif ver == 3:
             s, d, dus, db, eng, pl, dv = struct.unpack_from("<IIIIIII", data, off); off += 28
-            ts.append((s, d, dus, db, eng, pl, dv))
-    return wall_us, ts
+            ts.append((s, d, dus, db, eng, pl, dv, 0))
+        else:
+            s, d, dus, db, eng, pl, dv, fb = struct.unpack_from("<IIIIIIII", data, off); off += 32
+            ts.append((s, d, dus, db, eng, pl, dv, fb))
+    return wall_us, ts, sample
 
 
 def parse_optrace(path):
@@ -161,7 +168,7 @@ def parse_optrace(path):
                 continue
             try:
                 us = int(line.rsplit(" us=", 1)[1])
-                ts.append((None, us if us >= 0 else None, 0, 0, 0, 0, 0))
+                ts.append((None, us if us >= 0 else None, 0, 0, 0, 0, 0, 0))
             except ValueError:
                 continue
     return None, ts
@@ -352,10 +359,15 @@ def main():
     # ---- join 时间
     wall_us = None
     ts = None
+    sample = 0
     if args.op_ts:
-        wall_us, ts = parse_op_ts(args.op_ts)
+        wall_us, ts, sample = parse_op_ts(args.op_ts)
     elif args.optrace:
         wall_us, ts = parse_optrace(args.optrace)
+    if sample:
+        print(f"warn: op_ts 抽样口径 K={sample} — 仅 op 序号 %K==0 有有效记录, "
+              f"非采样槽恒零 (族耗时按全量 op 数归一, 勿作逐 op 对拍)",
+              file=sys.stderr)
     if ts:
         if len(ts) != len(ops):
             msg = (f"ts n={len(ts)} != blob n_ops={len(ops)} — op_ts.bin 陈腐"
@@ -364,10 +376,11 @@ def main():
                 raise SystemExit(f"strict: {msg}  (跑前 gehtp run 已清设备侧 op_ts.bin; "
                                  f"若仍不齐 = 该 blob 未在本轮重跑)")
             print(f"warn: {msg}", file=sys.stderr)
-        for rec, (s, d, dus, db, eng, pl, dv) in zip(ops, ts):
+        for rec, (s, d, dus, db, eng, pl, dv, fb) in zip(ops, ts):
             rec.start_us, rec.dur_us = s, d
             rec.dma_us, rec.dma_bytes, rec.engine = dus, db, eng
             rec.planned_engine, rec.deviation = pl, dv
+            rec.stg_fb = fb
 
     # ---- [run] 分段 (可选)
     if args.device_txt:
@@ -410,7 +423,8 @@ def main():
     if t_dma > 0:
         print(f"DMA 搬运实测: Σdma_us={t_dma / 1e3:.2f}ms Σdma={fmt_b(b_dma)} "
               f"有效带宽={b_dma / (t_dma * 1e-6) / 1e9:.1f}GB/s "
-              f"({b_dma / (t_dma * 1e-6) / args.peak_bw * 100:.0f}%峰值)")
+              f"({b_dma / (t_dma * 1e-6) / args.peak_bw * 100:.0f}%峰值) "
+              f"占wall={t_dma / denom * 100:.2f}% (T013 双缓冲可隐藏上界)")
     else:
         print("DMA 搬运实测: Σdma_us=0 (本 blob 无 W4A16 matmul 的 UserDMA 搬运)")
     print()
@@ -422,12 +436,16 @@ def main():
         n0 = sum(1 for r in have_ts if r.deviation == 0)
         n1 = sum(1 for r in have_ts if r.deviation == 1)
         n2 = sum(1 for r in have_ts if r.deviation == 2)
+        nstg = sum(1 for r in have_ts if r.stg_fb)
         print(f"== 偏差报告 (planned vs actual) ==")
-        print(f"按计划 {n0} | 允许回落 {n1} | 已中止 {n2}")
-        # 契约不变量 (T020): dev==0 ⟺ planned==actual; dev==1 ⟹ actual==fallback
-        # (emit 恒 fb=scalar); dev==2 ⟹ run 在该 op 中止
+        print(f"按计划 {n0} | 允许回落 {n1} | 已中止 {n2}"
+              + (f" | 搬运面回落 {nstg}" if nstg else ""))
+        # 契约不变量 (T020; 008 T015 扩三腿): dev==0 ⟺ planned==actual ∧
+        # stg_fb==0; dev==1 ⟹ 引擎回落 (actual==fallback) 或搬运面回落
+        # (stg_fb>0, engine 不变); dev==2 ⟹ run 在该 op 中止
         bad = [r for r in have_ts
-               if (r.deviation == 0) != (r.planned_engine == r.engine)]
+               if (r.deviation == 0) !=
+               (r.planned_engine == r.engine and not r.stg_fb)]
         print(f"不变量: {'PASS' if not bad else 'FAIL (%d 违例)' % len(bad)}")
         pairs = {}
         for r in have_ts:
@@ -469,12 +487,14 @@ def main():
     print()
 
     # ---- per-opcode 聚合
+    # 008 T014: dma/compute 重叠率 = Σdma_us ÷ Σdur_us — 该族双缓冲流水
+    # (T013) 的可隐藏时间上界; 阻塞 dc_dma_once 计时含固定开销, 是保守上界。
     print("== per-opcode 聚合 ==")
     print(f"{'opcode':<18} {'n':>5} {'total_us':>10} {'%wall':>6} {'avg_us':>9} "
-          f"{'max_us':>9} {'tot_bytes':>12}")
+          f"{'max_us':>9} {'tot_bytes':>12} {'Σdma_us':>9} {'dma/cpt':>7}")
     agg = {}
     for r in ops:
-        a = agg.setdefault(r.opcode, [0, 0, 0, 0])
+        a = agg.setdefault(r.opcode, [0, 0, 0, 0, 0])
         a[0] += 1
         if r.dur_us is not None:
             a[1] += r.dur_us
@@ -482,10 +502,14 @@ def main():
         tb = r.total_b
         if tb:
             a[3] += tb
+        if r.dma_us:
+            a[4] += r.dma_us
     for c, a in sorted(agg.items(), key=lambda kv: -kv[1][1]):
         avg = a[1] / a[0] if a[0] else 0
+        ov = f"{a[4] / a[1] * 100:.1f}%" if a[1] and a[4] else "-"
         print(f"{OP_NAMES.get(c, f'OP{c}'):<18} {a[0]:>5} {a[1]:>10} "
-              f"{a[1] / dw * 100:>5.1f}% {avg:>9.1f} {a[2]:>9} {fmt_b(a[3]):>12}")
+              f"{a[1] / dw * 100:>5.1f}% {avg:>9.1f} {a[2]:>9} {fmt_b(a[3]):>12} "
+              f"{a[4]:>9} {ov:>7}")
     print()
 
     # ---- chrome trace JSON
@@ -513,7 +537,7 @@ def main():
             wcsv = csvmod.writer(f)
             wcsv.writerow(["idx", "name", "opcode", "opcode_name", "start_us",
                            "dur_us", "dma_us", "dma_bytes", "engine",
-                           "planned_engine", "deviation", "in_b",
+                           "planned_engine", "deviation", "stg_fb", "in_b",
                            "w_b", "out_b", "pool_b", "flops", "vtcm", "note"])
             for r in ops:
                 wcsv.writerow([r.idx, r.name, r.opcode,
@@ -521,7 +545,7 @@ def main():
                                r.dma_us, r.dma_bytes,
                                ENGINE_NAMES.get(r.engine, r.engine),
                                ENGINE_NAMES.get(r.planned_engine, r.planned_engine),
-                               r.deviation,
+                               r.deviation, r.stg_fb,
                                r.in_b, r.w_b, r.out_b, r.pool_b, r.flops,
                                int(r.vtcm), r.note])
         print(f"csv: {args.csv}")

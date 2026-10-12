@@ -19,6 +19,7 @@
 #include "hnnx/ir/scalar_params.hpp"
 #include "hnnx/ir/types.hpp"
 #include "hnnx/serialize/serializer.hpp"
+#include "hnnx/opt/pass_view_fold.hpp"   // 008 US3 T017: dump_view_census 切片 stride 分解
 
 #include <cstdio>
 #include <cstdint>
@@ -76,12 +77,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
          const std::string& gguf_path, const std::string& match_path,
          bool ext_weights = false, const std::string& ext_weights_path = "",
          bool force_v2 = false, bool dma_runlist = false,
-         bool allow_missing_inputs = false) {
+         bool allow_missing_inputs = false,
+         uint64_t vtcm_budget = 16777216ull,
+         const std::string& residency_report = "") {
     // 1. deserialize .bin
     std::vector<uint8_t> bin;
     if (!load_file(bin_path, bin)) { std::fprintf(stderr, "error: cannot open %s\n", bin_path.c_str()); return 2; }
     GraphPrepare gp;
     if (!gp.deserialize(bin.data(), bin.size())) { std::fprintf(stderr, "error: deserialize failed\n"); return 2; }
+    if (getenv("GEHTP_DUMP_VIEWS")) {          /* 008 US3 T017: emit 前切片 stride 分解 */
+        std::fprintf(stderr, "[view-census EMIT]\n");
+        dump_view_census(&gp, stderr);
+    }
 
     // 1b. 第7步阶段一: 静态 DDR 偏移(编译期生命期分配, 打包进 TEMPOFF 槽)。
     //     compute 在 Emitter em 声明后执行(见下方 ddr_static 块)。
@@ -655,11 +662,13 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     /* 003 T015: 预置 staging → carve 记录。窗口 [DMA op, 消费 op 的下一图节点
      * 边界): 锚点 = DMA op 下标 —— staging 数据在 DMA 落池, 窗口起点必须覆盖
      * 写入点 (T013 运行期校验 st ≤ op_index < en, 活跃集含写入 op)。 */
+    uint64_t staging_sum = 0;
     for (const auto& stg : em.pending_stages) {
         uint32_t end = stg.end_pos <= order.size()
                            ? emit_boundary[stg.end_pos]
                            : (uint32_t)em.ops.size();
         if (end <= stg.op_index) end = stg.op_index + 1u;
+        staging_sum += stg.size_bytes;
         em.carve_entries.push_back({stg.op_index, stg.vtcm_offset, stg.size_bytes,
                                     stg.op_index, end});
     }
@@ -672,32 +681,274 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     // 上取整 —— probe VTCM 驻留 256KB = 256 单位)。VTCM 驻留项 temp_id
     // 带 0x4000 标记(WT_REF_VTCM_FLAG)。
     if (em.ddr_static) {
-        uint64_t bump_res = em.bump_reserve ? em.bump_reserve
-                                            : std::max<uint64_t>(4u << 20, em.ddr_static_cap / 4);
-        uint32_t reserve = ((uint32_t)((em.ddr_vtcm_cap + 1023) / 1024) << 16)
-                         | ((uint32_t)((bump_res + 1023) / 1024) & 0xFFFFu);
+        /* 008 T010: 划痕窗终算 — 末 op 的窗深不会触发复位, 补入峰值;
+         * 窗 [cap-peak, cap) 与规划器静态区 [0, planner_end) 必须不相交
+         * (planner_end = ddr_temp_tab 非 VTCM 项的最大 off+sz; scratch 项
+         * 在独立 ddr_scratch_tab, 不混入此计算)。 */
+        if (em.scratch_cur > em.scratch_peak) em.scratch_peak = em.scratch_cur;
+        uint64_t planner_end = 0;
+        for (const auto& [tid, offsz] : em.ddr_temp_tab) {
+            auto vit = em.ddr_temp_vtcm.find(tid);
+            if (vit != em.ddr_temp_vtcm.end() && vit->second) continue;
+            planner_end = std::max<uint64_t>(planner_end, (uint64_t)offsz.first + offsz.second);
+        }
+        if (em.scratch_peak) {
+            uint64_t win_lo = em.ddr_static_cap - em.scratch_peak;
+            if (win_lo < planner_end) {
+                std::fprintf(stderr,
+                             "error: emit 划痕窗 [%.1fMB, %.1fMB) 与规划静态区 [0, %.1fMB) 交叠 — "
+                             "升 --ddr-budget\n",
+                             win_lo / 1048576.0, em.ddr_static_cap / 1048576.0,
+                             planner_end / 1048576.0);
+                return 3;
+            }
+            std::fprintf(stderr, "[scratch] 物化窗 peak=%lluB (planner_end=%lluB cap=%lluB) entries=%zu\n",
+                         (unsigned long long)em.scratch_peak, (unsigned long long)planner_end,
+                         (unsigned long long)em.ddr_static_cap, em.ddr_scratch_tab.size());
+        }
+        if (em.ddr_static_cap > 0xFFFFFFFFull) {
+            std::fprintf(stderr, "error: TEMPOFF cap %llu 超 u32 线格式上限\n",
+                         (unsigned long long)em.ddr_static_cap);
+            return 3;
+        }
+        uint64_t bump_plan = em.bump_reserve ? em.bump_reserve
+                                             : std::max<uint64_t>(4u << 20, em.ddr_static_cap / 4);
+        /* 008 T010: 计划 bump = max(4MB, cap/4) 与实际表外需求无关 — 取
+         * emit 仿真峰值(泄漏式, 与运行期 temp_get 路径 2 同语义)兜底。
+         * p3 板跑实锤: 8MB bump 在 op1310 被广播物化 temp 耗尽。 */
+        uint64_t bump_res = std::max<uint64_t>(bump_plan, em.sim_bump_peak);
+        std::fprintf(stderr, "[bump] plan=%llu sim_peak=%llu chosen=%llu\n",
+                     (unsigned long long)bump_plan, (unsigned long long)em.sim_bump_peak,
+                     (unsigned long long)bump_res);
+        uint32_t pool_kb = (uint32_t)((em.ddr_vtcm_cap + 1023) / 1024);
+        uint32_t bump_kb = (uint32_t)((bump_res + 1023) / 1024);
+        /* reserve 两域各 16 位 KB — 超 65535KB 静默回绕 = 运行期池错配
+         * (p2 板跑实锤: cap 2GB → bump 512MB → 低 16 位回绕成 0)。 */
+        if (pool_kb > 0xFFFFu || bump_kb > 0xFFFFu) {
+            std::fprintf(stderr,
+                         "error: TEMPOFF reserve 域溢出: pool=%uKB bump=%uKB (上限各 65535KB) — "
+                         "降 --plan-vtcm-budget / --ddr-budget (bump=max(4MB,cap/4))\n",
+                         pool_kb, bump_kb);
+            return 3;
+        }
+        uint32_t reserve = (pool_kb << 16) | bump_kb;
         std::vector<uint8_t> tab;
         auto put32 = [&](uint32_t v) {
             for (int i = 0; i < 4; i++) tab.push_back((uint8_t)(v >> (8 * i)));
         };
         put32((uint32_t)em.ddr_static_cap);
         put32(reserve);
-        put32((uint32_t)em.ddr_temp_tab.size());
-        for (const auto& [tid, offsz] : em.ddr_temp_tab) {
-            uint32_t tagged_tid = tid;
-            if (em.ddr_temp_vtcm.count(tid) && em.ddr_temp_vtcm.at(tid))
-                tagged_tid |= WT_REF_VTCM_FLAG;
-            put32(tagged_tid);
-            put32(offsz.first);
-            put32(offsz.second);
-        }
+        put32((uint32_t)(em.ddr_temp_tab.size() + em.ddr_scratch_tab.size()));
+        auto put_entry = [&](uint32_t tid, uint32_t off, uint32_t sz, bool vtcm) {
+            put32(vtcm ? (tid | WT_REF_VTCM_FLAG) : tid);
+            put32(off);
+            put32(sz);
+        };
+        for (const auto& [tid, offsz] : em.ddr_temp_tab)
+            put_entry(tid, offsz.first, offsz.second,
+                      em.ddr_temp_vtcm.count(tid) && em.ddr_temp_vtcm.at(tid));
+        for (const auto& [tid, offsz] : em.ddr_scratch_tab)
+            put_entry(tid, offsz.first, offsz.second, false);
         uint32_t sid = em.add_slot((uint32_t)tab.size(),
                                    (uint32_t)(tab.size() / 4), tab.data());
         em.slots[sid].addr = WT_SLOT_TEMPOFF;
-        std::fprintf(stderr, "[ddr] TEMPOFF slot %u: cap=%llu vtcm_cap=%llu n_temps=%zu (vtcm=%zu)\n",
+        std::fprintf(stderr, "[ddr] TEMPOFF slot %u: cap=%llu vtcm_cap=%llu n_temps=%zu (vtcm=%zu scratch=%zu)\n",
                      sid, (unsigned long long)em.ddr_static_cap,
                      (unsigned long long)em.ddr_vtcm_cap,
-                     em.ddr_temp_tab.size(), em.ddr_temp_vtcm.size());
+                     em.ddr_temp_tab.size() + em.ddr_scratch_tab.size(),
+                     em.ddr_temp_vtcm.size(), em.ddr_scratch_tab.size());
+    }
+
+    // 5c. 008 US1: 三方全局预算门 + BudgetReport。物理模型 = 运行期镜像
+    // (oplist_exec.c vtcm_pool_ensure / exec_matmul_f16_hmx attach):
+    //   VTCM = [base, pool_base) 共享 scratch(HMX 逐 op carve) ∪ 顶部驻留池;
+    //   pool_size = TEMPOFF reserve 高 16 位(KB 单元) = vtcm_cap KB 上取整。
+    //   门: pool_rounded + hmx_arena_max ≤ --vtcm-budget(缺省 16MB)。
+    // arena 公式与 exec_conv2d_hmx 的 act|wgt|out|scale 2048 对齐序列同式
+    // (f16 matmul HMX 路径复用同布局); W4A16 与 w4_carve_need 同式; SPLIT
+    // 按本 op N 计。attach 型 HMX 消费(conv 等)不在闭式内 → uncovered
+    // 点名上报, 不静默降额。
+    {
+        uint64_t pool_rounded = ((em.ddr_vtcm_cap + 1023) / 1024) * 1024;
+        uint64_t carve_peak = 0;
+        for (const auto& c : em.carve_entries)
+            carve_peak = std::max<uint64_t>(carve_peak,
+                                            (uint64_t)c.vtcm_offset + c.size_bytes);
+        uint64_t arena_max = 0;
+        std::vector<uint32_t> uncovered;
+        for (size_t i = 0; i < em.ops.size(); i++) {
+            if ((em.op_annot[i] & 0x3u) != 2u) continue;  /* 2=WT_ENG_HMX (wt_engine) */
+            uint16_t opc = em.ops[i].opcode;
+            if (em.ops[i].n_args < 6) continue;
+            const uint32_t* a = em.ops[i].args;
+            uint64_t M = a[3], K = a[4], N = a[5];
+            /* SPLIT 线格式 [a,w,out,m,k,N_full,n0,nc,flags]: 逐 chunk 执行,
+             * arena 按 nc(=args[7]) 计 —— 按 N_full 计会把 v4 的 32-chunk
+             * lm_head 算成 ~500MB, 门对合法 blob 误杀(惰性门实锤拦截)。 */
+            if (opc == OP_MATMUL_F16_SPLIT && em.ops[i].n_args >= 8) N = a[7];
+            auto al2k = [](uint64_t x) { return (x + 2047) & ~(uint64_t)2047; };
+            auto al128 = [](uint64_t x) { return (x + 127) & ~(uint64_t)127; };
+            if (opc == OP_MATMUL_F16 || opc == OP_MATMUL_F16_BIAS ||
+                opc == OP_MATMUL_F16_SPLIT) {
+                uint64_t need = al2k(M * K * 2) + al2k(K * N * 2) + al2k(M * N * 2) + 2048;
+                arena_max = std::max(arena_max, need);
+            } else if (opc == OP_MATMUL_W4A16) {
+                /* 与 w4_carve_need (oplist_exec.c, dc_parts 分配序列)逐项同式 */
+                uint64_t need = al2k(M * K * 2) + al2k(M * N * 2) + al2k(K * N / 2) +
+                                al2k((N / 32) * 512) + al128(8 * (K / 32) * 4) +
+                                al128(8 * (N / 32) * 4) + 128 + 128;
+                arena_max = std::max(arena_max, need);
+            } else {
+                if (std::find(uncovered.begin(), uncovered.end(), (uint32_t)opc)
+                    == uncovered.end())
+                    uncovered.push_back(opc);
+            }
+        }
+        uint64_t slack = vtcm_budget > pool_rounded + arena_max
+                             ? vtcm_budget - pool_rounded - arena_max : 0;
+        double coverage = 0.0;
+        {
+            uint64_t tot = 0, res = 0;
+            for (const auto& [tid, offsz] : em.ddr_temp_tab) {
+                tot += offsz.second;
+                auto vit = em.ddr_temp_vtcm.find(tid);
+                if (vit != em.ddr_temp_vtcm.end() && vit->second) res += offsz.second;
+            }
+            coverage = tot ? (double)res / (double)tot : 0.0;
+        }
+        if (em.ddr_static)
+            std::fprintf(stderr,
+                         "[vtcm] pool=%llu(reserve %llu) arena_max=%llu carve_peak=%llu "
+                         "staging_sum=%llu slack=%llu coverage=%.4f\n",
+                         (unsigned long long)em.ddr_vtcm_cap,
+                         (unsigned long long)pool_rounded,
+                         (unsigned long long)arena_max, (unsigned long long)carve_peak,
+                         (unsigned long long)staging_sum, (unsigned long long)slack,
+                         coverage);
+        /* 报告先落盘再判门: 超限跑的报告 = 诊断证据, 不是可选输出 */
+        if (!residency_report.empty()) {
+            FILE* rf = std::fopen(residency_report.c_str(), "w");
+            if (!rf) {
+                std::fprintf(stderr, "error: cannot write residency report %s\n",
+                             residency_report.c_str());
+                return 2;
+            }
+            std::fprintf(rf, "# BudgetReport (008 US1) blob=%s\n", out_path.c_str());
+            std::fprintf(rf, "vtcm_budget %llu\n", (unsigned long long)vtcm_budget);
+            std::fprintf(rf, "resident_pool %llu\n", (unsigned long long)em.ddr_vtcm_cap);
+            std::fprintf(rf, "pool_reserve_rounded %llu\n", (unsigned long long)pool_rounded);
+            std::fprintf(rf, "hmx_arena_max %llu\n", (unsigned long long)arena_max);
+            std::fprintf(rf, "carve_peak %llu\n", (unsigned long long)carve_peak);
+            std::fprintf(rf, "staging_sum %llu\n", (unsigned long long)staging_sum);
+            std::fprintf(rf, "emit_scratch_peak %u\n", em.scratch_peak);
+            std::fprintf(rf, "bump_demand_sim %llu\n", (unsigned long long)em.sim_bump_peak);
+            std::fprintf(rf, "slack %llu\n", (unsigned long long)slack);
+            std::fprintf(rf, "coverage %.6f\n", coverage);
+            std::fprintf(rf, "n_temps %zu n_resident %zu n_spill %zu\n",
+                         em.ddr_temp_tab.size(), em.ddr_temp_vtcm.size(),
+                         em.ddr_spill_map.size());
+            std::fprintf(rf, "uncovered_hmx_opcodes");
+            for (uint32_t o : uncovered) std::fprintf(rf, " %u", o);
+            std::fprintf(rf, "\n");
+            /* 未驻留物化 temp + reason: 显式降级非静默 (T007)。planner 按
+             * 全量 planned temp 打包(含 10.8k 未物化项), 物化项被挤出的
+             * 每一笔都在这里点名。 */
+            for (const auto& [tid, offsz] : em.ddr_temp_tab) {
+                auto vit = em.ddr_temp_vtcm.find(tid);
+                if (vit == em.ddr_temp_vtcm.end() || !vit->second)
+                    std::fprintf(rf, "nonresident %u %u planner_displaced\n",
+                                 tid, offsz.second);
+            }
+            for (const auto& [op_id, os] : em.ddr_spill_map)
+                std::fprintf(rf, "spill %llu %u %u\n", (unsigned long long)op_id,
+                             os.first, os.second);
+            std::fclose(rf);
+        }
+        if (pool_rounded + arena_max > vtcm_budget) {
+            std::fprintf(stderr,
+                         "error: VTCM 三方预算门超限: resident_pool=%llu + hmx_arena=%llu "
+                         "> budget=%llu (carve_peak=%llu staging_sum=%llu slack=%llu) — "
+                         "降 --plan-vtcm-budget 重发 tagged.bin, 或有据升 --vtcm-budget\n",
+                         (unsigned long long)pool_rounded, (unsigned long long)arena_max,
+                         (unsigned long long)vtcm_budget, (unsigned long long)carve_peak,
+                         (unsigned long long)staging_sum, (unsigned long long)slack);
+            return 3;
+        }
+    }
+
+    // 5b. 008 T012: 预打包源槽条件 GC — 权重 crouton 预打包在场时, 被替换的
+    // 行主序源槽若无任何 op 引用 → 剥字节、置 len=0 哨兵(槽 id 恒稳, op args
+    // 零重写 — 非 slot arg 误携 bit15 时重映射会腐化, 哨兵法无此险), 压实
+    // weight/ext 区 → blob 不双存权重(打包=同字节量置换, 净增长≈0)。
+    // 无预打包零触碰(惰性门 md5 不动)。
+    if (!em.pp_recs.empty()) {
+        /* 槽引用位孪生表 — 与 oplist_parse.c arg_is_slot / 设备 exec 解引用
+         * 同表, 判据互指勿单边改。槽位上的值两种形态: 0x8000|slot (src_ref/
+         * matmul w/gather idx 等绝大多数) 或裸 slot id。裸形态只由六个发射
+         * 位点写出 (rmsnorm2 w/b, conv w/b, W4A16 w, conv1d_ssm w, SPILL/
+         * FILL 池) — 其余槽位上的裸值全是 temp 引用 (act/src), 不能当槽标
+         * 记, 否则 temp id 撞槽 id 把死槽全保活 (0.8B 板跑实锤: 2.04→2.89GB
+         * 近全量双存, 设备 malloc 爆)。漏标裸形态则反向丢活槽 (rc=38 rw0)。 */
+        auto arg_takes_bare_slot = [](uint16_t opcode, uint16_t idx) {
+            switch (opcode) {
+            case OP_RMSNORM2_F16: case OP_CONV2D_F16:
+                return idx == 1 || idx == 2;
+            case OP_MATMUL_W4A16: case OP_CONV1D_SSM_F16:
+                return idx == 1;
+            case OP_FILL:
+                return idx == 0;
+            case OP_SPILL:
+                return idx == 1;
+            default:
+                return false;
+            }
+        };
+        std::vector<uint8_t> refd(em.slots.size(), 0);
+        for (const auto& o : em.ops)
+            for (uint16_t ai = 0; ai < o.n_args; ai++) {
+                uint32_t a = o.args[ai];
+                if (a & 0x8000u) {
+                    if ((a & 0x7FFFu) < em.slots.size()) refd[a & 0x7FFFu] = 1;
+                } else if (arg_takes_bare_slot(o.opcode, ai) && a < em.slots.size()) {
+                    refd[a] = 1;
+                }
+            }
+        if (em.dummy_slot_id < em.slots.size()) refd[em.dummy_slot_id] = 1;
+        std::vector<wt_slot> nslots;
+        std::vector<uint8_t> narea, nextarea;
+        uint32_t dropped = 0;
+        for (uint32_t i = 0; i < em.slots.size(); i++) {
+            const wt_slot& s = em.slots[i];
+            if (!refd[i]) {
+                wt_slot dead{};
+                nslots.push_back(dead);
+                dropped++;
+                continue;
+            }
+            wt_slot ns = s;
+            if (s.addr == WT_SLOT_EXT_WGT) {
+                ns.offset = nextarea.size();
+                nextarea.insert(nextarea.end(), em.ext_weight_area.begin() + s.offset,
+                                em.ext_weight_area.begin() + s.offset + s.len);
+                while (nextarea.size() % 128 != 0) nextarea.push_back(0);
+            } else {
+                ns.offset = narea.size();
+                narea.insert(narea.end(), em.weight_area.begin() + s.offset,
+                             em.weight_area.begin() + s.offset + s.len);
+                while (narea.size() % 128 != 0) narea.push_back(0);
+            }
+            nslots.push_back(ns);
+        }
+        if (dropped) {
+            em.slots = std::move(nslots);
+            em.weight_area = std::move(narea);
+            em.ext_weight_area = std::move(nextarea);
+            std::fprintf(stderr,
+                         "[pp] T012 权重预打包 %zu 槽; GC 剥除 %u 未引用源槽 "
+                         "(weight=%zuB ext=%zuB)\n",
+                         em.pp_recs.size(), dropped, em.weight_area.size(),
+                         em.ext_weight_area.size());
+        }
     }
 
     // 6. 组装 blob
@@ -892,9 +1143,9 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                              (unsigned long long)((uint64_t)sl.offset + sl.len));
                 return 3;
             }
-        std::printf("WTOP OK: slots=%u ops=%u bytes=%zu (gguf hits=%u miss=%u)\n",
+        std::printf("WTOP OK: slots=%u ops=%u bytes=%zu (gguf hits=%u miss=%u) fold=%u\n",
                     (unsigned)em.slots.size(), (unsigned)em.ops.size(), em.blob.size(),
-                    em.gguf_hits, em.gguf_miss);
+                    em.gguf_hits, em.gguf_miss, em.fold_aliases);
 
     }
     /* 007 US2 (FR-003/T013): matmul 权重 miss = 匹配表不全/GGUF 不配套 →
@@ -1002,6 +1253,8 @@ int main(int argc, char** argv) {
     bool force_v2 = false;     // --force-v2: 小模型强制 v2 槽记录(设备回归 v2 通路用)
     bool dma_runlist = false;  // --dma-runlist: 溢出搬移发射真 OP_DMA(非 SPILL/FILL)
     bool allow_missing_inputs = false;  // --allow-missing-inputs: 缺文件的烘焙输入槽退回零填充(默认硬错)
+    uint64_t vtcm_budget = 16777216ull;  // --vtcm-budget: 物理总预算(三方门上限)
+    std::string residency_report;        // --residency-report: BudgetReport 落盘路径
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -1023,10 +1276,12 @@ int main(int argc, char** argv) {
         else if (a == "--force-v2") force_v2 = true;
         else if (a == "--dma-runlist") dma_runlist = true;
         else if (a == "--allow-missing-inputs") allow_missing_inputs = true;
+        else if (a == "--vtcm-budget") vtcm_budget = std::strtoull(next().c_str(), nullptr, 0);
+        else if (a == "--residency-report") residency_report = next();
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (bin_path.empty() || out_path.empty()) {
-        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ext-weights [--weights-bin <params.bin>]] [--dma-runlist] [--allow-missing-inputs]\n");
+        std::fprintf(stderr, "usage: wtop_emit --bin <tagged.bin> [--input-f16 <f16.raw>] --out <blob.wtop> [--manifest <json>] [--gguf <g> --match <tsv>] [--ext-weights [--weights-bin <params.bin>]] [--dma-runlist] [--allow-missing-inputs] [--vtcm-budget <n>] [--residency-report <path>]\n");
         return 2;
     }
     /* FR-003 预检: --gguf/--match 成对给。单给一个时旧逻辑静默忽略 → 全 f16
@@ -1038,5 +1293,5 @@ int main(int argc, char** argv) {
     }
     return emit(bin_path, in_f16, out_path, manifest_path, gguf_path, match_path,
                 ext_weights, ext_weights_path, force_v2, dma_runlist,
-                allow_missing_inputs);
+                allow_missing_inputs, vtcm_budget, residency_report);
 }

@@ -1,0 +1,89 @@
+# 48_vtcm_access 机理探针 — 30× matmul 归因 + GATE3 广播机理裁决（US2 前置）
+
+- 日期: 2026-10-09
+- 设备: d0f1784（Permissive 预检过，run_main_on_hex 互斥过）
+- **库指纹: libhvxhmx_008.so md5 `5a023fbb8a41cc4783662848af23f774`**（= T010/T011
+  锚库字节副本换 008 私有名，见 §0）；runner = `ex48a.so`（私有名，
+  NEEDED=libhvxhmx_008.so，vgather=0）
+- 源: `kernels/examples/48_vtcm_access/main.c`；构建/推板/跑:
+  `.scratch_008/build_run_48access.sh`；结果 `.scratch_008/48_vtcm_access.txt`
+  （**4/4 PASS**，关键数字三跑复现 ±1%）
+
+## §0 库漂移事件与私有名隔离（登记）
+
+T011 收口后板上 `libhvxhmx_007.so` 被 007 会话重推（md5 afd8dac9，1009 18:20，
+其 US2 W4A16 WIP，274600B ≠ 锚库 274632B）——008 的 47/48 例曾以
+DT_NEEDED=libhvxhmx_007.so 链接，首跑 48 时实际加载的已是外来库（当时脚本只打印
+不硬拦，幸数值门全过）。处置：锚库 5a023fbb 本地副本（.scratch_008/board/）
+复制为 **008 私有名 libhvxhmx_008.so**，`-l:libhvxhmx_008.so` 使 DT_NEEDED 跟
+私有名走；脚本加 md5 硬门（不符先推送、复检、仍不符 abort）。47/48 两脚本均已
+切换。**T011 evidence 指纹 5a023fbb 在其运行时刻为真，证据不受影响。**
+顺带修了脚本两处 `set -e` 陷阱：① 空闲板 ps 检查 `… | grep -q . && {…}` 在
+pipefail 下静默死 → 改 if 守卫；② md5sum 缺文件 rc=1 经命令替换杀赋值 →
+`|| true` 移进远端 shell。
+
+## 设计（G1-G7，exec_matmul_f16_hmx 相位逐字复刻，只计时不改语义）
+
+- G1 pack act → VTCM crouton（M32×K1024）
+- G2 pack wgt → VTCM crouton（K1024×N3584 主力形 + N1024 对照）
+- G3 HMX GEMM（act+wgt 已打包 tile，恒等 scale 页）
+- G4 unpack VTCM → DDR 行主
+- G5 同 pack 循环目标换 DDR scratch —— 标量散写 VTCM/DDR 对拍（唯一变量=目标）
+- G6 标量 gather y[i]=x[off[i]]：x@DDR vs x@VTCM —— GATE3 机理裁决
+- G7 HVX 向量流读 2MB：`hvhx_v2_copy_f16`（007 板上已证内核）dst 恒 DDR、
+  src 换面 —— Δ 隔离读侧
+- 守门：GEMM 单 tile 对标量 f32 参考（**相对范数 3%**，见限制②）；
+  全链两跑位级一致；输入敏感性必异；HVX 拷贝两侧 dst 逐字节==src
+
+## 冻结数字（主力形 M32×K1024×N3584，census avg 59.9ms/op）
+
+```
+pack_act→VTCM  M32xK1024      308us
+pack_wgt→VTCM  K1024xN3584  39850us   ← 66.4% of census
+pack_wgt→VTCM  K1024xN1024  11191us
+pack_wgt→DDR   K1024xN1024   3480us   ← 散写目标惩罚 3.24x
+hmx_gemm        K1024xN3584    119us
+unpack→DDR      M32xN3584     5588us
+phases sum 45865us (76.6%)  残余缺口 14035us (23.4%)
+scalar_gather  n=32768: DDR 250us vs VTCM 1650us  = 6.6x 惩罚
+hvx_copy_f16   2MB(dst@DDR): src@DDR 357us/it(6GB/s) vs src@VTCM 38us/it(55GB/s)
+               = 线性读 VTCM 快 9.4x
+```
+
+## 判读
+
+1. **30× 缺口归因定谳**：pack_wgt→VTCM = **39.85ms/op（66.4%）**——CPU 标量
+   散写 7MB 权重（hmx_crouton_pos 非线性下标）进 VTCM；GEMM 119µs（0.2%）、
+   unpack 5.59ms（9.3%）、pack_act 0.31ms。残余 14.0ms（23.4%）= 真执行器
+   per-op dispatch/carve/temp 记账（探针相位不含，归 US4 拆解）。
+2. **GEMM 免费定谳**：crouton 驻 VTCM 后 HMX GEMM 119µs——matmul wall 主项
+   不是算，是喂。与 T010「HMX 读 VTCM +2%」同向互证。
+3. **VTCM 散写惩罚 3.24×**（同 pack 循环只换目标）：CPU 标量非线性写 VTCM
+   显著劣于写 DDR。
+4. **GATE3 广播 43× 机理裁决**：数据依赖标量读 VTCM 慢 6.6×（G6）；而 HVX
+   线性流读 VTCM 反而**快 9.4×**（G7）→ 「VTCM 慢」不成立，**慢的是非线性/
+   数据依赖访问形态**（与 skill「GDN 标量划痕进 VTCM 7× 慢」同族）。43× 全幅
+   = 非线性读 + 写侧/工作集效应叠加；V81 迹重放另案不动。
+5. **T012 设计修正（本探针核心产出）**：原案「线性权重 DMA 预取」打错靶——
+   DMA 从来不是瓶颈（T011: 链 55GB/s），pack 才是。修正机制 =
+   **f16 HMX 族权重走 W4A16 预置发射同款：编译期预打包 crouton 进 blob，
+   运行期仅 DMA DDR→VTCM 线性预取（7MB ≈ 130µs，链式 submit 藏进前一 op
+   计算）+ GEMM 119µs**。权重静态 → pack 一次性成本归零，主力形 per-op
+   39.85ms → ~0.3ms 量级（~130×）。
+6. **unpack HVX 化为第二目标**：5.59ms/op 标量散读 VTCM → G7 已证 HVX 线性
+   读 VTCM 是快侧，007 P1 三形态范式可套（预期 ~50× → ~0.1ms）。
+7. **投影**：MATMUL_F16 族 9.44s → <0.5s 量级 → wall 24.24s → ~15s 域；
+   ≤8s 总门还需 US3（SPLIT 4.25s / SLICE / UNARY 三族）+ US4（14ms/op 级
+   per-op 开销）落地。
+
+## 限制（如实登记）
+
+1. 探针无 per-op dispatch/carve/temp 记账 → 14.0ms 缺口未拆（归 T016 census
+   digest + US4）。
+2. GEMM 门为相对范数 3% 非位级：HMX 乘内 f16 舍入使全正 1024 项 dot 元素差
+   ~2.5%（实测 tile rel-norm 1.18%），布局/scale 错会 O(1) 量级；位级口径由
+   全链 deterministic + 敏感性门 + T015 设备位级门兜底。
+3. 手搓 vmem 流读（第一版 G7）板上不执行数据搬运（0µs/2TB/s 假象；反汇编含
+   真 loop0+vmem.cur 循环但物理不可能），根因未究，已弃用换 007 已证内核——
+   不影响本探针任何结论，登记备查。
+4. hvx_copy DDR 侧有效 6GB/s 为该拷贝核 latency-bound 口径，非 DDR 带宽上限。

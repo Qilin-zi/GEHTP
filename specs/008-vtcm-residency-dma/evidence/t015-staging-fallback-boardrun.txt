@@ -1,0 +1,51 @@
+# T015 板跑验收 — staging 搬运回落 + 故障注入 (1010)
+
+设备 d0f1784 / lib libhvxhmx_008t15.so (signed md5 8fcf91b9b40e215c79a971497fe26c4a,
+未签名同源; worktree 全量 = T012 预打包 DMA 运行时 + T015 回落机制)
+runner gehtp_runner_008t15.so (-l: 私有名, DT_NEEDED 已验)
+blob .scratch_008/qwen35_08b_008t12.wtop: md5 646ee124 (复用 T012 资产, 182 pp 槽)
+op_ts 记录 ver=4 (32B): {start,dur,dma_us,dma_bytes,engine,planned_engine,deviation,stg_fb}
+
+## 机制 (T015)
+bit3 权重 DMA 预取失败 → `cpu_to_vtcm(wgt_cr,w,w_bytes)` 串行 memcpy+FLUSH 回落
+(预打包 crouton 字节线性, 与 DMA 逐字节等价) + `g_op_deviation=1` + `g_op_stg_fb++`
++ rtrace 行。fault 注入: job.txt 可选 `fault <mask>` → `wt_exec_set_fault(mask)`,
+bit0 强制 bit3 权重 DMA 走串行回落 (生产恒 0)。三腿不变量:
+`dev==0 ⟺ planned==actual ∧ stg_fb==0` (transport-only 回落时引擎仍 HMX, 旧式
+`dev==0 ⟺ planned==actual` 不成立)。
+
+## 双跑四门
+
+### Run A (fault=0, DMA 真路径)
+1. dma_us>0: Σdma_us=22.74ms Σdma=1.4GB 有效带宽 66.1GB/s (占wall=0.17%) PASS
+2. SC-002 HMX 族 dur ≤ 50% 锚: MATMUL_F16 + OP35 ≈ 2.9s = ~22% wall ≤ 50% PASS
+   (锚 13.69s/24.24s; T012 已量化 20.9%, A 跑同口径)
+3. 位级 md5: output_008t15A.f16.raw == f87461e2a5089c48413e70463f4aa7dc PASS
+4. 偏差不变量: 按计划 13901 | 允许回落 105 | 已中止 0 | 搬运面回落 0, 不变量 PASS
+   (105 = Eltwise_Unary HVX→scalar 合法回落, 锚上同款; 搬运面 0 次 = DMA 真路径无回落)
+
+### Run B (fault=1, 强制 bit3 权重 DMA 串行回落)
+1. [fault] mask=1 (runner 解析 fault 键 → wt_exec_set_fault) PASS
+2. [stg] 搬运面回落 182 次 (串行 cpu 拷贝, dev=1) — 182 = 全部 pp 权重槽 PASS
+3. 位级 md5: output_008t15B.f16.raw == f87461e2a5089c48413e70463f4aa7dc (回落逐字节等价) PASS
+4. 偏差不变量: 按计划 13901 | 允许回落 287 (=105+182) | 已中止 0 | 搬运面回落 182, 不变量 PASS
+
+## 性能
+A 跑 exec wall 13.04s (T012 13.38s 同级, DMA 真路径); B 跑 wall 15.61s (串行 memcpy
+回落比 DMA 慢 ~2.6s, 可预期 — 回落是正确性保险非快路径)。
+
+## 过程翻车记录 (机制教训, 勿重蹈)
+1. **三元运算符把 init 成功返回 0 当假**: `pp_drc = pp_iok ? dc_dma_once(&d) : 1`
+   —— `dc_dma_init` 成功返回 0 (dc_parts.c 末尾 `return 0`, 失败才 0xD200), 0 是
+   falsy → 走了 else 分支 → pp_drc=1、DMA 从未调用。症状: A 跑也 182 次回落、
+   Σdma_us=0、wall 15.7s (比 B 还慢)。取证探针 (ex=0xFDD49F58 真 dc_dma_once_ex
+   地址 + pr128) 曾把方向带偏到「绑定/构建坏」——实则是我自己的反转 bug。
+   教训: 判 init 成败必须 `!= 0` 显式比较, 禁止 `init_ret ? ok : fail` 三元。
+   终态用 if/else 显式分支 (`dc_dma_init(...) != 0 → pp_fb=1` else `dc_dma_once`)。
+2. 探针 `pr_drc = pr_iok ? dc_dma_once(&pr) : pr_iok` 同款 bug (pr_iok=0 时短路),
+   已随探针一并删除。取证探针须用独立 bool, 不能复用 init 返回值。
+
+## 回归
+- A 跑 md5 位级 == v4 锚 (回落路径字节等价); B 跑 md5 同 (串行回落同字节)。
+- 三腿不变量在「有回落」(B) 与「无回落」(A) 两态都 PASS。
+- ver=4 op_ts 记录 backward-compat: gehtp_prof.py 解析 ver3 旧档回归 PASS。

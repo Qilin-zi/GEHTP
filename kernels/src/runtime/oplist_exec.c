@@ -99,6 +99,7 @@ static FILE* g_rtrace = NULL;  /* 统一 trace 句柄(同路径双 FILE* 在 DSP
  * 新 runner 按 job.txt trace 键显式 set_trace(0/1) 拿净测量/取证两态) */
 static int g_trace_on = 1;
 void wt_exec_set_trace(int on) { g_trace_on = on ? 1 : 0; }
+
 /* 005 US3b (T019): bias 默认走 HMX (SC-005 已过: cos=1.0, 三判据 0 违例,
  * 2026-10-08, 46 号例)。wt_exec_force_bias_scalar 仅供测试例造标量参照,
  * 生产恒 0; qurt 无 env, 走显式 API。 */
@@ -110,6 +111,10 @@ static uint32_t g_ts_cap = 0;
 void wt_exec_set_ts(struct wt_op_ts* buf, uint32_t cap) {
     g_ts_buf = buf; g_ts_cap = buf ? cap : 0;
 }
+/* 008 T020 (US4): op_ts 抽样间隔 (0/1 = 全量逐条)。非采样 op 的 ts 槽保持零
+ * (runner memset 保证), 只省 dc_dma_get + 8 字段填充; 裁决/偏差不变量照旧。 */
+static uint32_t g_ts_sample = 0;
+void wt_exec_set_ts_sample(uint32_t k) { g_ts_sample = k; }
 /* PROF W-P3: 本 op 实际执行引擎 (WT_ENG_*)。各 exec_* 内部设置, run_range 读回 */
 static uint32_t g_last_engine = WT_ENG_SCALAR;
 /* 003 编译器驱动调度: 本 op 编译期指派引擎 (来自 blob v3 footer, 0/1/2)。
@@ -123,6 +128,11 @@ static uint32_t g_planned_fb_engine = WT_ENG_SCALAR;
  * 仅 v3 分发路径会置位 (engine_fallback_or_die); ver<3 无计划语义恒 0。
  * 中止态由 run_range 填充点按 rc!=0 统一置 2, 各 die 分支无需重复设。 */
 static uint32_t g_op_deviation = 0;
+static uint32_t g_op_stg_fb = 0;      /* 008 T015: 本 op 搬运面回落次数 */
+static uint32_t g_fault_mask = 0;     /* 008 T015: 测试故障注入 (生产恒 0) */
+void wt_exec_set_fault(uint32_t mask) {
+    g_fault_mask = mask;
+}
 static uint32_t g_current_op = 0xFFFFFFFFu;
 static uint32_t g_current_op_global = 0xFFFFFFFFu;
 static uint32_t g_current_opcode = 0u;
@@ -1905,7 +1915,7 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                                uint32_t M, uint32_t K, uint32_t N,
                                uint32_t n0, uint32_t N_full,
                                int t0, int t1, char* err, size_t errn,
-                               const uint16_t* bias, const uint8_t* w_q4) {
+                               const uint16_t* bias, const uint8_t* w_q4, int w_pp) {
     /* 003 T014 attach: 同 exec_conv2d_hmx —— wtcache 持 VTCM 时挂共享 scratch
      * 区, 不再整体放弃 (旧行为=静默回落标量)。scratch 覆盖 W4A16 arena →
      * matmul_carved 清零, 下一个 W4A16 op 重 carve。 */
@@ -1967,6 +1977,56 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
                 }
         }
 
+    if (w_pp) {
+        /* 008 T012: 预打包权重 (emit 期镜像打包, flags bit3) — 线性 DMA
+         * DDR→VTCM 替代标量散写 pack (探针 48_vtcm_access: 散写 39.85ms/op
+         * = 66.4% wall → DMA 后 ~0.3ms 量级)。src = blob 权重区 (loader
+         * CPU 写) → 铁律① FC_CPU→FC_DMA clean; dst = VTCM wgt_cr →
+         * DMA→HMX INVALIDATE (fence.c 决策表; T011 47_fence_conc G2 同栈
+         * 已验)。阻塞 dc_dma_once ~700µs 固定开销 v1 认 (T013 链式 submit
+         * 消化)。UserDMA 累加器 (run_range per-op) 自动计入本流。 */
+        /* 008 T015: DMA 预取失败 (job fault 注入构造 / desc 资源失败) →
+         * CPU 线性拷贝串行回落: 预打包 crouton 字节线性, memcpy+FLUSH 与
+         * DMA 逐字节等价。dev=1 + stg_fb (003 允许回落+上报, 绝不静默)。 */
+        int pp_fb = (g_fault_mask & 1u) != 0;
+        int pp_iok = 0, pp_drc = 0;
+        if (!pp_fb) {
+            if (fence_handoff((void*)w, (uint32_t)w_bytes, FC_CPU, FC_DMA, FM_DDR) != FENCE_OK) {
+                snprintf(err, errn, "matmul_f16 pp fence src combo"); return -1;
+            }
+            static dc_mutex_t pp_mu;
+            static int pp_mu_ready;
+            if (!pp_mu_ready) { dc_mutex_init(&pp_mu); pp_mu_ready = 1; }
+            struct dc_dma d;
+            if (dc_dma_init(&d, (uint8_t*)w, (uint8_t*)wgt_cr,
+                            (uint32_t)w_bytes, &pp_mu) != 0) {
+                pp_iok = -1;              /* init 失败 → 串行回落 */
+                pp_fb = 1;
+            } else {
+                pp_drc = dc_dma_once(&d);
+                dc_dma_destroy(&d);
+                if (pp_drc != 0) pp_fb = 1;
+                else if (fence_handoff((uint8_t*)wgt_cr, (uint32_t)w_bytes,
+                                       FC_DMA, FC_HMX, FM_VTCM) != FENCE_OK) {
+                    snprintf(err, errn, "matmul_f16 pp fence dst combo"); return -1;
+                }
+            }
+        }
+        if (pp_fb) {
+            cpu_to_vtcm((uint8_t*)wgt_cr, (const uint8_t*)w, (uint32_t)w_bytes);
+            g_op_deviation = 1u;
+            g_op_stg_fb++;
+            if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
+            if (g_rtrace) {
+                fprintf(g_rtrace,
+                        "staging_fallback op=%u code=%u bytes=%lu fault=%u iok=%d drc=0x%X -> serial cpu copy\n",
+                        (unsigned)g_current_op, (unsigned)g_current_opcode,
+                        (unsigned long)w_bytes, (unsigned)(g_fault_mask & 1u),
+                        pp_iok, pp_drc);
+                fflush(g_rtrace);
+            }
+        }
+    } else
     /* pack wgt: B[K,N] (或 t1 转置) → crouton[(c*n_dot+kt)*1024] (row=ic=k, col=oc=n)。
      * 002 US1: 全局列号 = n0 + c*32 + n, 行主 [K,N_full] 布局 stride=N_full
      * (n0=0/N_full=N 时与整 op 逐字节同公式)
@@ -2080,10 +2140,27 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
     }
     int t0 = (int)(flags & 1u), t1 = (int)(flags & 2u);
     int batched = (int)(flags & 4u);
+    int w_pp = (int)((flags >> 3) & 1u);   /* 008 T012: wgt 预打包 (emit 镜像) */
     uint32_t Bn = flags >> 16;
     if (Bn == 0) Bn = 1;
     /* FC bias (opcode 36) 仅非 batched 整 op (emit 侧保证; 手构图违禁硬错) */
     if (bias && batched) { snprintf(err, errn, "matmul_f16_bias 不支持 batched"); return -1; }
+    /* 008 T012: 预打包槽约束 — emit 仅非 batched 发 bit3, 手构图违禁硬错;
+     * w 必须 slot 引用且 len ≥ N_chunk*K*2 (越界 = emit/手构 bug, 不静默)。 */
+    if (w_pp) {
+        if (batched) { snprintf(err, errn, "matmul_f16 pp+batched 违禁"); return -1; }
+        if (!(op->args[1] & 0x8000u)) {
+            snprintf(err, errn, "matmul_f16 pp w 非 slot ref (0x%X)", op->args[1]);
+            return -1;
+        }
+        uint32_t pps = op->args[1] & 0x7FFFu;
+        if (pps >= b->n_slots || b->slots[pps].len < (size_t)N * K * 2u) {
+            snprintf(err, errn, "matmul_f16 pp slot bad (s=%u len=%llu need=%u)",
+                     (unsigned)pps, (unsigned long long)(pps < b->n_slots ? b->slots[pps].len : 0),
+                     (unsigned)(N * K * 2u));
+            return -1;
+        }
+    }
     const uint16_t* a = (const uint16_t*)ref_ptr(b, a_t);
     /* w 可为 slot(权重)或 temp(运行时 B, 如 attention q·kᵀ) */
     const uint16_t* w = (const uint16_t*)ref_ptr(b, op->args[1]);
@@ -2143,8 +2220,12 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
     if (bias && g_force_bias_scalar) want_hmx = 0;
     if (want_hmx) {
         int engine = 0;
+        /* 008 T012: 预打包 chunk 各持独立打包槽 (chunk 布局非全局 tile 子区,
+         * w_s 必异) → bit3 chunk 的续判键放宽为 (a_t, out_t) (out_t 每逻辑
+         * matmul 唯一, 判别性不降; 非 bit3 维持原三键零扰动)。 */
         if (op->opcode == OP_MATMUL_F16_SPLIT &&
-            g_split_prev.out_t == out_t && g_split_prev.a_t == a_t && g_split_prev.w_s == w_s)
+            g_split_prev.out_t == out_t && g_split_prev.a_t == a_t &&
+            (w_pp || g_split_prev.w_s == w_s))
             engine = g_split_prev.engine;  /* 续 chunk: 沿用已定引擎 */
         if (engine == 0) {
             if (batched) {
@@ -2157,19 +2238,19 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
                     const uint16_t* wb = w + (size_t)bb * K * N_full;
                     uint16_t* yb = y + (size_t)bb * M * N_full;
                     if (exec_matmul_f16_hmx(ab, wb, yb, M, K, N, 0, N_full, t0, t1,
-                                            err, errn, NULL, NULL) != 0) {
+                                            err, errn, NULL, NULL, 0) != 0) {
                         engine = -1;
                         break;
                     }
                 }
             } else {
                 engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
-                                              bias, w_q4) == 0)
+                                              bias, w_q4, w_pp) == 0)
                              ? 1 : -1;
             }
         } else if (engine == 1) {
             if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
-                                     bias, w_q4) != 0) {
+                                     bias, w_q4, w_pp) != 0) {
                 snprintf(err, errn, "matmul_f16 split 混合路径 (FR-013 ④ 违禁): 前 chunk HMX 本 chunk 失败");
                 return -1;
             }
@@ -2198,6 +2279,37 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "matmul_f16: Q4 权重槽无标量路径 (M=%u K=%u N=%u, "
                             "emit 未对齐时应兜底 f16)", M, K, N_full);
         return -1;
+    }
+    /* 008 T012: bit3 回落标量 — 打包槽解包到临时 chunk 局部行主面 (槽保持
+     * 打包态, 后继 bit3 op 的 HMX DMA 预取不受扰, 无脏槽集)。列号局部化:
+     * 全局列 n0+n → 局部 n; 偏差路径低频, 一次性 malloc 可接受。 */
+    if (w_pp) {
+        uint32_t n_col = N / 32u, n_dot = K / 32u;
+        uint16_t* tmp = (uint16_t*)malloc((size_t)N * K * 2u);
+        if (!tmp) { snprintf(err, errn, "matmul_f16 pp fallback alloc"); return -1; }
+        for (uint32_t c = 0; c < n_col; ++c)
+            for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                const uint16_t* tile = w + ((size_t)c * n_dot + kt) * 1024u;
+                for (uint32_t k = 0; k < 32u; ++k)
+                    for (uint32_t n = 0; n < 32u; ++n) {
+                        size_t dst = t1 ? ((size_t)(c * 32u + n) * K + (kt * 32u + k))
+                                        : ((size_t)(kt * 32u + k) * N + (c * 32u + n));
+                        tmp[dst] = tile[hmx_crouton_pos(k, n)];
+                    }
+            }
+        for (uint32_t m = 0; m < M; m++)
+            for (uint32_t n = 0; n < N; n++) {
+                float acc = 0.0f;
+                for (uint32_t k = 0; k < K; k++) {
+                    float av = f16_to_f32(a[t0 ? (size_t)k * M + m : (size_t)m * K + k]);
+                    float wv = f16_to_f32(tmp[t1 ? (size_t)n * K + k : (size_t)k * N + n]);
+                    acc += av * wv;
+                }
+                if (bias) acc += f16_to_f32(bias[n0 + n]);
+                y[(size_t)m * N_full + (n0 + n)] = f32_to_f16(acc);
+            }
+        free(tmp);
+        return 0;
     }
     /* 标量路径: 列号 = n0 + n, 行主 stride = N_full (n0=0/N_full=N 即旧公式) */
     if (batched) {
@@ -2473,18 +2585,49 @@ static int exec_transpose_gen(const struct wt_blob* b, const struct wt_op* op,
     }
     uint32_t out_dims[4];
     for (uint32_t i = 0; i < rk; i++) out_dims[i] = dims[p[i]];
-    uint32_t idx[4] = {0, 0, 0, 0};
-    for (size_t t = 0; t < n; t++) {
-        /* 输入线性坐标 → 输入多维坐标(与 perm 对应)→ 输出坐标 */
-        uint32_t rem = (uint32_t)t;
-        uint32_t ic[4] = {0, 0, 0, 0};
-        for (uint32_t i = 0; i < rk; i++) { ic[i] = rem / si[i]; rem %= si[i]; }
-        uint32_t oc[4] = {0, 0, 0, 0};
-        for (uint32_t ax = 0; ax < rk; ax++) oc[ax] = ic[p[ax]];
-        uint32_t ot = 0;
-        for (uint32_t ax = 0; ax < rk; ax++) ot += oc[ax] * so[ax];
-        dst[ot] = s16[t];
-        (void)idx; (void)out_dims;
+    /* 008 US3 T018: 最内轴固定 (p[rk-1]==rk-1) → 转置只在更外轴间置换, 每个
+     * "外块"是输入的连续 inner 个 f16, 可 HVX 块拷贝 (007 P1 broadcast 行循环
+     * 范式; 判据与 emit 侧 op_transpose 孪生 np[nrk-1]==nrk-1)。逐块 odometer
+     * 免 div/mod; pinv 把外输出坐标映回输入坐标。 */
+    uint32_t inner = dims[rk - 1];
+    if (b->annot_base && g_planned_engine == WT_ENG_HVX && p[rk - 1] == rk - 1 && inner > 0) {
+        uint32_t nblk = (uint32_t)n / inner;
+        uint32_t pinv[4] = {0, 0, 0, 0};
+        for (uint32_t j = 0; j < rk; j++) pinv[p[j]] = j;
+        uint32_t oc[4] = {0, 0, 0, 0};           /* 外输出坐标里程计 */
+        for (uint32_t b = 0; b < nblk; b++) {
+            uint32_t in_base = 0;
+            for (uint32_t j = 0; j + 1 < rk; j++)
+                in_base += oc[pinv[j]] * si[j];
+            hvhx_v2_copy_f16(dst + (size_t)b * inner, s16 + in_base, inner);
+            for (int ax = (int)rk - 2; ax >= 0; ax--) {
+                if (++oc[ax] < out_dims[ax]) break;
+                oc[ax] = 0;
+            }
+        }
+        g_last_engine = WT_ENG_HVX;  /* 实跑即计划 (dev=0) */
+        return 0;
+    }
+    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
+        engine_fallback_or_die(g_planned_engine,
+                               p[rk - 1] == rk - 1 ? "transpose inner==0"
+                                                   : "transpose innermost swapped",
+                               err, errn) != 0)
+        return -1;
+    /* 通用标量回落: 输出线性 odometer (免 div/mod, 连续写 + 跨步读) + pinv
+     * 映回输入线性。纯置换, 与旧输入线性 div/mod 版位级等价 (每输出元素写
+     * 一次, 读同一输入元素)。 */
+    uint32_t pinv2[4] = {0, 0, 0, 0};
+    for (uint32_t j = 0; j < rk; j++) pinv2[p[j]] = j;
+    uint32_t oc[4] = {0, 0, 0, 0};
+    for (size_t o = 0; o < n; o++) {
+        uint32_t t = 0;
+        for (uint32_t j = 0; j < rk; j++) t += oc[pinv2[j]] * si[j];
+        dst[o] = s16[t];
+        for (int ax = (int)rk - 1; ax >= 0; ax--) {
+            if (++oc[ax] < out_dims[ax]) break;
+            oc[ax] = 0;
+        }
     }
     return 0;
 }
@@ -2517,6 +2660,32 @@ static int exec_slice(const struct wt_blob* b, const struct wt_op* op,
         istr[i] = istr[i + 1] * dd[i + 1];
         ostr[i] = ostr[i + 1] * od[i + 1];
     }
+    /* 008 US3 T018: 最内轴 stride==1 → 输出每行是输入的连续字节段, 可 HVX
+     * 块拷贝 (007 P1 broadcast 行循环范式; 判据与 emit 侧 op_strided_slice
+     * 引擎注解孪生 ns[nrk-1]==1)。逐行 odometer 免 div/mod。 */
+    uint32_t row_elems = od[rk - 1];
+    if (b->annot_base && g_planned_engine == WT_ENG_HVX && ss[rk - 1] == 1 && row_elems > 0) {
+        uint32_t rows = n_out / row_elems;
+        uint32_t oc[2] = {0, 0};            /* 外轴里程计 (rk<=3 → 外轴至多 2) */
+        for (uint32_t row = 0; row < rows; row++) {
+            uint32_t in_off = bb[rk - 1];   /* 最内轴 begin = 行内起始偏移 */
+            for (uint32_t ax = 0; ax + 1 < rk; ax++)
+                in_off += (bb[ax] + oc[ax] * ss[ax]) * istr[ax];
+            hvhx_v2_copy_f16(y + (size_t)row * row_elems, x + in_off, row_elems);
+            for (int ax = (int)rk - 2; ax >= 0; ax--) {
+                if (++oc[ax] < od[ax]) break;
+                oc[ax] = 0;
+            }
+        }
+        g_last_engine = WT_ENG_HVX;  /* 实跑即计划 (dev=0) */
+        return 0;
+    }
+    if (b->annot_base && g_planned_engine != WT_ENG_SCALAR &&
+        engine_fallback_or_die(g_planned_engine,
+                               ss[rk - 1] == 1 ? "slice row_elems==0"
+                                               : "slice innermost stride>1",
+                               err, errn) != 0)
+        return -1;
     for (uint32_t i = 0; i < n_out; i++) {
         uint32_t rem = i, in_lin = 0;
         for (uint32_t ax = 0; ax < rk; ax++) {
@@ -3115,6 +3284,7 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         dc_dma_reset();                 /* W-P3: 每 op 前清 UserDMA 累加器 */
         g_last_engine = WT_ENG_SCALAR;  /* W-P3: 默认标量, exec_* 内部覆盖 */
         g_op_deviation = 0;             /* 003 T018: 偏差标志逐 op 复位 */
+        g_op_stg_fb = 0;                /* 008 T015: 搬运面回落逐 op 复位 */
         g_current_op = ii;              /* 回退日志上下文: 段内 op 序号 (与 optrace 行一致) */
         g_current_op_global = i;        /* 003 P2: carve 记录键 = 全局 op 序号 */
         g_current_opcode = op->opcode;
@@ -3173,7 +3343,10 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             const int64_t t1 = HAP_perf_get_time_us();
             if (op_us) op_us[ii] = t1 - t0;
             /* PROF W-P2: 打点对, 索引 = 全局 op 序号 (run_range 分段安全) */
-            if (g_ts_buf && i < g_ts_cap) {
+            /* 008 T020 (US4): 抽样模式下非采样 op 跳过 ts 填充 (槽保持零)。
+             * 裁决/偏差不变量仍逐 op 结算 (见上段), 只省 dc_dma_get + 8 字段。 */
+            if (g_ts_buf && i < g_ts_cap &&
+                (g_ts_sample == 0 || (i % g_ts_sample) == 0)) {
                 int64_t dma_us = 0, dma_bytes = 0;
                 dc_dma_get(&dma_us, &dma_bytes);   /* W-P3: 本 op UserDMA 量 */
                 g_ts_buf[i].start_us  = (uint32_t)(t0 - t_run0);
@@ -3186,6 +3359,7 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                  * 中止 op 的 engine = 默认 SCALAR (exec 未及覆盖)。 */
                 g_ts_buf[i].planned_engine = g_planned_engine;
                 g_ts_buf[i].deviation = rc ? 2u : g_op_deviation;
+                g_ts_buf[i].stg_fb = g_op_stg_fb;
             }
         }
         if (g_trace_on) {
