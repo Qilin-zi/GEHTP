@@ -115,4 +115,23 @@ struct ExtraSplit {
     uint32_t split_index;    // +40  本副本在 Split 的段序号(loader 注入)
 };
 
+// GdnBlock (009 块融合): linear_attn 整块几何。字段序 = data-model E3 wire 序
+// (勿动)。引用不走 extra (args≤16 硬约束, refs 全在 wt_op.args)。
+// 数值边界归 numerics-contract.md (contract_ver 联动)。
+struct ExtraGdnBlock {
+    uint32_t t;                 // +0  序列全长 (prefill = 输入 token 数)
+    uint32_t ntok;              // +4  本块 token 跨度 (prefill 单发射 = T)
+    uint32_t c;                 // +8  本 chunk 实际 token 数 (kernel c,
+                                //     ≤GDN_C_MAX=64 = 004 契约量, 尾块内算)
+    uint32_t h;                 // +12 头数 (生产 16)
+    uint32_t d;                 // +16 头维 (生产 128; conv 通道 3HD=6144)
+    uint32_t d_conv;            // +20 conv 窗长 (生产 4)
+    uint32_t chunk;             // +24 delta 名义分块 (生产 32)
+    uint32_t vtcm_budget_bytes; // +28 闭式预算 (见 extract_gdn_block_extra,
+                                //     128 对齐, FR-004 编译期自守门)
+    uint32_t state_idx;         // +32 US5 decode 状态槽 idx (0x6000|idx);
+                                //     prefill = 0xFFFFFFFF 瞬态 carve 哨兵
+    uint32_t contract_ver;      // +36 numerics-contract.md 版本 (现 1)
+};
+
 } // namespace hnnx

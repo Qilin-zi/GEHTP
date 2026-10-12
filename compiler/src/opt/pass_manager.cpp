@@ -14,6 +14,7 @@ void register_pass_fc_bias();
 void register_pass_view_fold();   // 005 P1
 void register_pass_eltwise_const();
 void register_pass_eltwise_div_to_mul();  // 005 P2(默认关)
+void register_pass_gdn_block();           // 009 US3(默认关)
 
 PassManager& PassManager::instance() {
     static PassManager mgr;
@@ -149,6 +150,7 @@ void PassManager::reset_stats() {
 }
 
 void register_builtin_passes() {
+    register_pass_gdn_block();   // 009: 结构 pass 必须先于 const_fold(保 beta/g 生产链)
     register_pass_const_fold();
     register_pass_shape_fold();
     register_pass_fusion_rules();

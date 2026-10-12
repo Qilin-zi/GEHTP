@@ -28,6 +28,7 @@ add_library(htp_core STATIC
     src/opt/pass_fc_bias.cpp
     src/opt/pass_view_fold.cpp
     src/opt/pass_eltwise_const.cpp
+    src/opt/pass_gdn_block.cpp
     src/cost/cost_model.cpp
     src/vtcm/fancy_allocator.cpp
     src/vtcm/runtime_alloc.cpp
@@ -253,6 +254,7 @@ add_executable(wtop_emit tools/wtop_emit.cpp
                tools/wtop_ops/op_scatter_nd.cpp
                tools/wtop_ops/op_copy_sem.cpp
                tools/wtop_ops/op_dwconv.cpp
+               tools/wtop_ops/op_gdn_block.cpp
                tools/wtop_ops/op_concat.cpp
                tools/wtop_ops/op_strided_slice.cpp
                tools/wtop_ops/op_split.cpp

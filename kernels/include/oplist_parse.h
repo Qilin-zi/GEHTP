@@ -107,6 +107,17 @@ extern "C" {
  * The header makes the optional region distinguishable from alignment padding. */
 #define WT_CARVE_MAGIC 0x43524156u /* "VARC" little-endian */
 #define WT_CARVE_REC_SIZE 20u
+/* 009 GDN 块融合 (2026-10-10): 可选 per-op 几何尾挂 footer, 位于 carve footer
+ * 之后、weight 128B 对齐之前:
+ *   [magic u32 = WT_GDN_EXTRA_MAGIC][count u32][count × {op_index u32, 40B extra}]
+ * 40B extra = 10×u32 (struct wt_gdn_extra), 字段序与 compiler ExtraGdnBlock
+ * (op_extra.hpp) 逐一对应: t/ntok/c/h/d/d_conv/chunk/vtcm_budget_bytes/
+ * state_idx/contract_ver。仅含 OP_GDN_BLOCK 的 blob 写此项; 无融合层则此处
+ * 是 128B 对齐填充(全 0), magic 探测永不误判(同 carve 逻辑)。 */
+#define WT_GDN_EXTRA_MAGIC 0x584E4447u /* "GNDX" little-endian */
+#define WT_GDN_EXTRA_WORDS 10u
+#define WT_GDN_EXTRA_BYTES (WT_GDN_EXTRA_WORDS * 4u) /* 40 */
+#define WT_GDN_EXTRA_REC   (4u + WT_GDN_EXTRA_BYTES) /* op_index + 40B = 44 */
 #define WT_ENG_ACT 0u
 #define WT_ENG_OUT 1u
 #define WT_ENG_WT 2u
@@ -237,6 +248,17 @@ enum {
                                q_raw=0: q 的 1/√D 缩放在 kernel 内;
                                q_raw=1: q 原样 (0.8B decode 图 chunk 机器
                                契约无此 scale, q̂ 直喂)。 */
+    /* 009 GDN 块融合 (2026-10-10): linear_attn 整块单发射 op。
+       [xqkv_t, conv_w_s, beta_t, g_t, y_t] arity 5。
+       几何 (T/ntok/C/H/D/d_conv/chunk/vtcm_budget_bytes/state_idx/
+       contract_ver) 全走 serialized_extra (ExtraGdnBlock 尾挂
+       [u32 len][bytes]), 不占 args (args≤16 硬约束下几何外置)。
+       ref 四套编码: 0x8000|slot 权重槽 (仅 idx1) / 裸 temp id /
+       0x4000|temp VTCM 驻留 / 0x6000|idx 状态槽 (US5 decode 步形,
+       prefill 态 state_idx=0xFFFFFFFF 瞬态 carve 哨兵, 在 extra 不在 args)。
+       xqkv_t = in_proj 出值 f16 [ntok, 3C]; conv_w_s = [d_conv, C] f16
+       同 op19 布局; beta/g_t = [C] 门控向量; y_t = 块出口 f16。 */
+    OP_GDN_BLOCK_F16 = 37,
 };
 
 /* 每个 opcode 的参数个数 (下标 = opcode) */
@@ -275,6 +297,7 @@ enum {
 #define WT_ARITY_MATMUL_F16_BIAS 8
 #define WT_ARITY_CONV1D_SSM_STEP_F16 6
 #define WT_ARITY_DELTA_CHUNK_F16 12
+#define WT_ARITY_GDN_BLOCK_F16 5
 
 struct wt_slot {
     uint32_t len;
@@ -289,6 +312,21 @@ struct wt_op {
     uint32_t args[WT_MAX_ARGS];
 };
 
+/* 009 GDN 块融合: OP_GDN_BLOCK 的几何 (ExtraGdnBlock 设备侧同构镜像)。
+ * 字段序与 compiler ExtraGdnBlock 逐一对应 (勿动); 全 u32 小端。 */
+struct wt_gdn_extra {
+    uint32_t t;                 /* 序列全长 (prefill = 输入 token 数) */
+    uint32_t ntok;              /* 本块 token 跨度 (prefill 单发射 = T) */
+    uint32_t c;                 /* 本 chunk 实际 token 数 (≤ GDN_C_MAX=64) */
+    uint32_t h;                 /* 头数 (生产 16) */
+    uint32_t d;                 /* 头维 (生产 128; conv 通道 3HD) */
+    uint32_t d_conv;            /* conv 窗长 (生产 4) */
+    uint32_t chunk;             /* delta 名义分块 (生产 32) */
+    uint32_t vtcm_budget_bytes; /* 闭式预算 (128 对齐, FR-004) */
+    uint32_t state_idx;         /* US5 decode 状态槽 idx; prefill=0xFFFFFFFF */
+    uint32_t contract_ver;      /* numerics-contract.md 版本 */
+};
+
 struct wt_blob {
     uint16_t ver;
     uint32_t n_slots;
@@ -301,6 +339,8 @@ struct wt_blob {
     const uint8_t* annot_base;  /* v3: 引擎注解表 (n_ops 条 u32); ver<3 = NULL */
     const uint8_t* carve_base;  /* v3: optional VTCM carve footer records */
     uint32_t n_carve;           /* number of entries in carve_base */
+    const uint8_t* gdn_base;    /* 009: optional per-op GDN 几何 footer (records) */
+    uint32_t n_gdn;             /* number of gdn extra records */
 };
 
 enum {

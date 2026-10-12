@@ -895,6 +895,127 @@ int main() {
         }
     }
 
+    std::printf("=== [16] gdn_block: linear_attn 块折叠 (009 US3, default-off) ===\n");
+    {
+        PassManager& pm = PassManager::instance();
+        /* 契约 (spike-report frozen + E4/T011 冻结输入面):
+         *   判别式 = grouping 含 /model/layers.N/linear_attn/ (containment);
+         *   GdnBlock 4 输入 = [xqkv(in_proj 出值), conv_w, beta, g]
+         *   (权重 matmul in_proj 与 beta/g 生产链 = survivor, 不折);
+         *   出口锚 = 输出离开可折集的成员 → 就地改名 GdnBlock + 接线四输入;
+         *   其余可折成员 OP_DEAD。 */
+        auto count_gdn = [](GraphPrepare& gp) {
+            size_t n = 0;
+            gp.for_each_op([&](OpDef* o) {
+                if (o && !o->is_dead() && o->name_tag && o->name_tag->name() &&
+                    std::strcmp(o->name_tag->name(), "GdnBlock") == 0) ++n;
+            });
+            return n;
+        };
+        auto set_grp = [](OpDef* o, const char* g) { if (o) o->grouping = g; };
+        /* 最小 GDN 形 (形状不参与匹配, 纯名判别):
+         * x(块外) → in_proj FC(survivor) → m1 → m2(+conv_w) → exit(锚);
+         * beta/g 生产链(survivor) ← 块内 const。 */
+        auto build_gdn_graph = [&](GraphPrepare& gp) {
+            auto x   = add_input(gp, 5, f32_def(1, 32, 96, 1));
+            auto win = add_const_f32(gp, 1, f32_def(96, 32, 1, 1), std::vector<float>(96 * 32, 0.5f));
+            auto cw  = add_const_f32(gp, 2, f32_def(4, 96, 1, 1), std::vector<float>(4 * 96, 0.25f));
+            set_grp(gp.get_op_at(cw), "/model/layers.0/linear_attn/Constant_conv_w");
+            auto bg = add_const_f32(gp, 3, f32_def(1, 32, 16, 1), std::vector<float>(32 * 16, 0.1f));
+            set_grp(gp.get_op_at(bg), "/model/layers.0/linear_attn/Constant_bg");
+            auto proj = add_unary_op(gp, 6, "FullyConnected", {x, win}, f32_def(1, 32, 32, 1));
+            set_grp(gp.get_op_at(proj), "/model/layers.0/linear_attn/in_proj/MatMul");
+            auto m1 = add_unary_op(gp, 7, "Eltwise_Unary", {proj}, f32_def(1, 32, 32, 1));
+            set_grp(gp.get_op_at(m1), "/model/layers.0/linear_attn/core/act");
+            auto m2 = add_unary_op(gp, 8, "Eltwise_Binary", {m1, cw}, f32_def(1, 32, 32, 1));
+            set_grp(gp.get_op_at(m2), "/model/layers.0/linear_attn/core/gdn");
+            auto betap = add_unary_op(gp, 10, "Eltwise_Unary", {bg}, f32_def(1, 32, 16, 1));
+            set_grp(gp.get_op_at(betap), "/model/layers.0/linear_attn/beta/sigmoid");
+            auto gpdec = add_unary_op(gp, 11, "Eltwise_Unary", {bg}, f32_def(1, 32, 16, 1));
+            set_grp(gp.get_op_at(gpdec), "/model/layers.0/linear_attn/g/neg_exp");
+            auto exit = add_unary_op(gp, 9, "Eltwise_Unary", {m2}, f32_def(1, 32, 32, 1));
+            set_grp(gp.get_op_at(exit), "/model/layers.0/linear_attn/out_proj/pre_reshape");
+            add_output(gp, 20, exit);
+        };
+        auto regrp_attn = [&](GraphPrepare& gp) {
+            for (op_id_t id : {6, 7, 8, 9, 10, 11}) {
+                OpDef* o = gp.get_op_at(id);
+                if (o && o->grouping.find("linear_attn") != std::string::npos)
+                    set_grp(o, "/model/layers.3/self_attn/core");
+            }
+            set_grp(gp.get_op_at(2), "/model/layers.3/self_attn/Constant_1");
+            set_grp(gp.get_op_at(3), "/model/layers.3/self_attn/Constant_2");
+        };
+
+        // A 正例: enable 后块折叠 — 可折成员灭/出口改名/四输入接线
+        pm.enable("gdn_block");
+        {
+            GraphPrepare gp;
+            build_gdn_graph(gp);
+            gp.run_optimize_passes(env);
+            OpDef* ex = gp.get_op_at(9);
+            OpDef* p7 = gp.get_op_at(7);
+            OpDef* p8 = gp.get_op_at(8);
+            OpDef* pj = gp.get_op_at(6);
+            OpDef* pb = gp.get_op_at(10);
+            OpDef* pg = gp.get_op_at(11);
+            CHECK(count_gdn(gp) == 1, "gdn: 正例恰 1 个 GdnBlock 出口");
+            CHECK(ex && !ex->is_dead() && ex->name_tag &&
+                  std::strcmp(ex->name_tag->name(), "GdnBlock") == 0,
+                  "gdn: 出口 op 改名 GdnBlock");
+            CHECK(ex && ex->inputs.size() == 4 && ex->inputs[0].src_id == 6 &&
+                  ex->inputs[1].src_id == 2 && ex->inputs[2].src_id == 10 &&
+                  ex->inputs[3].src_id == 11,
+                  "gdn: 接线 = [xqkv(in_proj), conv_w, beta, g]");
+            CHECK(p7 && p7->is_dead() && p8 && p8->is_dead(), "gdn: 可折成员 op 全灭");
+            CHECK(pj && !pj->is_dead() && pb && !pb->is_dead() && pg && !pg->is_dead(),
+                  "gdn: survivor (in_proj/beta/g 生产链) 不灭");
+            // 幂等: 二跑零改写 (仍恰 1 个, 接线不变)
+            gp.run_optimize_passes(env);
+            OpDef* ex2 = gp.get_op_at(9);
+            CHECK(count_gdn(gp) == 1 && ex2 && ex2->inputs.size() == 4 &&
+                  ex2->inputs[0].src_id == 6 && ex2->inputs[1].src_id == 2 &&
+                  ex2->inputs[2].src_id == 10 && ex2->inputs[3].src_id == 11,
+                  "gdn: 幂等二跑零改写");
+        }
+        // B 旁路消费者: m2 被块外 op 消费 → 闭合破坏 → 整层不折
+        {
+            GraphPrepare gp;
+            build_gdn_graph(gp);
+            auto by = add_unary_op(gp, 15, "Eltwise_Unary", {8}, f32_def(1, 32, 32, 1));
+            set_grp(gp.get_op_at(by), "/model/layers.0/mlp/gate");  // 块外名
+            add_output(gp, 21, by);
+            gp.run_optimize_passes(env);
+            CHECK(count_gdn(gp) == 0, "gdn: 旁路消费者 → 不折 (fallback)");
+            OpDef* ex = gp.get_op_at(9);
+            CHECK(ex && !ex->is_dead() && ex->name_tag &&
+                  std::strcmp(ex->name_tag->name(), "GdnBlock") != 0,
+                  "gdn: 旁路态出口未改名");
+        }
+        // C 未识别层: self_attn 判别词 → 零改写
+        {
+            GraphPrepare gp;
+            build_gdn_graph(gp);
+            regrp_attn(gp);
+            gp.run_optimize_passes(env);
+            CHECK(count_gdn(gp) == 0, "gdn: self_attn 层零改写");
+            OpDef* p7 = gp.get_op_at(7);
+            CHECK(p7 && !p7->is_dead(), "gdn: 未识别层成员不灭");
+        }
+        // D 逃生门: disable 后零折叠 (关闭态惰性, C1)
+        pm.disable("gdn_block");
+        {
+            GraphPrepare gp;
+            build_gdn_graph(gp);
+            gp.run_optimize_passes(env);
+            CHECK(count_gdn(gp) == 0, "gdn: --no-pass 逃生门计数 0");
+            OpDef* p8 = gp.get_op_at(8);
+            CHECK(p8 && !p8->is_dead(), "gdn: 逃生门成员存活");
+        }
+        // 还原 default-off 基态 (pm 是进程级单例, 勿泄漏给后续用例)
+        pm.disable("gdn_block");
+    }
+
     std::printf("\n%s: %d failures\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

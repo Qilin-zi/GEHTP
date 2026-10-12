@@ -168,7 +168,6 @@ struct Emitter {
     std::vector<StageRec> pending_stages;
     size_t stage_mark = 0;                 /* 主循环已回填 end_pos 的水位 */
     uint32_t vtcm_stage_top = 0xFFFFFFFFu; /* 惰性: staging 起点 (planner 驻留区上沿对齐 2048) */
-
     /* 008 T012: f16 权重编译期 crouton 预打包 (--dma-runlist)。探针定谳
      * (evidence/vtcm-access-probe.txt): pack_wgt 标量散写 = 66.4% wall,
      * GEMM 驱留后 119µs → 权重静态, pack 成本编译期一次性归零: 发射期按
@@ -178,6 +177,16 @@ struct Emitter {
      * 源槽若无其他引用者, emit 末尾条件 GC 剥除(blob 不双存权重)。 */
     struct PpRec { uint64_t w_op_id; uint32_t k, nn, n0, t1; uint32_t pp_slot; };
     std::vector<PpRec> pp_recs;
+    /* 009 T019: GdnBlock 内核私有 VTCM scratch (中间量 f32 驻留, FR-004)。
+     * 惰性分配一段 (alloc_vtcm_stage), 26 层非重叠生命期时间复用同段
+     * (层内 carve, 层间互斥不必同驻 — research D5; 生产形各层几何相同,
+     * 预算一致 3024896, 若未来层间几何分化需按 max 重分配, T025 复核)。 */
+    uint32_t gdn_scratch_off = 0xFFFFFFFFu;
+    uint32_t gdn_scratch_size = 0;
+    /* 009 T020: GdnBlock 几何尾挂 footer — 每融合 op 一条 {op_index, ExtraGdnBlock}
+     * (设备侧 exec_gdn_block 按 g_current_op_global 查几何)。与 carve 解耦:
+     * 无 VTCM 池时也登记 (内核仍需 H/D/d_conv/chunk/T 跑数值), carve 才需池。 */
+    std::vector<std::pair<uint32_t, ExtraGdnBlock>> gdn_extras;
     // 池内 bump 一块 staging 区, 登记为静态 VTCM temp, 返回 temp id (失败 -1:
     // 无 mem plan / 无 VTCM 池 / 池放不下 / temp id 耗尽)。基线取 ddr_op_map
     // 全量计划态上沿 (非物化态: 首个 W4A16 到达时高偏移驻留 temp 可能尚未物化)。
@@ -839,6 +848,16 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
     } else if (nm == "Conv2d") {
         engine = 2u;               /* WT_ENG_HMX */
         snprintf(why, sizeof why, "conv has HMX path");
+    } else if (nm == "GdnBlock") {
+        /* 009 块融合: 单发射块内 matmul 用 004 GEMV/mpyacc 方案 + conv/元素
+         * 级联, 实测执行体 = gdn_block_f16 (kernels/src/hvx/gdn_kern.c, HVX
+         * 内核族)。引擎注解必须与执行体一致 (WT_ENG_HVX), 否则运行期
+         * planned!=actual 触发 rc=50 引擎偏航硬门。无标量回落:
+         * 块不可执行时应已编译期 FallbackRecord 降级, 运行时回落 = 静默数值错
+         * (禁静默 FR-004)。 */
+        engine = 1u;               /* WT_ENG_HVX (执行体 gdn_kern.c 为 HVX) */
+        fb_allowed = 0u;
+        snprintf(why, sizeof why, "fused block HVX (004 GEMV/mpyacc), no scalar fallback");
     } else if (nm == "Add" || nm == "Eltwise_Binary" || nm == "Eltwise_Unary" ||
                nm == "ElementWiseNeuron" || nm == "Softmax") {
         /* 003 精度修正: 仅这些 op 名有默认开启的 HVX 内核。其余 elemwise/内存 op

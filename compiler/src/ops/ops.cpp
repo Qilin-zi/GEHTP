@@ -1115,6 +1115,45 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             else for (uint32_t i = 0; i + 2 < ork && batched; i++)
                 if (out_def.dims[i] != in_defs[1].dims[i]) batched = false;
         }
+        /* FC bias 折叠(pass_fc_bias)配套: op_data scalar "has_bias"==1 且
+         * inputs[2] 元素数 == nn 时按列加 bias, 与设备 exec_matmul_f16 标量
+         * 路径(f32 累加器加 bias)同口径 —— host/device 数值一致。
+         * 只认 scalar 标记: 注入形态下 inputs[2] 常是 N 元素 wscale const,
+         * 形状启发会误加(test_wtop_emit US1 实锤)。host_run --bin 路径
+         * op_data 不落盘, 标记丢失则按无 bias 跑(与折叠前行为一致)。
+         * 注意: 4D 填充(FC 输出 [1,1,m,n])使 ork>=3 误入 batched 分支, 而
+         * batched BMM 原本不套 bias —— dt_bias 就是被这条路径丢的(0.8B
+         * 实测: 全 FC ork>=3 → else 分支零命中)。故 mm_bias 须在 batched/
+         * else 分流前判定, 两分支都套(真实 attention BMM 无 has_bias 标记,
+         * mm_bias 恒 null, 零行为变化)。 */
+        const float* mm_bias = nullptr;
+        {
+            const ScalarParam* hb = scalar_get(sp, "has_bias");
+            if (hb && hb->is_numeric && hb->value_num != 0 &&
+                inputs.size() > 2 && inputs[2] && in_defs.size() > 2) {
+                size_t bn = 1;
+                for (uint32_t i = 0; i < in_defs[2].rank && i < 5; ++i) bn *= in_defs[2].dims[i];
+                if (bn == nn) mm_bias = reinterpret_cast<const float*>(inputs[2]);
+            }
+            if (getenv("GEHTP_MMBIAS_DBG")) {
+                size_t bn = 1;
+                for (uint32_t i = 0; in_defs.size() > 2 && i < in_defs[2].rank && i < 5; ++i)
+                    bn *= in_defs[2].dims[i];
+                std::fprintf(stderr,
+                    "[mmbias] oid=%llu m=%zu nn=%zu k=%zu ork=%u batched=%d ins=%zu indefs=%zu "
+                    "hb=%d in2set=%d in2rank=%u in2d0=%llu bn=%zu mmbias=%d in2[0]=%g\n",
+                    (unsigned long long)op_id,
+                    m, nn, k, ork, (int)batched, inputs.size(), in_defs.size(),
+                    (hb && hb->is_numeric && hb->value_num != 0) ? 1 : 0,
+                    (inputs.size() > 2 && inputs[2]) ? 1 : 0,
+                    (in_defs.size() > 2) ? in_defs[2].rank : 999,
+                    (in_defs.size() > 2 && in_defs[2].rank > 0) ?
+                        (unsigned long long)in_defs[2].dims[0] : 0ULL,
+                    bn, mm_bias ? 1 : 0,
+                    (inputs.size() > 2 && inputs[2]) ?
+                        reinterpret_cast<const float*>(inputs[2])[0] : -999.f);
+            }
+        }
         if (batched) {
             size_t Bn = 1;
             for (uint32_t i = 0; i + 2 < ork; i++) Bn *= out_def.dims[i];
@@ -1128,37 +1167,22 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
                             float bv = t1 ? B[(b * N2 + j) * k + p] : B[(b * k + p) * N2 + j];
                             acc += av * bv;
                         }
+                        if (mm_bias) acc += mm_bias[j];
                         out[(b * M2 + i) * N2 + j] = acc;
                     }
         } else {
-        /* FC bias 折叠(pass_fc_bias)配套: op_data scalar "has_bias"==1 且
-         * inputs[2] 元素数 == nn 时按列加 bias, 与设备 exec_matmul_f16 标量
-         * 路径(f32 累加器加 bias)同口径 —— host/device 数值一致。
-         * 只认 scalar 标记: 注入形态下 inputs[2] 常是 N 元素 wscale const,
-         * 形状启发会误加(test_wtop_emit US1 实锤)。host_run --bin 路径
-         * op_data 不落盘, 标记丢失则按无 bias 跑(与折叠前行为一致)。 */
-        const float* mm_bias = nullptr;
-        {
-            const ScalarParam* hb = scalar_get(sp, "has_bias");
-            if (hb && hb->is_numeric && hb->value_num != 0 &&
-                inputs.size() > 2 && inputs[2] && in_defs.size() > 2) {
-                size_t bn = 1;
-                for (uint32_t i = 0; i < in_defs[2].rank && i < 5; ++i) bn *= in_defs[2].dims[i];
-                if (bn == nn) mm_bias = reinterpret_cast<const float*>(inputs[2]);
-            }
-        }
-        for (size_t i = 0; i < m; ++i) {
-            for (size_t j = 0; j < nn; ++j) {
-                float acc = 0.0f;
-                for (size_t p = 0; p < k; ++p) {
-                    float av = t0 ? A[(size_t)p * m + i] : A[i * k + p];
-                    float bv = t1 ? B[j * k + p] : B[p * nn + j];
-                    acc += av * bv;
+            for (size_t i = 0; i < m; ++i) {
+                for (size_t j = 0; j < nn; ++j) {
+                    float acc = 0.0f;
+                    for (size_t p = 0; p < k; ++p) {
+                        float av = t0 ? A[(size_t)p * m + i] : A[i * k + p];
+                        float bv = t1 ? B[j * k + p] : B[p * nn + j];
+                        acc += av * bv;
+                    }
+                    if (mm_bias) acc += mm_bias[j];
+                    out[i * nn + j] = acc;
                 }
-                if (mm_bias) acc += mm_bias[j];
-                out[i * nn + j] = acc;
             }
-        }
         }
     } else if (op_type_name == "Conv" || op_type_name == "Conv2d"
                || op_type_name == "DepthWiseConv2d") {
@@ -1266,6 +1290,198 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         }
         const int32_t* i32 = reinterpret_cast<const int32_t*>(in0);
         for (size_t i = 0; i < n; ++i) out[i] = in0 ? (float)i32[i] : 0.0f;
+    } else if (op_type_name == "GdnBlock") {
+        /* 009 GDN 块融合 host 参考 (specs/009-gdn-block-fusion/numerics-contract.md
+         * contract_ver=1, B1-B5)。分立序列与融合块的合法舍入差 = 入口/出口 f16 量化,
+         * 块内一律 f32 (conv 门 SiLU 不落 f16=B2, delta/state 全 f32=B3)。
+         * 数学镜像 kernels/src/hvx/gdn_kern.c conv_f16/delta_chunk_f16 (f32 化),
+         * f16 转换位级同 gdn_ref.c gdn_f32_to_f16 (RNE)。
+         * 输入: in0=xqkv [T,3HD] (in_proj 出值, B1 不融); in1=conv_w [d_conv,3HD];
+         *       in2=beta [T,H]; in3=g 负 log decay [T,H] (均 token-major;
+         *       pass 已追索到 Softplus×(−exp(A_log)) Mul 输出, 值恒负)。
+         * q/k l2norm (HF use_qk_l2norm_in_kernel=True: x·rsqrt(Σx²+1e-6)),
+         * q 再乘 1/√D。
+         * 输出: y [T,HD] token-major, f16 量化值存 f32 缓冲 (B4, 喂 out_proj)。 */
+        const float* xqkv = inputs.size() > 0 && inputs[0] ? reinterpret_cast<const float*>(inputs[0]) : nullptr;
+        const float* cw   = inputs.size() > 1 && inputs[1] ? reinterpret_cast<const float*>(inputs[1]) : nullptr;
+        const float* beta = inputs.size() > 2 && inputs[2] ? reinterpret_cast<const float*>(inputs[2]) : nullptr;
+        const float* gdec = inputs.size() > 3 && inputs[3] ? reinterpret_cast<const float*>(inputs[3]) : nullptr;
+        auto spg = unpack_scalar_params(params);
+        const auto geom = [&](const char* key, long dflt) -> long {
+            if (const ScalarParam* p = scalar_get(spg, key))
+                return (long)(p->is_numeric ? p->value_num
+                                            : std::strtol(p->value_str.c_str(), nullptr, 10));
+            return dflt;
+        };
+        const long H = geom("H", 16), D = geom("D", 128), dcnv = geom("d_conv", 4);
+        const size_t chunk = (size_t)geom("chunk", 32);
+        const size_t HD = (size_t)H * (size_t)D, DI = 3 * HD;
+        size_t T = n / HD;
+        if (!xqkv || !cw || !beta || !gdec || T == 0) {
+            for (size_t i = 0; i < n; ++i) out[i] = 0.0f;
+            return;
+        }
+        /* f16 量化 (B1 输入侧已量化过, 此处只服务 B4 出口) */
+        const auto f32_to_f16_bits = [](float f) -> uint16_t {
+            uint32_t x; std::memcpy(&x, &f, 4);
+            uint32_t sign = (x >> 16) & 0x8000;
+            int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+            uint32_t man  = x & 0x7FFFFF;
+            uint16_t h;
+            if (((x >> 23) & 0xFF) == 0xFF) { h = (uint16_t)(sign | 0x7C00 | (man ? 0x200 : 0)); }
+            else if (exp >= 31) { h = (uint16_t)(sign | 0x7C00); }
+            else if (exp <= 0) {
+                if (exp < -10) { h = (uint16_t)sign; }
+                else {
+                    uint32_t m = 0x800000u | man, sh = (uint32_t)(14 - exp);
+                    uint32_t sub = m >> sh, rem = m & ((1u << sh) - 1);
+                    sub += (rem > (1u << (sh - 1)) || (rem == (1u << (sh - 1)) && (sub & 1))) ? 1u : 0u;
+                    h = (uint16_t)(sign | sub);
+                }
+            } else {
+                uint32_t m = man >> 13, r = man & 0x1FFF;
+                m += (r > 0x1000u || (r == 0x1000u && (m & 1))) ? 1u : 0u;
+                if (m >> 10) { m = 0; exp++; }
+                h = (uint16_t)(sign | ((uint32_t)exp << 10) | m);
+            }
+            return h;
+        };
+        const auto f16_bits_to_f32 = [](uint16_t h) -> float {
+            uint32_t sign = (uint32_t)(h >> 15) << 31;
+            uint32_t exp  = (h >> 10) & 0x1F, man = h & 0x3FF, bits;
+            if (exp == 0) {
+                if (man == 0) { bits = sign; }
+                else {
+                    int e = 0; uint32_t m = man;
+                    do { m <<= 1; e++; } while (!(m & 0x400));
+                    bits = sign | ((uint32_t)(127 - 15 - e + 1) << 23) | ((m & 0x3FF) << 13);
+                }
+            } else if (exp == 31) {
+                bits = sign | 0x7F800000u | (man << 13);
+            } else {
+                bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
+            }
+            float f; std::memcpy(&f, &bits, 4);
+            return f;
+        };
+        const auto f16q = [&](float f) -> float { return f16_bits_to_f32(f32_to_f16_bits(f)); };
+
+        /* B2: conv + SiLU, f32 滑窗零起, 权重 [d_conv, DI], 推窗在算后 (conv_f16 同) */
+        std::vector<float> yc(T * DI), win((size_t)(dcnv - 1) * DI, 0.0f);
+        for (size_t t = 0; t < T; ++t) {
+            const float* xr = xqkv + t * DI;
+            float* yr = &yc[t * DI];
+            for (size_t ch = 0; ch < DI; ++ch) {
+                float s = 0.0f;
+                for (long i = 0; i < dcnv - 1; ++i)
+                    s += cw[(size_t)i * DI + ch] * win[(size_t)i * DI + ch];
+                s += cw[(size_t)(dcnv - 1) * DI + ch] * xr[ch];
+                yr[ch] = s / (1.0f + std::exp(-s));
+            }
+            std::memmove(win.data(), win.data() + DI, (size_t)(dcnv - 2) * DI * sizeof(float));
+            std::memcpy(win.data() + (size_t)(dcnv - 2) * DI, xr, DI * sizeof(float));
+        }
+
+        /* B3: delta 块内全 f32; state f32 原地零起 (prefill), chunk 跨块携带 */
+        const float scale = 1.0f / std::sqrt((float)D);
+        std::vector<float> S((size_t)H * D * D, 0.0f);
+        std::vector<float> kf(chunk * D), vf(chunk * D), qf(chunk * D), Gc(chunk),
+                           bmat(chunk * D), u(chunk * D), bf(D);
+        for (long h = 0; h < H; ++h) {
+            float* Sh = &S[(size_t)h * D * D];
+            for (size_t base = 0; base < T; base += chunk) {
+                const int c = (int)std::min(chunk, T - base);
+                float acc = 0.0f;
+                for (int t = 0; t < c; ++t) {
+                    acc += gdec[(base + (size_t)t) * H + (size_t)h];
+                    Gc[(size_t)t] = acc;
+                }
+                for (int t = 0; t < c; ++t) {
+                    const float* yrow = &yc[(base + (size_t)t) * DI + (size_t)h * D];
+                    /* q/k l2norm (HF use_qk_l2norm_in_kernel=True, FLA 口径:
+                     * x·rsqrt(Σx²+eps), eps=1e-6); q 再乘 1/√D, k 不乘。 */
+                    float qsq = 0.0f, ksq = 0.0f;
+                    for (int nn = 0; nn < D; ++nn) {
+                        float qv = yrow[nn], kv = yrow[HD + nn];
+                        qsq += qv * qv;
+                        ksq += kv * kv;
+                        vf[(size_t)t * D + nn] = yrow[2 * HD + nn];
+                    }
+                    const float iq = 1.0f / std::sqrt(qsq + 1e-6f);
+                    const float ik = 1.0f / std::sqrt(ksq + 1e-6f);
+                    for (int nn = 0; nn < D; ++nn) {
+                        kf[(size_t)t * D + nn] = yrow[HD + nn] * ik;
+                        qf[(size_t)t * D + nn] = yrow[nn] * (iq * scale);
+                    }
+                }
+                std::vector<float> L((size_t)c * c, 0.0f), Tm((size_t)c * c, 0.0f);
+                for (int j = 0; j < c; ++j) {
+                    float bj = beta[(base + (size_t)j) * H + (size_t)h];
+                    for (int i = 0; i < j; ++i) {
+                        float s = 0.0f;
+                        for (int nn = 0; nn < D; ++nn)
+                            s += kf[(size_t)j * D + nn] * kf[(size_t)i * D + nn];
+                        L[(size_t)j * c + i] = std::exp(Gc[j] - Gc[i]) * s * bj;
+                    }
+                }
+                for (int r = 0; r < c; ++r)                            /* Tm=(I+L)^{-1}, ref_solve_tri 同式 */
+                    for (int j = 0; j < c; ++j) {
+                        float s = (r == j) ? 1.0f : 0.0f;
+                        for (int i = 0; i < r; ++i)
+                            s -= L[(size_t)r * c + i] * Tm[(size_t)i * c + j];
+                        Tm[(size_t)r * c + j] = s;
+                    }
+                for (int j = 0; j < c; ++j) {
+                    float ej = std::exp(Gc[j]);
+                    float bj = beta[(base + (size_t)j) * H + (size_t)h];
+                    for (int m = 0; m < D; ++m) {
+                        float sk = 0.0f;
+                        for (int nn = 0; nn < D; ++nn)
+                            sk += Sh[(size_t)m * D + nn] * kf[(size_t)j * D + nn];
+                        bmat[(size_t)j * D + m] = bj * (vf[(size_t)j * D + m] - ej * sk);
+                        u[(size_t)j * D + m] = 0.0f;
+                    }
+                    for (int i = 0; i <= j; ++i) {
+                        float tij = Tm[(size_t)j * c + i];
+                        if (tij == 0.0f) continue;
+                        for (int m = 0; m < D; ++m)
+                            u[(size_t)j * D + m] += tij * bmat[(size_t)i * D + m];
+                    }
+                }
+                for (int t = 0; t < c; ++t) {
+                    float et = std::exp(Gc[t]);
+                    for (int m = 0; m < D; ++m) {
+                        float s = 0.0f;
+                        for (int nn = 0; nn < D; nn++)
+                            s += Sh[(size_t)m * D + nn] * qf[(size_t)t * D + nn];
+                        bf[m] = et * s;
+                    }
+                    for (int i = 0; i <= t; ++i) {
+                        float qk = 0.0f, w = std::exp(Gc[t] - Gc[i]);
+                        for (int nn = 0; nn < D; nn++)
+                            qk += qf[(size_t)t * D + nn] * kf[(size_t)i * D + nn];
+                        qk *= w;
+                        if (qk == 0.0f) continue;
+                        for (int m = 0; m < D; ++m) bf[m] += qk * u[(size_t)i * D + m];
+                    }
+                    for (int m = 0; m < D; ++m)                         /* B4: 出口 f16 量化 */
+                        out[(base + (size_t)t) * HD + (size_t)h * D + m] = f16q(bf[m]);
+                }
+                float eC = std::exp(Gc[c - 1]);
+                for (size_t z = 0; z < (size_t)D * D; ++z) Sh[z] *= eC;
+                for (int i = 0; i < c; ++i) {
+                    float w = std::exp(Gc[c - 1] - Gc[i]);
+                    const float* ui = &u[(size_t)i * D];
+                    const float* ki = &kf[(size_t)i * D];
+                    for (int m = 0; m < D; ++m) {
+                        float wu = w * ui[m];
+                        if (wu == 0.0f) continue;
+                        float* row = Sh + (size_t)m * D;
+                        for (int nn = 0; nn < D; nn++) row[nn] += wu * ki[nn];
+                    }
+                }
+            }
+        }
     } else if (op_type_name == "KvAppendF16" || op_type_name == "KvGatherKT"
                || op_type_name == "KvGatherV" || op_type_name == "Conv1dSsmStepF16"
                || op_type_name == "DeltaChunkF16" || op_type_name == "DecodeFaceF16") {
@@ -1529,6 +1745,7 @@ std::unique_ptr<Op> TileOp::construct(const OpIoPtrs& io, op_id_t id) { return g
 std::unique_ptr<Op> ConditionalOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> ConditionalAddOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 std::unique_ptr<Op> SwitchedOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
+std::unique_ptr<Op> GdnBlockOp::construct(const OpIoPtrs& io, op_id_t id) { return generic_construct(io, id, nullptr); }
 
 // Op registration helper
 // Source: op_package_registry.cc, op_package_ops_opts_registration.cc
@@ -1711,6 +1928,10 @@ void register_all_ops() {
         reg.register_op_fn("Conditional", ConditionalOp::construct);
         reg.register_op_fn("ConditionalAdd", ConditionalAddOp::construct);
         reg.register_op_fn("Switched", SwitchedOp::construct);
+        // 009 GDN 块融合锚 (pass 就地改名, host 参考在 TypicalOp::execute
+        // "GdnBlock" 分支)。未注册时 factory-null → 整层输出空缓冲,
+        // 融合 host 对拍假败(1010 T025 实锤 cos 0.15 = 18 层全跳过)。
+        reg.register_op_fn("GdnBlock", GdnBlockOp::construct);
         // 004 T018 decode 图状态 op (execute 按 op_type_name 分派; generate 会
         // 设 op_type_name, construct 只需产出 TypicalOp 载 params)
         reg.register_op_fn("KvAppendF16", AddOp::construct);

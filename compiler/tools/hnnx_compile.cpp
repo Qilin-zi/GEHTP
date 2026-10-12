@@ -18,6 +18,7 @@
 #include "hnnx/frontend/qnn_ir_loader.hpp"
 #include "hnnx/ir/graph_prepare.hpp"
 #include "hnnx/opt/pass_manager.hpp"
+#include "hnnx/opt/pass_gdn_block.hpp"
 #include "hnnx/schedule/scheduler.hpp"
 #include "hnnx/serialize/context_binary_writer.hpp"
 #include "hnnx/api/hexagon_nn_env.hpp"
@@ -419,6 +420,8 @@ int main(int argc, char** argv) {
     if (opt_stats) {
         std::printf("[opt-stats] %s\n",
                     PassManager::instance().stats_line().c_str());
+        // 009 C1: gdn_block 逐层覆盖(含 fallback 原因, 禁静默)
+        std::printf("[opt-stats] %s\n", gdn_block_opt_stats().c_str());
     }
     if (!ddr_offsets_path.empty()) {
         // 第7步阶段一: 静态 DDR 偏移表(必须在全部图变换之后 —— 生命期

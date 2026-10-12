@@ -2316,6 +2316,49 @@ std::vector<uint8_t> extract_split_extra(const GraphPrepare& gp, const OpDef& op
     return raw_extra(&e, sizeof(e));
 }
 
+/* 009 T016: GdnBlock 块几何 extractor。
+ * H/D/d_conv/chunk 标量口径与 ops.cpp GdnBlock host 参考分支 (T011) 一致;
+ * T 从 in0 (xqkv [T,3HD]) 形状积 / 3HD 推导, 标量 "T" 可显式覆盖。
+ * c = min(chunk, T) (kernel 按 chunk 循环, 尾块在内核内截; ≤GDN_C_MAX=64
+ * 由设备侧 exec 校验, 004 契约)。
+ * vtcm_budget_bytes 闭式 = 内核私有 scratch 保守超集 (内核可复用/别名;
+ * FR-004 超 16MB 由 emit carve 门显式失败, 非 parse 层):
+ *   state f32 H·D·D·4 + conv 滑窗 f32 (d_conv−1)·3HD·4
+ *   + yc 暂存 f16 T·3HD·2 + y 出口 f16 T·HD·2 + beta/g f16 T·H·2·2
+ *   + L/T 三角 f16 2·H·c·c·2 + chunk 缓冲 f32 5·H·c·D·4, 128 对齐。 */
+std::vector<uint8_t> extract_gdn_block_extra(const GraphPrepare& gp, const OpDef& opdef) {
+    ExtraGdnBlock e{};
+    e.h = static_cast<uint32_t>(scalar_num(opdef, "H", 16));
+    e.d = static_cast<uint32_t>(scalar_num(opdef, "D", 128));
+    e.d_conv = static_cast<uint32_t>(scalar_num(opdef, "d_conv", 4));
+    e.chunk = static_cast<uint32_t>(scalar_num(opdef, "chunk", 32));
+    const uint64_t hd = (uint64_t)e.h * e.d, di3 = 3ull * hd;
+    uint64_t t = (uint64_t)scalar_num(opdef, "T", 0);
+    if (t == 0) {
+        const OpDef* x = opdef.inputs.size() > 0 ? gp.get_op_at(opdef.inputs[0].src_id) : nullptr;
+        if (x) {
+            uint64_t elems = 1;
+            for (uint32_t i = 0; i < x->output_def.rank; ++i) elems *= x->output_def.dims[i];
+            if (di3 && elems >= di3 && elems % di3 == 0) t = elems / di3;
+        }
+    }
+    e.t = (uint32_t)t;
+    e.ntok = e.t;
+    e.c = e.chunk < e.t ? e.chunk : e.t;
+    const uint64_t cc = e.c;
+    uint64_t budget = (uint64_t)e.h * e.d * e.d * 4ull
+                    + (uint64_t)(e.d_conv ? e.d_conv - 1u : 0u) * di3 * 4ull
+                    + t * di3 * 2ull + t * hd * 2ull
+                    + t * e.h * 2ull * 2ull
+                    + 2ull * e.h * cc * cc * 2ull
+                    + 5ull * e.h * cc * e.d * 4ull;
+    if (budget > 0xFFFFFFFFull) budget = 0xFFFFFFFFull;   /* 超界哨兵, emit 门显式失败 */
+    e.vtcm_budget_bytes = (uint32_t)((budget + 127ull) & ~127ull);
+    e.state_idx = 0xFFFFFFFFu;   /* prefill 瞬态 carve 哨兵; US5 实义化 */
+    e.contract_ver = 1u;         /* numerics-contract.md contract_ver=1 */
+    return raw_extra(&e, sizeof(e));
+}
+
 // 004 T018 decode 状态族: 5×u32 定长 extra 的 per-type 键表(extractor 与
 // rebuild_op_data_from_extra 双侧共用; 键域与 ops.cpp dnum / wtop_emit 一一对应)
 bool decode_state_keys(const char* nm, const char* (&keys)[5]) {
@@ -2381,6 +2424,7 @@ std::map<std::string, ExtraInfoFn>& extra_info_registry() {
         m["Pad"] = extract_pad_extra;
         m["ScatterNd"] = extract_scatternd_extra;
         m["Split"] = extract_split_extra;
+        m["GdnBlock"] = extract_gdn_block_extra;
         // 004 T018: decode 图状态族(net.json loader op_data → extra 尾随)
         m["DecodeFaceF16"] = extract_decode_state_extra;
         m["KvAppendF16"] = extract_decode_state_extra;

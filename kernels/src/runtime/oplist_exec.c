@@ -3055,6 +3055,77 @@ static int exec_delta_chunk(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
+/* 009: 按 op 序号查 GDN 几何尾挂 footer 记录 (稀疏, 线性扫; ≤26 条)。
+ * 逐字段 wt_rd_u32 读入调用方 struct, 避免未对齐指针解引用 (blob 基址不保证 4B 对齐)。
+ * 返回 1=命中 (写入 *out), 0=未命中。 */
+static int gdn_extra_lookup(const struct wt_blob* b, uint32_t op_index,
+                            struct wt_gdn_extra* out) {
+    if (!b->gdn_base || !b->n_gdn) return 0;
+    const uint8_t* p = b->gdn_base;
+    for (uint32_t i = 0; i < b->n_gdn; i++, p += WT_GDN_EXTRA_REC) {
+        if (wt_rd_u32(p) != op_index) continue;
+        out->t                 = wt_rd_u32(p + 4u);
+        out->ntok              = wt_rd_u32(p + 8u);
+        out->c                 = wt_rd_u32(p + 12u);
+        out->h                 = wt_rd_u32(p + 16u);
+        out->d                 = wt_rd_u32(p + 20u);
+        out->d_conv            = wt_rd_u32(p + 24u);
+        out->chunk             = wt_rd_u32(p + 28u);
+        out->vtcm_budget_bytes = wt_rd_u32(p + 32u);
+        out->state_idx         = wt_rd_u32(p + 36u);
+        out->contract_ver      = wt_rd_u32(p + 40u);
+        return 1;
+    }
+    return 0;
+}
+
+/* OP_GDN_BLOCK_F16: [xqkv_t, conv_w_s, beta_t, g_t, y_t] arity 5。
+ * 几何 (T/H/D/d_conv/chunk) 走 gdn 尾挂 footer (ExtraGdnBlock 设备侧镜像),
+ * 不进 args (args≤16 硬约束)。整块单发射: conv+SiLU → delta chunk 级联,
+ * 中间量 f32 驻私有 scratch (B2/B3), 出口 y f16 (B4)。prefill 态 state
+ * 零起瞬态 (decode 步形 state_idx 持久化归 T027/US5)。 */
+static int exec_gdn_block(const struct wt_blob* b, const struct wt_op* op,
+                          char* err, size_t errn) {
+    struct wt_gdn_extra ge;
+    if (!gdn_extra_lookup(b, g_current_op_global, &ge)) {
+        snprintf(err, errn, "gdn block op %u missing geometry extra", g_current_op_global);
+        return -1;
+    }
+    uint32_t T = ge.t, H = ge.h, D = ge.d, dcnv = ge.d_conv, chunk = ge.chunk;
+    if (!T || !H || !D || dcnv < 2 || chunk == 0 || chunk > GDN_C_MAX) {
+        snprintf(err, errn, "gdn block geom (T=%u H=%u D=%u dc=%u chunk=%u)",
+                 T, H, D, dcnv, chunk);
+        return -1;
+    }
+    const uint32_t HD = H * D, DI = 3u * HD;
+    const uint16_t* xqkv = (const uint16_t*)ref_ptr(b, op->args[0]);
+    const uint16_t* cw   = (const uint16_t*)ref_ptr(b, op->args[1]);
+    const uint16_t* beta = (const uint16_t*)ref_ptr(b, op->args[2]);
+    const uint16_t* g    = (const uint16_t*)ref_ptr(b, op->args[3]);
+    uint16_t* y = (uint16_t*)temp_get(op->args[4], (size_t)T * HD * 2u);
+    if (!xqkv || !cw || !beta || !g || !y) {
+        snprintf(err, errn, "gdn block ref fail"); return -1;
+    }
+    /* conv_w 槽长校验: [d_conv, DI] f16 (同 op19 布局) */
+    if (b->slots[op->args[1] & 0x7FFFu].len != (size_t)dcnv * DI * 2u) {
+        snprintf(err, errn, "gdn block w slot len mismatch");
+        return -1;
+    }
+    /* prefill 瞬态 state: f32 零起 (decode 步形 0x6000|idx 持久槽归 T027)。
+     * memalign(128) 供 gdn_block_f16 HVX matvec/外积对齐 (T022d)。 */
+    float* S = (float*)memalign(128, (size_t)H * D * D * 4u);
+    if (!S) { snprintf(err, errn, "gdn block state alloc"); return -1; }
+    memset(S, 0, (size_t)H * D * D * 4u);
+    int rc = gdn_block_f16((const int16_t*)xqkv, (const int16_t*)cw,
+                           (const int16_t*)beta, (const int16_t*)g,
+                           (int16_t*)y, S, (int)T, (int)H, (int)D,
+                           (int)dcnv, (int)chunk);
+    free(S);
+    if (rc != 0) { snprintf(err, errn, "gdn_block_f16 rc=%d", rc); return -1; }
+    g_last_engine = WT_ENG_HVX;  /* 003 T017 纪律: 执行体 gdn_kern.c 为 HVX, 成功后记避免误标 */
+    return 0;
+}
+
 /* ---- 算子执行注册表(算子三件套·设备侧) ----
  * 每 opcode 一个 xop_* 入口(签名统一 wt_op_exec_fn), 注册进 g_op_exec_table[]。
  * 加新算子 = 写一个 exec_* 实现 + 一个 xop_* 薄壳 + 表加一项,
@@ -3211,6 +3282,10 @@ static int xop_delta_chunk(const struct wt_op_ctx* cx) {
     return exec_delta_chunk(cx->b, cx->op, cx->err, cx->errn);
 }
 
+static int xop_gdn_block(const struct wt_op_ctx* cx) {
+    return exec_gdn_block(cx->b, cx->op, cx->err, cx->errn);
+}
+
 static int xop_matmul_f16(const struct wt_op_ctx* cx) {
     return exec_matmul_f16(cx->b, cx->op, cx->err, cx->errn);
 }
@@ -3266,6 +3341,7 @@ static const wt_op_exec_fn g_op_exec_table[] = {
     [OP_TRANSPOSE_GEN_F16] = xop_transpose_gen,
     [OP_CONV1D_SSM_STEP_F16] = xop_conv1d_ssm_step,
     [OP_DELTA_CHUNK_F16] = xop_delta_chunk,
+    [OP_GDN_BLOCK_F16] = xop_gdn_block,
 };
 
 int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
