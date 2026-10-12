@@ -348,10 +348,22 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
             }
             for (int t = 0; t < c; t++) {
                 const float* yrow = yc + (size_t)(base + t) * DI + (size_t)h * D;
-                memcpy(kf + (size_t)t * D, yrow + hd, (size_t)D * 4);        /* q|k|v 三段 (c1b 口径) */
-                memcpy(vf + (size_t)t * D, yrow + 2 * hd, (size_t)D * 4);
-                memcpy(qf + (size_t)t * D, yrow, (size_t)D * 4);
-                gdn_hvx_scale(qf + (size_t)t * D, D, scale);
+                /* q/k l2norm (HF use_qk_l2norm_in_kernel=True, 镜像 ops.cpp GdnBlock):
+                 * x·rsqrt(Σx²+1e-6); q 再乘 1/√D, k 不乘; v 原样。缺失则
+                 * k·k 点积无界 → (I+L)^{-1} 前代回代溢出 → Inf/NaN (全链门败因)。 */
+                float qsq = 0.0f, ksq = 0.0f;
+                for (int nn = 0; nn < D; nn++) {
+                    float qv = yrow[nn], kv = yrow[hd + nn];
+                    qsq += qv * qv;
+                    ksq += kv * kv;
+                    vf[(size_t)t * D + nn] = yrow[2 * hd + nn];
+                }
+                const float iq = 1.0f / sqrtf(qsq + 1e-6f);
+                const float ik = 1.0f / sqrtf(ksq + 1e-6f);
+                for (int nn = 0; nn < D; nn++) {
+                    kf[(size_t)t * D + nn] = yrow[hd + nn] * ik;
+                    qf[(size_t)t * D + nn] = yrow[nn] * (iq * scale);
+                }
                 for (int nn = 0; nn < D; nn++) {                             /* 转置 [D][c] 供 GEMM (T022d) */
                     kf_T[(size_t)nn * c + t] = kf[(size_t)t * D + nn];
                     qf_T[(size_t)nn * c + t] = qf[(size_t)t * D + nn];

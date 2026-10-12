@@ -2953,6 +2953,7 @@ static int exec_gdn_block(const struct wt_blob* b, const struct wt_op* op,
                            (int)dcnv, (int)chunk);
     free(S);
     if (rc != 0) { snprintf(err, errn, "gdn_block_f16 rc=%d", rc); return -1; }
+    g_last_engine = WT_ENG_HVX;  /* 003 T017 纪律: 执行体 gdn_kern.c 为 HVX, 成功后记避免误标 */
     return 0;
 }
 

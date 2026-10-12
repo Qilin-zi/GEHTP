@@ -761,13 +761,15 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
         engine = 2u;               /* WT_ENG_HMX */
         snprintf(why, sizeof why, "conv has HMX path");
     } else if (nm == "GdnBlock") {
-        /* 009 块融合: 单发射块内 matmul/conv HMX 主导 + elemwise HVX + DMA
-         * 双缓冲 (FR-006 三原则, 落地在 exec_gdn_block T020)。无标量回落:
+        /* 009 块融合: 单发射块内 matmul 用 004 GEMV/mpyacc 方案 + conv/元素
+         * 级联, 实测执行体 = gdn_block_f16 (kernels/src/hvx/gdn_kern.c, HVX
+         * 内核族)。引擎注解必须与执行体一致 (WT_ENG_HVX), 否则运行期
+         * planned!=actual 触发 rc=50 引擎偏航硬门。无标量回落:
          * 块不可执行时应已编译期 FallbackRecord 降级, 运行时回落 = 静默数值错
          * (禁静默 FR-004)。 */
-        engine = 2u;               /* WT_ENG_HMX */
+        engine = 1u;               /* WT_ENG_HVX (执行体 gdn_kern.c 为 HVX) */
         fb_allowed = 0u;
-        snprintf(why, sizeof why, "fused block HMX-dominant (FR-006), no scalar fallback");
+        snprintf(why, sizeof why, "fused block HVX (004 GEMV/mpyacc), no scalar fallback");
     } else if (nm == "Add" || nm == "Eltwise_Binary" || nm == "Eltwise_Unary" ||
                nm == "ElementWiseNeuron" || nm == "Softmax") {
         /* 003 精度修正: 仅这些 op 名有默认开启的 HVX 内核。其余 elemwise/内存 op
