@@ -171,7 +171,7 @@ int main(void) {
             int c = (NT - t0 < CK) ? (NT - t0) : CK;
             delta_chunk_f16(&rk, k16 + (size_t)t0 * D, v16 + (size_t)t0 * D,
                             q16 + (size_t)t0 * D, be + t0, gg + t0,
-                            y16 + (size_t)t0 * D, c, NT);
+                            y16 + (size_t)t0 * D, c, NT, 0);
         }
         float* ykf = malloc(nz * 4);
         for (size_t z = 0; z < nz; z++) ykf[z] = gdn_f16_to_f32(y16[z]);
@@ -218,12 +218,12 @@ int main(void) {
             float* ybf = malloc((size_t)2 * CK * D * 4);
             memcpy(Sa, S0, (size_t)2 * D * D * 4);
             rec_state_t ra = { 2, D, Sa };
-            delta_chunk_f16(&ra, k16, v16, q16, be, gg, ya, CK, CK);
+            delta_chunk_f16(&ra, k16, v16, q16, be, gg, ya, CK, CK, 0);
             memcpy(Sb, S0, (size_t)2 * D * D * 4);
             rec_state_t rb = { 2, D, Sb };
-            delta_chunk_f16(&rb, k16, v16, q16, be, gg, yb, 8, CK);
+            delta_chunk_f16(&rb, k16, v16, q16, be, gg, yb, 8, CK, 0);
             delta_chunk_f16(&rb, k16 + 8 * D, v16 + 8 * D, q16 + 8 * D, be + 8, gg + 8,
-                            yb + 8 * D, 8, CK);
+                            yb + 8 * D, 8, CK, 0);
             for (size_t z = 0; z < (size_t)2 * CK * D; z++) {
                 yaf[z] = gdn_f16_to_f32(ya[z]); ybf[z] = gdn_f16_to_f32(yb[z]);
             }

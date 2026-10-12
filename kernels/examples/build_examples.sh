@@ -30,6 +30,9 @@ CFLAGS="-mv81 -O2 -mhvx -mhvx-length=128B -mhmx -shared -fPIC -std=gnu11 -Wall"
 LDFLAGS="-lc -ldl -lgcc"
 
 DEVDIR="${GEHTP_DEV_TMP:-/data/local/tmp/hvxhmx23}"
+# 例程结果 .txt 固定写到 /data/local/tmp/hrt/gehtp/ (example_util.c ex_open_result 硬编码),
+# 与 DEVDIR(部署/工作目录) 分离 — 见 docs/GEHTP_DEVICE_RUNBOOK.md §2.2。
+RESULT_DEV="/data/local/tmp/hrt/gehtp"
 BUILD="$LIB/build"
 RES="$LIB/results"
 BLOBS="$BUILD/blobs"
@@ -126,8 +129,8 @@ adb shell "chmod 755 $DEVDIR/*" >/dev/null 2>&1
 run_shell() { adb shell "cd $DEVDIR && ADSP_LIBRARY_PATH=$DEVDIR CDSP_LIBRARY_PATH=$DEVDIR $1"; }
 
 pull_result() {   # pull_result <name> → results/<name>.txt (仅设备文件非空才覆盖, 防清空旧结果)
-    if adb shell "test -s $DEVDIR/$1.txt"; then
-        adb shell "cat $DEVDIR/$1.txt" > "$RES/$1.txt"
+    if adb shell "test -s $RESULT_DEV/$1.txt"; then
+        adb shell "cat $RESULT_DEV/$1.txt" > "$RES/$1.txt"
     else
         echo "WARNING: $1.txt missing or empty on device, keeping local old file" >&2
     fi
