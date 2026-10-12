@@ -131,6 +131,7 @@ struct Emitter {
     uint64_t ddr_static_cap = 0;   // 编译期静态区大小(表外 temp 池尾 bump)
     uint64_t ddr_vtcm_cap = 0;     // VTCM 驻留池大小(0=无驻留)
     uint64_t bump_reserve = 0;     // 表外 bump 预留(字节; M2 起由 TAG_MEM_PLAN 供给)
+    uint64_t pin_cap = 0;          // wtcache 常驻区容量(字节, 2048 对齐; 0=不 pin, 执行器回退 4096)
     /* 008 T010: 表外 temp 的运行期 bump 需求仿真(泄漏式, 与 temp_get 路径 2
      * 同语义: 同 id 够大即复用, 不够则新块不回收)。计划 bump=max(4MB,cap/4)
      * 与实际需求无关 — 广播物化 temp 恒 out_idx!=0 无静态项(p3 板跑实锤:

@@ -376,6 +376,7 @@ public:
         uint64_t ddr_cap = 0;       // DDR 池静态区大小(字节)
         uint64_t vtcm_cap = 0;      // VTCM 驻留池大小(字节, 0=无驻留)
         uint64_t bump_reserve = 0;  // 表外 bump 预留(字节, max(4MB, cap/4))
+        uint64_t pin_cap = 0;       // wtcache 常驻区容量(字节, 2048 对齐; 0=不 pin → 执行器回退 4096)
         std::vector<MemPlanEntry> entries;
         std::vector<MemPlanSpill> spills;
     };

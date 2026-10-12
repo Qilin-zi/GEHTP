@@ -24,7 +24,7 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 **Purpose**: 在动任何代码前锁死回归基线，保证「不回退」可判定
 
-- [ ] T001 跑 `build_examples.sh` 确认 35 例 + 261 门 + W4A16 256³ 65536/65536 全绿，记录 cos 0.998642 / wall 6.31s 基线锚（对照 specs/010-static-mem-plan-closure/spec.md 的 SC-005）
+- [x] T001 跑 `build_examples.sh` 确认 35 例 + 261 门 + W4A16 256³ 65536/65536 全绿，记录 cos 0.998642 / wall 6.31s 基线锚（对照 specs/010-static-mem-plan-closure/spec.md 的 SC-005）
 
 ---
 
@@ -46,11 +46,11 @@ description: "Task list for 静态内存规划收口 (010-static-mem-plan-closur
 
 ### Implementation
 
-- [ ] T003 [US4] 在 compiler/include/hnnx/ir/graph_prepare.hpp 的 `MemPlan` 结构（`graph_prepare.cpp:704-710`）新增 `pin_cap: u64` 字段
-- [ ] T004 [US4] 在 compiler/src/ir/graph_prepare.cpp 的 `vtcm_auto_scan`（`:670`）真算 pin_cap（替换固定 align2048 余量假设），公式 `pool = 16MB − scratch_max − pin_cap`，语义对齐 `wtcache_impl.c:108`（字节、2048 对齐、0 → 默认 12MB）
-- [ ] T005 [US4] 在 compiler/tools/wtop_emit.cpp 的 TEMPOFF 槽头写 `pin_cap`（`wtop_emit.cpp:668-697`，头部 `[cap][reserve][pin_cap][n]`，pin_cap 单位字节 2048 对齐）
-- [ ] T006 [US4] 在 kernels/src/runtime/oplist_exec.c 的 TEMPOFF 解析（`:2550` 起）读 pin_cap，替代两处 `wtcache_open(wc, 4096)`（`:315, :590`）；`pin_cap == 0` 回退 4096（关池口径 byte-exact）
-- [ ] T007 [US4] 验证 B：关池口径 pin_cap=0 回退 4096 且 byte-exact；非零口径日志显示 pin_cap 读自 blob（见 quickstart.md 验证 B）
+- [x] T003 [US4] 在 compiler/include/hnnx/ir/graph_prepare.hpp 的 `MemPlan` 结构（`graph_prepare.cpp:704-710`）新增 `pin_cap: u64` 字段
+- [x] T004 [US4] 在 compiler/src/ir/graph_prepare.cpp 的 `vtcm_auto_scan`（`:670`）真算 pin_cap（替换固定 align2048 余量假设），公式 `pool = 16MB − scratch_max − pin_cap`，语义对齐 `wtcache_impl.c:108`（字节、2048 对齐、0 → 默认 12MB）
+- [x] T005 [US4] 在 compiler/tools/wtop_emit.cpp 的 TEMPOFF 槽头写 `pin_cap`（`wtop_emit.cpp:668-697`，头部 `[cap][reserve][pin_cap][n]`，pin_cap 单位字节 2048 对齐）
+- [x] T006 [US4] 在 kernels/src/runtime/oplist_exec.c 的 TEMPOFF 解析（`:2550` 起）读 pin_cap，替代两处 `wtcache_open(wc, 4096)`（`:315, :590`）；`pin_cap == 0` 回退 4096（关池口径 byte-exact）
+- [x] T007 [US4] 验证 B：关池口径 pin_cap=0 回退 4096 且 byte-exact；非零口径日志显示 pin_cap 读自 blob（见 quickstart.md 验证 B）
 
 **Checkpoint**: pin_cap 可配置化完成，US1 可开始
 

@@ -965,12 +965,12 @@ int main() {
                 if (w->slots[s].addr == WT_SLOT_TEMPOFF) tp = &w->slots[s];
             if (tp) {
                 const uint8_t* p = w->weight_base + tp->offset;
-                uint32_t n; std::memcpy(&n, p + 8, 4);
+                uint32_t n; std::memcpy(&n, p + 12, 4);
                 for (uint32_t i = 0; i < n; i++) {
                     uint32_t tid, off, sz;
-                    std::memcpy(&tid, p + 12 + i * 12, 4);
-                    std::memcpy(&off, p + 16 + i * 12, 4);
-                    std::memcpy(&sz, p + 20 + i * 12, 4);
+                    std::memcpy(&tid, p + 16 + i * 12, 4);
+                    std::memcpy(&off, p + 20 + i * 12, 4);
+                    std::memcpy(&sz, p + 24 + i * 12, 4);
                     if ((tid & 0x4000u) && (tid & 0x3FFFu) == (d.args[1] & 0x3FFFu) &&
                         sz == M * K * 2u && (off & 2047u) == 0u) {
                         stg_off = off;
@@ -1031,8 +1031,8 @@ int main() {
             uint8_t* pl = b2.data() + i + 12;
             size_t plsz = (size_t)wc1 * 4;
             uint32_t ne;
-            std::memcpy(&ne, pl + 16, 4);
-            size_t no = 20;
+            std::memcpy(&ne, pl + 20, 4);
+            size_t no = 24;
             for (uint32_t e = 0; e < ne && no + 20 <= plsz; e++, no += 20) {
                 uint32_t flags;
                 std::memcpy(&flags, pl + no + 16, 4);
@@ -1046,7 +1046,7 @@ int main() {
             }
             CHECK(nvtcm >= 2, "T022: TAG_MEM_PLAN ≥2 个 VTCM 驻留项");
             if (nvtcm < 2) break;
-            no = 20;
+            no = 24;
             const uint32_t one = 1;
             for (uint32_t e = 0; e < ne && no + 20 <= plsz; e++, no += 20) {
                 std::memcpy(pl + no + 8, &vtcm_off0, 4);

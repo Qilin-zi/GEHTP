@@ -601,7 +601,7 @@ static uint64_t mm_scratch_need(uint32_t m, uint32_t k, uint32_t n) {
     size_t off_s = (off_o + o + 2047u) & ~(size_t)2047u;
     return off_s + 2048u;
 }
-struct VtcmAutoScan { bool w4 = false; bool conv = false; uint64_t scratch_max = 0; };
+struct VtcmAutoScan { bool w4 = false; bool conv = false; uint64_t scratch_max = 0; uint64_t weight_sum = 0; };
 static VtcmAutoScan vtcm_auto_scan(const GraphPrepare& gp);
 
 // Source: graph_prepare.cc, 2329 bytes at 0xF71F00
@@ -679,13 +679,23 @@ GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) 
         } else {
             VtcmAutoScan vas = vtcm_auto_scan(*this);
             constexpr uint64_t kVtcmTotal = 16ull << 20;  // 设备 A2 query; 发射侧 kVTCMTotal 同源
-            const uint64_t head = (vas.conv ? (2ull << 20) : 0ull) + (512ull << 10);
+            constexpr uint64_t kPinMisc = 512ull << 10;   // 固定杂项余量(执行器 pin_cap==0 回退 4096 + ring/temp 上界)
+            const uint64_t conv_head = (vas.conv ? (2ull << 20) : 0ull);
+            // 010 T004: pin_cap 真算 = 权重常驻需求 2048 对齐(替换旧的固定 align2048 余量假设)。
+            // 权重过大(与 scratch + 固定余量合计 ≥ 16MB)时不 pin → 0(执行器回退 4096 = 旧口径流式)。
+            uint64_t pin_cap = (vas.weight_sum + 2047u) & ~uint64_t(2047u);
+            if (pin_cap > 0 && pin_cap + vas.scratch_max + conv_head + kPinMisc >= kVtcmTotal) {
+                pin_cap = 0;  // 权重塞不进(与 scratch/余量争 16MB) → 流式, 不 pin
+            }
+            const uint64_t head = conv_head + kPinMisc + pin_cap;
             if (vas.w4) {
                 std::fprintf(stderr, "[memplan] vtcm auto off: 图含 W4A16 matmul (carve/池预算统一另线收口)\n");
             } else if (vas.scratch_max + head < kVtcmTotal) {
                 vtcm_eff = (kVtcmTotal - vas.scratch_max - head) & ~uint64_t(1023u);
-                std::fprintf(stderr, "[memplan] vtcm auto: scratch_max=%llu conv=%d head=%llu → pool=%llu (%.2fMB)\n",
+                mem_plan_.pin_cap = pin_cap;
+                std::fprintf(stderr, "[memplan] vtcm auto: scratch_max=%llu conv=%d pin_cap=%llu head=%llu → pool=%llu (%.2fMB)\n",
                              (unsigned long long)vas.scratch_max, (int)vas.conv,
+                             (unsigned long long)pin_cap,
                              (unsigned long long)head,
                              (unsigned long long)vtcm_eff, vtcm_eff / 1048576.0);
             } else {
@@ -1788,18 +1798,19 @@ bool GraphPrepare::do_serialize(Serializer& ser) const {
     }
 
     // TAG_MEM_PLAN(M2 内存规划收编): 编译器定稿的静态内存规划, wtop_emit 照抄。
-    // [u32 ver=1][u32 ddr_cap][u32 vtcm_cap][u32 bump_reserve][u32 n_entries]
+    // [u32 ver=1][u32 ddr_cap][u32 vtcm_cap][u32 bump_reserve][u32 pin_cap][u32 n_entries]
     //   n×20B {u32 op_id}{u32 out_idx}{u32 offset}{u32 size}{u32 flags bit0=in_vtcm}
     // [u32 n_spills] n×16B {u32 op_id}{u32 spill_off}{u32 size}{u32 pad}
     if (has_mem_plan_) {
         const MemPlan& mp = mem_plan_;
-        std::vector<uint8_t> buf(20 + mp.entries.size() * 20 + 4 + mp.spills.size() * 16, 0);
+        std::vector<uint8_t> buf(24 + mp.entries.size() * 20 + 4 + mp.spills.size() * 16, 0);
         size_t o = 0;
         auto w32 = [&](uint32_t v) { std::memcpy(buf.data() + o, &v, 4); o += 4; };
         w32(1);
         w32(static_cast<uint32_t>(mp.ddr_cap));
         w32(static_cast<uint32_t>(mp.vtcm_cap));
         w32(static_cast<uint32_t>(mp.bump_reserve));
+        w32(static_cast<uint32_t>(mp.pin_cap));
         w32(static_cast<uint32_t>(mp.entries.size()));
         for (const auto& e : mp.entries) {
             w32(static_cast<uint32_t>(e.op_id));
@@ -2522,6 +2533,9 @@ static VtcmAutoScan vtcm_auto_scan(const GraphPrepare& gp) {
             const OpDef* w = gp.get_op_at(od->inputs[1].src_id);
             if (w && w->const_data_size > 0 &&
                 (uint64_t)w->const_data_size * 2u == (uint64_t)k * n) { r.w4 = true; continue; }
+            // 权重常驻需求(010 T004): 非 W4A16 权重按 op 求和(共享权重重复计 =
+            // 保守上界; 发射侧 f32→f16 洗白后实际字节更小, 此处只做 budget 上界)。
+            if (w && w->const_data_size > 0) r.weight_sum += w->const_data_size;
         }
         // 可分块性镜像(op_matmul: !has_bias && !batched && 32 对齐 && 整 op 超界);
         // 二分循环逐字照抄发射侧, 保证 N_chunk 一致 → scratch 峰值一致
@@ -2825,11 +2839,12 @@ bool GraphPrepare::deserialize(const uint8_t* buf, size_t buf_size) {
         if (tag == TAG_MEM_PLAN) {
             // M2: 对称回读编译器定稿规划(字段序同写侧; 坏记录不置 has_)
             BinReader rr(rec, data_size);
-            if (rr.remaining() >= 20 && rr.r32() == 1) {
+            if (rr.remaining() >= 24 && rr.r32() == 1) {
                 MemPlan mp;
                 mp.ddr_cap = rr.r32();
                 mp.vtcm_cap = rr.r32();
                 mp.bump_reserve = rr.r32();
+                mp.pin_cap = rr.r32();
                 uint32_t ne = rr.r32();
                 bool ok = true;
                 for (uint32_t i = 0; i < ne; i++) {

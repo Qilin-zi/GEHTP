@@ -54,7 +54,19 @@ static const char* NET_B =
     "\"/mm\":{\"type\":\"MatMul\",\"input_names\":[\"input\",\"w\"],"
     "\"output_names\":[\"out\"]}}}}";
 
-struct TempoffInfo { bool present = false; uint32_t cap = 0, vtcm_cap = 0, n = 0, n_vtcm = 0; };
+// 小 matmul 锚(模型相关 pin_cap): input[32,64] @ w[64,64] → out[32,64]
+// weight f32 = 64*64*4 = 16384 → pin_cap = align2048(16384) = 16384 (非零, 区别于 NET_A/B 的 0;
+// 首版用 f32 预洗白字节做上界, 实际 f16 常驻更小 —— US1 收口时换精确口径)
+static const char* NET_C =
+    "{\"graph\":{\"tensors\":{"
+    "\"input\":{\"id\":1,\"type\":0,\"data_type\":562,\"dims\":[32,64]},"
+    "\"w\":{\"id\":2,\"type\":4,\"data_type\":562,\"dims\":[64,64]},"
+    "\"out\":{\"id\":3,\"type\":1,\"data_type\":562,\"dims\":[32,64]}},"
+    "\"nodes\":{"
+    "\"/mm\":{\"type\":\"MatMul\",\"input_names\":[\"input\",\"w\"],"
+    "\"output_names\":[\"out\"]}}}}";
+
+struct TempoffInfo { bool present = false; uint32_t cap = 0, vtcm_cap = 0, pin_cap = 0, n = 0, n_vtcm = 0; };
 
 static TempoffInfo inspect_tempoff(const std::string& blob_path) {
     TempoffInfo ti;
@@ -65,15 +77,17 @@ static TempoffInfo inspect_tempoff(const std::string& blob_path) {
     for (uint32_t s = 0; s < wb->n_slots; s++) {
         if (wb->slots[s].addr != 0xFFFFFFFDu) continue;  // WT_SLOT_TEMPOFF
         const uint8_t* p = wb->weight_base + wb->slots[s].offset;
-        uint32_t cap, reserve, n;
-        std::memcpy(&cap, p, 4); std::memcpy(&reserve, p + 4, 4); std::memcpy(&n, p + 8, 4);
+        uint32_t cap, reserve, pin_cap, n;
+        std::memcpy(&cap, p, 4); std::memcpy(&reserve, p + 4, 4);
+        std::memcpy(&pin_cap, p + 8, 4); std::memcpy(&n, p + 12, 4);
         ti.present = true;
         ti.cap = cap;
         ti.vtcm_cap = (reserve >> 16) * 1024u;
+        ti.pin_cap = pin_cap;
         ti.n = n;
         for (uint32_t i = 0; i < n; i++) {
             uint32_t tid;
-            std::memcpy(&tid, p + 12 + i * 12, 4);
+            std::memcpy(&tid, p + 16 + i * 12, 4);
             if (tid & 0x4000u) ti.n_vtcm++;
         }
         break;
@@ -109,8 +123,12 @@ int main() {
     float ib[32 * 1024];
     for (size_t i = 0; i < 32 * 1024; i++) ib[i] = 0.01f;
     CHECK(write_file(dir + "in_b.f32.raw", ib, sizeof(ib)), "write in_b");
+    float ic[32 * 64];
+    for (size_t i = 0; i < 32 * 64; i++) ic[i] = 0.01f;
+    CHECK(write_file(dir + "in_c.f32.raw", ic, sizeof(ic)), "write in_c");
     CHECK(write_file(dir + "net_a.json", NET_A, std::strlen(NET_A)), "write net_a");
     CHECK(write_file(dir + "net_b.json", NET_B, std::strlen(NET_B)), "write net_b");
+    CHECK(write_file(dir + "net_c.json", NET_C, std::strlen(NET_C)), "write net_c");
 
     // 1. 迷你图缺省 auto: scratch_max=0 → pool = 16MB − 512KB = 16252928
     {
@@ -121,8 +139,10 @@ int main() {
             TempoffInfo ti = inspect_tempoff(blob);
             CHECK(ti.present, "a_auto: TEMPOFF 槽存在(驻留默认开)");
             CHECK(ti.vtcm_cap == 16252928u, "a_auto: vtcm_cap == 16MB-512KB = 16252928");
+            CHECK(ti.pin_cap == 0u, "a_auto: pin_cap == 0 (无权重)");
             CHECK(ti.n_vtcm >= 1, "a_auto: ≥1 个 VTCM 驻留项");
-            std::printf("  [info] cap=%u vtcm_cap=%u n=%u n_vtcm=%u\n", ti.cap, ti.vtcm_cap, ti.n, ti.n_vtcm);
+            std::printf("  [info] cap=%u vtcm_cap=%u pin_cap=%u n=%u n_vtcm=%u\n",
+                        ti.cap, ti.vtcm_cap, ti.pin_cap, ti.n, ti.n_vtcm);
         } else std::fprintf(stderr, "  (%s)\n", log.c_str());
     }
 
@@ -160,7 +180,25 @@ int main() {
             CHECK(ti.present, "b_auto: TEMPOFF 槽存在");
             CHECK(ti.vtcm_cap == 3209216u,
                   "b_auto: vtcm_cap == 3209216 (scratch_max=13043712 镜像公式锚)");
-            std::printf("  [info] cap=%u vtcm_cap=%u n=%u n_vtcm=%u\n", ti.cap, ti.vtcm_cap, ti.n, ti.n_vtcm);
+            CHECK(ti.pin_cap == 0u, "b_auto: pin_cap == 0 (12MB 权重过载 → 流式)");
+            std::printf("  [info] cap=%u vtcm_cap=%u pin_cap=%u n=%u n_vtcm=%u\n",
+                        ti.cap, ti.vtcm_cap, ti.pin_cap, ti.n, ti.n_vtcm);
+        } else std::fprintf(stderr, "  (%s)\n", log.c_str());
+    }
+
+    // 5. 小 matmul 锚: 模型相关 pin_cap = 8192 (权重 f16 64×64×2, 塞得进 16MB)
+    {
+        std::string log;
+        std::string blob = build_blob(dir, "c_auto", dir + "net_c.json", dir + "in_c.f32.raw", "", &log);
+        CHECK(!blob.empty(), "c_auto compile+emit 通过");
+        if (!blob.empty()) {
+            TempoffInfo ti = inspect_tempoff(blob);
+            CHECK(ti.present, "c_auto: TEMPOFF 槽存在");
+            CHECK(ti.pin_cap == 16384u, "c_auto: pin_cap == 16384 (权重 64×64 f32 上界, 2048 对齐)");
+            CHECK(ti.vtcm_cap > 0u && ti.vtcm_cap < 16252928u,
+                  "c_auto: vtcm_cap 有池且 < 无权重满池 (pin_cap+scratch 挤占)");
+            std::printf("  [info] cap=%u vtcm_cap=%u pin_cap=%u n=%u n_vtcm=%u\n",
+                        ti.cap, ti.vtcm_cap, ti.pin_cap, ti.n, ti.n_vtcm);
         } else std::fprintf(stderr, "  (%s)\n", log.c_str());
     }
 
