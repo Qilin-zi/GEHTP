@@ -555,7 +555,8 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     uint32_t act_s = op->args[0], w_s = op->args[1], out_t = op->args[2];
     uint32_t M = op->args[3], K = op->args[4], N = op->args[5];
     uint32_t act_b = M * K * 2u, wt_b = K * N / 2u, out_b = M * N * 2u;
-    uint32_t bias_b = (N / 32u) * 512u, tbl_b = 8u * (K / 32u) * 4u;
+    uint32_t bias_b = (N / 32u) * 512u;
+    uint32_t atbl_b = 8u * (K / 32u) * 4u, otbl_b = 8u * (N / 32u) * 4u;
     static dc_mutex_t mu;
     static int mu_ready;
     if (!mu_ready) { dc_mutex_init(&mu); mu_ready = 1; }
@@ -574,8 +575,8 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         const uint8_t* p = b->weight_base + b->slots[i].offset;
         uint32_t L = b->slots[i].len;
         if (!bias && L == bias_b) { bias = p; bias_slot_idx = i; }
-        else if (!atbl && L == tbl_b) atbl = p;
-        else if (!otbl && L == tbl_b) otbl = p;
+        else if (!atbl && L == atbl_b) atbl = p;
+        else if (!otbl && L == otbl_b) otbl = p;
     }
     if (!bias || !atbl || !otbl) {
         snprintf(err, errn, "supply slots missing (bias/atbl/otbl)");
