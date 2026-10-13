@@ -43,6 +43,7 @@ EXAMPLES=(01_runtime_init 02_convf16_gemm 03_convbbb_int8 04_convhbh_u16 \
           18_smallm_gemv 19_gdn_sm 20_dualdomain 21_oplist_exec \
           22_dualcore_threads 23_fence 24_arena 25_harness 26_wpool \
           27_pxbridge 28_gdn_tree 29_kvcache 30_graph_step 31_gemm_dispatch 32_rbr \
+          49_gemv_batch_bench \
           33_bledger 34_dmaring 35_btrack 36_absoak 37_conv2d_add 38_transformer_ops \
           39_probe 40_qwen_layer3 41_qwen_layer0 43_gdn_sm_08b)
 

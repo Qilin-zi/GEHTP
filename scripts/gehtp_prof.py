@@ -42,9 +42,12 @@ OP_NAMES = {
     21: "ARGMAX_F16", 22: "KV_APPEND_F16", 23: "KV_GATHER_F16",
     24: "MATMUL_F16", 25: "RMSNORM2_F16", 26: "BROADCAST_F16",
     27: "TRANSPOSE_GEN_F16", 28: "SCATTER_ND_F16",
+    29: "CONV1D_SSM_STEP_F16", 30: "DELTA_CHUNK_F16",
+    33: "DMA", 34: "PAD_F16", 35: "MATMUL_F16_SPLIT",
+    36: "MATMUL_F16_BIAS", 37: "GDN_BLOCK_F16",
 }
 # 搬运类 op (三分账的"搬"): 纯数据移动/重排, 零 FLOPs
-MOVE_OPS = {3, 5, 8, 9, 10, 14, 15, 16, 20, 26, 27}
+MOVE_OPS = {3, 5, 8, 9, 10, 14, 15, 16, 20, 26, 27, 33}
 # W-P3: 设备侧 enum wt_engine 同序 (oplist_exec.h)
 ENGINE_NAMES = {0: "scalar", 1: "HVX", 2: "HMX"}
 
@@ -280,6 +283,39 @@ def derive_bytes(op, slots):
         op.w_b = _slot_len(slots, a[1])            # idx (i32 槽)
         op.out_b = n_out * 2
         op.note = f"idx={n_idx}×K{K} block={block}(≈)"
+    elif c == 29 and need(6):  # CONV1D_SSM_STEP [x,w,y,state,C,d_conv] (decode 步形)
+        C, dc = a[4], a[5]
+        op.in_b, op.w_b, op.out_b = C * 2, _slot_len(slots, a[1]), C * 2
+        op.flops = 2 * C * dc
+        op.note = "decode 步进 conv+SiLU"
+    elif c == 30 and need(12):  # DELTA_CHUNK (decode 步形, 几何在 args H/D)
+        H, D = a[10], a[11]
+        op.in_b = 3 * H * D * 2
+        op.out_b = H * D * 2
+        op.flops = 2 * H * D * D
+        op.note = "decode delta chunk(≈)"
+    elif c == 33 and need(8):  # DMA [src,dst,bytes,src_off,dst_off,flags,fsrc,fdst]
+        op.in_b = a[2]
+        op.out_b = 0
+        op.note = f"runlist DMA {a[2]}B"
+    elif c == 34 and need(7):  # PAD_F16 [x,y,outer,in_inner,out_inner,before,val]
+        outer, ii, oi = a[2], a[3], a[4]
+        op.in_b, op.out_b = outer * ii * 2, outer * oi * 2
+        op.note = "pad 物化"
+    elif c == 35 and need(9):  # MATMUL_F16_SPLIT [a,w,out,M,K,N_full,n0,N_chunk,flags]
+        M, K, Nfull, Nc = a[3], a[4], a[5], a[7]
+        op.in_b = M * K * 2                  # act 每 chunk 全读 (M×K)
+        op.w_b = K * Nc * 2                  # 本 chunk 权列 [n0..n0+Nc)
+        op.out_b = M * Nc * 2
+        op.flops = 2 * M * K * Nc
+        op.note = f"N 分块 {Nc}/{Nfull}"
+    elif c == 36 and need(8):  # MATMUL_F16_BIAS [a,w,out,M,K,N,flags,bias]
+        M, K, N = a[3], a[4], a[5]
+        op.in_b, op.w_b, op.out_b = M * K * 2, (_slot_len(slots, a[1]) or 0) + N * 2, M * N * 2
+        op.flops = 2 * M * N * K
+        op.note = "FC+bias 折叠"
+    elif c == 37 and need(5):  # GDN_BLOCK [xqkv,conv_w,beta,g,y] 几何在 serialized_extra
+        op.note = "GDN 块(几何在 extra, bytes 不推)"
     # VTCM 驻留引用注记 (0x4000|temp 编码, 任一操作数命中即标)
     op.vtcm = any((x & 0xC000) == 0x4000 for x in a)
 
