@@ -1,0 +1,42 @@
+=== 013_gehtp_runner ===
+M0 after ex_open
+=== 013_gehtp_runner (generic WTOP runner) ===
+M1 before job read
+M2 job read 190
+M3 job keys ok /data/local/tmp/hvxhmx23/gehtp/qwen35_08b_010.wtop /data/local/tmp/hvxhmx23/gehtp/output_013_f16.f16.raw
+[prof] per-op optrace OFF
+[prof] op_ts full (每 op 记录, 口径=全量逐条)
+M4 wgt_size=(none)
+M5 blob 2041208960 in 128
+M6 before wt_parse
+M7 wt_parse ok
+M8 before weights load
+[ext-weights] no /data/local/tmp/hvxhmx23/gehtp/qwen35_08b_010.weights.bin (fallback to inline weights)
+M10 before wt_exec_run_io
+M11 exec done rc=0 total_us=5982080
+[timing] ops=11504 sum_op_us=5964094 wall_us=5982080 ops_per_sec=1923.1
+op_timing code=7 n=1291 total_us=26454 avg_us=20.5 max_us=921
+op_timing code=11 n=225 total_us=335661 avg_us=1491.8 max_us=4065
+op_timing code=12 n=1655 total_us=749612 avg_us=452.9 max_us=2830
+op_timing code=13 n=6 total_us=377 avg_us=62.8 max_us=64
+op_timing code=14 n=25 total_us=911 avg_us=36.4 max_us=106
+op_timing code=15 n=2373 total_us=82001 avg_us=34.6 max_us=161
+op_timing code=16 n=54 total_us=8452 avg_us=156.5 max_us=178
+op_timing code=17 n=1170 total_us=317906 avg_us=271.7 max_us=1305
+op_timing code=18 n=18 total_us=443 avg_us=24.6 max_us=25
+op_timing code=19 n=18 total_us=332135 avg_us=18451.9 max_us=18610
+op_timing code=20 n=1192 total_us=665474 avg_us=558.3 max_us=18863
+op_timing code=24 n=325 total_us=2426246 avg_us=7465.4 max_us=12275
+op_timing code=25 n=79 total_us=244486 avg_us=3094.8 max_us=5283
+op_timing code=26 n=1622 total_us=79140 avg_us=48.8 max_us=5814
+op_timing code=27 n=175 total_us=142916 avg_us=816.7 max_us=3702
+op_timing code=28 n=1154 total_us=110762 avg_us=96.0 max_us=2614
+op_timing code=34 n=90 total_us=10308 avg_us=114.5 max_us=227
+op_timing code=35 n=32 total_us=430810 avg_us=13462.8 max_us=13750
+[timing] slowest op#5140 code=20 us=18863
+[prof] op_ts.bin 11504 ops
+M12 wrote 15892480 bytes
+[run] seg_us read=4332132 parse=15160 wgt=27379 exec=5982080 write=27839 wall=10984006
+[PASS] 11504 ops, out temp 2796 = 15892480 bytes -> /data/local/tmp/hvxhmx23/gehtp/output_013_f16.f16.raw
+[PASS] 42_gehtp_runner overall
+--- summary: 0 pass, 0 fail ---

@@ -41,9 +41,9 @@ description: "Task list for 013-executor-hoist"
 - [x] T007 [US1] `kernels/src/runtime/oplist_parse.c`：arity 校验放宽为 `n_args==arity || (legacy_arity && n_args==legacy_arity)`；不 bump WT_BLOB_VER（R2）
 - [x] T008 [P] [US1] `compiler/tools/test_wtop_emit.cpp`：§9-arity 序列化→反序列化往返(全槽引用无损) + legacy 6 参新 parse 逐字节等价断言
 - [x] T009 [US1] `kernels/src/runtime/oplist_exec.c` exec_matmul：`n_args==9` 直读三槽（槽长校验保留=emit 契约哨兵），**删 O(n_slots) 扫描**（仅 9-arity 路径；6-arity legacy 路径逐字节不动）（依赖 T006,T007）
-- [ ] T010 [US1] 合成 blob 设备门（003 T014 法）：单 W4A16 op 微 blob(9-arity) 上板 d0f1784，输出 == P5 dc_w4 已知答案位级；同源 6-arity 版双跑对照一致；私有名纪律
+- [x] T010 [US1] 合成 blob 设备门（003 T014 法）：单 W4A16 op 微 blob(9-arity) 上板 d0f1784，输出 == P5 dc_w4 已知答案位级；同源 6-arity 版双跑对照一致；私有名纪律——**实测 2026-10-13**：mk_w4_v9.py 把 blob_w4.wtop(v1 6-arity) 仅改 matmul op3 6→9 参(追加 args[6..8]=bias/atbl/otbl 裸 slot 2/3/4) → blob_w4_v9.wtop；私有 lib(013)+runner(013)+job(013) 上板，9-arity 与 6-arity 双跑输出 md5 均=7654a8f6 == dev_w4.f16.raw 逐字节一致(T009 直读 == legacy 扫描, 且 T005/T007 未破 legacy)
 - [x] T011 [US1] W4A16 emit M 门槛（重定范围 2026-10-13）：emit 侧仅 `M%256==0` 才发 W4A16(opcode 1=OP_MATMUL_W4A16)，否则回落 f16（对齐 M<32→GEMV / 32≤M<256→dense_f16 路由）——避免真实 emit 产出 M=32/M=1 的 0xA002 失败 W4A16。原生 W4A16 的 0.8B E2E 收益断言显式移出 013 范围（M%256 NO-GO 裁决），B 段不设 w4 全图性能门
-- [ ] T012 [US1] B 段零回归门（US5）：f16 默认线输出 md5 == f87461e2（位级）；gdn 线 cos ≥0.9999(锚 0.999930，cos-min 门设锚下防假 FAIL) / top1 32/32；host ctest 全绿；B 段收益进 results
+- [x] T012 [US1] B 段零回归门（US5）：f16 默认线输出 md5 == f87461e2（位级）；gdn 线 cos ≥0.9999(锚 0.999930，cos-min 门设锚下防假 FAIL) / top1 32/32；host ctest 全绿；B 段收益进 results——**实测 2026-10-13**：复用板上现存 blob（f16 `qwen35_08b_010.wtop` md5 3f857926 / gdn `qwen35_08b_fused_pp.wtop` md5 a7935fdf）+ 私有 lib_013/runner_013；f16 out_temp=2796（非 m4/v4 的 1620，010 blob 经更多 pass n_ops=11504）→ 输出 md5 **f87461e2** 位级、exec 5.98s；gdn out_temp=96 → cos **0.999930**/top1 **32/32**/md5 9d1c0877、exec 2.76s；host ctest **50/50**。零回归机理=B 段改动仅触 opcode 1，f16/gdn 无 W4A16 为死代码。证据 evidence/t012-*
 
 **Checkpoint**: MVP 交付——W4A16 供给侧机制(4 表生成 + 9-arity + 扫描已删 + M 门槛)可达，合成 M=256 blob 验证；原生 W4A16 0.8B E2E 移出范围(M%256 NO-GO)。A/C/D 全不做也独立成立
 
