@@ -21,9 +21,9 @@ description: "Task list for 013-executor-hoist"
 
 **Purpose**: worktree 隔离 + 三线基线取证 + 环境健康门
 
-- [ ] T001 建 worktree `/disk1/gehtp-wt/013-executor-hoist` 分支 `013-executor-hoist` off `origin/task/prof-wp`(734986b)；确认主树 012 未提交 WIP(oplist_exec.c)不被触碰——改前查 [[gehtp-cross-session-coordination]]
-- [ ] T002 三线基线复测并存档 `specs/013-executor-hoist/baseline/`：默认/gdn 线(cos 0.999930/top1 32/32/exec ~2.77s)、f16 非融合线(md5 f87461e2/exec 5.99s)、007 q4 线(cos 0.993484/exec 25.7s)；op_ts + 输出 md5 全留档
-- [ ] T003 环境健康门：host ctest 49/49 + build_examples 337 pass + check_device_golden 可跑（任一红先修环境；0.8B 正典旗标清单确认含 --dma-runlist/--no-pass fc_bias_fold）
+- [x] T001 建 worktree `/disk1/gehtp-wt/013-executor-hoist` 分支 `013-executor-hoist`——实际基 **a57a4cd**（012 已收口 push，fetch 后 rebase d804e03；原计划 734986b 已过时）；主树无未提交 tracked WIP（012 已提交）
+- [x] T002 三线基线复测并存档 `baseline/baseline-20261013.md`：gdn/pp 线**新鲜复跑**（wall 2751.8ms/md5 9d1c0877 位级同 012 锚/不变量 PASS，op_ts 28312B 留档）；f16 线文档锚（板无 blob，T012 复跑）；q4 线 25.7s 文档锚（R9 冻结分母）
+- [x] T003 环境健康门：**ctest 48/49 预存红**（test_wtop_emit 5 子断言 = 65c4f2e 010 merge 引入，aab6371 复验 0 红——修复归 B 段 T006/T008）；examples 321/9 预存（012 同树当日复现）；gdn 线复跑位级命中 = 板路健康 ✓
 
 **Checkpoint**: 基线锚在手，后续每段对拍有据
 
