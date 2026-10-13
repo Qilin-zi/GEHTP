@@ -35,7 +35,7 @@ description: "Task list for 013-executor-hoist"
 
 **Independent Test**: 合成单 op blob(M=256)对拍 P5 已知答案 + 三线零回归(f16 位级 / gdn 双门)
 
-- [ ] T004 [P] [US1] 新建 `compiler/tools/requant_w4a16.cc`：Q4_0 GGUF(经 gguf_wtlink 读取层) → packed_w(K*N/2) + atbl(8*(K/32)*4, i*M*8) + otbl(8*(N/32)*4, K≠N 分列) + folded_bias((N/32)*512) 四槽；小矩阵对拍单测先行（契约=contracts/contract-w4a16-op.md 供给侧节）
+- [x] T004 [P] [US1] 新建 `compiler/tools/requant_w4a16.cc`：Q4_0 GGUF(经 gguf_wtlink 读取层) → packed_w(K*N/2) + atbl(8*(K/32)*4, i*M*8) + otbl(8*(N/32)*4, K≠N 分列) + folded_bias((N/32)*512) 四槽；小矩阵对拍单测先行（契约=contracts/contract-w4a16-op.md 供给侧节）——**降级 2026-10-13**：atbl/otbl 闭式已落地+对拍全绿(ctest 50/50)；packed_w/folded_bias 因 oracle 已失(DFlashSpecCppRunner/htpw4a16_v81)降级为 requant_w4a16.h 尾注文档化 gap, T010 复用板上 oracle .raw
 - [x] T005 [P] [US1] `kernels/include/op_spec.inc`：OP_MATMUL_W4A16 `arity=9` + 新增可选 `legacy_arity` 列(默认 0，本 opcode=6)——单点注册表纪律不回潮（R1）
 - [x] T006 [US1] `compiler/tools/wtop_ops/op_matmul.cpp` + `wtop_emit.cpp`：W4A16 op 构造 6→9 参，args[6..8]=bias/atbl/otbl 槽引用(0x8000|s)；emit 供给侧接 requant 产物（依赖 T004,T005）
 - [x] T007 [US1] `kernels/src/runtime/oplist_parse.c`：arity 校验放宽为 `n_args==arity || (legacy_arity && n_args==legacy_arity)`；不 bump WT_BLOB_VER（R2）

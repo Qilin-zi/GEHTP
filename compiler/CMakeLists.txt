@@ -346,3 +346,9 @@ add_test(NAME test_runtime_alloc COMMAND test_runtime_alloc)
 add_executable(test_tiling_rule tests/test_tiling_rule.cpp)
 target_link_libraries(test_tiling_rule htp_core)
 add_test(NAME test_tiling_rule COMMAND test_tiling_rule)
+
+# 013 T004: W4A16 供给侧 atbl/otbl 闭式对拍 (requant_w4a16 独立成件, 不链 htp_core)
+add_executable(test_requant_w4a16 tests/test_requant_w4a16.cpp
+               tools/requant_w4a16.cc)
+target_include_directories(test_requant_w4a16 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+add_test(NAME test_requant_w4a16 COMMAND test_requant_w4a16)
