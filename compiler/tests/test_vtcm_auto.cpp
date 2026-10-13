@@ -66,7 +66,15 @@ static const char* NET_C =
     "\"/mm\":{\"type\":\"MatMul\",\"input_names\":[\"input\",\"w\"],"
     "\"output_names\":[\"out\"]}}}}";
 
-struct TempoffInfo { bool present = false; uint32_t cap = 0, vtcm_cap = 0, pin_cap = 0, n = 0, n_vtcm = 0; };
+struct TempoffInfo {
+    bool present = false;
+    uint32_t cap = 0, vtcm_cap = 0, pin_cap = 0, n = 0, n_vtcm = 0;
+    /* 013 T013: TEMPOFF 尾随 VTCM 静态布局段 */
+    bool has_layout = false;
+    uint32_t l_magic = 0, l_ver = 0;
+    uint32_t l_pin_off = 0, l_pin_sz = 0, l_arena_off = 0, l_arena_sz = 0;
+    uint32_t l_resid_off = 0, l_resid_sz = 0;
+};
 
 static TempoffInfo inspect_tempoff(const std::string& blob_path) {
     TempoffInfo ti;
@@ -90,10 +98,39 @@ static TempoffInfo inspect_tempoff(const std::string& blob_path) {
             std::memcpy(&tid, p + 16 + i * 12, 4);
             if (tid & 0x4000u) ti.n_vtcm++;
         }
+        /* 013 T013: 布局段在 temp 表之后 (len ≥ 16+n*12+32 才存在) */
+        if (wb->slots[s].len >= 16u + n * 12u + WT_TEMPOFF_LAYOUT_BYTES) {
+            const uint8_t* q = p + 16 + n * 12;
+            std::memcpy(&ti.l_magic, q, 4); std::memcpy(&ti.l_ver, q + 4, 4);
+            std::memcpy(&ti.l_pin_off, q + 8, 4);  std::memcpy(&ti.l_pin_sz, q + 12, 4);
+            std::memcpy(&ti.l_arena_off, q + 16, 4); std::memcpy(&ti.l_arena_sz, q + 20, 4);
+            std::memcpy(&ti.l_resid_off, q + 24, 4); std::memcpy(&ti.l_resid_sz, q + 28, 4);
+            ti.has_layout = true;
+        }
         break;
     }
     delete wb;
     return ti;
+}
+
+/* 013 T013: 校验 TEMPOFF 尾随 VTCM 静态布局段 (magic/ver/三区)。断言直映
+ * wtop_emit.cpp 布局段发射式, 不依赖预算门 pin 项语义 (pin>0 小模型门偏松)。 */
+static void check_layout(const TempoffInfo& ti, const char* tag) {
+    std::printf("  [layout %s]\n", tag);
+    CHECK(ti.has_layout, "布局段存在 (len ≥ 16+n*12+32)");
+    if (!ti.has_layout) return;
+    CHECK(ti.l_magic == WT_TEMPOFF_LAYOUT_MAGIC, "magic == 'VTCL' (0x5654434C)");
+    CHECK(ti.l_ver == WT_TEMPOFF_LAYOUT_VER, "ver == 1");
+    CHECK(ti.l_pin_off == 0u, "region_pin.off == 0");
+    uint32_t pin_sz = ti.pin_cap ? ti.pin_cap : 4096u;
+    CHECK(ti.l_pin_sz == pin_sz, "region_pin.size == (pin_cap ? pin_cap : 4096)");
+    CHECK(ti.l_arena_off == ((pin_sz + 2047u) & ~2047u), "region_arena.off == align2048(pin_sz)");
+    CHECK(ti.l_arena_sz % 2048u == 0u, "region_arena.size 2048 对齐");
+    uint32_t pool_rounded = ((ti.vtcm_cap + 1023u) / 1024u) * 1024u;
+    CHECK(ti.l_resid_sz == pool_rounded, "region_resident.size == vtcm_cap KB 上取整");
+    if (pool_rounded) {
+        CHECK(ti.l_resid_off + ti.l_resid_sz == 16777216u, "region_resident 尾倒划到 16MB 顶");
+    }
 }
 
 // compile+emit 一趟, 返回 blob 路径; 失败返回空
@@ -141,6 +178,7 @@ int main() {
             CHECK(ti.vtcm_cap == 16252928u, "a_auto: vtcm_cap == 16MB-512KB = 16252928");
             CHECK(ti.pin_cap == 0u, "a_auto: pin_cap == 0 (无权重)");
             CHECK(ti.n_vtcm >= 1, "a_auto: ≥1 个 VTCM 驻留项");
+            check_layout(ti, "a_auto");
             std::printf("  [info] cap=%u vtcm_cap=%u pin_cap=%u n=%u n_vtcm=%u\n",
                         ti.cap, ti.vtcm_cap, ti.pin_cap, ti.n, ti.n_vtcm);
         } else std::fprintf(stderr, "  (%s)\n", log.c_str());
@@ -181,6 +219,7 @@ int main() {
             CHECK(ti.vtcm_cap == 3209216u,
                   "b_auto: vtcm_cap == 3209216 (scratch_max=13043712 镜像公式锚)");
             CHECK(ti.pin_cap == 0u, "b_auto: pin_cap == 0 (12MB 权重过载 → 流式)");
+            check_layout(ti, "b_auto");
             std::printf("  [info] cap=%u vtcm_cap=%u pin_cap=%u n=%u n_vtcm=%u\n",
                         ti.cap, ti.vtcm_cap, ti.pin_cap, ti.n, ti.n_vtcm);
         } else std::fprintf(stderr, "  (%s)\n", log.c_str());
@@ -197,6 +236,7 @@ int main() {
             CHECK(ti.pin_cap == 16384u, "c_auto: pin_cap == 16384 (权重 64×64 f32 上界, 2048 对齐)");
             CHECK(ti.vtcm_cap > 0u && ti.vtcm_cap < 16252928u,
                   "c_auto: vtcm_cap 有池且 < 无权重满池 (pin_cap+scratch 挤占)");
+            check_layout(ti, "c_auto");
             std::printf("  [info] cap=%u vtcm_cap=%u pin_cap=%u n=%u n_vtcm=%u\n",
                         ti.cap, ti.vtcm_cap, ti.pin_cap, ti.n, ti.n_vtcm);
         } else std::fprintf(stderr, "  (%s)\n", log.c_str());

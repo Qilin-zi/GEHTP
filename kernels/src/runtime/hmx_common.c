@@ -216,6 +216,14 @@ int hmx_runtime_is_attached(void)
     return g_vtcm_attached;
 }
 
+/* 013 A 段 T014 (R5): 有界区域 setup 统一入口。base=0/NULL → 全量 acquire
+ * (旧义); base!=0 → 挂共享 scratch 区 (与 attach 同语义, 不二次 acquire)。 */
+int hmx_runtime_setup_region(void *base, unsigned int size)
+{
+    if (!base) return hmx_runtime_setup(0);
+    return hmx_runtime_attach(base, size);
+}
+
 /* ============================================================
  *  HMX 执行权限: 本线程 timeshare HMX unit
  *  (照搬 htpacc hmx_mgr.c hmx_manager_enable/disable_execution)

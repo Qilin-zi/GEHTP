@@ -72,6 +72,12 @@ extern void hmx_runtime_teardown(void);
 extern int  hmx_runtime_attach(void *base, unsigned int size);
 extern int  hmx_runtime_is_attached(void);
 
+/* 013 A 段 T014 (R5): 有界区域 setup 统一入口。base=0/NULL → 全量 acquire
+ * (旧义, 委托 hmx_runtime_setup); base!=0 → 挂共享 scratch 区 [base,base+size)
+ * (同 hmx_runtime_attach, 不二次 acquire)。旧 hmx_runtime_setup(size) 签名
+ * 不动, 既有调用点 (示例 / hmx_convf16 等) 零扰动编译通过。 */
+extern int  hmx_runtime_setup_region(void *base, unsigned int size);
+
 /** @return 当前 runtime 持有的 VTCM 基地址 (setup 后有效; 未 setup 返回 NULL). */
 extern void        *hmx_runtime_get_vtcm_base(void);
 

@@ -86,6 +86,15 @@ extern "C" {
  * TEMPOFF 槽 reserve 字段拆两段(u32): [低 16 位=表外 bump 预留 KB] |
  * [高 16 位=VTCM 池大小 KB](0=无 VTCM 驻留)。 */
 #define WT_REF_VTCM_FLAG 0x4000u
+/* 013 A 段 (T013/T016): TEMPOFF 槽尾随 VTCM 静态布局段 (R4 载体)。
+ * 槽数据 = [cap][reserve][pin_cap][n][n × {tid,off,sz}] 之后追加:
+ * [magic u32][ver u32][region_pin{off,size}][region_arena{off,size}]
+ * [region_resident{off,size}] —— 三区互斥、VTCM 基址相对偏移; resident
+ * 尾倒划 (off = budget - pool_rounded)。旧运行期只认前 16+n*12 字节, 忽略
+ * 尾随段 (len ≥ 16+n*12 容忍); 新运行期按 magic 判存在、按表一次分区。 */
+#define WT_TEMPOFF_LAYOUT_MAGIC 0x5654434Cu  /* 'VTCL' */
+#define WT_TEMPOFF_LAYOUT_VER   1u
+#define WT_TEMPOFF_LAYOUT_BYTES 32u           /* magic+ver+3×{off,size} = 8 u32 */
 /* 004 decode P2 (FR-004): 命名持久状态表槽。slot.addr == STATE →
  * 槽数据 = [n u32][n × {bytes u32}] (n ≤ WT_MAX_STATES), 每项一块
  * DDR 缓冲 (memalign 128, 零初始化)。状态生命期 = 进程级持久:

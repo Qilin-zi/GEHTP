@@ -763,6 +763,34 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     // [高 16 位=VTCM 池大小]。两个域都 ≤ 65535(单元是 KB 级, 128 对齐
     // 上取整 —— probe VTCM 驻留 256KB = 256 单位)。VTCM 驻留项 temp_id
     // 带 0x4000 标记(WT_REF_VTCM_FLAG)。
+    // 013 T013: HMX arena 上界闭式 (布局段 + 预算门双用, 单源防漂移)。
+    // 与 5c 预算门原式逐项同 (f16 matmul / W4A16 w4_carve_need / SPLIT 按 N)。
+    auto hmx_arena_max_of = [&]() -> uint64_t {
+        uint64_t amax = 0;
+        for (size_t i = 0; i < em.ops.size(); i++) {
+            if ((em.op_annot[i] & 0x3u) != 2u) continue;  /* 2=WT_ENG_HMX (wt_engine) */
+            uint16_t opc = em.ops[i].opcode;
+            if (em.ops[i].n_args < 6) continue;
+            const uint32_t* a = em.ops[i].args;
+            uint64_t M = a[3], K = a[4], N = a[5];
+            /* SPLIT 线格式 [a,w,out,m,k,N_full,n0,nc,flags]: 逐 chunk 执行,
+             * arena 按 nc(=args[7]) 计 —— 按 N_full 计会把 v4 的 32-chunk
+             * lm_head 算成 ~500MB, 门对合法 blob 误杀(惰性门实锤拦截)。 */
+            if (opc == OP_MATMUL_F16_SPLIT && em.ops[i].n_args >= 8) N = a[7];
+            auto al2k = [](uint64_t x) { return (x + 2047) & ~(uint64_t)2047; };
+            auto al128 = [](uint64_t x) { return (x + 127) & ~(uint64_t)127; };
+            if (opc == OP_MATMUL_F16 || opc == OP_MATMUL_F16_BIAS ||
+                opc == OP_MATMUL_F16_SPLIT) {
+                amax = std::max(amax, al2k(M * K * 2) + al2k(K * N * 2) + al2k(M * N * 2) + 2048);
+            } else if (opc == OP_MATMUL_W4A16) {
+                /* 与 w4_carve_need (oplist_exec.c, dc_parts 分配序列)逐项同式 */
+                amax = std::max(amax, al2k(M * K * 2) + al2k(M * N * 2) + al2k(K * N / 2) +
+                                       al2k((N / 32) * 512) + al128(8 * (K / 32) * 4) +
+                                       al128(8 * (N / 32) * 4) + 128 + 128);
+            }
+        }
+        return amax;
+    };
     if (em.ddr_static) {
         /* 008 T010: 划痕窗终算 — 末 op 的窗深不会触发复位, 补入峰值;
          * 窗 [cap-peak, cap) 与规划器静态区 [0, planner_end) 必须不相交
@@ -833,6 +861,26 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                       em.ddr_temp_vtcm.count(tid) && em.ddr_temp_vtcm.at(tid));
         for (const auto& [tid, offsz] : em.ddr_scratch_tab)
             put_entry(tid, offsz.first, offsz.second, false);
+        /* 013 T013 (A 段, R4 载体): TEMPOFF 尾随 VTCM 静态布局段。
+         * [magic][ver][pin{off,sz}][arena{off,sz}][resident{off,sz}]
+         * 三区互斥、VTCM 基址相对偏移; resident 尾倒划 = budget - pool_rounded。
+         * pin=0 → 执行器回退 4096 (与 wtcache_pin_arg 同口径)。
+         * 旧运行期只认前 16+n*12 字节 (len ≥ 16+n*12 容忍), 忽略尾随段;
+         * 新运行期 (T015/T016) 按 magic 判存在、按表一次分区。 */
+        {
+            uint64_t pool_rounded = ((em.ddr_vtcm_cap + 1023) / 1024) * 1024;
+            uint64_t arena_max = hmx_arena_max_of();
+            uint32_t pin_sz = em.pin_cap ? em.pin_cap : 4096u;
+            uint32_t arena_off = (pin_sz + 2047u) & ~2047u;
+            uint32_t arena_sz = (uint32_t)((arena_max + 2047u) & ~2047u);
+            uint32_t resid_off = (uint32_t)(vtcm_budget > pool_rounded ? vtcm_budget - pool_rounded : 0u);
+            uint32_t resid_sz = (uint32_t)pool_rounded;
+            put32(WT_TEMPOFF_LAYOUT_MAGIC);
+            put32(WT_TEMPOFF_LAYOUT_VER);
+            put32(0u);          put32(pin_sz);
+            put32(arena_off);   put32(arena_sz);
+            put32(resid_off);   put32(resid_sz);
+        }
         uint32_t sid = em.add_slot((uint32_t)tab.size(),
                                    (uint32_t)(tab.size() / 4), tab.data());
         em.slots[sid].addr = WT_SLOT_TEMPOFF;
@@ -858,31 +906,16 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         for (const auto& c : em.carve_entries)
             carve_peak = std::max<uint64_t>(carve_peak,
                                             (uint64_t)c.vtcm_offset + c.size_bytes);
-        uint64_t arena_max = 0;
+        /* 013 T013: arena 闭式统一进 hmx_arena_max_of (布局段+预算门单源),
+         * 此处只点名 uncovered (非 f16/w4 的 HMX 消费 op, 不静默降额) */
+        uint64_t arena_max = hmx_arena_max_of();
         std::vector<uint32_t> uncovered;
         for (size_t i = 0; i < em.ops.size(); i++) {
             if ((em.op_annot[i] & 0x3u) != 2u) continue;  /* 2=WT_ENG_HMX (wt_engine) */
             uint16_t opc = em.ops[i].opcode;
             if (em.ops[i].n_args < 6) continue;
-            const uint32_t* a = em.ops[i].args;
-            uint64_t M = a[3], K = a[4], N = a[5];
-            /* SPLIT 线格式 [a,w,out,m,k,N_full,n0,nc,flags]: 逐 chunk 执行,
-             * arena 按 nc(=args[7]) 计 —— 按 N_full 计会把 v4 的 32-chunk
-             * lm_head 算成 ~500MB, 门对合法 blob 误杀(惰性门实锤拦截)。 */
-            if (opc == OP_MATMUL_F16_SPLIT && em.ops[i].n_args >= 8) N = a[7];
-            auto al2k = [](uint64_t x) { return (x + 2047) & ~(uint64_t)2047; };
-            auto al128 = [](uint64_t x) { return (x + 127) & ~(uint64_t)127; };
-            if (opc == OP_MATMUL_F16 || opc == OP_MATMUL_F16_BIAS ||
-                opc == OP_MATMUL_F16_SPLIT) {
-                uint64_t need = al2k(M * K * 2) + al2k(K * N * 2) + al2k(M * N * 2) + 2048;
-                arena_max = std::max(arena_max, need);
-            } else if (opc == OP_MATMUL_W4A16) {
-                /* 与 w4_carve_need (oplist_exec.c, dc_parts 分配序列)逐项同式 */
-                uint64_t need = al2k(M * K * 2) + al2k(M * N * 2) + al2k(K * N / 2) +
-                                al2k((N / 32) * 512) + al128(8 * (K / 32) * 4) +
-                                al128(8 * (N / 32) * 4) + 128 + 128;
-                arena_max = std::max(arena_max, need);
-            } else {
+            if (opc != OP_MATMUL_F16 && opc != OP_MATMUL_F16_BIAS &&
+                opc != OP_MATMUL_F16_SPLIT && opc != OP_MATMUL_W4A16) {
                 if (std::find(uncovered.begin(), uncovered.end(), (uint32_t)opc)
                     == uncovered.end())
                     uncovered.push_back(opc);
