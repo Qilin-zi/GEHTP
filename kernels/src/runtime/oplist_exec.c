@@ -2116,6 +2116,17 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
      * 1024/1024, conv_add 32768/32768 对替换前裸 asm 基线)。
      * 勿用 hvhx_v2_hmx_gemm_dot_fp16 — 那是 ggml core_dot 移植路径, 布局
      * (row-major pair) 不同, 未上板验证。 */
+    /* 012 US1: HMX 会话外提 — acquire/release 从 (r,c) 逐 tile 提到整段走查
+     * 一次 (M=32 时 192 次 → 1 次)。hmx_enable_execution = HAP 资源/电源
+     * 握手 (贵), hmx_unit_acquire = 软件自旋锁 (便宜); 累加器边界仍由
+     * 每 tile 的 Q6_mxclracc_hf 提供, tile 内 asm 序列逐条不动 — 仅握手
+     * 层次变化。单线程 runtime 无竞争, 长持 HAP lock 免逐 tile 电源门控。
+     * 读出后 CPU unpack 仍在 release 之后 (顺序与原逐 tile 版一致)。 */
+    hmx_enable_execution();
+    hmx_unit_acquire();
+    /* 012 US1 注记: act 装载与 wgt 装载必须逐对同包发射 (assembler:
+     * "packet has HMX weight without an activation" 硬规则), 故无法把
+     * act K 链驻留复用跨列; 逐对 kt 装载为 ISA 允许的唯一形态。 */
     for (uint32_t r = 0; r < n_row; ++r) {
         for (uint32_t c = 0; c < n_col; ++c) {
             uint16_t* out_tile = out_cr + ((size_t)r * n_col + c) * 1024u;
@@ -2126,8 +2137,6 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
             if (bias)
                 for (uint32_t n = 0; n < 32u; ++n)
                     sca[2u * n + 1u] = bias[n0 + c * 32u + n];
-            hmx_enable_execution();
-            hmx_unit_acquire();
             Q6_mxclracc_hf();
             Q6_bias_mxmem2_A((void *)sca);
             for (uint32_t kt = 0; kt < n_dot; ++kt) {
@@ -2138,10 +2147,10 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
             }
             memset(out_tile, 0, 2048u);
             Q6_mxmem_AR_after_hf((void *)out_tile, 0u);
-            hmx_unit_release();
-            hmx_disable_execution();
         }
     }
+    hmx_unit_release();
+    hmx_disable_execution();
 
     /* unpack out: crouton[(r*n_col+c)*1024] → row-major y[M,N_full] 列子区间 [n0, n0+N) */
     for (uint32_t r = 0; r < n_row; ++r)
