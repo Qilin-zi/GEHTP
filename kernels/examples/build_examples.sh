@@ -30,6 +30,9 @@ CFLAGS="-mv81 -O2 -mhvx -mhvx-length=128B -mhmx -shared -fPIC -std=gnu11 -Wall"
 LDFLAGS="-lc -ldl -lgcc"
 
 DEVDIR="${GEHTP_DEV_TMP:-/data/local/tmp/hvxhmx23}"
+# 例程结果 .txt 固定写到 /data/local/tmp/hrt/gehtp/ (example_util.c ex_open_result 硬编码),
+# 与 DEVDIR(部署/工作目录) 分离 — 见 docs/GEHTP_DEVICE_RUNBOOK.md §2.2。
+RESULT_DEV="/data/local/tmp/hrt/gehtp"
 BUILD="$LIB/build"
 RES="$LIB/results"
 BLOBS="$BUILD/blobs"
@@ -85,6 +88,9 @@ if [ -f "$G41_DIR/layer_0.wtop" ]; then
     adb push "$G41_DIR/layer_0.wtop" "$DEVDIR/g41/layer_0.wtop" >/dev/null 2>&1
     adb push "$G41_DIR/in_ncf.f16.raw" "$DEVDIR/g41/in_ncf.f16.raw" >/dev/null 2>&1 || true
     adb push "$G41_DIR/gold_ncf.f16.raw" "$DEVDIR/g41/gold_ncf.f16.raw" >/dev/null 2>&1 || true
+    if [ -f "$G41_DIR/out_temp.txt" ]; then
+        adb push "$G41_DIR/out_temp.txt" "$DEVDIR/g41/out_temp.txt" >/dev/null 2>&1 || true
+    fi
 fi
 # GEHTP 例40 资产(M4.2: L3 单层 blob + 输入/金标)
 G40_DIR="${GEHTP_40_DIR:-$LIB/../test_models/qwen35_08b/layers/layer_3}"
@@ -93,6 +99,9 @@ if [ -f "$G40_DIR/layer_3.wtop" ]; then
     adb push "$G40_DIR/layer_3.wtop" "$DEVDIR/g40/layer_3.wtop" >/dev/null 2>&1
     adb push "$G40_DIR/in.f16.raw" "$DEVDIR/g40/in.f16.raw" >/dev/null 2>&1 || true
     adb push "$G40_DIR/gold.f16.raw" "$DEVDIR/g40/gold.f16.raw" >/dev/null 2>&1 || true
+    if [ -f "$G40_DIR/out_temp.txt" ]; then
+        adb push "$G40_DIR/out_temp.txt" "$DEVDIR/g40/out_temp.txt" >/dev/null 2>&1 || true
+    fi
 fi
 
 for tag in w4 w5; do
@@ -114,8 +123,8 @@ adb push "$BLOBS/blob_w5.wtop" "$DEVDIR/" >/dev/null
 adb push "$BLOBS/rms_w.f16.raw" "$DEVDIR/" >/dev/null
 adb push "$LIB/assets/s2560/Y_gold.raw" "$DEVDIR/" >/dev/null
 adb push "$LIB/assets/s256/Y_gold_2563.raw" "$DEVDIR/assets/s256/" >/dev/null
-# 例 13 dlopen V2.1 库 — 设备 hvxhmx_libs 目录已有现成 signed 件
-adb shell "cp /data/local/tmp/hvxhmx_libs/libhvxhmx_v2.so $DEVDIR/libhvxhmx_v2.so 2>/dev/null || true"
+# 例 13 compat dlsym: 直接 dlopen 当前 libhvxhmx_v23.so(已随上一步 push; v73/v75/v79
+# 兼容符号在 src/compat 层, 同名 v2 库早已退役 → 不再单独 cp 旧件)
 # 例 20 dump 目录: DSP 上 system() 无 shell, 必须 host 预建
 adb shell "rm -rf $DEVDIR/dd_out; mkdir -p $DEVDIR/dd_out" >/dev/null 2>&1
 # skel/host launcher: 用 third_party 收编件(避免外部路径依赖)
@@ -126,8 +135,8 @@ adb shell "chmod 755 $DEVDIR/*" >/dev/null 2>&1
 run_shell() { adb shell "cd $DEVDIR && ADSP_LIBRARY_PATH=$DEVDIR CDSP_LIBRARY_PATH=$DEVDIR $1"; }
 
 pull_result() {   # pull_result <name> → results/<name>.txt (仅设备文件非空才覆盖, 防清空旧结果)
-    if adb shell "test -s $DEVDIR/$1.txt"; then
-        adb shell "cat $DEVDIR/$1.txt" > "$RES/$1.txt"
+    if adb shell "test -s $RESULT_DEV/$1.txt"; then
+        adb shell "cat $RESULT_DEV/$1.txt" > "$RES/$1.txt"
     else
         echo "WARNING: $1.txt missing or empty on device, keeping local old file" >&2
     fi

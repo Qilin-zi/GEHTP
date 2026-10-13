@@ -13,12 +13,65 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace hnnx {
+
+// 有效生命期分析: direct = 最后直接消费位置; eff = 沿 Reshape 引用消除别名链
+// 取 max(与 wtop_ops::alias_temp 的 last_use 并集语义对齐)。compute_ddr_offsets
+// 与 emit_ddr_offset_table 共享, 保证 TEMPOFF 与 TSV 裁判口径一致。
+struct Liveness {
+    std::unordered_map<op_id_t, uint32_t> direct;
+    std::unordered_map<op_id_t, uint32_t> eff;
+};
+
+static Liveness compute_eff_last_use(const GraphPrepare& gp,
+                                     const std::vector<op_id_t>& order) {
+    Liveness lv;
+    // 1. 直接消费: 逐 op 扫 inputs 边(out_idx==0 为 DDR 静态缓冲)。
+    for (size_t p = 0; p < order.size(); p++) {
+        const OpDef* c = gp.get_op_at(order[p]);
+        if (!c) continue;
+        for (const auto& e : c->inputs)
+            if (e.out_idx == 0)
+                lv.direct[e.src_id] = (uint32_t)p;
+    }
+    // 2. Reshape 引用消除(op_reshape → alias_temp): Reshape 不物化, 其输出
+    // 别名到输入 temp。producer 缓冲真实生命期须沿 Reshape 链延伸到最后一个
+    // "真读者"。
+    auto is_alias_op = [&](op_id_t id) -> bool {
+        const OpDef* o = gp.get_op_at(id);
+        return o && o->name_tag && o->name_tag->name() &&
+               std::strcmp(o->name_tag->name(), "Reshape") == 0;
+    };
+    std::unordered_map<op_id_t, std::vector<op_id_t>> alias_next;  // producer → 别名它的 Reshape
+    for (op_id_t id : order) {
+        const OpDef* o = gp.get_op_at(id);
+        if (!o || !is_alias_op(id) || o->inputs.empty()) continue;
+        if (o->inputs[0].out_idx == 0)
+            alias_next[o->inputs[0].src_id].push_back(id);
+    }
+    // 3. 逆拓扑序传播: alias_next 边指向更晚的 op, 倒序处理保证子节点已算。
+    for (size_t i = order.size(); i-- > 0;) {
+        op_id_t pid = order[i];
+        uint32_t best = UINT32_MAX;
+        auto lu = lv.direct.find(pid);
+        if (lu != lv.direct.end()) best = lu->second;
+        auto nit = alias_next.find(pid);
+        if (nit != alias_next.end()) {
+            for (op_id_t r : nit->second) {
+                uint32_t sub = lv.eff[r];
+                if (sub != UINT32_MAX && (best == UINT32_MAX || sub > best)) best = sub;
+            }
+        }
+        lv.eff[pid] = best;
+    }
+    return lv;
+}
 
 int GraphPrepare::compute_ddr_offsets(uint64_t budget,
                                       std::vector<DdrTempEntry>* entries,
@@ -38,9 +91,16 @@ int GraphPrepare::compute_ddr_offsets(uint64_t budget,
     if (order.empty()) order = get_ordering();  // 未调度: 退回拓扑序
     if (order.empty()) return -1;
 
-    std::unordered_map<op_id_t, uint32_t> pos;
-    for (size_t i = 0; i < order.size(); i++) pos[order[i]] = (uint32_t)i;
     uint32_t n = (uint32_t)order.size();
+
+    // 活性分析(与 wtop_ops::alias_temp 语义对齐): 逐 op 扫 inputs 边(out_idx==0
+    // 为 DDR 静态缓冲)记最后直接消费位置, 再沿 Reshape 引用消除别名链取 max
+    // 得到有效生命期终点。40_qwen_layer3 temp6/temp25 重叠根因: Eltwise_Binary
+    // 产 K 张量只被一个 Reshape 直接引用, 而该 Reshape 别名链一路拉到 softmax
+    // 之后的 PV MatMul —— 直接读者法把生命期低估到 [生产, Reshape), 与后段
+    // temp25 重叠。eff = 沿 Reshape 链递归取 max; UINT32_MAX = 全链无消费者。
+    Liveness lv = compute_eff_last_use(*this, order);
+    std::unordered_map<op_id_t, uint32_t>& eff_use = lv.eff;
 
     std::vector<fa::FancyAllocator::AllocRequest> reqs;
     for (size_t p = 0; p < order.size(); p++) {
@@ -58,18 +118,14 @@ int GraphPrepare::compute_ddr_offsets(uint64_t budget,
         if (es == 0 || es > 4) es = 4;
         uint64_t bytes = (elems * es + 127) & ~uint64_t(127);
 
+        // 活性: 有效生命期 = 沿 Reshape 别名链取 max 最后读者 + 1;
+        // 无消费者(图输出 producer)活到图尾。
         uint32_t life_end = (uint32_t)p + 1;
-        bool has_consumer = false;
-        for (op_id_t cid : od->consumers) {
-            OpDef* c = get_op_at(cid);
-            if (!c || c->is_dead()) continue;
-            has_consumer = true;
-            auto it = pos.find(cid);
-            life_end = (it != pos.end())
-                           ? std::max(life_end, it->second + 1)
-                           : n;  // 消费者不在计划序(如 Output)→ 活到图尾
-        }
-        if (!has_consumer) life_end = n;  // 图输出 producer
+        uint32_t last = eff_use[od->op_id];
+        if (last != UINT32_MAX)
+            life_end = std::max(life_end, last + 1);
+        else
+            life_end = n;
 
         reqs.push_back({od->op_id, (size_t)bytes, (uint32_t)p, life_end});
     }
@@ -172,24 +228,18 @@ int GraphPrepare::emit_ddr_offset_table(const char* path, uint64_t budget) {
     std::unordered_map<op_id_t, uint32_t> pos;
     for (size_t i = 0; i < order.size(); i++) pos[order[i]] = (uint32_t)i;
     uint32_t n = (uint32_t)order.size();
+    // 活性用 inputs 真值反推(与 compute_ddr_offsets 同源; consumers 缓存陈旧;
+    // 沿 Reshape 别名链取 max 的口径与 TEMPOFF 一致)。
+    Liveness lv = compute_eff_last_use(*this, order);
     for (const auto& e : entries) {
         uint32_t lb = 0, le = 0;
         auto pit = pos.find(e.op_id);
         if (pit != pos.end()) {
             lb = pit->second;
             le = lb + 1;
-            const OpDef* od = get_op_at(e.op_id);
-            if (od) {
-                bool has_consumer = false;
-                for (op_id_t cid : od->consumers) {
-                    const OpDef* c = get_op_at(cid);
-                    if (!c || c->is_dead()) continue;
-                    has_consumer = true;
-                    auto cit = pos.find(cid);
-                    le = (cit != pos.end()) ? std::max(le, cit->second + 1) : n;
-                }
-                if (!has_consumer) le = n;
-            }
+            auto lu = lv.eff.find(e.op_id);
+            if (lu != lv.eff.end()) le = std::max(le, lu->second + 1);
+            else le = n;
         }
         f << e.op_id << " " << e.offset << " " << e.size << " " << lb << " " << le << "\n";
     }

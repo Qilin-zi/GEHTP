@@ -62,6 +62,7 @@ void wt_exec_pool_init(uint8_t* base, uint32_t total_cap, uint32_t static_cap,
 struct wt_exec_stats {
     uint32_t ops, nop, matmul, rmsnorm, silu, pin, pin_skipped;
     uint32_t im2col, conv2d, add, spill, fill, transpose;  /* GEHTP 阶段9 */
+    uint32_t restage;  /* 010 US1: 权重实际 DDR→VTCM 换入次数 (与编译期规划值对账, SC-003) */
 };
 int  wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
                        uint32_t* engine_m, int64_t* op_us, char* err, size_t errn);

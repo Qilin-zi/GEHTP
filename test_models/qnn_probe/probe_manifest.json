@@ -1,9 +1,11 @@
 {
+  "manifest_ver": 2,
   "input_slot": 0,
   "input_elems": 32,
-  "output_temp": 9,
-  "n_slots": 22,
-  "n_ops": 117,
-  "op_ids": [3,7,8,10,11,13,16,20,20,22,23,25,26,28,28,29,40,14,17,30,30,35,32,33,36,37,37,38,44,45,47,47,49,49,50,15,18,42,51,53,54,56,57,58,63,64,67,68,69,70,72,73,74,75,77,78,79,81,82,84,85,87,90,93,93,95,96,98,99,100,100,101,112,88,91,102,102,104,105,107,108,109,109,110,116,117,118,118,119,119,120,89,92,114,121,123,124,126,127,128,130,132,139,140,134,135,136,137,141,142,144,145,146,148,149,151,152],
-  "opcodes": [20,25,11,24,11,16,11,26,12,15,11,15,14,26,12,7,27,16,11,26,12,15,15,11,14,26,12,7,27,24,26,12,26,7,13,16,11,27,24,27,11,24,11,7,25,11,24,11,11,12,24,11,12,11,24,11,7,25,11,24,11,16,11,26,12,15,11,15,14,26,12,7,27,16,11,26,12,15,11,15,14,26,12,7,27,24,26,12,26,7,13,16,11,27,24,27,11,24,11,7,25,11,24,11,24,11,11,12,12,11,24,11,7,25,11,24,11]
+  "output_temp": 26,
+  "n_slots": 23,
+  "n_ops": 91,
+  "op_ids": [3,7,10,13,20,20,22,23,25,26,28,28,29,40,14,30,30,35,32,33,36,37,37,38,44,45,47,47,49,49,50,15,42,51,53,56,58,63,67,69,70,72,74,77,79,81,84,87,93,93,95,96,98,99,100,100,101,112,88,102,102,104,105,107,108,109,109,110,116,117,118,118,119,119,120,89,114,121,123,126,128,130,134,136,137,139,141,144,146,148,151],
+  "opcodes": [20,25,24,16,26,12,15,11,15,14,26,12,7,27,16,26,12,15,15,11,14,26,12,7,27,24,26,12,26,7,13,16,27,24,27,24,7,25,24,11,12,24,12,24,7,25,24,16,26,12,15,11,15,14,26,12,7,27,16,26,12,15,11,15,14,26,12,7,27,24,26,12,26,7,13,16,27,24,27,24,7,25,24,11,12,24,12,24,7,25,24],
+  "op_names": ["Gather","RmsNorm","FullyConnected","Split","Eltwise_Binary","Eltwise_Binary","StridedSlice","Eltwise_Unary","StridedSlice","Concat","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Transpose","Split","Eltwise_Binary","Eltwise_Binary","StridedSlice","StridedSlice","Eltwise_Unary","Concat","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Transpose","MatMul","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Softmax","Split","Transpose","MatMul","Transpose","FullyConnected","Eltwise_Binary","RmsNorm","FullyConnected","ElementWiseNeuron","Eltwise_Binary","FullyConnected","Eltwise_Binary","FullyConnected","Eltwise_Binary","RmsNorm","FullyConnected","Split","Eltwise_Binary","Eltwise_Binary","StridedSlice","Eltwise_Unary","StridedSlice","Concat","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Transpose","Split","Eltwise_Binary","Eltwise_Binary","StridedSlice","Eltwise_Unary","StridedSlice","Concat","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Transpose","MatMul","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Eltwise_Binary","Softmax","Split","Transpose","MatMul","Transpose","FullyConnected","Eltwise_Binary","RmsNorm","FullyConnected","ElementWiseNeuron","Eltwise_Binary","FullyConnected","Eltwise_Binary","FullyConnected","Eltwise_Binary","RmsNorm","FullyConnected"]
 }

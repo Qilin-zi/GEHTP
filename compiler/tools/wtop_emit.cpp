@@ -145,6 +145,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         em.ddr_static_cap = mp.ddr_cap;
         em.ddr_vtcm_cap = mp.vtcm_cap;
         em.bump_reserve = mp.bump_reserve;
+        em.pin_cap = mp.pin_cap;
         em.ddr_static = true;
         for (const auto& s : mp.spills)
             em.ddr_spill_map[s.op_id] = {(uint32_t)s.offset, (uint32_t)s.size};
@@ -757,7 +758,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     em.pending_stages.clear();
 
     // 5b. 第7步阶段一: 静态 temp 偏移表 → TEMPOFF 槽
-    // [cap u32][reserve u32][n u32][n × {temp_id u32, offset u32, size u32}]
+    // [cap u32][reserve u32][pin_cap u32][n u32][n × {temp_id u32, offset u32, size u32}]
     // 第7步阶段二: reserve 字段拆两段(u32): [低 16 位=表外 bump 预留] |
     // [高 16 位=VTCM 池大小]。两个域都 ≤ 65535(单元是 KB 级, 128 对齐
     // 上取整 —— probe VTCM 驻留 256KB = 256 单位)。VTCM 驻留项 temp_id
@@ -820,6 +821,7 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         };
         put32((uint32_t)em.ddr_static_cap);
         put32(reserve);
+        put32((uint32_t)em.pin_cap);  // 010 T005: pin_cap 字节 2048 对齐(0=不 pin → 执行器回退 4096)
         put32((uint32_t)(em.ddr_temp_tab.size() + em.ddr_scratch_tab.size()));
         auto put_entry = [&](uint32_t tid, uint32_t off, uint32_t sz, bool vtcm) {
             put32(vtcm ? (tid | WT_REF_VTCM_FLAG) : tid);
@@ -977,6 +979,8 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 return idx == 1 || idx == 2;
             case OP_MATMUL_W4A16: case OP_CONV1D_SSM_F16:
                 return idx == 1;
+            case OP_PIN:   /* 010 US1: pin 权重裸 slot (T009 发射) */
+                return idx == 0;
             case OP_FILL:
                 return idx == 0;
             case OP_SPILL:

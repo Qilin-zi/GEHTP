@@ -485,58 +485,76 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
         }
         if (!in0 || !rg) { for (size_t i = 0; i < n; ++i) out[i] = 0.0f; }
         else {
-            /* rank 5 支持: GDN 迭代链 131[1,16,1,64,64]→138[1,16,1,1,64]
-             * 类 rank5 切片(此前 rank 截 4 → 第 5 组 ranges 丢弃 + 输出
-             * 坐标按 4 维走, 138 内容错乱) */
-            uint32_t rank = out_def.rank;
-            if (rank > 5) rank = 5;
-            /* ranges 轴数 = param 元素数/3; 与 rank 不同时右对齐(前导轴恒等,
-             * QNN 前导 1 填充) */
-            uint32_t n_axes = rank;
+            /* StridedSlice: ranges = [begin,end,stride]×n_axes, 输入 in_rank 维。
+             * GDN 5D 迭代链 in=[1,16,1,1,64] out=[1,16,1,37] (rank 5→4): 切片产
+             * [1,16,1,1,37], 后随 Reshape 挤掉 size-1 轴 (别名消除折叠进 out_def)。
+             * 旧代码按 out_rank 切片 → 第 5 组 ranges 丢弃 + 轴错位 (out 轴 3 误映射
+             * in 轴 3 stride=64 而非 in 轴 4 stride=1) → src 越界段错误。正解: 按
+             * in_rank 切片, 输出 flat 下标 == 切片 5D flat 下标 (Reshape 对 flat 恒等),
+             * 再经 begin/stride 映射回输入。 */
+            uint32_t in_rank = 5;
+            if (!in_defs.empty()) { in_rank = in_defs[0].rank; if (in_rank > 5) in_rank = 5; }
+            /* ranges 轴数 = param 元素数/3; 与输入轴右对齐(前导轴恒等, QNN 前导 1 填充) */
+            uint32_t n_axes = in_rank;
             if (in_defs.size() > 1) {
                 size_t en = 1;
                 for (uint32_t d = 0; d < in_defs[1].rank && d < 5; ++d)
                     en *= in_defs[1].dims[d];
-                if (en % 3 == 0 && en / 3 <= rank) n_axes = (uint32_t)(en / 3);
+                if (en % 3 == 0 && en / 3 <= in_rank) n_axes = (uint32_t)(en / 3);
             }
-            uint32_t ax_off = rank - n_axes;
+            uint32_t ax_off = in_rank >= n_axes ? in_rank - n_axes : 0;
             int b[5] = {0, 0, 0, 0, 0}, e[5] = {0, 0, 0, 0, 0}, s[5] = {1, 1, 1, 1, 1};
-            for (uint32_t ax = 0; ax < n_axes; ax++) {
+            for (uint32_t ax = 0; ax < n_axes && ax_off + ax < 5; ax++) {
                 b[ax_off + ax] = (int)rg[ax * 3 + 0];
                 e[ax_off + ax] = (int)rg[ax * 3 + 1];
                 s[ax_off + ax] = (int)rg[ax * 3 + 2];
                 if (s[ax_off + ax] == 0) s[ax_off + ax] = 1;
             }
-            /* 输入形状(in_defs[0])右对齐, 前导 1 填充 */
+            /* 输入形状(in_defs[0])左对齐 in_rank 槽 */
             uint32_t id_[5] = {1, 1, 1, 1, 1};
-            if (!in_defs.empty()) {
-                uint32_t ir = in_defs[0].rank;
-                uint32_t off = rank > ir ? rank - ir : 0;
-                for (uint32_t ax = 0; ax < ir && off + ax < 5; ax++)
-                    id_[off + ax] = in_defs[0].dims[ax];
+            size_t input_n = 1;
+            if (!in_defs.empty())
+                for (uint32_t ax = 0; ax < in_rank; ax++) {
+                    id_[ax] = in_defs[0].dims[ax];
+                    input_n *= in_defs[0].dims[ax];
+                }
+            /* 前导恒等轴: 未在 ranges 里显式给出的轴 = [0, dim, 1] */
+            for (uint32_t d = 0; d < ax_off; d++) e[d] = (int)id_[d];
+            /* 负 end: QNN 语义 end<0 = dim+end(负索引回绕) */
+            for (uint32_t d = 0; d < 5; d++)
+                if (e[d] < 0) e[d] += (int)id_[d];
+            /* 每轴切片后尺寸 sd[] (span/stride 上取整; 空切片=0) */
+            uint32_t sd[5] = {1, 1, 1, 1, 1};
+            for (uint32_t d = 0; d < in_rank; d++) {
+                if (e[d] <= b[d]) { sd[d] = 0; continue; }
+                uint32_t span = (uint32_t)(e[d] - b[d]);
+                sd[d] = (span + (uint32_t)s[d] - 1) / (uint32_t)s[d];
             }
             size_t in_strides[5] = {1, 1, 1, 1, 1};
-            for (int d = 3; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
-            uint32_t od[5] = {1, 1, 1, 1, 1};
-            for (uint32_t ax = 0; ax < rank; ax++) od[ax] = out_def.dims[ax];
-            size_t out_strides[5] = {1, 1, 1, 1, 1};
-            for (int d = 3; d >= 0; d--) out_strides[d] = out_strides[d + 1] * od[d + 1];
+            for (int d = (int)in_rank - 2; d >= 0; d--) in_strides[d] = in_strides[d + 1] * id_[d + 1];
+            /* 切片 5D 的 C 序步长; 输出 flat 下标 == 切片 flat 下标(Reshape 恒等) */
+            size_t sd_strides[5] = {1, 1, 1, 1, 1};
+            for (int d = (int)in_rank - 2; d >= 0; d--) sd_strides[d] = sd_strides[d + 1] * (sd[d + 1] ? sd[d + 1] : 1u);
             if (getenv("GEHTP_EXDIAG")) {
-                std::fprintf(stderr, "[ssb] oid=%llu rank=%u n_axes=%u ax_off=%u b=[%d,%d,%d,%d,%d] e=[%d,%d,%d,%d,%d] s=[%d,%d,%d,%d,%d] id=[%u,%u,%u,%u,%u] od=[%u,%u,%u,%u,%u]\n",
+                std::fprintf(stderr, "[ssb] oid=%llu in_rank=%u n_axes=%u ax_off=%u b=[%d,%d,%d,%d,%d] e=[%d,%d,%d,%d,%d] s=[%d,%d,%d,%d,%d] id=[%u,%u,%u,%u,%u] sd=[%u,%u,%u,%u,%u] out_rank=%u\n",
                              (unsigned long long)op_id,
-                             rank, n_axes, ax_off, b[0], b[1], b[2], b[3], b[4],
+                             in_rank, n_axes, ax_off, b[0], b[1], b[2], b[3], b[4],
                              e[0], e[1], e[2], e[3], e[4], s[0], s[1], s[2], s[3], s[4],
                              id_[0], id_[1], id_[2], id_[3], id_[4],
-                             od[0], od[1], od[2], od[3], od[4]);
+                             sd[0], sd[1], sd[2], sd[3], sd[4], out_def.rank);
             }
             for (size_t i = 0; i < n; i++) {
                 size_t rem = i, src = 0;
-                for (uint32_t d = 0; d < rank; d++) {
-                    size_t c = rem / out_strides[d];
-                    rem %= out_strides[d];
-                    src += (size_t)(b[d] + (int)c * s[d]) * in_strides[d];
+                int oob = 0;
+                for (uint32_t d = 0; d < in_rank; d++) {
+                    uint32_t jd = sd[d] ? (uint32_t)(rem / sd_strides[d]) : 0;
+                    rem %= sd_strides[d];
+                    int64_t coord = (int64_t)b[d] + (int64_t)jd * s[d];
+                    if (coord < 0) coord += id_[d];   /* QNN 负 begin 回绕 */
+                    if (coord < 0 || coord >= (int64_t)id_[d]) { oob = 1; break; }
+                    src += (size_t)coord * in_strides[d];
                 }
-                out[i] = in0[src];
+                out[i] = (!oob && src < input_n) ? in0[src] : 0.0f;
             }
         }
     } else if (op_type_name == "Pad") {
@@ -730,6 +748,14 @@ void TypicalOp::execute(const std::vector<const uint8_t*>& inputs,
             if (C == 0) C = 1;
             size_t groups = n / C;
             if (groups == 0) groups = 1;
+            if (getenv("GEHTP_EXDIAG")) {
+                std::fprintf(stderr, "[rmsdiag] oid=%llu rank=%u dims=[%u,%u,%u,%u] rk=%u C=%zu groups=%zu n=%zu scale=%g,%g,%g,%g in0=%g,%g,%g,%g\n",
+                             (unsigned long long)op_id, out_def.rank,
+                             out_def.dims[0], out_def.dims[1], out_def.dims[2], out_def.dims[3],
+                             rk, C, groups, n,
+                             scale?scale[0]:0.f, scale?scale[1]:0.f, scale?scale[2]:0.f, scale?scale[3]:0.f,
+                             in0[0], in0[1], in0[2], in0[3]);
+            }
             for (size_t g = 0; g < groups; g++) {
                 double acc = 0.0;
                 for (size_t c = 0; c < C; c++) {

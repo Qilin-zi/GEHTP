@@ -74,6 +74,9 @@ struct wt_exec {
      * VTCM 偏移(哨兵 0xFFFFFFFF = 无驻留); vtcm_pool = wtcache 的 VTCM 基址。 */
     uint8_t* vtcm_pool;
     uint32_t vtcm_pool_size;
+    uint32_t wtcache_pin_cap;   /* 010 T006: TEMPOFF pin_cap(字节, 0=不 pin → 回退 4096) */
+    uint32_t wt_resident_slot;   /* 010 US1: 当前驻留 VTCM 的权重 slot (0xFFFFFFFF=无) */
+    uint32_t bias_resident_slot; /* 010 US1: 当前驻留 VTCM 的 bias slot (0xFFFFFFFF=无) */
     uint32_t vtcm_off_arr[MAX_TEMPS];
     /* 004 P2 (FR-004): 命名持久状态表。bufs 按首 run 解析 WT_SLOT_STATE
      * 槽一次性分配 (DDR, 零初始化), 生命期 = 进程级 —— shutdown 不回收,
@@ -313,6 +316,12 @@ static void cpu_to_vtcm(uint8_t* dst, const uint8_t* src, uint32_t bytes) {
                          QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 }
 
+/* 010 T006: TEMPOFF pin_cap(0=不 pin) → wtcache_open 实参; 0 回退旧硬编码 4096
+ * (关池口径 byte-exact 门覆盖)。pin_cap 单位字节, 已 2048 对齐(128 对齐超集)。 */
+static uint32_t wtcache_pin_arg(void) {
+    return g_exec.wtcache_pin_cap ? g_exec.wtcache_pin_cap : 4096u;
+}
+
 /* VTCM 驻留池懒初始化: 从 VTCM 尾部倒划, 避开 MATMUL carve arena。 */
 static int vtcm_pool_ensure(void) {
     if (g_exec.vtcm_pool) return 0;
@@ -322,7 +331,7 @@ static int vtcm_pool_ensure(void) {
          * attach 模式下 base 借自 wtcache 时 engine_ready 必已置位,
          * 不会走到本分支, teardown 清指针不伤 wtcache 的 ctx。 */
         if (hmx_runtime_get_vtcm_base()) hmx_runtime_teardown();
-        if (wtcache_open(&g_exec.wc, 4096) != WTC_OK) return -1;
+        if (wtcache_open(&g_exec.wc, wtcache_pin_arg()) != WTC_OK) return -1;
         g_exec.engine_ready = 1;
     }
     void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
@@ -560,10 +569,11 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     }
 
     const uint8_t *bias = NULL, *atbl = NULL, *otbl = NULL;
+    uint32_t bias_slot_idx = 0xFFFFFFFFu;
     for (uint32_t i = 0; i < b->n_slots; i++) {
         const uint8_t* p = b->weight_base + b->slots[i].offset;
         uint32_t L = b->slots[i].len;
-        if (!bias && L == bias_b) bias = p;
+        if (!bias && L == bias_b) { bias = p; bias_slot_idx = i; }
         else if (!atbl && L == tbl_b) atbl = p;
         else if (!otbl && L == tbl_b) otbl = p;
     }
@@ -589,6 +599,11 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     int shape_same = g_exec.matmul_carved &&
                      g_exec.e.m == M && g_exec.e.k == K && g_exec.e.n == N;
     if (!shape_same || live_end != g_exec.carve_live_end) {
+        /* 010 US1: re-carve (形状/live 变化, 或前置 f16/conv 抢走全量 VTCM 后
+         * matmul_carved=0) 会重排 arena → e.wt/e.bias 偏移可能变, 旧驻留副本
+         * 失效, 强制下一把重搬。驻留追踪只在本 carve 区间内有效。 */
+        g_exec.wt_resident_slot = 0xFFFFFFFFu;
+        g_exec.bias_resident_slot = 0xFFFFFFFFu;
         int rc = 0;
         if (!g_exec.engine_ready) {
             /* VTCM 互斥回收: 前置 MATMUL_F16/CONV2D 的 HMX 快路径 hmx_runtime_setup
@@ -597,7 +612,7 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
              * wtcache), 但 engine_ready=0 + base 非 NULL 只能是自有 ctx, 安全。
              * 反向 (wtcache 先开, f16 后到) 走 attach 共享 scratch 区, 不冲突。 */
             if (hmx_runtime_get_vtcm_base()) hmx_runtime_teardown();
-            rc = wtcache_open(&g_exec.wc, 4096);
+            rc = wtcache_open(&g_exec.wc, wtcache_pin_arg());
             if (rc != WTC_OK) { snprintf(err, errn, "wtcache 0x%X", rc); return -1; }
         }
         void* vb = NULL; uint32_t vs = 0; void* pb = NULL; uint32_t pc = 0;
@@ -654,8 +669,19 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
     uint8_t* out_ddr = temp_get(out_t, out_b);
     if (!out_ddr) { snprintf(err, errn, "temp %u alloc", (unsigned)out_t); return -1; }
 
-    cpu_to_vtcm(g_exec.e.wt, b->weight_base + b->slots[w_s].offset, wt_b);
-    cpu_to_vtcm(g_exec.e.bias, bias, bias_b);
+    /* 010 US1 (T011): 权重已驻留且本 carve 区间未重划 → 跳过重复 DDR→VTCM 搬
+     * (D2 的每 MATMUL 无条件 cpu_to_vtcm)。驻留追踪在 re-carve 时已置空, 故
+     * 这里只跳过「同 slot + 同 carve」的二次搬运, 字节恒等 (同源同址, 跳过
+     * 拷贝结果不变)。restage 计数 = 实际换入次数, 供 wt_w3_report 对账。 */
+    if (g_exec.wt_resident_slot != w_s) {
+        cpu_to_vtcm(g_exec.e.wt, b->weight_base + b->slots[w_s].offset, wt_b);
+        g_exec.wt_resident_slot = w_s;
+        g_exec.st.restage++;
+    }
+    if (g_exec.bias_resident_slot != bias_slot_idx) {
+        cpu_to_vtcm(g_exec.e.bias, bias, bias_b);
+        g_exec.bias_resident_slot = bias_slot_idx;
+    }
 
     if (act_s & WT_REF_VTCM_FLAG) {
         uint8_t* act_vtcm = (uint8_t*)ref_ptr(b, act_s);
@@ -708,6 +734,8 @@ void wt_exec_shutdown(void) {
         g_exec.engine_ready = 0;
         g_exec.matmul_carved = 0;
     }
+    g_exec.wt_resident_slot = 0xFFFFFFFFu;    /* 010 US1: VTCM 关闭后驻留副本失效 */
+    g_exec.bias_resident_slot = 0xFFFFFFFFu;
     /* 单块池: 一次释放(旧 per-temp free ×256 全删) */
     free(g_exec.pool);
     g_exec.pool = NULL;
@@ -720,6 +748,7 @@ void wt_exec_shutdown(void) {
     if (hmx_runtime_is_attached()) hmx_runtime_teardown();
     g_exec.vtcm_pool = NULL;
     g_exec.vtcm_pool_size = 0;
+    g_exec.wtcache_pin_cap = 0;
     g_exec.carve_op = 0xFFFFFFFFu;
     g_exec.carve_live_end = 0u;
     for (uint32_t i = 0; i < MAX_TEMPS; i++) {
@@ -2732,17 +2761,18 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
         if (b->slots[s].addr != WT_SLOT_TEMPOFF) continue;
         const uint8_t* p = b->weight_base + b->slots[s].offset;
         uint32_t len = b->slots[s].len;
-        if (len < 12u) { snprintf(err, errn, "tempoff slot short"); return -1; }
-        uint32_t cap, reserve, n;
-        memcpy(&cap, p, 4); memcpy(&reserve, p + 4, 4); memcpy(&n, p + 8, 4);
-        if (len < 12u + n * 12u) { snprintf(err, errn, "tempoff table short"); return -1; }
+        if (len < 16u) { snprintf(err, errn, "tempoff slot short"); return -1; }
+        uint32_t cap, reserve, pin_cap, n;
+        memcpy(&cap, p, 4); memcpy(&reserve, p + 4, 4); memcpy(&pin_cap, p + 8, 4); memcpy(&n, p + 12, 4);
+        if (len < 16u + n * 12u) { snprintf(err, errn, "tempoff table short"); return -1; }
         if (cap == 0 || cap > 0x80000000u) { snprintf(err, errn, "tempoff cap bad"); return -1; }
         uint32_t vtcm_cap = (reserve >> 16) * 1024u;
         reserve = (reserve & 0xFFFFu) * 1024u;
+        g_exec.wtcache_pin_cap = pin_cap;  /* 010 T006: 0=不 pin → wtcache_open 回退 4096 */
         uint8_t* pool = memalign(128, (size_t)cap + reserve);
         if (!pool) { snprintf(err, errn, "tempoff pool alloc"); return -1; }
         for (uint32_t i = 0; i < n; i++) {
-            const uint8_t* e = p + 12 + i * 12;
+            const uint8_t* e = p + 16 + i * 12;
             uint32_t tid, off, sz;
             memcpy(&tid, e, 4); memcpy(&off, e + 4, 4); memcpy(&sz, e + 8, 4);
             uint32_t tid_clean = tid & 0x3FFFu;
@@ -2786,7 +2816,7 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
         }
         /* 双向存在性(集合语义): temp id 回收复用同段 VTCM 会有重复对, 合法。 */
         for (uint32_t i = 0; i < tn; i++) {
-            const uint8_t* e = tp + 12 + i * 12;
+            const uint8_t* e = tp + 16 + i * 12;
             uint32_t tid, off, sz;
             memcpy(&tid, e, 4); memcpy(&off, e + 4, 4); memcpy(&sz, e + 8, 4);
             if (!(tid & WT_REF_VTCM_FLAG)) continue;
@@ -2818,7 +2848,7 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
             }
             uint32_t i;
             for (i = 0; i < tn; i++) {
-                const uint8_t* e = tp + 12 + i * 12;
+                const uint8_t* e = tp + 16 + i * 12;
                 uint32_t tid2, off2, sz2;
                 memcpy(&tid2, e, 4); memcpy(&off2, e + 4, 4); memcpy(&sz2, e + 8, 4);
                 if ((tid2 & WT_REF_VTCM_FLAG) && off2 == co && sz2 == cs) break;
@@ -3155,10 +3185,16 @@ static int xop_pin(const struct wt_op_ctx* cx) {
     if (!g_exec.engine_ready) { g_exec.st.pin_skipped++; return 0; }
     const uint8_t* p = b->weight_base + b->slots[s].offset;
     uint32_t L = b->slots[s].len;
-    if (L == g_exec.e.k * g_exec.e.n / 2u)
+    if (L == g_exec.e.k * g_exec.e.n / 2u) {
+        /* 010 US1 (T010): PIN 真搬一次并登记驻留, 后续 MATMUL 读到同 slot 跳过
+         * 二次搬运 (D2: PIN 与 MATMUL 各搬一次 → 只搬一次)。 */
         cpu_to_vtcm(g_exec.e.wt, p, L);
-    else if (L == (g_exec.e.n / 32u) * 512u)
+        g_exec.wt_resident_slot = s;
+        g_exec.st.restage++;
+    } else if (L == (g_exec.e.n / 32u) * 512u) {
         cpu_to_vtcm(g_exec.e.bias, p, L);
+        g_exec.bias_resident_slot = s;
+    }
     g_exec.pinned_count++;
     return 0;
 }
@@ -3384,11 +3420,11 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             if (g_trace_on) {
                 if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
                 if (g_rtrace) {
-                    fprintf(g_rtrace, "pre%u code=%u a=%u,%u,%u,%u pool=%u\n",
+                    fprintf(g_rtrace, "pre%u code=%u a=%u,%u,%u,%u pool=%u base=%p\n",
                             (unsigned)ii, (unsigned)op->opcode,
                             (unsigned)op->args[0], (unsigned)op->args[1],
                             (unsigned)op->args[2], (unsigned)op->args[3],
-                            (unsigned)g_exec.pool_used);
+                            (unsigned)g_exec.pool_used, (void*)g_exec.pool);
                     fflush(g_rtrace);
                 }
             }

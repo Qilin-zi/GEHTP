@@ -86,7 +86,7 @@ static int case_gdnsm(void* ud) {
     for (int t0 = 0; t0 < NT; t0 += CK) {
         int c = (NT - t0 < CK) ? NT - t0 : CK;
         delta_chunk_f16(&rk, k16 + (size_t)t0*D, v16 + (size_t)t0*D,
-                        q16 + (size_t)t0*D, be + t0, gg + t0, y16 + (size_t)t0*D, c, NT);
+                        q16 + (size_t)t0*D, be + t0, gg + t0, y16 + (size_t)t0*D, c, NT, 0);
     }
     harn_emit(y16, nz * 2);
     /* 手写直跑 (同调用序列, 独立缓冲) — 逐字节一致 */
@@ -97,7 +97,7 @@ static int case_gdnsm(void* ud) {
     for (int t0 = 0; t0 < NT; t0 += CK) {
         int c = (NT - t0 < CK) ? NT - t0 : CK;
         delta_chunk_f16(&rd, k16 + (size_t)t0*D, v16 + (size_t)t0*D,
-                        q16 + (size_t)t0*D, be + t0, gg + t0, yd + (size_t)t0*D, c, NT);
+                        q16 + (size_t)t0*D, be + t0, gg + t0, yd + (size_t)t0*D, c, NT, 0);
     }
     float* ykf = malloc(nz*4);
     for (size_t z = 0; z < nz; z++) ykf[z] = gdn_f16_to_f32(y16[z]);

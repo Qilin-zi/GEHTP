@@ -131,6 +131,11 @@ struct Emitter {
     uint64_t ddr_static_cap = 0;   // 编译期静态区大小(表外 temp 池尾 bump)
     uint64_t ddr_vtcm_cap = 0;     // VTCM 驻留池大小(0=无驻留)
     uint64_t bump_reserve = 0;     // 表外 bump 预留(字节; M2 起由 TAG_MEM_PLAN 供给)
+    uint64_t pin_cap = 0;          // wtcache 常驻区容量(字节, 2048 对齐; 0=不 pin, 执行器回退 4096)
+    /* 010 US1: 已发射 OP_PIN 的 W4A16 权重槽集(去重: 同权重多 matmul 只 pin 一次,
+     * 运行期驻留追踪负责 matmul→matmul 复用)。planned restage 计数 = 本集大小
+     * (= blob 中 OP_PIN 条数, 供 SC-003 对账)。 */
+    std::map<uint32_t, bool> w4_pinned;
     /* 008 T010: 表外 temp 的运行期 bump 需求仿真(泄漏式, 与 temp_get 路径 2
      * 同语义: 同 id 够大即复用, 不够则新块不回收)。计划 bump=max(4MB,cap/4)
      * 与实际需求无关 — 广播物化 temp 恒 out_idx!=0 无静态项(p3 板跑实锤:
@@ -670,6 +675,29 @@ struct Emitter {
             wslots[w->op_id] = id;
             return id;
         }
+        /* es=1 池宽度判别: bool/uint8 掩码 (GDN Trilu tri_keep) 以 1B/elem
+         * 存 int8 0/1 字节。f32 路径会把 int8 字节按位误读成 denormal
+         * f32 → f16 全零 (设备 SELECT cond 恒零, 41 例全链崩坏根因);
+         * 且 count 只取 cds/4=1024 ≠ 4096 真元素数。逐字节拓宽 f16 入槽,
+         * 与 host materialize (es==1 → (float)src[i]) 同一口径。 */
+        {
+            size_t dims_elems = 1;
+            for (uint32_t i = 0; i < w->output_def.rank && i < 5; ++i)
+                dims_elems *= (size_t)w->output_def.dims[i];
+            if (w->output_def.element_size == 1 && dims_elems > 0 &&
+                (size_t)w->const_data_size == dims_elems &&
+                w->const_data_offset + dims_elems <= gp.const_pool().size()) {
+                const uint8_t* src = gp.const_pool().data() + w->const_data_offset;
+                std::vector<uint16_t> w16b(dims_elems);
+                for (size_t i = 0; i < dims_elems; i++)
+                    w16b[i] = src[i] ? 0x3C00u : 0x0000u;
+                std::vector<uint8_t> wbytes(dims_elems * 2);
+                std::memcpy(wbytes.data(), w16b.data(), wbytes.size());
+                uint32_t id = slot_for((uint32_t)wbytes.size(), (uint32_t)dims_elems, wbytes.data());
+                wslots[w->op_id] = id;
+                return id;
+            }
+        }
         std::vector<uint16_t> w16(n);
         /* 权重字节源始终从 const_pool 读 (const_data_offset 是 const_pool 内偏移)。
          * 路线B 仅改变槽路由: slot_for 已按 ext_weights 选 add_ext_slot/add_slot。
@@ -681,6 +709,15 @@ struct Emitter {
         std::memcpy(wbytes.data(), w16.data(), wbytes.size());
         uint32_t id = slot_for((uint32_t)wbytes.size(), (uint32_t)n, wbytes.data());
         wslots[w->op_id] = id;
+        if (getenv("GEHTP_EMITDBG"))
+            std::fprintf(stderr, "[slotdbg] const op_id=%llu n=%zu slot=%u cds=%zu cdo=%zu es=%u rank=%u dims=[%u,%u,%u,%u,%u] se=%zu first8=%04x %04x %04x %04x\n",
+                         (unsigned long long)w->op_id, n, id,
+                         (size_t)w->const_data_size, (size_t)w->const_data_offset,
+                         w->output_def.element_size, w->output_def.rank,
+                         w->output_def.dims[0], w->output_def.dims[1], w->output_def.dims[2],
+                         w->output_def.dims[3], w->output_def.dims[4],
+                         w->serialized_extra.size(),
+                         w16[0], w16[1], w16[2], w16[3]);
         return id;
     }
     /* int 索引 const 原样入槽 (ScatterNd/Gather 索引等; 设备按 int32 直读)。

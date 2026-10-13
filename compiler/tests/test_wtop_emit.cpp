@@ -167,6 +167,42 @@ static void build_matmul_w4(GraphPrepare& gp, uint32_t M, uint32_t K, uint32_t N
     gp.append_node("Output", 40, oin, 1, nullptr, 0, nullptr);
 }
 
+/* 010 US1 (T009): 同权重两连续 matmul 共享 const 节点 W → OP_PIN 去重为 1 条
+ * (planned restage = 去重权重槽数)。N==K 使 FC1 输出 [M,N] 恰可作 FC2 输入
+ * [M,K], 形状闭合; 两 FC 均引 const 节点 1 的同一权重槽。 */
+static void build_matmul_w4_shared(GraphPrepare& gp, uint32_t M, uint32_t K, uint32_t N) {
+    OutputDef w_od{};
+    w_od.rank = 2; w_od.dims[0] = N; w_od.dims[1] = K;
+    w_od.element_size = 1;
+    w_od.dtype = static_cast<uint32_t>(DType::Float32);
+    std::vector<uint8_t> W((size_t)N * K, 0x5A);
+    gp.append_const_node(1, w_od, W.data(), W.size());
+    gp.get_op_at(1)->name_tag = string_tag_t::map_str("W");
+
+    OutputDef in_od{};
+    in_od.rank = 2; in_od.dims[0] = M; in_od.dims[1] = K;
+    in_od.element_size = 2;
+    in_od.dtype = static_cast<uint32_t>(DType::Float16);
+    gp.append_node("Input", 10, nullptr, 0, &in_od, 1, nullptr);
+
+    InputDef mm_in[2] = {{10, 0}, {1, 0}};
+    OutputDef mm_od{};
+    mm_od.rank = 2; mm_od.dims[0] = M; mm_od.dims[1] = N;
+    mm_od.element_size = 2;
+    mm_od.dtype = static_cast<uint32_t>(DType::Float16);
+    gp.append_node("FullyConnected", 20, mm_in, 2, &mm_od, 1, nullptr);
+
+    InputDef mm2_in[2] = {{20, 0}, {1, 0}};
+    OutputDef mm2_od{};
+    mm2_od.rank = 2; mm2_od.dims[0] = M; mm2_od.dims[1] = N;
+    mm2_od.element_size = 2;
+    mm2_od.dtype = static_cast<uint32_t>(DType::Float16);
+    gp.append_node("FullyConnected", 21, mm2_in, 2, &mm2_od, 1, nullptr);
+
+    InputDef oin[1] = {{21, 0}};
+    gp.append_node("Output", 40, oin, 1, nullptr, 0, nullptr);
+}
+
 static bool load_file(const std::string& path, std::vector<uint8_t>& out) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -906,6 +942,7 @@ int main() {
     /* 9. 003 T015: W4A16 act 预置 — DDR→VTCM OP_DMA + 引用规范化。
      * 图带 mem plan (DDR 池 + VTCM 池 → TEMPOFF 槽); --dma-runlist 下:
      *   ops = [OP_DMA {0x8000|0, 0x4000|stg, M*K*2, 0,0, 1, FF, FF},
+     *          OP_PIN {w 裸 slot},                      ← 010 US1 新增
      *          OP_MATMUL_W4A16 {0x4000|stg, w 裸 slot, out, M,K,N}]
      * TEMPOFF 含 staging 驻留项 (2048 对齐), carve footer 记录覆盖 DMA op。
      * 无 --dma-runlist: 主输入 act 不可表达 (运行期仅认裸 slot/0x4000|temp)
@@ -941,10 +978,12 @@ int main() {
         wt_blob* w = new wt_blob{};
         CHECK(load_file(dir + "w4pre.wtop", bl) &&
               wt_parse(bl.data(), bl.size(), w) == WT_OK, "T015: wt_parse OK");
-        if (w->n_ops == 2 && w->ops[0].opcode == OP_DMA &&
-            w->ops[1].opcode == OP_MATMUL_W4A16) {
+        if (w->n_ops == 3 && w->ops[0].opcode == OP_DMA &&
+            w->ops[1].opcode == OP_PIN &&
+            w->ops[2].opcode == OP_MATMUL_W4A16) {
             const wt_op& d = w->ops[0];
-            const wt_op& mm = w->ops[1];
+            const wt_op& pin = w->ops[1];
+            const wt_op& mm = w->ops[2];
             CHECK(d.n_args == 8 && d.args[0] == (0x8000u | 0u) &&
                   d.args[2] == M * K * 2u && d.args[3] == 0u && d.args[4] == 0u &&
                   d.args[5] == 1u && d.args[6] == WT_DMA_FENCE_NONE &&
@@ -956,21 +995,24 @@ int main() {
             CHECK(!(mm.args[1] & 0xC000u) && mm.args[1] < w->n_slots &&
                   mm.args[3] == M && mm.args[4] == K && mm.args[5] == N,
                   "T015: w 裸 slot 引用 + M/K/N");
+            CHECK(pin.n_args == 1 && pin.args[0] == mm.args[1],
+                  "T015: US1 OP_PIN[权重裸 slot] == matmul w 引用");
             CHECK(w->annot_base && wt_annot_engine(wt_rd_u32(w->annot_base)) == 0u &&
-                  wt_annot_engine(wt_rd_u32(w->annot_base + 4)) == 2u,
-                  "T015: 注解 DMA=SCALAR / matmul=HMX");
+                  wt_annot_engine(wt_rd_u32(w->annot_base + 4)) == 0u &&
+                  wt_annot_engine(wt_rd_u32(w->annot_base + 8)) == 2u,
+                  "T015: 注解 DMA=SCALAR / PIN=SCALAR / matmul=HMX");
             uint32_t stg_off = 0xFFFFFFFFu;
             const wt_slot* tp = nullptr;
             for (uint32_t s = 0; s < w->n_slots && !tp; s++)
                 if (w->slots[s].addr == WT_SLOT_TEMPOFF) tp = &w->slots[s];
             if (tp) {
                 const uint8_t* p = w->weight_base + tp->offset;
-                uint32_t n; std::memcpy(&n, p + 8, 4);
+                uint32_t n; std::memcpy(&n, p + 12, 4);
                 for (uint32_t i = 0; i < n; i++) {
                     uint32_t tid, off, sz;
-                    std::memcpy(&tid, p + 12 + i * 12, 4);
-                    std::memcpy(&off, p + 16 + i * 12, 4);
-                    std::memcpy(&sz, p + 20 + i * 12, 4);
+                    std::memcpy(&tid, p + 16 + i * 12, 4);
+                    std::memcpy(&off, p + 20 + i * 12, 4);
+                    std::memcpy(&sz, p + 24 + i * 12, 4);
                     if ((tid & 0x4000u) && (tid & 0x3FFFu) == (d.args[1] & 0x3FFFu) &&
                         sz == M * K * 2u && (off & 2047u) == 0u) {
                         stg_off = off;
@@ -989,9 +1031,64 @@ int main() {
             }
             CHECK(carve_ok, "T015: carve footer 记录 (off/size 一致, 窗口盖 DMA op 0)");
         } else {
-            CHECK(false, "T015: ops = [OP_DMA, OP_MATMUL_W4A16]");
+            CHECK(false, "T015: ops = [OP_DMA, OP_PIN, OP_MATMUL_W4A16]");
         }
         delete w;
+    }
+
+    /* 9b. 010 US1 (T009): 同权重两连续 matmul → OP_PIN 去重为 1 条
+     * (planned restage = 去重权重槽数 = OP_PIN 条数)。spec Story 1 验收:
+     * 「同权重连续多个 matmul」图只 pin 一次。 */
+    {
+        const uint32_t M = 32, K = 64, N = 64;
+        GraphPrepare g;
+        build_matmul_w4_shared(g, M, K, N);
+        g.set_plan_budgets(64u << 20, 1u << 20);
+        HexagonNNEnv env2;
+        env2.set_soc_type(75);
+        env2.set_num_nsps(1);
+        if (g.prepare(env2) == GraphStatus::Success) {
+            std::vector<uint8_t> b2(1u << 22, 0);
+            size_t b2_size = 0;
+            if (g.serialize(b2.data(), b2.size(), b2_size) && b2_size != 0) {
+                const std::string bp = dir + "w4shared.bin";
+                const std::string ip = dir + "w4shared.f16.raw";
+                const std::string op2 = dir + "w4shared.wtop";
+                write_file(bp, b2.data(), b2_size);
+                std::vector<uint16_t> in16((size_t)M * K, 0x3C00);
+                write_file(ip, in16.data(), in16.size() * 2);
+                std::string c2 = std::string(WTOP_EMIT_PATH) + " --bin " + bp +
+                                 " --input-f16 " + ip + " --out " + op2 +
+                                 " --dma-runlist 2>/dev/null";
+                CHECK(std::system(c2.c_str()) == 0, "US1: 同权重双 FC emit exit 0");
+                std::vector<uint8_t> bl;
+                wt_blob* w = new wt_blob{};
+                if (load_file(op2, bl) && wt_parse(bl.data(), bl.size(), w) == WT_OK) {
+                    uint32_t pin_ops = 0, mm_ops = 0;
+                    for (uint32_t i = 0; i < w->n_ops; i++) {
+                        if (w->ops[i].opcode == OP_PIN) pin_ops++;
+                        else if (w->ops[i].opcode == OP_MATMUL_W4A16) mm_ops++;
+                    }
+                    CHECK(mm_ops == 2, "US1: 双 FC → 2 条 W4A16 matmul");
+                    CHECK(pin_ops == 1, "US1: 同权重去重 → 1 条 OP_PIN (planned restage)");
+                    /* 校验 PIN 的裸 slot == 两 matmul 的 w 引用 (同槽) */
+                    uint32_t pin_slot = 0xFFFFFFFFu, w0 = 0xFFFFFFFFu, w1 = 0xFFFFFFFFu;
+                    bool got0 = false;
+                    for (uint32_t i = 0; i < w->n_ops; i++) {
+                        if (w->ops[i].opcode == OP_PIN) pin_slot = w->ops[i].args[0];
+                        else if (w->ops[i].opcode == OP_MATMUL_W4A16) {
+                            if (!got0) { w0 = w->ops[i].args[1]; got0 = true; }
+                            else w1 = w->ops[i].args[1];
+                        }
+                    }
+                    CHECK(pin_slot == w0 && w0 == w1,
+                          "US1: PIN slot == 双 matmul w 引用 (同槽共享)");
+                } else {
+                    CHECK(false, "US1: wt_parse 失败");
+                }
+                delete w;
+            }
+        }
     }
 
     /* 10. 003 T022: carve 重叠不变量负例 — conv_add 图 + 预算(多 temp 驻留
@@ -1031,8 +1128,8 @@ int main() {
             uint8_t* pl = b2.data() + i + 12;
             size_t plsz = (size_t)wc1 * 4;
             uint32_t ne;
-            std::memcpy(&ne, pl + 16, 4);
-            size_t no = 20;
+            std::memcpy(&ne, pl + 20, 4);
+            size_t no = 24;
             for (uint32_t e = 0; e < ne && no + 20 <= plsz; e++, no += 20) {
                 uint32_t flags;
                 std::memcpy(&flags, pl + no + 16, 4);
@@ -1046,7 +1143,7 @@ int main() {
             }
             CHECK(nvtcm >= 2, "T022: TAG_MEM_PLAN ≥2 个 VTCM 驻留项");
             if (nvtcm < 2) break;
-            no = 20;
+            no = 24;
             const uint32_t one = 1;
             for (uint32_t e = 0; e < ne && no + 20 <= plsz; e++, no += 20) {
                 std::memcpy(pl + no + 8, &vtcm_off0, 4);

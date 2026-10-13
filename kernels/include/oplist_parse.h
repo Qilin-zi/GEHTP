@@ -55,7 +55,8 @@ extern "C" {
  *   bit 0-1  engine           0=scalar 1=HVX 2=HMX 3=reserved (对齐 wt_engine)
  *   bit 2    fallback_allowed 0=禁止回落(硬报错) 1=允许回落
  *   bit 3-4  fallback_engine  允许回落时回落到的单元 (0/1/2)
- *   bit 5-31 保留 (0)
+ *   bit 5    carve_reuse      1=复用上一 carve 0=逐 op carve (010 US5)
+ *   bit 6-31 保留 (0)
  * ver<=2 无此 footer → 运行期走 legacy 自决 (FR-009)。v3 恒 24B slot 记录
  * (ver>=2 单规则), 与 v2 大权重路径共享 slot 线格式; 小模型多付 12B/slot。 */
 #define WT_BLOB_VER_3 3u
@@ -383,6 +384,13 @@ static inline uint32_t wt_annot_pack(uint32_t engine, uint32_t fallback_allowed,
 static inline uint32_t wt_annot_engine(uint32_t a) { return a & 0x3u; }
 static inline uint32_t wt_annot_fb_allowed(uint32_t a) { return (a >> 2) & 1u; }
 static inline uint32_t wt_annot_fb_engine(uint32_t a) { return (a >> 3) & 0x3u; }
+/* 契约 C (010 US5): op_annot bit5 = carve 复用标志。emit 侧在 wt_annot_pack 后置位;
+ * exec 侧读 bit5 决定跳过 re-carve (见 oplist_exec.c exec_matmul)。 */
+static inline uint32_t wt_annot_set_reuse(uint32_t* a, int reuse) {
+    if (reuse) { *a |= (1u << 5); } else { *a &= ~(1u << 5); }
+    return *a;
+}
+static inline uint32_t wt_annot_reuse(uint32_t a) { return (a >> 5) & 1u; }
 
 #ifdef __cplusplus
 }

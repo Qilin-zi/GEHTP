@@ -121,6 +121,17 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
                                          off, act_bytes});
             act_arg = 0x4000u | (uint32_t)stg;
         }
+        /* 010 US1 (T008/T009): 权重 pin 决策显式下发 — 每个 W4A16 权重槽
+         * 首次消费前发一条 OP_PIN[slot](去重)。运行期 xop_pin 在 carve 就绪
+         * 时真搬一次并登记驻留; 后续同权重 matmul 走 exec_matmul 驻留追踪
+         * 跳过重复 DDR→VTCM 搬 (FR-001/FR-002)。planned restage = OP_PIN 条数
+         * = 去重权重槽数 (SC-003 对账源)。 */
+        if (em.w4_pinned.insert({w_raw, true}).second) {
+            uint32_t prev = em.cur_engine;
+            em.cur_engine = wt_annot_pack(0u, 1u, 0u);  /* PIN = 内存/控制 op */
+            em.add_op(OP_PIN, {w_raw});
+            em.cur_engine = prev;
+        }
         em.add_op(OP_MATMUL_W4A16, {act_arg, w_raw, out_t, m, k, nn});
     } else {
         uint32_t flags = 0;
