@@ -210,7 +210,7 @@ int main(void) {
             free(L); free(T); free(Lf); free(Tr); free(Tk);
         }
 
-        /* 拆分一致 16 = 8+8 (H=2 head) */
+        /* 拆分一致 32 = 16+16 (H=2 head; 0.8B 变体 CK=32, 拆半须用 CK/2 而非例19的 8) */
         {
             float* Sa = malloc((size_t)2 * D * D * 4);
             float* Sb = malloc((size_t)2 * D * D * 4);
@@ -218,20 +218,21 @@ int main(void) {
             int16_t* yb = malloc((size_t)2 * CK * D * 2);
             float* yaf = malloc((size_t)2 * CK * D * 4);
             float* ybf = malloc((size_t)2 * CK * D * 4);
+            const int half = CK / 2;
             memcpy(Sa, S0, (size_t)2 * D * D * 4);
             rec_state_t ra = { 2, D, Sa };
             delta_chunk_f16(&ra, k16, v16, q16, be, gg, ya, CK, CK, 0);
             memcpy(Sb, S0, (size_t)2 * D * D * 4);
             rec_state_t rb = { 2, D, Sb };
-            delta_chunk_f16(&rb, k16, v16, q16, be, gg, yb, 8, CK, 0);
-            delta_chunk_f16(&rb, k16 + 8 * D, v16 + 8 * D, q16 + 8 * D, be + 8, gg + 8,
-                            yb + 8 * D, 8, CK, 0);
+            delta_chunk_f16(&rb, k16, v16, q16, be, gg, yb, half, CK, 0);
+            delta_chunk_f16(&rb, k16 + half * D, v16 + half * D, q16 + half * D,
+                            be + half, gg + half, yb + half * D, half, CK, 0);
             for (size_t z = 0; z < (size_t)2 * CK * D; z++) {
                 yaf[z] = gdn_f16_to_f32(ya[z]); ybf[z] = gdn_f16_to_f32(yb[z]);
             }
             int ok = cos_sim(yaf, ybf, (size_t)2 * CK * D) > 0.9999 &&
                      cos_sim(Sa, Sb, (size_t)2 * D * D) > 0.9999;
-            ex_check("chunk_split_16_8_8", ok ? 0 : 1, 0);
+            ex_check("chunk_split_32_16_16", ok ? 0 : 1, 0);
             free(Sa); free(Sb); free(ya); free(yb); free(yaf); free(ybf);
         }
 

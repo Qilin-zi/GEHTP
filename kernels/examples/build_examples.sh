@@ -88,6 +88,9 @@ if [ -f "$G41_DIR/layer_0.wtop" ]; then
     adb push "$G41_DIR/layer_0.wtop" "$DEVDIR/g41/layer_0.wtop" >/dev/null 2>&1
     adb push "$G41_DIR/in_ncf.f16.raw" "$DEVDIR/g41/in_ncf.f16.raw" >/dev/null 2>&1 || true
     adb push "$G41_DIR/gold_ncf.f16.raw" "$DEVDIR/g41/gold_ncf.f16.raw" >/dev/null 2>&1 || true
+    if [ -f "$G41_DIR/out_temp.txt" ]; then
+        adb push "$G41_DIR/out_temp.txt" "$DEVDIR/g41/out_temp.txt" >/dev/null 2>&1 || true
+    fi
 fi
 # GEHTP 例40 资产(M4.2: L3 单层 blob + 输入/金标)
 G40_DIR="${GEHTP_40_DIR:-$LIB/../test_models/qwen35_08b/layers/layer_3}"
@@ -96,6 +99,9 @@ if [ -f "$G40_DIR/layer_3.wtop" ]; then
     adb push "$G40_DIR/layer_3.wtop" "$DEVDIR/g40/layer_3.wtop" >/dev/null 2>&1
     adb push "$G40_DIR/in.f16.raw" "$DEVDIR/g40/in.f16.raw" >/dev/null 2>&1 || true
     adb push "$G40_DIR/gold.f16.raw" "$DEVDIR/g40/gold.f16.raw" >/dev/null 2>&1 || true
+    if [ -f "$G40_DIR/out_temp.txt" ]; then
+        adb push "$G40_DIR/out_temp.txt" "$DEVDIR/g40/out_temp.txt" >/dev/null 2>&1 || true
+    fi
 fi
 
 for tag in w4 w5; do
@@ -117,8 +123,8 @@ adb push "$BLOBS/blob_w5.wtop" "$DEVDIR/" >/dev/null
 adb push "$BLOBS/rms_w.f16.raw" "$DEVDIR/" >/dev/null
 adb push "$LIB/assets/s2560/Y_gold.raw" "$DEVDIR/" >/dev/null
 adb push "$LIB/assets/s256/Y_gold_2563.raw" "$DEVDIR/assets/s256/" >/dev/null
-# 例 13 dlopen V2.1 库 — 设备 hvxhmx_libs 目录已有现成 signed 件
-adb shell "cp /data/local/tmp/hvxhmx_libs/libhvxhmx_v2.so $DEVDIR/libhvxhmx_v2.so 2>/dev/null || true"
+# 例 13 compat dlsym: 直接 dlopen 当前 libhvxhmx_v23.so(已随上一步 push; v73/v75/v79
+# 兼容符号在 src/compat 层, 同名 v2 库早已退役 → 不再单独 cp 旧件)
 # 例 20 dump 目录: DSP 上 system() 无 shell, 必须 host 预建
 adb shell "rm -rf $DEVDIR/dd_out; mkdir -p $DEVDIR/dd_out" >/dev/null 2>&1
 # skel/host launcher: 用 third_party 收编件(避免外部路径依赖)

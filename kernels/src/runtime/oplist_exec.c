@@ -3420,11 +3420,11 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             if (g_trace_on) {
                 if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
                 if (g_rtrace) {
-                    fprintf(g_rtrace, "pre%u code=%u a=%u,%u,%u,%u pool=%u\n",
+                    fprintf(g_rtrace, "pre%u code=%u a=%u,%u,%u,%u pool=%u base=%p\n",
                             (unsigned)ii, (unsigned)op->opcode,
                             (unsigned)op->args[0], (unsigned)op->args[1],
                             (unsigned)op->args[2], (unsigned)op->args[3],
-                            (unsigned)g_exec.pool_used);
+                            (unsigned)g_exec.pool_used, (void*)g_exec.pool);
                     fflush(g_rtrace);
                 }
             }

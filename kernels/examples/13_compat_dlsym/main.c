@@ -37,9 +37,9 @@ int main(void)
 {
     ex_open_result("13_compat_dlsym");
 
-    void *h = dlopen("libhvxhmx_v2.so", RTLD_NOW | RTLD_LOCAL);
-    if (!h) { ex_log("FATAL: dlopen FAIL: %s", dlerror()); ex_check("dlopen libhvxhmx_v2.so", 1, 0); return ex_summary(); }
-    ex_check("dlopen libhvxhmx_v2.so", 0, 0);
+    void *h = dlopen("libhvxhmx_v23.so", RTLD_NOW | RTLD_LOCAL);
+    if (!h) { ex_log("FATAL: dlopen FAIL: %s", dlerror()); ex_check("dlopen libhvxhmx_v23.so", 1, 0); return ex_summary(); }
+    ex_check("dlopen libhvxhmx_v23.so", 0, 0);
 
     if (hmx_runtime_setup(2*1024*1024) != 0) { ex_log("FATAL: setup FAIL"); return ex_summary(); }
 

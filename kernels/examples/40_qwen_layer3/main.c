@@ -24,7 +24,8 @@
 
 #define D "/data/local/tmp/hvxhmx23/g40"
 #define N_ELEM (1u * 1024u * 32u)   /* 输出 [1,1024,32] = 32768 */
-#define OUT_TEMP 1u                  /* manifest: output_temp */
+#define OUT_TEMP_DEF 50u            /* 旧 emit 缺省; 以 g40/out_temp.txt 为准
+                                   (alias 合并后 temp 编号漂移, manifest 才是契约) */
 
 static uint8_t* read_file(const char* p, size_t* out_len) {
     FILE* f = fopen(p, "rb");
@@ -74,6 +75,18 @@ int main(void) {
     if (rc != WT_OK) { ex_log("[FAIL] wt_parse rc=%d %s", rc, wt_err_str(rc)); return 1; }
     ex_log("[PASS] wt_parse: %u slots %u ops", w->n_slots, w->n_ops);
 
+    /* output_temp 从部署文件读 (manifest 契约; 硬编码会在 alias 合并
+     * 使 temp 编号漂移时 memcpy 越界 → PD 死) */
+    uint32_t out_temp = OUT_TEMP_DEF;
+    FILE* otf = fopen(D "/out_temp.txt", "r");
+    if (otf) {
+        uint32_t v = 0;
+        if (fscanf(otf, "%u", &v) == 1 && v < WT_EXEC_MAX_TEMPS) out_temp = v;
+        fclose(otf);
+    }
+    ex_log("[cfg] out_temp=%u (bytes=%u)", (unsigned)out_temp,
+           (unsigned)wt_exec_temp_bytes(out_temp));
+
     char err[128] = {0};
 
     /* C2(分段诊断): GEHTP_SPLIT_RUN=1 时把整段拆成两半跑, 定位崩溃 op 段 */
@@ -122,8 +135,39 @@ int main(void) {
                     if (f < mn) mn = f;
                     if (f > mx) mx = f;
                 }
-                ex_log("[diag]   temp%u: n=%u -inf=%u nan=%u min=%g max=%g head=%04x %04x %04x %04x",
-                       v, n, ninf, nnan, (double)mn, (double)mx, p[0], p[1], p[2], p[3]);
+                ex_log("[diag]   temp%u: n=%u -inf=%u nan=%u min=%g max=%g head=%04x %04x %04x %04x addr=%p",
+                       v, n, ninf, nnan, (double)mn, (double)mx, p[0], p[1], p[2], p[3], (void*)p);
+                char dp[160];
+                snprintf(dp, sizeof(dp), D "/dmp_%u.f16.raw", v);
+                FILE* df = fopen(dp, "wb");
+                if (df) { fwrite(p, 1, bytes, df); fclose(df); }
+            }
+            if (strstr(dm, "addrs")) {
+                for (uint32_t v = 0; v < 64; v++) {
+                    uint32_t bytes = wt_exec_temp_bytes(v);
+                    const void* p = wt_exec_temp(v);
+                    if (p) ex_log("[diag]   T%02u addr=%p bytes=%u", v, p, bytes);
+                }
+            }
+            wt_exec_shutdown();
+            return 0;
+        }
+        /* dump2 模式: "dump2 N" → run_range(0,N) 后整块 dump temp6/temp25 */
+        if (strncmp(dm, "dump2", 5) == 0) {
+            uint32_t pn = 0;
+            sscanf(dm + 5, "%u", &pn);
+            if (pn > w->n_ops) pn = w->n_ops;
+            rc = wt_exec_run_range(w, 0, pn, NULL, NULL, err, sizeof(err));
+            ex_log("[dump2] range(0,%u) rc=%d %s", pn, rc, rc ? err : "");
+            for (int k = 0; k < 2; k++) {
+                uint32_t v = k ? 25u : 6u;
+                uint32_t bytes = wt_exec_temp_bytes(v);
+                const uint16_t* p = (const uint16_t*)wt_exec_temp(v);
+                char path[64];
+                snprintf(path, sizeof(path), D "/dump2_%u.f16.raw", v);
+                FILE* f = fopen(path, "wb");
+                if (f && p && bytes) { fwrite(p, 1, bytes, f); fclose(f); }
+                ex_log("[dump2] temp%u ptr=%p bytes=%u", v, (void*)p, bytes);
             }
             wt_exec_shutdown();
             return 0;
@@ -237,10 +281,12 @@ int main(void) {
 
     /* C3: run_io 注入输入, 输出 → out_io */
     ex_log("[milestone] before run_io");
-    uint16_t* out_io = malloc(N_ELEM * 2u);
+    uint32_t out_bytes = wt_exec_temp_bytes(out_temp);
+    if (out_bytes < N_ELEM * 2u) out_bytes = N_ELEM * 2u;
+    uint16_t* out_io = malloc(out_bytes);
     if (!out_io) { ex_log("[FAIL] io alloc"); bad = 1; }
     else {
-        rc = wt_exec_run_io(w, in, out_io, OUT_TEMP, NULL, NULL, err, sizeof(err));
+        rc = wt_exec_run_io(w, in, out_io, out_temp, NULL, NULL, err, sizeof(err));
         if (rc) { ex_log("[FAIL] run_io rc=%d %s", rc, err); bad = 1; }
         else ex_log("[PASS] run_io ok");
         ex_log("[milestone] after run_io");

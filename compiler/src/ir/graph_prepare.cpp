@@ -987,15 +987,15 @@ GraphPrepare::ExecResult GraphPrepare::execute_host(
             for (size_t i = 0; i < elem_n && src; i++)
                 buf[i] = (float)src[i];
         }
-        if (getenv("GEHTP_EXDIAG") && (id == 117 || id == 118)) {
-            std::fprintf(stderr, "[const] id=%llu es=%zu size=%zu elem=%zu first16=",
+        if (getenv("GEHTP_EXDIAG")) {
+            std::fprintf(stderr, "[const] id=%llu es=%zu size=%zu off=%llu elem=%zu rank=%u dims=[%u,%u,%u,%u] first4=%g,%g,%g,%g\n",
                          (unsigned long long)id, es, (size_t)opdef->const_data_size,
-                         elem_n);
-            for (size_t k = 0; k < 16 && k < elem_n; k++)
-                std::fprintf(stderr, "%.0f,", buf[k]);
-            std::fprintf(stderr, " nz=%zu\n",
-                         std::count_if(buf.begin(), buf.end(),
-                                       [](float x) { return x != 0.0f; }));
+                         (unsigned long long)opdef->const_data_offset, elem_n,
+                         opdef->output_def.rank,
+                         opdef->output_def.dims[0], opdef->output_def.dims[1],
+                         opdef->output_def.dims[2], opdef->output_def.dims[3],
+                         buf.size() > 0 ? buf[0] : 0.f, buf.size() > 1 ? buf[1] : 0.f,
+                         buf.size() > 2 ? buf[2] : 0.f, buf.size() > 3 ? buf[3] : 0.f);
         }
     }
 

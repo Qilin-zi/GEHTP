@@ -22,9 +22,10 @@
 #include "oplist_parse.h"
 #include "oplist_exec.h"
 
-#define D "/data/local/tmp/hvxhmx_c1"
+#define D "/data/local/tmp/hvxhmx23/g41"
 #define N_ELEM (1u * 1024u * 32u)   /* 输出 [1,1024,32] = 32768 */
-#define OUT_TEMP 7u                  /* manifest: output_temp */
+#define OUT_TEMP_DEF 14u            /* 旧 emit 缺省; 以 g41/out_temp.txt 为准
+                                   (重编译后 temp 编号漂移, manifest 才是契约) */
 
 static uint8_t* read_file(const char* p, size_t* out_len) {
     FILE* f = fopen(p, "rb");
@@ -73,11 +74,23 @@ int main(void) {
     int rc = wt_parse(blob, blob_len, w);
     if (rc != WT_OK) { ex_log("[FAIL] wt_parse rc=%d %s", rc, wt_err_str(rc)); return 1; }
     ex_log("[PASS] wt_parse: %u slots %u ops", w->n_slots, w->n_ops);
+    /* output_temp 从部署文件读 (manifest 契约; 硬编码会在重编译
+     * temp 编号漂移时 memcpy 越界 → PD 死) */
+    uint32_t out_temp = OUT_TEMP_DEF;
+    FILE* otf = fopen(D "/out_temp.txt", "r");
+    if (otf) {
+        uint32_t v = 0;
+        if (fscanf(otf, "%u", &v) == 1 && v < WT_EXEC_MAX_TEMPS) out_temp = v;
+        fclose(otf);
+    }
+    ex_log("[cfg] out_temp=%u (bytes=%u)", (unsigned)out_temp,
+           (unsigned)wt_exec_temp_bytes(out_temp));
+
 
     char err[128] = {0};
 
     /* C2(分段诊断): GEHTP_SPLIT_RUN=1 时把整段拆成两半跑, 定位崩溃 op 段 */
-    FILE* sflag = fopen("/data/local/tmp/hvxhmx_c1/split_flag", "r");
+    FILE* sflag = fopen(D "/split_flag", "r");
     if (sflag) {
         uint32_t lim = 0;
         if (fscanf(sflag, "%u", &lim) == 1 && lim == 0) lim = w->n_ops / 2u;
@@ -92,7 +105,7 @@ int main(void) {
     }
 
     /* 二分定位第一个输出含 inf/nan 的 op (g41/diag_mode 存在时) */
-    FILE* dflag = fopen("/data/local/tmp/hvxhmx_c1/diag_mode", "r");
+    FILE* dflag = fopen(D "/diag_mode", "r");
     if (dflag) {
         char dm[64] = {0};
         (void)!fread(dm, 1, sizeof(dm) - 1, dflag);
@@ -239,10 +252,12 @@ int main(void) {
 
     /* C3: run_io 注入输入, 输出 → out_io */
     ex_log("[milestone] before run_io");
-    uint16_t* out_io = malloc(N_ELEM * 2u);
+    uint32_t out_bytes = wt_exec_temp_bytes(out_temp);
+    if (out_bytes < N_ELEM * 2u) out_bytes = N_ELEM * 2u;
+    uint16_t* out_io = malloc(out_bytes);
     if (!out_io) { ex_log("[FAIL] io alloc"); bad = 1; }
     else {
-        rc = wt_exec_run_io(w, in, out_io, OUT_TEMP, NULL, NULL, err, sizeof(err));
+        rc = wt_exec_run_io(w, in, out_io, out_temp, NULL, NULL, err, sizeof(err));
         if (rc) { ex_log("[FAIL] run_io rc=%d %s", rc, err); bad = 1; }
         else ex_log("[PASS] run_io ok");
         ex_log("[milestone] after run_io");

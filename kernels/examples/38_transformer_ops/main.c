@@ -292,8 +292,14 @@ GATE(gather) {
     struct mini* m = mini_new(2, 1);
     mini_slot(m, 0, tbl, rows * row_n * 2u, rows * row_n);
     mini_slot(m, 1, idx, 12, 3);
-    uint32_t args[5] = {0u /*table 裸槽*/, 1u /*idx 裸槽*/, 0u /*out*/, 3u * row_n, row_n * 2u};
-    mini_op(m, 0, OP_GATHER_F16, args, 5);
+    /* 15 参 GATHER (b66ed12 语义): [tbl,idx,out,n,packed(axis|xrank<<8|
+     * irank<<16),td0..4,xd0..4]; 常量槽 → 0x8000|slot。tbl [4,4] 轴0
+     * 被 idx [3] 替换 → 输出 [3,4]: out[i][j] = tbl[idx[i]][j] */
+    uint32_t args[15] = {0x8000u | 0u, 0x8000u | 1u, 0u, 3u * row_n,
+                         0u | (1u << 8) | (2u << 16),
+                         4u, 4u, 1u, 1u, 1u,
+                         3u, 1u, 1u, 1u, 1u};
+    mini_op(m, 0, OP_GATHER_F16, args, 15);
     uint16_t out[16];
     mini_run(m, out, sizeof(out), 0);
     free(m->buf); free(m);
