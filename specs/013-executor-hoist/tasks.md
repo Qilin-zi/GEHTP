@@ -57,8 +57,8 @@ description: "Task list for 013-executor-hoist"
 
 **依赖**: US-B（供给侧机制：扫描已删 + M 门槛已装，A 在其上做 VTCM 布局）
 
-- [ ] T013 [P] [US2] `compiler/tools/wtop_emit.cpp`：TEMPOFF 槽扩展布局段（R4 载体）——`[magic][ver][region_pin][region_arena][region_resident]` 各 {off,size}，三区互斥；驻留按消费引擎分域（HMX→VTCM / HVX,scalar→DDR，008 GATE3 铁律）；BudgetReport 门 `resident_pool+hmx_arena≤16MB` 编译期硬报错（契约=contracts/contract-vtcm-layout.md）
-- [ ] T014 [P] [US2] `kernels/src/runtime/hmx_common.c`：hmx_runtime_setup 增 (base,size) 区域参数，0/NULL=全量兼容旧义（R5）；17_w4a16_gemm 等旧调用点零改动编译通过
+- [x] T013 [P] [US2] `compiler/tools/wtop_emit.cpp`：TEMPOFF 槽扩展布局段（R4 载体）——`[magic][ver][region_pin][region_arena][region_resident]` 各 {off,size}，三区互斥；驻留按消费引擎分域（HMX→VTCM / HVX,scalar→DDR，008 GATE3 铁律）；BudgetReport 门 `resident_pool+hmx_arena≤16MB` 编译期硬报错（契约=contracts/contract-vtcm-layout.md）——**实测 2026-10-13**：emit 在 TEMPOFF temp 表后追加 32B 布局段（`magic 'VTCL' 0x5654434C` + `ver 1` + pin/arena/resident 三区各 {off,size}），旧运行时 `len<16+n*12` 检查是 `<` 非 `==` 故尾随段向后兼容；test_vtcm_auto 三形态全绿（a_auto pin=0/arena=0/resid 尾倒 16MB；b_auto 同；c_auto pin=16384/arena_off=align2048），ctest 50/50
+- [x] T014 [P] [US2] `kernels/src/runtime/hmx_common.c`：hmx_runtime_setup 增 (base,size) 区域参数，0/NULL=全量兼容旧义（R5）；17_w4a16_gemm 等旧调用点零改动编译通过——**实测 2026-10-13**：改签名会毁 ~20 个 `hmx_runtime_setup(2*1024*1024)` 旧调用点（base=(void*)2097152=UB），故新增独立 `hmx_runtime_setup_region(void* base, size)`：base=0→委托全量 setup，base!=0→attach 共享 scratch（同 hmx_runtime_attach 语义）；旧签名不动、旧调用点零扰动
 - [ ] T015 [US2] `kernels/src/runtime/wtcache_impl.c`：wtcache 布局由 emit 布局表驱动（attach 共享 scratch 分区语义，003 T014 底座）
 - [ ] T016 [US2] `kernels/src/runtime/oplist_exec.c`：装载期按表一次分区（此后零运行时布局决策）；删 hmx↔wtcache/驻留池 teardown/re-acquire 探戈；flush 收敛=装载后全 VTCM 一次 + re-carve 仅 arena 区段 flush + 驻留写 flush 保留（R6 正确性边界）（依赖 T013,T014,T015）
 - [ ] T017 [US2] A 段门（US5）：对拍 B 末态——f16 线 md5 f87461e2 / gdn 线 cos ≥0.9999（原生 w4 线已移出范围 M%256 NO-GO）；op_ts 实证全 VTCM flush 次数=1、探戈零发生（trace 断言）；预算门在编译期拦截一次超限构造（负例测试）；A 段收益进 results
