@@ -382,7 +382,7 @@ void register_pass_gdn_block() {
     // beta/g 生产链折成 const 并被 DCE 清退(1010 实测 members 5/7, 接线
     // 源 beta=0/g=0), 生产链既失, 块边界无从识别。
     p.phase = PHASE_0;
-    p.enabled = false;       // 默认关 —— 融合非设备准入, --enable-pass 打开
+    p.enabled = true;        // 默认开 —— 融合已设备验收(009 T026 双门, prefill 2.16× exec)
     p.matcher = gdn_matcher;
     p.rewrite = [](OpDef* op, GraphPrepare* gp) { return collapse_layer(op, gp); };
     PassManager::instance().add_pass(std::move(p));
