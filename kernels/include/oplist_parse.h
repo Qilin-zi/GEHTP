@@ -131,6 +131,11 @@ extern "C" {
  * OP_DMA {src=act 源, dst=0x4000|stg, M*K*2, 0,0, flags=1, FF, FF} 紧邻
  * OP_MATMUL_W4A16 {0x4000|stg, w_裸slot, out, M,K,N}。 */
 
+/* ── opcode 枚举 ─────────────────────────────────────────────────────────
+ * 各 opcode 参数契约 (arity / 参数身份 slot_check / 语义名 name / kind) 的
+ * 机器可读真源在 op_spec.inc 的 wt_op_spec[] (011 单点注册表)。下列注释已
+ * 降级为人类导读: 括号内 arg 列表为简写, subtype 枚举 / 行为注记(尚未机器化
+ * 的部分)仍以本注释为准。 */
 enum {
     OP_NOP = 0,
     OP_MATMUL_W4A16 = 1,
@@ -262,44 +267,6 @@ enum {
     OP_GDN_BLOCK_F16 = 37,
 };
 
-/* 每个 opcode 的参数个数 (下标 = opcode) */
-#define WT_ARITY_NOP 0
-#define WT_ARITY_MATMUL 6
-#define WT_ARITY_RMSNORM 4
-#define WT_ARITY_PIN 1
-#define WT_ARITY_SILU 3
-#define WT_ARITY_IM2COL 15
-#define WT_ARITY_CONV2D_F16 13
-#define WT_ARITY_ADD_F16 4
-#define WT_ARITY_SPILL 4
-#define WT_ARITY_FILL 4
-#define WT_ARITY_TRANSPOSE_F16 6
-#define WT_ARITY_UNARY_F16 4
-#define WT_ARITY_BINARY_F16 5
-#define WT_ARITY_SOFTMAX_F16 4
-#define WT_ARITY_CONCAT_F16 16
-#define WT_ARITY_STRIDED_SLICE_F16 16
-#define WT_ARITY_SPLIT_F16 16
-#define WT_ARITY_REDUCE_F16 9
-#define WT_ARITY_CUMSUM_F32 7
-#define WT_ARITY_CONV1D_SSM_F16 6
-#define WT_ARITY_GATHER_F16 15
-#define WT_ARITY_ARGMAX_F16 3
-#define WT_ARITY_KV_APPEND_F16 4
-#define WT_ARITY_KV_GATHER_F16 7
-#define WT_ARITY_MATMUL_F16 7
-#define WT_ARITY_RMSNORM2_F16 5
-#define WT_ARITY_BROADCAST_F16 12
-#define WT_ARITY_TRANSPOSE_GEN_F16 8
-#define WT_ARITY_SCATTER_ND_F16 14
-#define WT_ARITY_DMA 8
-#define WT_ARITY_PAD_F16 7
-#define WT_ARITY_MATMUL_F16_SPLIT 9
-#define WT_ARITY_MATMUL_F16_BIAS 8
-#define WT_ARITY_CONV1D_SSM_STEP_F16 6
-#define WT_ARITY_DELTA_CHUNK_F16 12
-#define WT_ARITY_GDN_BLOCK_F16 5
-
 struct wt_slot {
     uint32_t len;
     uint32_t count;
@@ -343,6 +310,11 @@ struct wt_blob {
     const uint8_t* gdn_base;    /* 009: optional per-op GDN 几何 footer (records) */
     uint32_t n_gdn;             /* number of gdn extra records */
 };
+
+/* 算子输入契约单点注册表: enum wt_arg_kind + struct wt_arg_spec/wt_op_spec +
+ * static const wt_op_spec[]。下标 = opcode, arity/身份/语义的唯一事实源
+ * (011 op-contract-registry)。位置须在 OP_* enum 与 WT_MAX_ARGS 之后。 */
+#include "op_spec.inc"
 
 enum {
     WT_OK = 0,

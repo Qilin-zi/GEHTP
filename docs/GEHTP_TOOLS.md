@@ -497,6 +497,7 @@ cd kernels/examples && ./build_examples.sh            # 全部（33 例 181 门�
 - **引擎门 = shape 对齐谓词**（核心 `%32==0`）：matmul f16 → HMX 当 M/K/N 均 %32==0 否则标量；conv2d 同理；add → HVX 当 n≥64（`GEHTP_HVX_ADD`）；rmsnorm HVX 门（`GEHTP_HVX_RMSNORM`）；W4A16 恒 HMX。
 - VTCM 双 acquire 互斥（`hmx_runtime_setup` vs `wtcache_open`），003 线正把它改为编译期 carve 定界。
 - blob ver=3 契约：引擎注解 footer（engine/fb_allowed/fb_engine）+ 可选 carve footer；carve 重叠/超预算/双源不一致 = emit 期硬错误；运行期计划引擎不可用 = die 绝不静默换单元。
+- **算子输入契约单点注册表（011）**：每 opcode 的 arity + 每 arg 的 `name`/`kind`/`slot_check` 唯一事实源 = `kernels/include/op_spec.inc` 的 `wt_op_spec[]`（`oplist_parse.h` include 之）；`arity_of()`/`arg_is_slot()` 改读该表，旧 `#define WT_ARITY_*` 宏与两张 switch 已删除。`compiler/tests/test_wtop_emit.cpp` 的 `test_op_spec_registry` 永久守卫（新增 opcode 漏填 name/kind 构建期即暴露）。迁移为 byte-exact：转录经 38 opcode×16 arg 逐值 parity 对拍，设备例 21 host↔device W3 逐行一致。
 
 ### 12.5 `kernels/host/` host 辅助工具
 

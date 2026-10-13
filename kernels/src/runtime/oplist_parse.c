@@ -8,83 +8,17 @@ static uint32_t align_up(uint32_t x, uint32_t a) {
 }
 
 static int arity_of(uint16_t opcode) {
-    switch (opcode) {
-    case OP_NOP: return WT_ARITY_NOP;
-    case OP_MATMUL_W4A16: return WT_ARITY_MATMUL;
-    case OP_RMSNORM_F16: return WT_ARITY_RMSNORM;
-    case OP_PIN: return WT_ARITY_PIN;
-    case OP_SILU_F16: return WT_ARITY_SILU;
-    case OP_IM2COL: return WT_ARITY_IM2COL;
-    case OP_CONV2D_F16: return WT_ARITY_CONV2D_F16;
-    case OP_ADD_F16: return WT_ARITY_ADD_F16;
-    case OP_SPILL: return WT_ARITY_SPILL;
-    case OP_FILL: return WT_ARITY_FILL;
-    case OP_TRANSPOSE_F16: return WT_ARITY_TRANSPOSE_F16;
-    case OP_UNARY_F16: return WT_ARITY_UNARY_F16;
-    case OP_BINARY_F16: return WT_ARITY_BINARY_F16;
-    case OP_SOFTMAX_F16: return WT_ARITY_SOFTMAX_F16;
-    case OP_CONCAT_F16: return WT_ARITY_CONCAT_F16;
-    case OP_STRIDED_SLICE_F16: return WT_ARITY_STRIDED_SLICE_F16;
-    case OP_SPLIT_F16: return WT_ARITY_SPLIT_F16;
-    case OP_REDUCE_F16: return WT_ARITY_REDUCE_F16;
-    case OP_CUMSUM_F32: return WT_ARITY_CUMSUM_F32;
-    case OP_CONV1D_SSM_F16: return WT_ARITY_CONV1D_SSM_F16;
-    case OP_GATHER_F16: return WT_ARITY_GATHER_F16;
-    case OP_ARGMAX_F16: return WT_ARITY_ARGMAX_F16;
-    case OP_KV_APPEND_F16: return WT_ARITY_KV_APPEND_F16;
-    case OP_KV_GATHER_F16: return WT_ARITY_KV_GATHER_F16;
-    case OP_MATMUL_F16: return WT_ARITY_MATMUL_F16;
-    case OP_RMSNORM2_F16: return WT_ARITY_RMSNORM2_F16;
-    case OP_BROADCAST_F16: return WT_ARITY_BROADCAST_F16;
-    case OP_TRANSPOSE_GEN_F16: return WT_ARITY_TRANSPOSE_GEN_F16;
-    case OP_SCATTER_ND_F16: return WT_ARITY_SCATTER_ND_F16;
-    case OP_DMA: return WT_ARITY_DMA;
-    case OP_PAD_F16: return WT_ARITY_PAD_F16;
-    case OP_MATMUL_F16_SPLIT: return WT_ARITY_MATMUL_F16_SPLIT;
-    case OP_MATMUL_F16_BIAS: return WT_ARITY_MATMUL_F16_BIAS;
-    case OP_CONV1D_SSM_STEP_F16: return WT_ARITY_CONV1D_SSM_STEP_F16;
-    case OP_DELTA_CHUNK_F16: return WT_ARITY_DELTA_CHUNK_F16;
-    case OP_GDN_BLOCK_F16: return WT_ARITY_GDN_BLOCK_F16;
-    default: return -1;
-    }
+    /* 011: 单点注册表读取 (arity 唯一事实源)。保留空洞 31/32 表内为 -1;
+     * 越界 opcode 由 bounds 检查拦截 (等价旧 switch 的 default: return -1)。 */
+    if (opcode >= (uint16_t)(sizeof(wt_op_spec) / sizeof(wt_op_spec[0]))) return -1;
+    return wt_op_spec[opcode].arity;
 }
 
-/* 该 arg 下标是否是 slot 引用 */
+/* 该 arg 下标是否是 slot 引用 (011: 单点注册表读取; slot_check 逐值转录) */
 static int arg_is_slot(uint16_t opcode, uint16_t idx) {
-    switch (opcode) {
-    case OP_MATMUL_W4A16: return idx == 0 || idx == 1;
-    case OP_RMSNORM_F16: return idx == 1;
-    case OP_PIN: return idx == 0;
-    case OP_CONV2D_F16: return idx == 1 || idx == 2;
-    case OP_SPILL: return idx == 1;
-    case OP_FILL: return idx == 0;
-    case OP_UNARY_F16: return idx == 0;
-    case OP_BINARY_F16: return idx == 0 || idx == 1;
-    case OP_SOFTMAX_F16: return idx == 0;
-    case OP_CONCAT_F16: return idx <= 7;
-    case OP_STRIDED_SLICE_F16: return idx == 0;
-    case OP_SPLIT_F16: return idx == 0;
-    case OP_REDUCE_F16: return idx == 0;
-    case OP_CUMSUM_F32: return idx == 0;
-    case OP_CONV1D_SSM_F16: return idx == 0 || idx == 1;
-    case OP_GATHER_F16: return idx == 0 || idx == 1;
-    case OP_ARGMAX_F16: return idx == 0;
-    case OP_KV_APPEND_F16: return idx == 0 || idx == 1 || idx == 2;
-    case OP_KV_GATHER_F16: return idx == 0 || idx == 1;
-    case OP_MATMUL_F16: return idx == 0 || idx == 1;
-    case OP_RMSNORM2_F16: return idx == 1 || idx == 2;
-    case OP_BROADCAST_F16: return idx == 0;
-    case OP_TRANSPOSE_GEN_F16: return idx == 0;
-    case OP_SCATTER_ND_F16: return idx == 0 || idx == 1 || idx == 2;
-    case OP_DMA: return idx == 0 || idx == 1;
-    case OP_PAD_F16: return idx == 0;
-    case OP_MATMUL_F16_SPLIT: return idx == 0 || idx == 1;
-    case OP_MATMUL_F16_BIAS: return idx == 0 || idx == 1 || idx == 7;
-    case OP_CONV1D_SSM_STEP_F16: return idx == 0 || idx == 1;
-    case OP_DELTA_CHUNK_F16: return idx <= 4;
-    case OP_GDN_BLOCK_F16: return idx == 1;
-    default: return 0;
-    }
+    if (opcode >= (uint16_t)(sizeof(wt_op_spec) / sizeof(wt_op_spec[0]))) return 0;
+    if (idx >= WT_MAX_ARGS) return 0;
+    return wt_op_spec[opcode].args[idx].slot_check;
 }
 
 int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {

@@ -276,9 +276,31 @@ static void fc_ref(const uint16_t* a, const uint16_t* w, uint16_t* y,
         }
 }
 
+/* 011: 算子契约注册表自检 (永久守卫)。每个已定义 opcode 的前 arity 个 arg
+ * 必须有非空语义名 + 已分类 kind (无 WT_ARG_UNCLASSIFIED), arity 界内。
+ * 后续新增 opcode 若忘填 name/kind 会在构建期单测暴露。 */
+static void test_op_spec_registry(void) {
+    const int n = OP_GDN_BLOCK_F16 + 1;
+    int bad_arity = 0, unnamed = 0, unclassified = 0;
+    for (int op = 0; op < n; op++) {
+        int ar = wt_op_spec[op].arity;
+        if (ar < 0) continue; /* 空洞 31/32 */
+        if (ar > (int)WT_MAX_ARGS) { bad_arity++; continue; }
+        for (int i = 0; i < ar; i++) {
+            const struct wt_arg_spec& a = wt_op_spec[op].args[i];
+            if (a.name == nullptr || a.name[0] == '\0') unnamed++;
+            if (a.kind == WT_ARG_UNCLASSIFIED) unclassified++;
+        }
+    }
+    CHECK(bad_arity == 0, "op_spec: arity 全界内");
+    CHECK(unnamed == 0, "op_spec: 无未命名 arg");
+    CHECK(unclassified == 0, "op_spec: 无未分类 kind");
+}
+
 int main() {
     std::printf("=== wtop_emit test (M1 host closure) ===\n\n");
     register_all_ops();
+    test_op_spec_registry();
 
     // 1. 建图 → prepare → serialize
     GraphPrepare gp;
