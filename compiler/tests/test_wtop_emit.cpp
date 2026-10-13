@@ -140,11 +140,15 @@ static bool write_file(const std::string& path, const void* data, size_t len) {
 
 /* 003 T015: W4A16 图 — W const 槽长 K*N/2 (const_data_size=K*N, f32→f16 折半
  * 后命中 w4 判定), Input[M,K] → FullyConnected(M,K,N) → Output, act=主输入
- * (EXT_IN 槽 0) = staging 预置形态。 */
+ * (EXT_IN 槽 0) = staging 预置形态。
+ * 013 T008: element_size=4(f32) 使 ensure_weight_slot 走 f32→f16 折半路径
+ * (n=const_data_size/4 → n*2 = K*N/2)。原 element_size=1 会命中 010 新增的
+ * es=1 bool 掩码拓宽分支(GDN Trilu), 把 K*N 字节按 1B/elem 扩成 K*N*2 槽,
+ * w4 判定 (len==K*N/2) 落空 → 回落 f16。 */
 static void build_matmul_w4(GraphPrepare& gp, uint32_t M, uint32_t K, uint32_t N) {
     OutputDef w_od{};
     w_od.rank = 2; w_od.dims[0] = N; w_od.dims[1] = K;
-    w_od.element_size = 1;
+    w_od.element_size = 4;
     w_od.dtype = static_cast<uint32_t>(DType::Float32);
     std::vector<uint8_t> W((size_t)N * K, 0x5A);
     gp.append_const_node(1, w_od, W.data(), W.size());
@@ -173,7 +177,7 @@ static void build_matmul_w4(GraphPrepare& gp, uint32_t M, uint32_t K, uint32_t N
 static void build_matmul_w4_shared(GraphPrepare& gp, uint32_t M, uint32_t K, uint32_t N) {
     OutputDef w_od{};
     w_od.rank = 2; w_od.dims[0] = N; w_od.dims[1] = K;
-    w_od.element_size = 1;
+    w_od.element_size = 4;
     w_od.dtype = static_cast<uint32_t>(DType::Float32);
     std::vector<uint8_t> W((size_t)N * K, 0x5A);
     gp.append_const_node(1, w_od, W.data(), W.size());
@@ -970,7 +974,7 @@ int main() {
      * 无 --dma-runlist: 主输入 act 不可表达 (运行期仅认裸 slot/0x4000|temp)
      * → emit 硬错误退出。 */
     {
-        const uint32_t M = 32, K = 64, N = 32;
+        const uint32_t M = 256, K = 64, N = 32;
         auto emit_w4 = [&](bool runlist) -> int {
             GraphPrepare g;
             build_matmul_w4(g, M, K, N);
@@ -1062,7 +1066,7 @@ int main() {
      * (planned restage = 去重权重槽数 = OP_PIN 条数)。spec Story 1 验收:
      * 「同权重连续多个 matmul」图只 pin 一次。 */
     {
-        const uint32_t M = 32, K = 64, N = 64;
+        const uint32_t M = 256, K = 64, N = 64;
         GraphPrepare g;
         build_matmul_w4_shared(g, M, K, N);
         g.set_plan_budgets(64u << 20, 1u << 20);
@@ -1111,6 +1115,55 @@ int main() {
                 delete w;
             }
         }
+    }
+
+    /* 9c. 013 T008: W4A16 双 arity 序列化→反序列化往返 + legacy 等价。
+     * 手组 blob: 9 参(arity 9)与 6 参(legacy_arity 6)均过 wt_parse; args[6..8]
+     * = bias/atbl/otbl 裸 slot 引用往返无损; 7/8 参(两 arity 之间) -> ARITY。
+     * 槽布局: slot0 act(EXT_IN)/slot1 w/slot2 bias/slot3 atbl/slot4 otbl, 全
+     * 128 对齐。9 参裸 slot id (bias=2/atbl=3/otbl=4) 直写, 与 T006 emit 同约定。 */
+    {
+        auto build_w4_blob = [](uint16_t n_args, const std::vector<uint32_t>& args) {
+            std::vector<uint8_t> b;
+            auto w16 = [&b](uint16_t v) { b.push_back((uint8_t)(v & 0xff)); b.push_back((uint8_t)(v >> 8)); };
+            auto w32 = [&b](uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((uint8_t)(v >> (8 * i))); };
+            b.insert(b.end(), {'W', 'T', 'O', 'P'});
+            w16(WT_BLOB_VER_2); w16(WT_ENDIAN_CHK);
+            w32(5); w32(1);                       // 5 slots, 1 op
+            w32(128);  w32(64);  w32(0);    w32(0); w32(WT_SLOT_EXT_IN); w32(0);  // act
+            w32(1024); w32(512); w32(128);  w32(0); w32(0);            w32(0);  // w K*N/2
+            w32(512);  w32(256); w32(1152); w32(0); w32(0);            w32(0);  // bias
+            w32(64);   w32(32);  w32(1664); w32(0); w32(0);            w32(0);  // atbl
+            w32(32);   w32(16);  w32(1792); w32(0); w32(0);            w32(0);  // otbl
+            w16(OP_MATMUL_W4A16); w16(n_args);
+            for (uint32_t a : args) w32(a);
+            while (b.size() % 128) b.push_back(0);
+            b.resize(b.size() + 2048, 0);         // weight 区 (盖住最大 slot 端 1824)
+            return b;
+        };
+        wt_blob* w4 = new wt_blob{};
+        std::vector<uint8_t> b9 = build_w4_blob(9u, {0x8000u | 0u, 1u, 100u, 256u, 64u, 32u, 2u, 3u, 4u});
+        CHECK(wt_parse(b9.data(), b9.size(), w4) == WT_OK, "T008: W4A16 9 参 wt_parse OK");
+        CHECK(w4->ops[0].opcode == OP_MATMUL_W4A16 && w4->ops[0].n_args == 9,
+              "T008: opcode=1 / n_args=9 契约");
+        CHECK(w4->ops[0].args[0] == (0x8000u | 0u) && w4->ops[0].args[1] == 1u &&
+              w4->ops[0].args[3] == 256u && w4->ops[0].args[4] == 64u && w4->ops[0].args[5] == 32u,
+              "T008: 9 参 act/w/M/K/N 往返无损");
+        CHECK(w4->ops[0].args[6] == 2u && w4->ops[0].args[7] == 3u && w4->ops[0].args[8] == 4u,
+              "T008: args[6..8]=bias/atbl/otbl 裸 slot 引用往返无损");
+
+        std::vector<uint8_t> b6 = build_w4_blob(6u, {0x8000u | 0u, 1u, 100u, 256u, 64u, 32u});
+        CHECK(wt_parse(b6.data(), b6.size(), w4) == WT_OK, "T008: W4A16 6 参 legacy wt_parse OK");
+        CHECK(w4->ops[0].n_args == 6 && w4->ops[0].args[0] == (0x8000u | 0u) &&
+              w4->ops[0].args[1] == 1u && w4->ops[0].args[2] == 100u &&
+              w4->ops[0].args[3] == 256u && w4->ops[0].args[4] == 64u && w4->ops[0].args[5] == 32u,
+              "T008: legacy 6 参逐字节等价");
+
+        std::vector<uint8_t> b7 = build_w4_blob(7u, {0x8000u | 0u, 1u, 100u, 256u, 64u, 32u, 2u});
+        CHECK(wt_parse(b7.data(), b7.size(), w4) == WT_ERR_ARITY, "T008: 7 参 -> ARITY");
+        std::vector<uint8_t> b8 = build_w4_blob(8u, {0x8000u | 0u, 1u, 100u, 256u, 64u, 32u, 2u, 3u});
+        CHECK(wt_parse(b8.data(), b8.size(), w4) == WT_ERR_ARITY, "T008: 8 参 -> ARITY");
+        delete w4;
     }
 
     /* 10. 003 T022: carve 重叠不变量负例 — conv_add 图 + 预算(多 temp 驻留
@@ -1230,7 +1283,7 @@ int main() {
               std::strstr((const char*)err.data(), "resident_pool") != nullptr,
               "T008a: 错误文本含 resident_pool/hmx_arena 数值");
 
-        const uint32_t WM = 32, WK = 64, WN = 32;
+        const uint32_t WM = 256, WK = 64, WN = 32;
         auto emit_w4b = [&](const std::string& extra) -> int {
             GraphPrepare g;
             build_matmul_w4(g, WM, WK, WN);

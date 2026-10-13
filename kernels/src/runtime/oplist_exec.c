@@ -571,16 +571,36 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
 
     const uint8_t *bias = NULL, *atbl = NULL, *otbl = NULL;
     uint32_t bias_slot_idx = 0xFFFFFFFFu;
-    for (uint32_t i = 0; i < b->n_slots; i++) {
-        const uint8_t* p = b->weight_base + b->slots[i].offset;
-        uint32_t L = b->slots[i].len;
-        if (!bias && L == bias_b) { bias = p; bias_slot_idx = i; }
-        else if (!atbl && L == atbl_b) atbl = p;
-        else if (!otbl && L == otbl_b) otbl = p;
-    }
-    if (!bias || !atbl || !otbl) {
-        snprintf(err, errn, "supply slots missing (bias/atbl/otbl)");
-        return -1;
+    if (op->n_args == 9) {
+        /* 013: 9-arity 直读三槽 (emit 把 bias/atbl/otbl 槽索引写入 args[6..8],
+         * 与 w_raw 同款裸 slot 约定)。槽长校验保留 = emit 契约哨兵。 */
+        uint32_t bias_s = op->args[6], atbl_s = op->args[7], otbl_s = op->args[8];
+        if (bias_s >= b->n_slots || atbl_s >= b->n_slots || otbl_s >= b->n_slots) {
+            snprintf(err, errn, "w4a16 supply slot oob");
+            return -1;
+        }
+        bias = b->weight_base + b->slots[bias_s].offset;
+        atbl = b->weight_base + b->slots[atbl_s].offset;
+        otbl = b->weight_base + b->slots[otbl_s].offset;
+        bias_slot_idx = bias_s;
+        if (b->slots[bias_s].len != bias_b || b->slots[atbl_s].len != atbl_b ||
+            b->slots[otbl_s].len != otbl_b) {
+            snprintf(err, errn, "w4a16 supply slot size mismatch");
+            return -1;
+        }
+    } else {
+        /* 6-arity legacy: 槽表按长度扫描 (逐字节不动) */
+        for (uint32_t i = 0; i < b->n_slots; i++) {
+            const uint8_t* p = b->weight_base + b->slots[i].offset;
+            uint32_t L = b->slots[i].len;
+            if (!bias && L == bias_b) { bias = p; bias_slot_idx = i; }
+            else if (!atbl && L == atbl_b) atbl = p;
+            else if (!otbl && L == otbl_b) otbl = p;
+        }
+        if (!bias || !atbl || !otbl) {
+            snprintf(err, errn, "supply slots missing (bias/atbl/otbl)");
+            return -1;
+        }
     }
     if (!(act_s & WT_REF_VTCM_FLAG) && b->slots[act_s].len != act_b) {
         snprintf(err, errn, "act slot size mismatch");

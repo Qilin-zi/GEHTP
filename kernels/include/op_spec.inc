@@ -43,8 +43,9 @@ struct wt_arg_spec {
 };
 
 struct wt_op_spec {
-    int8_t            arity;   /* ≤ WT_MAX_ARGS(16); -1 = 空洞/无效哨兵 */
+    int8_t            arity;        /* ≤ WT_MAX_ARGS(16); -1 = 空洞/无效哨兵 */
     struct wt_arg_spec args[WT_MAX_ARGS];
+    int8_t            legacy_arity; /* 013: 旧 arity(默认 0=无); OP_MATMUL_W4A16=6 */
 };
 
 /* 下标 = opcode (0..37, 位置序)。仅前 arity 个 args 有效, 其余零初始化。
@@ -58,15 +59,18 @@ static const struct wt_op_spec wt_op_spec[] WT_OP_SPEC_UNUSED = {
     /* 0  OP_NOP: [] */
     { 0, { { NULL, WT_ARG_UNCLASSIFIED, 0 } } },
 
-    /* 1  OP_MATMUL_W4A16: [act, w, out, M, K, N] */
-    { 6, {
-        { "act", WT_ARG_REF,  1 },
-        { "w",   WT_ARG_SLOT, 1 },
-        { "out", WT_ARG_TEMP, 0 },
-        { "M",   WT_ARG_IMM,  0 },
-        { "K",   WT_ARG_IMM,  0 },
-        { "N",   WT_ARG_IMM,  0 },
-    } },
+    /* 1  OP_MATMUL_W4A16: [act, w, out, M, K, N, bias, atbl, otbl] (legacy 6) */
+    { 9, {
+        { "act",  WT_ARG_REF,  1 },
+        { "w",    WT_ARG_SLOT, 1 },
+        { "out",  WT_ARG_TEMP, 0 },
+        { "M",    WT_ARG_IMM,  0 },
+        { "K",    WT_ARG_IMM,  0 },
+        { "N",    WT_ARG_IMM,  0 },
+        { "bias", WT_ARG_SLOT, 1 },
+        { "atbl", WT_ARG_SLOT, 1 },
+        { "otbl", WT_ARG_SLOT, 1 },
+    }, 6 },
 
     /* 2  OP_RMSNORM_F16: [x, w, y, n] */
     { 4, {

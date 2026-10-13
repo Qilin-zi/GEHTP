@@ -14,6 +14,12 @@ static int arity_of(uint16_t opcode) {
     return wt_op_spec[opcode].arity;
 }
 
+/* 013: 旧 arity(默认 0=无 legacy)。仅 OP_MATMUL_W4A16 设 6, 用于放宽校验。 */
+static int legacy_arity_of(uint16_t opcode) {
+    if (opcode >= (uint16_t)(sizeof(wt_op_spec) / sizeof(wt_op_spec[0]))) return 0;
+    return wt_op_spec[opcode].legacy_arity;
+}
+
 /* 该 arg 下标是否是 slot 引用 (011: 单点注册表读取; slot_check 逐值转录) */
 static int arg_is_slot(uint16_t opcode, uint16_t idx) {
     if (opcode >= (uint16_t)(sizeof(wt_op_spec) / sizeof(wt_op_spec[0]))) return 0;
@@ -76,8 +82,11 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
         uint16_t opcode = wt_rd_u16(buf + p);
         uint16_t n_args = wt_rd_u16(buf + p + 2);
         int ar = arity_of(opcode);
+        int lar = legacy_arity_of(opcode);
         if (ar < 0) return WT_ERR_OPCODE;
-        if (n_args != (uint16_t)ar) return WT_ERR_ARITY;
+        /* 013: 双 arity 放宽 — n_args==arity 或 (legacy_arity && n_args==legacy_arity) */
+        if (n_args != (uint16_t)ar && !(lar > 0 && n_args == (uint16_t)lar))
+            return WT_ERR_ARITY;
         if (size < p + 4u + (size_t)n_args * 4u) return WT_ERR_OP_TRUNC;
         out->ops[i].opcode = opcode;
         out->ops[i].n_args = n_args;

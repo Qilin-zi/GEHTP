@@ -73,7 +73,11 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
     }
     /* Q4_0 打包权重(K*N/2 字节)→ W4A16;f16 池权重 → MATMUL_F16
      * (float 图; probe 首撞: f16 权重被按 W4A16 执行直接失败) */
+    /* 013 T011: 原生 W4A16 需 M%256==0 (M=32/128 实测 0xA002 失败, dd_worker
+     * M%256 前置判)。M%256!=0 的打包权重回落 f16 路由(M<32→GEMV /
+     * 32≤M<256→dense_f16), 绝不发必然失败的 W4A16。 */
     bool w4 = w_is_const && (w_s != em.dummy_slot_id) &&
+              (m % 256u == 0u) &&
               (em.slots[w_s & 0x7FFFu].len == (k * nn / 2u));
     if (w4) {
         if (has_bias) {
@@ -132,7 +136,26 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             em.add_op(OP_PIN, {w_raw});
             em.cur_engine = prev;
         }
-        em.add_op(OP_MATMUL_W4A16, {act_arg, w_raw, out_t, m, k, nn});
+        /* 013 T006: 9-arity 供给侧直连 — 编译期按闭式长度定位 bias/atbl/otbl
+         * 三槽 (与运行期旧扫描同式: bias=(N/32)*512, atbl=8*(K/32)*4,
+         * otbl=8*(N/32)*4), 直写 args[6..8] 裸 slot id (同 w_raw 约定)。三槽
+         * 齐全 → 9 参 (运行期删扫描直读); 缺任一 → 6 参 legacy (运行期扫描)。
+         * 终态由 T004 requant 生成三槽后按 id 直引 (此处长度定位 = 机制占位)。 */
+        uint32_t bias_b = (nn / 32u) * 512u;
+        uint32_t atbl_b = 8u * (k / 32u) * 4u;
+        uint32_t otbl_b = 8u * (nn / 32u) * 4u;
+        uint32_t bias_s = 0xFFFFFFFFu, atbl_s = 0xFFFFFFFFu, otbl_s = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < em.slots.size(); i++) {
+            uint32_t L = em.slots[i].len;
+            if (bias_s == 0xFFFFFFFFu && L == bias_b) bias_s = i;
+            else if (atbl_s == 0xFFFFFFFFu && L == atbl_b) atbl_s = i;
+            else if (otbl_s == 0xFFFFFFFFu && L == otbl_b) otbl_s = i;
+        }
+        if (bias_s != 0xFFFFFFFFu && atbl_s != 0xFFFFFFFFu && otbl_s != 0xFFFFFFFFu)
+            em.add_op(OP_MATMUL_W4A16,
+                      {act_arg, w_raw, out_t, m, k, nn, bias_s, atbl_s, otbl_s});
+        else
+            em.add_op(OP_MATMUL_W4A16, {act_arg, w_raw, out_t, m, k, nn});
     } else {
         uint32_t flags = 0;
         if (nm == "MatMul")
