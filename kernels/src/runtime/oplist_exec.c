@@ -1261,7 +1261,10 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, n * 2u);
     if (!x || !y) { snprintf(err, errn, "unary ref fail"); return -1; }
-    if (g_rtrace) { fprintf(g_rtrace, "unary x=%p y=%p n=%u sub=%u\n", (void*)x, (void*)y, (unsigned)n, (unsigned)subtype); fflush(g_rtrace); }
+    /* 曾有 if(g_rtrace) fprintf+fflush 调试行在此: rtrace 句柄被 run 级里程碑
+     * 常开打开后, 该行退化为逐 op 落盘 (~900us/op, 0.6B decode 84 unary op/步
+     * ≈75ms/步)。008 T020 只门控了 pre/post 行, 漏了这条。调试走 optrace
+     * pre/post (g_trace_on), 勿再往 exec_* 内加裸 fprintf。 */
     /* HVX 快路径(策略 B): 有 f32 内核的 subtype, n >= 32 时走
      * f16→f32(向量 cvt)→内核(就地)→f32→f16。exp/sigmoid/tanh/silu 定义域
      * 无约束; sqrt/rsqrt/log 标量带负输入钳 0 守卫, 暂留标量避免 NaN 回归。 */
@@ -1290,6 +1293,11 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
             }
         } else if (subtype == 14) {
             memcpy(y, x, (size_t)n * 2u);
+            hvx_ok = 1;
+        } else if (subtype == 0) {
+            /* NEG: f16 符号位 XOR 向量化 (位级 = 标量 -v, ±0/NaN 同), 免
+             * f32 scratch 往返。0.6B decode RoPE Neg ×56 曾是 16.3% wall。 */
+            hvhx_v2_neg_f16(y, x, n);
             hvx_ok = 1;
         }
         if (hvx_ok) {

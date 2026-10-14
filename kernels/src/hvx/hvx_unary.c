@@ -329,6 +329,31 @@ void hvhx_v2_sqr_f32(float * __restrict__ dst, const float * __restrict__ src, u
 /* ============================================================
  *  取整
  * ============================================================ */
+void hvhx_v2_neg_f16(uint16_t * __restrict__ dst,
+                     const uint16_t * __restrict__ src, uint32_t n)
+{
+    /* f16 取反 = 符号位 XOR, 对 ±0/NaN/subnormal 均位级 = 标量 -v
+     * (0.6B decode RoPE Neg ×56, 消 scalar 回落 ~112ms/步) */
+#if HVX_V2_KERNELS_ENABLED
+    uint32_t i = 0;
+    /* dst 前导至 128B 对齐 (src 走 hvx_vmemu 免对齐), 64 f16/向量 */
+    uintptr_t daddr = (uintptr_t)dst;
+    uint32_t lead = (uint32_t)(((128u - (daddr & 127u)) & 127u) / 2u);
+    if (lead > n) lead = n;
+    for (; i < lead; ++i) dst[i] = src[i] ^ 0x8000u;
+    uint32_t body = (n - i) / 64u;
+    for (uint32_t v = 0; v < body; ++v) {
+        uint32_t base = i + v * 64u;
+        HVX_Vector va = hvx_vmemu(src + base);
+        *(HVX_Vector *)(dst + base) = hvx_vec_neg_f16(va);
+    }
+    i += body * 64u;
+    for (; i < n; ++i) dst[i] = src[i] ^ 0x8000u;
+#else
+    for (uint32_t i = 0; i < n; ++i) dst[i] = src[i] ^ 0x8000u;
+#endif
+}
+
 void hvhx_v2_floor_f32(float * __restrict__ dst, const float * __restrict__ src, uint32_t n)
 {
 #if HVX_V2_KERNELS_ENABLED
