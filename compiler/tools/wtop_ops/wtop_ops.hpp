@@ -887,6 +887,16 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
         }
         if (has_bias)
             snprintf(why, sizeof why, "has_bias (HMX bias path unverified)");
+        else if (m < 32u) {
+            /* 004 T013: M<32 GEMV 快路径 (exec_matmul_f16_gemv) 运行期恒走 HVX
+             * (t0=0 时)。编译期必须同口径计划 HVX, 否则触发 planned!=actual
+             * 引擎偏航硬门 (rc=6 "unadjudicated engine deviation")。t0=1
+             * (A 转置) 无 GEMV 体, 运行时回落标量 = 允许回落 (dev=1), 不破坏
+             * 不变量。has_bias 排前面: 偏置 matmul 无 GEMV 体 (bias 被丢), 恒
+             * 计划标量 (与 HMX 未验证 bias 同口径)。 */
+            engine = 1u;           /* WT_ENG_HVX */
+            snprintf(why, sizeof why, "m%u<32 GEMV HVX fast path", m);
+        }
         else if ((m % 32u) || (k % 32u) || (n % 32u))
             snprintf(why, sizeof why, "shape %ux%ux%u not 32-aligned", m, k, n);
         else if (need_mm(m, k, n) > kVTCM)
