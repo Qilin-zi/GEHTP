@@ -170,6 +170,38 @@ static int32_t argmax_f16(const uint8_t* p, uint32_t bytes) {
     return bi;
 }
 
+/* ---- op_ts (PROF W-P2) 逐 op 时间戳 dump ----
+ * 注册 wt_exec_set_ts 后 run_io 回填 n_ops 条 {start,dur,dma,engine,...};
+ * run 成功即覆盖写 WTS1 ver=4 二进制 (与 scripts/gehtp_prof.py 同契约),
+ * 索引 = 全局 op 序号。零 optrace 落盘污染 (纯内存回填 + 一次 43KB write)。 */
+static struct wt_op_ts* g_ts_buf = NULL;
+static uint32_t g_ts_n = 0;
+static char g_ts_path[256];
+
+static void dump_op_ts(int64_t wall_us) {
+    if (!g_ts_buf || !g_ts_n) return;
+    int fd = open(g_ts_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) { ex_log("[warn] op_ts open %s fail", g_ts_path); return; }
+    uint8_t hdr[24];
+    memcpy(hdr, "WTS1", 4);
+    uint32_t ver = 4u;
+    memcpy(hdr + 4, &ver, 4);
+    memcpy(hdr + 8, &g_ts_n, 4);
+    uint32_t sample = 0u;
+    memcpy(hdr + 12, &sample, 4);
+    uint64_t wall = (uint64_t)wall_us;
+    memcpy(hdr + 16, &wall, 8);
+    size_t body = sizeof(*g_ts_buf) * (size_t)g_ts_n;
+    ssize_t w1 = write(fd, hdr, sizeof(hdr));
+    ssize_t w2 = write(fd, g_ts_buf, body);
+    close(fd);
+    if (w1 != (ssize_t)sizeof(hdr) || w2 != (ssize_t)body)
+        ex_log("[warn] op_ts short write (%zd/%zd)", (ssize_t)w1, (ssize_t)w2);
+    else
+        ex_log("[op_ts] wrote %s n=%u wall_us=%lld",
+               g_ts_path, (unsigned)g_ts_n, (long long)wall_us);
+}
+
 static int write_resp(const char* path, const char* json) {
     size_t n = strlen(json);
     uint8_t hdr[4] = { (uint8_t)(n >> 24), (uint8_t)(n >> 16),
@@ -359,6 +391,7 @@ static int handle_request(struct wt_blob* w, uint8_t* req, size_t rlen,
             int32_t tok = argmax_f16(wt_exec_temp(out_temp),
                                      wt_exec_temp_last_bytes(out_temp));
             ex_log("[run] argmax tok=%d", (int)tok);
+            dump_op_ts(us);
             if (want_out) {
                 if (dump_out_file(out_p, out_temp) != 0)
                     ex_log("[warn] dump out failed (non-fatal)");
@@ -434,6 +467,13 @@ int main(void) {
     }
     ex_log("M7 wt_parse ok (slots=%u ops=%u)", (unsigned)w->n_slots, (unsigned)w->n_ops);
     wt_exec_set_trace(trace_on);
+    g_ts_buf = calloc(w->n_ops, sizeof(*g_ts_buf));
+    if (g_ts_buf) {
+        wt_exec_set_ts(g_ts_buf, w->n_ops);
+        g_ts_n = w->n_ops;
+        snprintf(g_ts_path, sizeof(g_ts_path), "%s.op_ts.bin", blob_p);
+        ex_log("M7.5 op_ts enabled (n=%u -> %s)", (unsigned)g_ts_n, g_ts_path);
+    }
 
     if (have_wgt) {
         size_t wgt_len = (size_t)strtoul(wgt_size_s, NULL, 10);
