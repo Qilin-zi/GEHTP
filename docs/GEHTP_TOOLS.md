@@ -129,7 +129,7 @@ scripts/gehtp setup [--device <serial>]
 
 | 任务 | 解释器 |
 |---|---|
-| serving 栈 + pytest | `/disk1/miniforge3/envs/llmserv/bin/python`（fastapi/uvicorn/tokenizers/httpx 已装；`venv_qpm*` 已坏勿用） |
+| serving 栈 + pytest | `/disk1/miniforge3/envs/llmserv/bin/python`（fastapi/uvicorn/tokenizers/httpx 已装） |
 | 模型导出 / golden / replay | `/home/speech/miniforge3/bin/python3`（torch/transformers/onnxruntime/safetensors） |
 | prof / 判据 / 审计类脚本 | 任意带 numpy 的 python3 |
 | pip 安装 | 走清华镜像 |
