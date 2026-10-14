@@ -75,9 +75,9 @@ description: "Task list for 013-executor-hoist"
 
 **依赖**: US-A（布局基座）
 
-- [ ] T018 [US3] `compiler/tools/wtop_emit.cpp`：carve footer 扩展序列化——每布局 {layout_id,M,K,N,n0,off_wt,off_bias,off_act,off_out,arena_hi}，去重键=(M,K,N,n0)，op 注解引用 layout_id；旧字段保留（超集扩展，003 双源对拍哨兵继续生效）（契约=contracts/contract-carve-layout.md）
-- [ ] T019 [US3] `kernels/src/runtime/oplist_exec.c`：装载期逐 layout 重算 dc_w4_carve/w4_carve_need 对拍 emit 偏移（漂移→拒绝装载）；热路径=四指针直赋+arena_hi 查 emit 值，**删 carve_live_top 扫描与热路径 dc_arena_init/dc_w4_carve**（依赖 T018）
-- [ ] T020 [US3] C 段门（US5）：f16/gdn 位级 vs A 末态（W4A16 carve 机制走合成 M=256 blob）；matmul 族逐 op 时长前后对照量化；手工破坏 emit 偏移一字段的 blob → 装载期硬报错（哨兵有效性）；C 段收益进 results
+- [X] T018 [US3] `compiler/tools/wtop_emit.cpp`：carve footer 扩展序列化——每布局 {layout_id,M,K,N,n0,off_wt,off_bias,off_act,off_out,arena_hi}，去重键=(M,K,N,n0)，op 注解引用 layout_id；旧字段保留（超集扩展，003 双源对拍哨兵继续生效）（契约=contracts/contract-carve-layout.md）
+- [X] T019 [US3] `kernels/src/runtime/oplist_exec.c`：装载期逐 layout 重算 dc_w4_carve/w4_carve_need 对拍 emit 偏移（漂移→拒绝装载）；热路径=四指针直赋+arena_hi 查 emit 值，**删 carve_live_top 扫描与热路径 dc_arena_init/dc_w4_carve**（依赖 T018）
+- [X] T020 [US3] C 段门（US5）：f16/gdn 位级 vs A 末态（W4A16 carve 机制走合成 M=256 blob）；matmul 族逐 op 时长前后对照量化；手工破坏 emit 偏移一字段的 blob → 装载期硬报错（哨兵有效性）；C 段收益进 results
 
 **Checkpoint**: 执行器 carve 面只剩指针切换
 

@@ -74,7 +74,36 @@
 
 
 
-## US-C — carve 静态布局表（未开始）
+## US-C — carve 静态布局表（已收口 2026-10-14：T018-T020 全绿）
+
+> 白话：以前每次遇到 W4A16 矩阵乘，执行器都要现场"画格子"（在 VTCM 高速内存里逐块
+> 计算激活/输出/权重/偏置各放哪、各占多少，即 carve）。现在编译器把格子画好后直接
+> 写进 blob 尾部（CRVL 表），执行器装载时按公式复核一遍（对不上就拒载），热路径只做
+> 八个指针赋值——现场画格子的扫描和初始化全部从热路径删除。
+
+**T018 `wtop_emit.cpp`（commit 待归档）**：
+
+- CRVL footer：`[magic 'CRVL' 0x4C565243][n_layouts][n×40B 布局记录][n_refs][n×8B {op_index, layout_id}]`，位于 gdn footer 之后、128B 权重对齐之前，magic 探测确定性（填充全零）。
+- 布局记录 {layout_id, M, K, N, n0, off_wt, off_bias, off_act, off_out, arena_hi}；去重键 (M,K,N,n0)（同形 W4A16 共享一布局）；发射门=em.ddr_static（有 TEMPOFF/VTCL）且存在 W4A16 op；M/K/N 异常（0 或 ≥2²¹）留 legacy carve。
+- 偏移=镜像 `dc_w4_carve` 分配序的闭式公式（host 已证公式与逐块顺序分配逐字节等价）。
+
+**T019 `oplist_parse.h/.c` + `oplist_exec.c`**：
+
+- 解析侧仅边界校验；执行器装载期逐布局：记录合法性（lid/n0/对 32 取模）+ 闭式重算五偏移与线值对拍——**漂移即拒载**（err="cl drift #N: … 线值/算值"）+ arena_hi≤布局 arena 段 + 每 ref 的 op 边界/opcode/args[3..5] 形状一致性；随后一次性展开 cl[] 八指针。
+- 热路径：查 cl_ref 命中 → 布局不变时零工作（仅 atbl/otbl 供给槽逐 op 刷新，因 w4a16_invoke 破坏性重写表）；布局切换 → 驻留槽失效 + 八指针直赋 + arena 段 FLUSH（arena_flush++）。**热路径已无 carve_live_top 扫描 / dc_arena_init / dc_w4_carve**；未引用的 W4A16 op 落 legacy carve 兜底。
+
+**T020 设备门（板 d0f1784，证据 `evidence/t020-cl-device-gate.md`，lib `libhvxhmx_018.so`/runner `gehtp_runner_018b.so` 签名版指纹 ed4e46d6/347a3c56）**：
+
+- 合成 M=256,K=N=2560 W4A16（v3+TEMPOFF/VTCL+CRVL）三跑：twin（无 CRVL，legacy 路径）与 cl（CRVL 快路径）输出均 `7654a8f6` **位级同 003 时代已知答案**；bad（CRVL off_wt 破坏 1 字节）装载期硬拒 `cl drift #0: wt 2621695/2621440`，零输出。
+- 计数器（optrace）：cl 跑 `layout=1 arena_flush=1 tango=0`（快路径触发恰一次 arena 段 flush——补上 A 段"re-carve flush 编译在未触发"缺口）；twin `layout=0`；bad 拒载于热路径前。
+- 0.8B 零回归：f16 线 `f87461e2` 位级同锚（11504 ops，exec 5.97s）；gdn 线 `9d1c0877` 位级同锚（exec 2.75s）。
+- **收益量化（单 op 对照）**：W4A16 op 13.47ms(legacy)→6.92ms(CL)=**1.95×**；整 exec 34.7→32.1ms（单 op 图收益被读权重摊薄；多 W4A16 op 真图收益随 op 数放大）。
+
+### C 段诚实定位
+
+- 机制+位级门全绿；**0.8B 基准图当前无 W4A16 op**（lm_head 为 f16），收益兑现在真图待 W4A16 供给侧 emit 打开（013 记忆已记"收益未兑"缺口，与 B 段同口径）。
+- 过程坑：`/data/local/tmp/hvxhmx23/gehtp` 已变 root:755（他会话 root adb 活跃）——绕行=私有目录 cl020 + runner 重编私有名烘焙 job 路径；板上库**必须推 SWIV 签名版、但以普通 .so 名落地**（推未签名版 dlopen 直接死，且 FARF 不可见）；`run_main_on_hexagon.farf` 掩码文件可开 AP 侧详细日志（用后已删）。
+
 
 ## US-D — 形态 flag 化（未开始）
 

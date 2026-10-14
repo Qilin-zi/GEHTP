@@ -1056,6 +1056,45 @@ int main() {
                     carve_ok = true;
             }
             CHECK(carve_ok, "T015: carve footer 记录 (off/size 一致, 窗口盖 DMA op 0)");
+            /* 013 C 段 (T018): carve 布局 footer — mem plan (ddr_static=VTCL
+             * 在场) + W4A16 op → 必发射。闭式独立重算对拍 (dc_w4_carve 镜像);
+             * 引用对 op=2 (matmul) → layout_id=0。 */
+            {
+                uint64_t e_act = 0;
+                uint64_t e_out = (e_act + (uint64_t)M * K * 2u + 2047u) & ~2047ull;
+                uint64_t e_wt = (e_out + (uint64_t)M * N * 2u + 2047u) & ~2047ull;
+                uint64_t e_bias = (e_wt + (uint64_t)K * N / 2u + 2047u) & ~2047ull;
+                uint64_t e_atbl = (e_bias + (uint64_t)(N / 32u) * 512u + 127u) & ~127ull;
+                uint64_t e_otbl = (e_atbl + (uint64_t)8u * (K / 32u) * 4u + 127u) & ~127ull;
+                uint64_t e_mask = (e_otbl + (uint64_t)8u * (N / 32u) * 4u + 127u) & ~127ull;
+                uint64_t e_hi = e_mask + 128u + 16u;
+                CHECK(w->n_cl == 1u && w->cl_base != NULL,
+                      "T018: CL footer 存在 (n_cl=1)");
+                CHECK(wt_rd_u32(w->cl_base + 0u) == 0u &&
+                      wt_rd_u32(w->cl_base + 4u) == M &&
+                      wt_rd_u32(w->cl_base + 8u) == K &&
+                      wt_rd_u32(w->cl_base + 12u) == N &&
+                      wt_rd_u32(w->cl_base + 16u) == 0u,
+                      "T018: 记录 {layout_id=0, M, K, N, n0=0}");
+                CHECK(wt_rd_u32(w->cl_base + 20u) == e_wt &&
+                      wt_rd_u32(w->cl_base + 24u) == e_bias &&
+                      wt_rd_u32(w->cl_base + 28u) == e_act &&
+                      wt_rd_u32(w->cl_base + 32u) == e_out &&
+                      wt_rd_u32(w->cl_base + 36u) == e_hi,
+                      "T018: 闭式偏移 {off_wt,off_bias,off_act,off_out,arena_hi}");
+                CHECK(w->n_cl_ref == 1u && w->cl_ref_base != NULL &&
+                      wt_rd_u32(w->cl_ref_base + 0u) == 2u &&
+                      wt_rd_u32(w->cl_ref_base + 4u) == 0u,
+                      "T018: 引用对 {op_index=2 (matmul), layout_id=0}");
+                /* 哨兵漂移负例在设备门 (执行器装载期拒载); host 侧只证
+                 * wt_parse 对损坏 footer 仍边界安全 */
+                std::vector<uint8_t> badcl = bl;
+                badcl[(size_t)(w->cl_base - bl.data()) + 20u] ^= 0xFFu;
+                wt_blob* wb3 = new wt_blob{};
+                CHECK(wt_parse(badcl.data(), badcl.size(), wb3) == WT_OK,
+                      "T018: off_wt 漂移 -> wt_parse 仍 OK (拒载在执行器装载期)");
+                delete wb3;
+            }
         } else {
             CHECK(false, "T015: ops = [OP_DMA, OP_PIN, OP_MATMUL_W4A16]");
         }
@@ -1109,6 +1148,10 @@ int main() {
                     }
                     CHECK(pin_slot == w0 && w0 == w1,
                           "US1: PIN slot == 双 matmul w 引用 (同槽共享)");
+                    /* 013 C 段 (T018): 同形双 matmul → 布局 dedup (键 M,K,N,n0):
+                     * n_cl=1 / n_cl_ref=2 (每 op 一条引用) */
+                    CHECK(w->n_cl == 1u && w->n_cl_ref == 2u,
+                          "T018: 同形 dedup — 1 布局 2 引用");
                 } else {
                     CHECK(false, "US1: wt_parse 失败");
                 }

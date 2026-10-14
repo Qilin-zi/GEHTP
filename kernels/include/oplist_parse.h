@@ -128,6 +128,22 @@ extern "C" {
 #define WT_GDN_EXTRA_WORDS 10u
 #define WT_GDN_EXTRA_BYTES (WT_GDN_EXTRA_WORDS * 4u) /* 40 */
 #define WT_GDN_EXTRA_REC   (4u + WT_GDN_EXTRA_BYTES) /* op_index + 40B = 44 */
+/* 013 C 段 (T018): 可选 carve 布局 footer, 位于 gdn footer 之后、weight
+ * 128B 对齐之前:
+ *   [magic u32][n_layouts u32][n_layouts × 40B][n_refs u32]
+ *   [n_refs × {op_index u32, layout_id u32}]
+ * 40B record = 10×u32 {layout_id, M, K, N, n0, off_wt, off_bias, off_act,
+ * off_out, arena_hi} —— dc_w4_carve 分配序列的闭式镜像 (arena 相对偏移;
+ * atbl/otbl/mask/extra 偏移由 M/K/N 闭式推导, 不上线)。dedup 键 =
+ * (M,K,N,n0); layout_id = 记录下标。执行器装载期独立重算闭式对拍 (漂移 =
+ * 拒载) 并展开为绝对指针, W4A16 热路径退化为指针直赋。仅 has_layout
+ * (VTCL 在场) 时消费; 仅含 OP_MATMUL_W4A16 的 blob 写此项; magic 探测
+ * 同 carve/gdn 逻辑 (对齐填充全 0 永不误判)。 */
+#define WT_CARVE_LAYOUT_MAGIC 0x4C565243u /* "CRVL" little-endian */
+#define WT_CL_REC_SIZE 40u
+#define WT_CL_REF_REC 8u
+#define WT_MAX_CL 256u        /* 执行器布局表容量 (emit 超 = footer 仍写全) */
+#define WT_MAX_CL_REF 1024u   /* 执行器 op→layout 引用表容量 */
 #define WT_ENG_ACT 0u
 #define WT_ENG_OUT 1u
 #define WT_ENG_WT 2u
@@ -318,6 +334,10 @@ struct wt_blob {
     uint32_t n_carve;           /* number of entries in carve_base */
     const uint8_t* gdn_base;    /* 009: optional per-op GDN 几何 footer (records) */
     uint32_t n_gdn;             /* number of gdn extra records */
+    const uint8_t* cl_base;     /* 013 C 段: optional carve 布局 footer (40B/条) */
+    uint32_t n_cl;              /* 布局条数 */
+    const uint8_t* cl_ref_base; /* op→layout 引用对区 (8B/条 {op_index, layout_id}) */
+    uint32_t n_cl_ref;
 };
 
 /* 算子输入契约单点注册表: enum wt_arg_kind + struct wt_arg_spec/wt_op_spec +

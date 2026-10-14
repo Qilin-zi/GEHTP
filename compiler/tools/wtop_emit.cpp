@@ -1262,6 +1262,84 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 put32(ge.second.contract_ver);
             }
         }
+        /* 013 C 段 (T018): carve 布局 footer — 序列化 dc_w4_carve 分配序列
+         * 的闭式布局, dedup 键 (M,K,N,n0), 引用对 op→layout_id。仅 TEMPOFF/
+         * VTCL 在场 (ddr_static) 且存在 OP_MATMUL_W4A16 时发射; 执行器仅
+         * has_layout 消费 (装载期闭式对拍 + 热路径指针直赋)。
+         * 闭式序列 (dc_parts.c dc_w4_carve 单源镜像, 勿单边改):
+         *   act m*k*2@2048 → out m*n*2@2048 → wt k*n/2@2048 → bias (n/32)*512@2048
+         *   → atbl 8*(k/32)*4@128 → otbl 8*(n/32)*4@128 → mask 32@128 → extra 16@128
+         * atbl/otbl/mask/extra 偏移由 M/K/N 闭式推导, 不上线。 */
+        if (em.ddr_static) {
+            struct ClRec {
+                uint32_t M, K, N;
+                uint32_t off_act, off_out, off_wt, off_bias, arena_hi;
+            };
+            std::vector<ClRec> cls;
+            std::vector<std::pair<uint32_t, uint32_t>> refs; /* {op_index, layout_id} */
+            std::map<uint64_t, uint32_t> key2id; /* M<<42|K<<21|N (各 <2^21) */
+            for (uint32_t i = 0; i < em.ops.size(); i++) {
+                const wt_op& o = em.ops[i];
+                if (o.opcode != OP_MATMUL_W4A16) continue;
+                uint32_t M = o.args[3], K = o.args[4], N = o.args[5];
+                if (M == 0 || K == 0 || N == 0 || M >= (1u << 21) ||
+                    K >= (1u << 21) || N >= (1u << 21)) continue; /* 留 legacy carve */
+                uint64_t key = ((uint64_t)M << 42) | ((uint64_t)K << 21) | N;
+                auto it = key2id.find(key);
+                uint32_t id;
+                if (it == key2id.end()) {
+                    auto al = [](uint64_t v, uint64_t a) {
+                        return (v + a - 1) & ~(a - 1);
+                    };
+                    ClRec r{};
+                    r.M = M; r.K = K; r.N = N;
+                    uint64_t off_act = 0;
+                    uint64_t off_out = al(off_act + (uint64_t)M * K * 2, 2048);
+                    uint64_t off_wt = al(off_out + (uint64_t)M * N * 2, 2048);
+                    uint64_t off_bias = al(off_wt + (uint64_t)K * N / 2, 2048);
+                    uint64_t off_atbl = al(off_bias + (uint64_t)(N / 32) * 512, 128);
+                    uint64_t off_otbl = al(off_atbl + (uint64_t)8 * (K / 32) * 4, 128);
+                    uint64_t off_mask = al(off_otbl + (uint64_t)8 * (N / 32) * 4, 128);
+                    uint64_t off_extra = off_mask + 128; /* ru(off_mask+32,128) */
+                    r.off_act = (uint32_t)off_act;
+                    r.off_out = (uint32_t)off_out;
+                    r.off_wt = (uint32_t)off_wt;
+                    r.off_bias = (uint32_t)off_bias;
+                    r.arena_hi = (uint32_t)(off_extra + 16);
+                    id = (uint32_t)cls.size();
+                    key2id[key] = id;
+                    cls.push_back(r);
+                } else {
+                    id = it->second;
+                }
+                refs.push_back({i, id});
+            }
+            if (!refs.empty()) {
+                auto put32 = [&](uint32_t v) {
+                    size_t old = em.blob.size();
+                    em.blob.resize(old + 4);
+                    std::memcpy(em.blob.data() + old, &v, 4);
+                    p += 4;
+                };
+                put32(WT_CARVE_LAYOUT_MAGIC);
+                put32((uint32_t)cls.size());
+                for (uint32_t li = 0; li < cls.size(); li++) {
+                    const ClRec& r = cls[li];
+                    put32(li);            /* layout_id */
+                    put32(r.M); put32(r.K); put32(r.N);
+                    put32(0u);            /* n0 (W4A16 恒 0, 契约字段位) */
+                    put32(r.off_wt); put32(r.off_bias);
+                    put32(r.off_act); put32(r.off_out);
+                    put32(r.arena_hi);
+                }
+                put32((uint32_t)refs.size());
+                for (const auto& rf : refs) { put32(rf.first); put32(rf.second); }
+                std::fprintf(stderr, "[013] CL footer: layouts=%zu refs=%zu "
+                             "(first m%u k%u n%u arena_hi %u)\n",
+                             cls.size(), refs.size(), cls[0].M, cls[0].K, cls[0].N,
+                             cls[0].arena_hi);
+            }
+        }
         size_t woff = (p + 127) & ~(size_t)127;
         em.blob.resize(woff + em.weight_area.size(), 0);
         std::memcpy(em.blob.data() + woff, em.weight_area.data(), em.weight_area.size());

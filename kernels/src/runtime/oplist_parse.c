@@ -131,6 +131,24 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
             out->n_gdn = ng;
             p += 8u + (size_t)ng * WT_GDN_EXTRA_REC;
         }
+
+        /* 013 C 段 (T018): 可选 carve 布局 footer — [magic][n_layouts]
+         * [n×40B][n_refs][n_refs×8B], 位于 gdn footer 之后。此处仅边界
+         * 校验; 装载期哨兵对拍与指针展开在执行器 (wt_exec_load_tempoff)。 */
+        if (size >= p + 8u && wt_rd_u32(buf + p) == WT_CARVE_LAYOUT_MAGIC) {
+            uint32_t nl = wt_rd_u32(buf + p + 4u);
+            if (size < p + 8u + (size_t)nl * WT_CL_REC_SIZE + 4u)
+                return WT_ERR_OP_TRUNC;
+            out->cl_base = buf + p + 8u;
+            out->n_cl = nl;
+            p += 8u + (size_t)nl * WT_CL_REC_SIZE;
+            uint32_t nr = wt_rd_u32(buf + p);
+            if (size < p + 4u + (size_t)nr * WT_CL_REF_REC)
+                return WT_ERR_OP_TRUNC;
+            out->cl_ref_base = buf + p + 4u;
+            out->n_cl_ref = nr;
+            p += 4u + (size_t)nr * WT_CL_REF_REC;
+        }
     }
 
     out->weight_off = align_up((uint32_t)p, WT_WEIGHT_ALIGN);

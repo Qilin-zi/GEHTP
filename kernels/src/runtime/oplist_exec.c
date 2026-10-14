@@ -50,6 +50,13 @@
 
 #define MAX_TEMPS 16384  /* VTCM 驻留默认开: 静态登记限制 temp id 回收, 0.8B 水位逼近全体 op 数(~14k), 4096 不够。上限=TEMPOFF tid 14 位编码(0x3FFF), 与 WT_EXEC_MAX_TEMPS 同步 */
 
+/* 013 C 段 T019: carve 布局装载期展开形态 — dc_w4_carve 结果的绝对指针镜像
+ * (arena 基址 = vb + layout_arena_off)。热路径只做指针切换。 */
+struct wt_cl_entry {
+    uint32_t m, k, n;
+    uint8_t *act, *out, *wt, *bias, *atbl, *otbl, *mask, *extra;
+};
+
 struct wt_exec {
     struct wtcache_ctx* wc;
     struct dc_arena arena;
@@ -83,6 +90,14 @@ struct wt_exec {
     uint32_t layout_pin_off, layout_pin_sz;
     uint32_t layout_arena_off, layout_arena_sz;
     uint32_t layout_resid_off, layout_resid_sz;
+    /* 013 C 段 T019: carve 布局表 (装载期闭式对拍 + 展开为绝对指针)。n_cl=0
+     * = 无 CL footer (旧 blob / 无 W4A16 op) → W4A16 全走 legacy carve。 */
+    uint32_t n_cl, n_cl_ref;
+    uint32_t carve_layout;       /* 当前布局 (layout_id+1; 0=未设) */
+    uint8_t* cl_arena_base;      /* arena 段 [arena_off, resid_off) 基址 (切换 flush 用) */
+    uint32_t cl_arena_len;
+    struct wt_cl_entry cl[WT_MAX_CL];
+    struct { uint32_t op, id; } cl_ref[WT_MAX_CL_REF];
     uint32_t wt_resident_slot;   /* 010 US1: 当前驻留 VTCM 的权重 slot (0xFFFFFFFF=无) */
     uint32_t bias_resident_slot; /* 010 US1: 当前驻留 VTCM 的 bias slot (0xFFFFFFFF=无) */
     uint32_t vtcm_off_arr[MAX_TEMPS];
@@ -623,100 +638,142 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "w slot size mismatch");
         return -1;
     }
-    /* 003 T013/T014: 逐 op carve。carve footer 给本 op 活跃的 VTCM 驻留区间,
-     * arena 只在驻留区之上(池内 live_top 起)领取, 绝不下压到活跃驻留上;
-     * 形状或 live 上界变了才重划(指针面只依赖 基址+容量+M/K/N), 避免逐 op
-     * 的 dc_w4_carve + 全 VTCM flush。 */
-    uint32_t live_top = (g_exec.vtcm_pool_size && b->carve_base)
-                            ? carve_live_top(b, g_current_op_global) : 0u;
-    uint32_t live_end = (live_top + 2047u) & ~2047u;
-    int shape_same = g_exec.matmul_carved &&
-                     g_exec.e.m == M && g_exec.e.k == K && g_exec.e.n == N;
-    if (!shape_same || live_end != g_exec.carve_live_end) {
-        /* 010 US1: re-carve (形状/live 变化, 或前置 f16/conv 抢走全量 VTCM 后
-         * matmul_carved=0) 会重排 arena → e.wt/e.bias 偏移可能变, 旧驻留副本
-         * 失效, 强制下一把重搬。驻留追踪只在本 carve 区间内有效。 */
-        g_exec.wt_resident_slot = 0xFFFFFFFFu;
-        g_exec.bias_resident_slot = 0xFFFFFFFFu;
-        int rc = 0;
-        if (!g_exec.engine_ready) {
-            /* VTCM 互斥回收: 前置 MATMUL_F16/CONV2D 的 HMX 快路径 hmx_runtime_setup
-             * 持全量 VTCM 且从不释放 → 同进程二次 acquire 返 0 (WTC_ERR_VTCM_ACQUIRE)。
-             * 先 teardown 让出再独占。teardown 对 attach 模式只清指针 (ctx 归
-             * wtcache), 但 engine_ready=0 + base 非 NULL 只能是自有 ctx, 安全。
-             * 反向 (wtcache 先开, f16 后到) 走 attach 共享 scratch 区, 不冲突。
-             * 013 A 段 T016: has_layout 时装载期已开 wtcache (engine_ready=1),
-             * 本 !engine_ready 分支是死代码; teardown 再显式禁探戈。 */
-            if (!g_exec.has_layout && hmx_runtime_get_vtcm_base()) {
-                hmx_runtime_teardown();
-                g_exec.st.tango++;   /* 013 A 段: 探戈取证 (旧路径独有) */
+    /* 013 C 段 T019: carve 布局热路径 — 装载期已把 dc_w4_carve 结果展开为
+     * 绝对指针, 此处仅指针切换: 布局未变且未被 HMX attach 抢走 (matmul_carved)
+     * 时零工作; 变更一次直赋 + 驻留追踪失效 (不同布局 e.wt/e.bias 地址不同;
+     * attach 曾覆写 arena 内容, 同布局重建也须重搬) + arena 段 flush 一次
+     * (同 A 段 re-carve 语义)。live 扫描 / dc_arena_init / dc_w4_carve /
+     * 容量决策全部装载期一次完成, 热路径零扫描零决策。引用表未命中 (emit
+     * 跳过的形态) → legacy carve 兜底。 */
+    uint32_t cl_li = 0u;
+    if (g_exec.has_layout && g_exec.n_cl) {
+        for (uint32_t i = 0; i < g_exec.n_cl_ref; i++) {
+            if (g_exec.cl_ref[i].op == g_current_op_global) {
+                cl_li = g_exec.cl_ref[i].id + 1u;
+                break;
             }
-            rc = wtcache_open(&g_exec.wc, wtcache_pin_arg());
-            if (rc != WTC_OK) { snprintf(err, errn, "wtcache 0x%X", rc); return -1; }
         }
-        void* vb = NULL; uint32_t vs = 0; void* pb = NULL; uint32_t pc = 0;
-        wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
-        /* 013 A 段: has_layout 时 carve 基址查表 (装载期已验 == align2048(pc));
-         * 旧 blob 保持运行时反推 (零回归)。 */
-        uint32_t off = g_exec.has_layout ? g_exec.layout_arena_off
-                                         : ((pc + 2047u) & ~2047u);
-        if (!vb || off >= vs) {
-            snprintf(err, errn, "vtcm no room (off %u vs %lu)",
-                     (unsigned)off, (unsigned long)vs);
-            return -1;
+    }
+    if (cl_li) {
+        struct wt_cl_entry* L = &g_exec.cl[cl_li - 1u];
+        if (!g_exec.matmul_carved || g_exec.carve_layout != cl_li) {
+            g_exec.wt_resident_slot = 0xFFFFFFFFu;
+            g_exec.bias_resident_slot = 0xFFFFFFFFu;
+            struct dc_w4* e = &g_exec.e;
+            e->m = L->m; e->k = L->k; e->n = L->n;
+            e->act = L->act; e->out = L->out;
+            e->wt = L->wt;  e->bias = L->bias;
+            e->atbl = L->atbl; e->otbl = L->otbl;
+            e->mask = L->mask; e->extra = L->extra;
+            g_exec.carve_layout = cl_li;
+            g_exec.matmul_carved = 1;
+            g_exec.carve_op = g_current_op_global;
+            g_exec.carve_live_end = 0u;
+            qurt_mem_cache_clean((qurt_addr_t)g_exec.cl_arena_base,
+                                 g_exec.cl_arena_len,
+                                 QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            g_exec.st.arena_flush++;
         }
-        /* 驻留池未起则先起(首个 VTCM 驻留消费点在 temp_get, 这里提前要基址) */
-        if (g_exec.vtcm_pool_size && vtcm_pool_ensure() != 0) {
-            snprintf(err, errn, "vtcm resident pool ensure");
-            return -1;
-        }
-        /* arena 上界 = VTCM 尾倒划驻留池的顶端, 再按本 op 活跃 carve 上沿放回。
-         * 活跃驻留 = carve footer 里 residency_start <= op < end 的记录, 占池内
-         * [0, live_top); 池内 [live_top, pool_size) 此刻是死区, arena 可以借用。
-         * 无 carve footer (ver<3) → live_top=0 → 上界 = vs - pool_size, 与旧
-         * 布局逐字节同界。live_end 超 pool = 编译期/运行期布局漂移, 硬报错。 */
-        uint32_t arena_hi = vs;
-        if (g_exec.vtcm_pool_size) {
-            if (live_end > g_exec.vtcm_pool_size) {
-                snprintf(err, errn, "carve live %u > pool %u at op %u",
-                         (unsigned)live_end, (unsigned)g_exec.vtcm_pool_size,
-                         (unsigned)g_current_op_global);
+        /* 供给表逐 op 刷新: 布局 dedup 后不同 op 可共享布局但各持槽位
+         * (dc_w4_invoke 每把回填 host 原始表 — w4a16_invoke 破坏性重写) */
+        g_exec.e.atbl_ddr = atbl;
+        g_exec.e.otbl_ddr = otbl;
+    } else {
+        /* 003 T013/T014: 逐 op carve。carve footer 给本 op 活跃的 VTCM 驻留区间,
+         * arena 只在驻留区之上(池内 live_top 起)领取, 绝不下压到活跃驻留上;
+         * 形状或 live 上界变了才重划(指针面只依赖 基址+容量+M/K/N), 避免逐 op
+         * 的 dc_w4_carve + 全 VTCM flush。 */
+        uint32_t live_top = (g_exec.vtcm_pool_size && b->carve_base)
+                                ? carve_live_top(b, g_current_op_global) : 0u;
+        uint32_t live_end = (live_top + 2047u) & ~2047u;
+        int shape_same = g_exec.matmul_carved &&
+                         g_exec.e.m == M && g_exec.e.k == K && g_exec.e.n == N;
+        if (!shape_same || live_end != g_exec.carve_live_end) {
+            /* 010 US1: re-carve (形状/live 变化, 或前置 f16/conv 抢走全量 VTCM 后
+             * matmul_carved=0) 会重排 arena → e.wt/e.bias 偏移可能变, 旧驻留副本
+             * 失效, 强制下一把重搬。驻留追踪只在本 carve 区间内有效。 */
+            g_exec.wt_resident_slot = 0xFFFFFFFFu;
+            g_exec.bias_resident_slot = 0xFFFFFFFFu;
+            int rc = 0;
+            if (!g_exec.engine_ready) {
+                /* VTCM 互斥回收: 前置 MATMUL_F16/CONV2D 的 HMX 快路径 hmx_runtime_setup
+                 * 持全量 VTCM 且从不释放 → 同进程二次 acquire 返 0 (WTC_ERR_VTCM_ACQUIRE)。
+                 * 先 teardown 让出再独占。teardown 对 attach 模式只清指针 (ctx 归
+                 * wtcache), 但 engine_ready=0 + base 非 NULL 只能是自有 ctx, 安全。
+                 * 反向 (wtcache 先开, f16 后到) 走 attach 共享 scratch 区, 不冲突。
+                 * 013 A 段 T016: has_layout 时装载期已开 wtcache (engine_ready=1),
+                 * 本 !engine_ready 分支是死代码; teardown 再显式禁探戈。 */
+                if (!g_exec.has_layout && hmx_runtime_get_vtcm_base()) {
+                    hmx_runtime_teardown();
+                    g_exec.st.tango++;   /* 013 A 段: 探戈取证 (旧路径独有) */
+                }
+                rc = wtcache_open(&g_exec.wc, wtcache_pin_arg());
+                if (rc != WTC_OK) { snprintf(err, errn, "wtcache 0x%X", rc); return -1; }
+            }
+            void* vb = NULL; uint32_t vs = 0; void* pb = NULL; uint32_t pc = 0;
+            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+            /* 013 A 段: has_layout 时 carve 基址查表 (装载期已验 == align2048(pc));
+             * 旧 blob 保持运行时反推 (零回归)。 */
+            uint32_t off = g_exec.has_layout ? g_exec.layout_arena_off
+                                             : ((pc + 2047u) & ~2047u);
+            if (!vb || off >= vs) {
+                snprintf(err, errn, "vtcm no room (off %u vs %lu)",
+                         (unsigned)off, (unsigned long)vs);
                 return -1;
             }
-            arena_hi = vs - (g_exec.vtcm_pool_size - live_end);
+            /* 驻留池未起则先起(首个 VTCM 驻留消费点在 temp_get, 这里提前要基址) */
+            if (g_exec.vtcm_pool_size && vtcm_pool_ensure() != 0) {
+                snprintf(err, errn, "vtcm resident pool ensure");
+                return -1;
+            }
+            /* arena 上界 = VTCM 尾倒划驻留池的顶端, 再按本 op 活跃 carve 上沿放回。
+             * 活跃驻留 = carve footer 里 residency_start <= op < end 的记录, 占池内
+             * [0, live_top); 池内 [live_top, pool_size) 此刻是死区, arena 可以借用。
+             * 无 carve footer (ver<3) → live_top=0 → 上界 = vs - pool_size, 与旧
+             * 布局逐字节同界。live_end 超 pool = 编译期/运行期布局漂移, 硬报错。 */
+            uint32_t arena_hi = vs;
+            if (g_exec.vtcm_pool_size) {
+                if (live_end > g_exec.vtcm_pool_size) {
+                    snprintf(err, errn, "carve live %u > pool %u at op %u",
+                             (unsigned)live_end, (unsigned)g_exec.vtcm_pool_size,
+                             (unsigned)g_current_op_global);
+                    return -1;
+                }
+                arena_hi = vs - (g_exec.vtcm_pool_size - live_end);
+            }
+            uint32_t arena_cap = (arena_hi > off) ? (arena_hi - off) : 0u;
+            /* dc_arena_alloc 撞 OOM 是设备侧 FARF abort, 必须运行期先核容量 */
+            uint32_t need = w4_carve_need(M, K, N);
+            if (arena_cap < need) {
+                snprintf(err, errn, "carve cap %u < need %u (m%u k%u n%u live %u pool %lu)",
+                         (unsigned)arena_cap, (unsigned)need,
+                         (unsigned)M, (unsigned)K, (unsigned)N,
+                         (unsigned)live_end, (unsigned long)g_exec.vtcm_pool_size);
+                return -1;
+            }
+            dc_arena_init(&g_exec.arena, (uint8_t*)vb + off, arena_cap);
+            if (dc_w4_carve(&g_exec.e, &g_exec.arena, M, K, N, atbl, otbl)) {
+                snprintf(err, errn, "carve m%u k%u n%u", (unsigned)M, (unsigned)K, (unsigned)N);
+                return -1;
+            }
+            /* wtcache_open 末尾 memset(VTCM,0) 留 dirty 零行, 驱逐会覆盖 HMX 直写的 e.out
+             * (dualdomain run3 同根因); FLUSH 清干净。013 A 段 T016 (R6 flush 收敛):
+             * has_layout 时装载期已全 VTCM flush 一次, re-carve 仅 flush arena 区段;
+             * 旧 blob (无布局段) 保持全 VTCM flush (零回归)。 */
+            if (g_exec.has_layout) {
+                qurt_mem_cache_clean((qurt_addr_t)((uint8_t*)vb + g_exec.layout_arena_off),
+                                     g_exec.layout_resid_off - g_exec.layout_arena_off,
+                                     QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+                g_exec.st.arena_flush++;   /* 013 A 段 (R6): arena 区段 flush 计数 */
+            } else {
+                qurt_mem_cache_clean((qurt_addr_t)vb, vs, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            }
+            g_exec.engine_ready = 1;
+            g_exec.matmul_carved = 1;
+            g_exec.carve_op = g_current_op_global;
+            g_exec.carve_live_end = live_end;
         }
-        uint32_t arena_cap = (arena_hi > off) ? (arena_hi - off) : 0u;
-        /* dc_arena_alloc 撞 OOM 是设备侧 FARF abort, 必须运行期先核容量 */
-        uint32_t need = w4_carve_need(M, K, N);
-        if (arena_cap < need) {
-            snprintf(err, errn, "carve cap %u < need %u (m%u k%u n%u live %u pool %lu)",
-                     (unsigned)arena_cap, (unsigned)need,
-                     (unsigned)M, (unsigned)K, (unsigned)N,
-                     (unsigned)live_end, (unsigned long)g_exec.vtcm_pool_size);
-            return -1;
-        }
-        dc_arena_init(&g_exec.arena, (uint8_t*)vb + off, arena_cap);
-        if (dc_w4_carve(&g_exec.e, &g_exec.arena, M, K, N, atbl, otbl)) {
-            snprintf(err, errn, "carve m%u k%u n%u", (unsigned)M, (unsigned)K, (unsigned)N);
-            return -1;
-        }
-        /* wtcache_open 末尾 memset(VTCM,0) 留 dirty 零行, 驱逐会覆盖 HMX 直写的 e.out
-         * (dualdomain run3 同根因); FLUSH 清干净。013 A 段 T016 (R6 flush 收敛):
-         * has_layout 时装载期已全 VTCM flush 一次, re-carve 仅 flush arena 区段;
-         * 旧 blob (无布局段) 保持全 VTCM flush (零回归)。 */
-        if (g_exec.has_layout) {
-            qurt_mem_cache_clean((qurt_addr_t)((uint8_t*)vb + g_exec.layout_arena_off),
-                                 g_exec.layout_resid_off - g_exec.layout_arena_off,
-                                 QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
-            g_exec.st.arena_flush++;   /* 013 A 段 (R6): arena 区段 flush 计数 */
-        } else {
-            qurt_mem_cache_clean((qurt_addr_t)vb, vs, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
-        }
-        g_exec.engine_ready = 1;
-        g_exec.matmul_carved = 1;
-        g_exec.carve_op = g_current_op_global;
-        g_exec.carve_live_end = live_end;
-    }
+    } /* !cl_li: legacy carve */
     uint8_t* out_ddr = temp_get(out_t, out_b);
     if (!out_ddr) { snprintf(err, errn, "temp %u alloc", (unsigned)out_t); return -1; }
 
@@ -813,6 +870,9 @@ void wt_exec_shutdown(void) {
     g_exec.wtcache_pin_cap = 0;
     g_exec.carve_op = 0xFFFFFFFFu;
     g_exec.carve_live_end = 0u;
+    g_exec.n_cl = 0u;        /* 013 C 段: 布局表随 wtcache 关闭失效 (绝对指针悬空) */
+    g_exec.n_cl_ref = 0u;
+    g_exec.carve_layout = 0u;
     for (uint32_t i = 0; i < MAX_TEMPS; i++) {
         g_exec.static_off_arr[i] = 0xFFFFFFFFu;
         g_exec.vtcm_off_arr[i] = 0xFFFFFFFFu;
@@ -2974,6 +3034,100 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
              (unsigned)(g_exec.layout_arena_off + g_exec.layout_arena_sz),
              (unsigned)g_exec.layout_resid_off,
              (unsigned)(g_exec.layout_resid_off + g_exec.layout_resid_sz));
+        /* 013 C 段 T019: carve 布局 footer 装载期展开 (仅 has_layout 消费)。
+         * 逐 layout 独立重算 dc_w4_carve 闭式序列对拍 —— 漂移 (拼接/改写/
+         * 异版工具产物) 拒载, 不落运行时; 过界 (arena_hi > arena 段) 同拒。
+         * 记录五元组展开为绝对指针 (atbl/otbl/mask/extra 偏移闭式推导)。 */
+        if (b->cl_base && b->n_cl) {
+            if (b->n_cl > WT_MAX_CL || b->n_cl_ref > WT_MAX_CL_REF) {
+                snprintf(err, errn, "cl table too big (%u/%u refs %u/%u)",
+                         (unsigned)b->n_cl, WT_MAX_CL,
+                         (unsigned)b->n_cl_ref, WT_MAX_CL_REF);
+                return -1;
+            }
+            uint8_t* abase = (uint8_t*)vb + g_exec.layout_arena_off;
+            for (uint32_t i = 0; i < b->n_cl; i++) {
+                const uint8_t* r = b->cl_base + (size_t)i * WT_CL_REC_SIZE;
+                uint32_t lid = wt_rd_u32(r), M = wt_rd_u32(r + 4u),
+                         K = wt_rd_u32(r + 8u), N = wt_rd_u32(r + 12u),
+                         n0 = wt_rd_u32(r + 16u);
+                uint32_t off_wt = wt_rd_u32(r + 20u), off_bias = wt_rd_u32(r + 24u),
+                         off_act = wt_rd_u32(r + 28u), off_out = wt_rd_u32(r + 32u),
+                         arena_hi = wt_rd_u32(r + 36u);
+                if (lid != i || n0 != 0u || M == 0u || K < 32u || N < 32u ||
+                    (M % 32u) || (K % 32u) || (N % 32u)) {
+                    snprintf(err, errn, "cl rec bad #%u (lid %u n0 %u m%u k%u n%u)",
+                             (unsigned)i, (unsigned)lid, (unsigned)n0,
+                             (unsigned)M, (unsigned)K, (unsigned)N);
+                    return -1;
+                }
+                /* 闭式对拍 (dc_parts.c dc_w4_carve 单源镜像):
+                 * act/out/wt/bias @2048; atbl/otbl/mask/extra @128 */
+                uint64_t x_act = 0;
+                uint64_t x_out = (x_act + (uint64_t)M * K * 2u + 2047u) & ~2047ull;
+                uint64_t x_wt = (x_out + (uint64_t)M * N * 2u + 2047u) & ~2047ull;
+                uint64_t x_bias = (x_wt + (uint64_t)K * N / 2u + 2047u) & ~2047ull;
+                uint64_t x_atbl = (x_bias + (uint64_t)(N / 32u) * 512u + 127u) & ~127ull;
+                uint64_t x_otbl = (x_atbl + (uint64_t)8u * (K / 32u) * 4u + 127u) & ~127ull;
+                uint64_t x_mask = (x_otbl + (uint64_t)8u * (N / 32u) * 4u + 127u) & ~127ull;
+                uint64_t x_hi = x_mask + 128u + 16u;
+                if (off_act != x_act || off_out != x_out || off_wt != x_wt ||
+                    off_bias != x_bias || arena_hi != x_hi) {
+                    snprintf(err, errn,
+                             "cl drift #%u: act %u/%llu out %u/%llu wt %u/%llu "
+                             "bias %u/%llu hi %u/%llu",
+                             (unsigned)i, (unsigned)off_act, (unsigned long long)x_act,
+                             (unsigned)off_out, (unsigned long long)x_out,
+                             (unsigned)off_wt, (unsigned long long)x_wt,
+                             (unsigned)off_bias, (unsigned long long)x_bias,
+                             (unsigned)arena_hi, (unsigned long long)x_hi);
+                    return -1;
+                }
+                if (arena_hi > g_exec.layout_arena_sz) {
+                    snprintf(err, errn, "cl arena_hi %u > arena %u (m%u k%u n%u)",
+                             (unsigned)arena_hi, (unsigned)g_exec.layout_arena_sz,
+                             (unsigned)M, (unsigned)K, (unsigned)N);
+                    return -1;
+                }
+                struct wt_cl_entry* e = &g_exec.cl[i];
+                e->m = M; e->k = K; e->n = N;
+                e->act = abase + off_act;
+                e->out = abase + off_out;
+                e->wt = abase + off_wt;
+                e->bias = abase + off_bias;
+                e->atbl = abase + (uint32_t)x_atbl;
+                e->otbl = abase + (uint32_t)x_otbl;
+                e->mask = abase + (uint32_t)x_mask;
+                e->extra = abase + ((uint32_t)x_mask + 128u);
+            }
+            for (uint32_t i = 0; i < b->n_cl_ref; i++) {
+                const uint8_t* r = b->cl_ref_base + (size_t)i * WT_CL_REF_REC;
+                uint32_t opi = wt_rd_u32(r), lid = wt_rd_u32(r + 4u);
+                if (opi >= b->n_ops || lid >= b->n_cl) {
+                    snprintf(err, errn, "cl ref oob (op %u lid %u)",
+                             (unsigned)opi, (unsigned)lid);
+                    return -1;
+                }
+                const struct wt_op* o = &b->ops[opi];
+                if (o->opcode != OP_MATMUL_W4A16 ||
+                    o->args[3] != g_exec.cl[lid].m || o->args[4] != g_exec.cl[lid].k ||
+                    o->args[5] != g_exec.cl[lid].n) {
+                    snprintf(err, errn, "cl ref mismatch (op %u lid %u)",
+                             (unsigned)opi, (unsigned)lid);
+                    return -1;
+                }
+                g_exec.cl_ref[i].op = opi;
+                g_exec.cl_ref[i].id = lid;
+            }
+            g_exec.cl_arena_base = abase;
+            g_exec.cl_arena_len = g_exec.layout_resid_off - g_exec.layout_arena_off;
+            g_exec.n_cl = b->n_cl;
+            g_exec.n_cl_ref = b->n_cl_ref;
+            g_exec.carve_layout = 0u;
+            FARF(ALWAYS, "013 C-seg cl: layouts=%u refs=%u arena[%p,%u)",
+                 (unsigned)g_exec.n_cl, (unsigned)g_exec.n_cl_ref,
+                 (void*)g_exec.cl_arena_base, (unsigned)g_exec.cl_arena_len);
+        }
     }
     /* 003 T013: carve footer ↔ TEMPOFF 双源对拍(重数匹配)。emit 侧已有同款
      * 检查, 这里防 blob 被拼接/改写/异版工具产出后的静默布局漂移 —— 漂移时
