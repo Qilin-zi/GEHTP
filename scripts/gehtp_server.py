@@ -724,7 +724,7 @@ async def chat_completions(request: Request) -> Response:
                         pass
                     if session.status == SessionStatus.ACTIVE:
                         session.fail()
-                session_manager.release(session.session_id)
+                session_manager.release(session.session_id, remove=True)
                 request_queue.release()
                 metrics.set_active_sessions(session_manager.active_count())
 
@@ -765,13 +765,13 @@ async def chat_completions(request: Request) -> Response:
                 )
                 raise DeviceError(event["message"])
     except Exception:
-        session_manager.release(session.session_id)
+        session_manager.release(session.session_id, remove=True)
         request_queue.release()
         metrics.set_active_sessions(session_manager.active_count())
         raise
 
     if finish_reason == "cancelled":
-        session_manager.release(session.session_id)
+        session_manager.release(session.session_id, remove=True)
         request_queue.release()
         metrics.set_active_sessions(session_manager.active_count())
         raise DeviceError("client disconnected", code="client_disconnected")
@@ -788,7 +788,7 @@ async def chat_completions(request: Request) -> Response:
         generation_latency_ms=generation_latency_ms,
     )
     session_manager.finish(session.session_id)
-    session_manager.release(session.session_id)
+    session_manager.release(session.session_id, remove=True)
     request_queue.release()
     metrics.set_active_sessions(session_manager.active_count())
     logger.info(
