@@ -48,6 +48,18 @@ void hvhx_v2_cvt_f16_to_f32(float * __restrict__ dst,
 void hvhx_v2_cvt_f32_to_f16(uint16_t * __restrict__ dst,
                             const float * __restrict__ src, uint32_t n);
 
+/* ---- Q4_0 反量化 + crouton pack (013; w4 线反量化税 12.5s → HVX) ----
+ * 输入: 每 tile 640B = 512B quant + 128B scale(仅前 64B 用, 32 f16 d_n)。
+ *       quant 字节 qt[i*32+n] = [hi=q(2i+1,n)][lo=q(2i,n)] (i=K 对, n=oc 列)。
+ * 数学: out[pos(k,n)] = f32_to_f16(f16_to_f32(d_n) * (q(k,n)-8)), RNE。
+ * 输出: 每 tile 1024 f16 crouton (16×64f16), pos(k,n)=(k>>1)*64+2n+(k&1)。
+ * 与 oplist_exec 标量 T017 LUT 分支逐位同 (f32 中间 + RNE)。
+ * lane 序 = pair-interleave (crouton), 非 ggml core_dot row-major pair。
+ * dst/src 均按 tile 连续 (c-major × kt 序), n_tiles = n_col*n_dot。 */
+void hvhx_v2_dequant_q4_0_crouton(uint16_t * __restrict__ dst,
+                                  const uint8_t * __restrict__ src,
+                                  uint32_t n_tiles);
+
 /* ---- broadcast 纯搬运原语 (007 US1; 位级 = 标量逐元素拷贝, 无数值语义) ----
  * fill: dst[i] = s;  copy: dst[i] = src[i], i ∈ [0, n)。
  * HVX 主体 + 首/尾标量; 任意地址安全。host 路径标量。 */

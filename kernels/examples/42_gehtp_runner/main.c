@@ -35,8 +35,12 @@
 #define GEHTP_JOB_PATH "/data/local/tmp/hvxhmx23/gehtp/job.txt"
 #endif
 #define JOB_PATH GEHTP_JOB_PATH
-/* PROF W-P2: 逐 op 时间戳对产物 (host gehtp run 拉回, gehtp_prof.py 消费) */
+/* PROF W-P2: 逐 op 时间戳对产物 (host gehtp run 拉回, gehtp_prof.py 消费)。
+ * 变体构建可 -DOP_TS_PATH 私有化 (与 GEHTP_JOB_PATH/RESULT_NAME 同律,
+ * 共享板上防 op_ts 撞车)。 */
+#ifndef OP_TS_PATH
 #define OP_TS_PATH "/data/local/tmp/hrt/gehtp/op_ts.bin"
+#endif
 
 /* op_ts.bin 线格式 (全小端): magic 'WTS1' u32 | ver u32 | n_ops u32 | pad u32
  * | exec_wall_us u64 | n_ops × wt_op_ts 记录 (相对 exec 入口)。

@@ -318,3 +318,91 @@ void hvhx_v2_copy_f16(uint16_t * __restrict__ dst,
 #endif
 }
 
+/* ---- Q4_0 反量化 + crouton pack (013; 契约见 hvxhmx_v2_binary.h) ----
+ * ref = oplist_exec T017 LUT 分支的逐位同款: d*(q-8) 在 f32 精确
+ * (≤15 位有效数 < 24), 唯一舍入点 = f32→f16 RNE; u32 对写
+ * (hi<<16)|lo 即 crouton pair-interleave 面 pos(k,n)=(k>>1)*64+2n+(k&1)。 */
+static void hb_dequant_q4_0_crouton_ref(uint16_t * __restrict__ dst,
+                                        const uint8_t * __restrict__ src,
+                                        uint32_t n_tiles)
+{
+    for (uint32_t t = 0; t < n_tiles; ++t) {
+        const uint8_t * qt = src + (size_t)t * 640u;
+        const uint16_t * dv = (const uint16_t *)(const void *)(qt + 512u);
+        uint32_t * tile32 = (uint32_t *)(void *)(dst + (size_t)t * 1024u);
+        for (uint32_t cp = 0; cp < 16u; ++cp) {
+            const uint8_t * qb = qt + cp * 32u;
+            for (uint32_t n = 0; n < 32u; ++n) {
+                float d = hb_f16_to_f32(dv[n]);
+                uint32_t b = qb[n];
+                tile32[cp * 32u + n] =
+                    ((uint32_t)hb_f32_to_f16(d * (float)((int)(b >> 4) - 8)) << 16)
+                    | hb_f32_to_f16(d * (float)((int)(b & 0xFu) - 8));
+            }
+        }
+    }
+}
+
+void hvhx_v2_dequant_q4_0_crouton(uint16_t * __restrict__ dst,
+                                  const uint8_t * __restrict__ src,
+                                  uint32_t n_tiles)
+{
+#if HVX_V2_KERNELS_ENABLED
+    /* vmem 对齐存储要求; 未对齐 dst 回落 ref (调用点 wgt_cr 由 HMX carve
+     * 128B 对齐, 此为防御) */
+    if (((uintptr_t)dst & 127u) != 0u) {
+        hb_dequant_q4_0_crouton_ref(dst, src, n_tiles);
+        return;
+    }
+    const HVX_Vector nib_mask = Q6_Vb_vsplat_R(0x0F);
+    /* 整数→f32 无舍入: 位拼 2^23+q (vor, q≤15 与尾数位不相交) 再减
+     * (2^23+8) = f32(q-8) 精确 */
+    const HVX_Vector magic = Q6_V_vsplat_R(0x4B000000u);
+    const HVX_Vector base  = hvx_vec_splat_f32(8388616.0f);
+    for (uint32_t t = 0; t < n_tiles; ++t) {
+        const uint8_t * qt = src + (size_t)t * 640u;
+        /* 缩放: v_sc = [d0..d31 | 垃圾], f16→f32 (C 序) 的 lo 半即
+         * f32 lane n = d_n, 一次乘法覆盖 n=0..31 (垃圾全落 hi 弃用) */
+        HVX_Vector v_sc = hvx_vmemu(qt + 512);
+        HVX_Vector scale = Q6_V_lo_W(hvx_vec_f16_to_f32(v_sc));
+        for (uint32_t g = 0; g < 4u; ++g) {
+            HVX_Vector vq = hvx_vmemu(qt + g * 128);
+            /* 低 nibble = K 偶行, 高 nibble = K 奇行 (板探针 S1 证实);
+             * vshuff(Vh,Vl,-1) 字节交织: mix.lo = 前半 [e,o,e,o..],
+             * mix.hi = 后半 → 交织序即 K 偶/奇逐列对 */
+            HVX_Vector v_e = Q6_V_vand_VV(vq, nib_mask);
+            HVX_Vector v_o = Q6_Vub_vlsr_VubR(vq, 4);
+            HVX_VectorPair mix = Q6_W_vshuff_VVR(v_o, v_e, -1);
+            for (uint32_t h = 0; h < 2u; ++h) {
+                HVX_Vector half = h ? Q6_V_hi_W(mix) : Q6_V_lo_W(mix);
+                /* vzxt = vunpack 奇偶拆分 (板探针 S2 证实, 非位置序):
+                 * w16.lo = K 偶行 u16, w16.hi = K 奇行 u16;
+                 * 每 64 lane = 2 个 cp 各 32 列 (n 序) */
+                HVX_VectorPair w16 = Q6_Wuh_vzxt_Vub(half);
+                /* u16→u32 又按 n 奇偶拆 → vshuff -4 (u32 粒度, 板探针实测) 交织复原
+                 * lo=cpA n 序 / hi=cpB n 序 */
+                HVX_VectorPair w32e = Q6_Wuw_vzxt_Vuh(Q6_V_lo_W(w16));
+                HVX_VectorPair w32o = Q6_Wuw_vzxt_Vuh(Q6_V_hi_W(w16));
+                HVX_VectorPair rec_e =
+                    Q6_W_vshuff_VVR(Q6_V_hi_W(w32e), Q6_V_lo_W(w32e), -4);
+                HVX_VectorPair rec_o =
+                    Q6_W_vshuff_VVR(Q6_V_hi_W(w32o), Q6_V_lo_W(w32o), -4);
+                for (uint32_t c = 0; c < 2u; ++c) {
+                    HVX_Vector qe = hvx_vec_sub_f32_f32(Q6_V_vor_VV(
+                        c ? Q6_V_hi_W(rec_e) : Q6_V_lo_W(rec_e), magic), base);
+                    HVX_Vector qo = hvx_vec_sub_f32_f32(Q6_V_vor_VV(
+                        c ? Q6_V_hi_W(rec_o) : Q6_V_lo_W(rec_o), magic), base);
+                    HVX_Vector pe = hvx_vec_mul_f32_f32(qe, scale);
+                    HVX_Vector po = hvx_vec_mul_f32_f32(qo, scale);
+                    /* f32→f16 RNE 交织版 (_shuff): 偶 lane=pe(K 偶行), 奇=po —— 板探针 SC 实证即 crouton 序 */
+                    hvx_vmem(dst + ((size_t)t * 16u + g * 4u + h * 2u + c) * 64u) =
+                        hvx_vec_f32_to_f16_shuff(pe, po);
+                }
+            }
+        }
+    }
+#else
+    hb_dequant_q4_0_crouton_ref(dst, src, n_tiles);
+#endif
+}
+
