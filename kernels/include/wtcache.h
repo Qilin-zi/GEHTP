@@ -63,6 +63,10 @@ void wtcache_layout(const struct wtcache_ctx* ctx,
                     void** vtcm_base, uint32_t* vtcm_size,
                     void** pin_base, uint32_t* pin_cap);
 
+/* 013 A 段 (R6): 本进程全 VTCM flush 次数 (= wtcache_open 次数)。
+ * 布局 blob 期望恒 1 (装载期一次); >1 = teardown/re-acquire 探戈发生。 */
+uint32_t wtcache_flush_count(void);
+
 /* ============================================================
  * 1-C-α: 权重 pin (tcm_migration 等价)
  * ============================================================ */

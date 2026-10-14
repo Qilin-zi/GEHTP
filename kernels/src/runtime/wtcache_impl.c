@@ -43,6 +43,10 @@ volatile int g_wtc_mb_count = 0;
 volatile void* g_wtc_mb_last_dst = 0;
 volatile int g_wtc_mb_last_slot = -1;
 
+/* 013 A 段 (R6): 全 VTCM flush 计数 (wtcache_open 各一次) */
+static uint32_t g_flush_count = 0;
+uint32_t wtcache_flush_count(void) { return g_flush_count; }
+
 /* round v up to next multiple of a (power of 2) */
 static inline uint32_t round_up(uint32_t v, uint32_t a) {
     return (v + a - 1u) & ~(a - 1u);
@@ -152,9 +156,11 @@ int wtcache_open(struct wtcache_ctx** out, uint32_t pin_cap_bytes) {
     memset(c->vtcm_base, 0, c->vtcm_size);
     /* V2.2 修复 (dualdomain run3 / wt_repack W4 同族根因): memset 是 CPU write-back
      * 写, 留下 dirty 零行; 之后 HMX 直写 VTCM 的面 (e.out) 会被这些行逐出时用 0
-     * 覆盖。open 末尾对全 VTCM 一次 FLUSH 把零行落定, 后续任何 carve 面都干净。 */
+     * 覆盖。open 末尾对全 VTCM 一次 FLUSH 把零行落定, 后续任何 carve 面都干净。
+     * 013 A 段 (R6): 计数 —— 布局 blob 全 run 期望恒 1, >1 = 探戈发生。 */
     qurt_mem_cache_clean((qurt_addr_t)c->vtcm_base, c->vtcm_size,
                          QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    g_flush_count++;
 
     /* 布局: pin → ring_in → ring_out → temp. ring 区在 ring_init 时再切. */
     c->pin_cap = pin_cap_bytes ? pin_cap_bytes : (WTC_DEFAULT_PIN_MB << 20);

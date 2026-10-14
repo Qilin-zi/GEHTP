@@ -1,0 +1,39 @@
+=== 016r_gehtp_runner ===
+M0 after ex_open
+=== 016r_gehtp_runner (generic WTOP runner) ===
+M1 before job read
+M2 job read 187
+M3 job keys ok /data/local/tmp/hvxhmx23/gehtp/qwen35_08b_fused_pp.wtop /data/local/tmp/hvxhmx23/gehtp/out_016r_gdn.f16.raw
+[prof] per-op optrace OFF
+[prof] op_ts full (每 op 记录, 口径=全量逐条)
+M4 wgt_size=(none)
+M5 blob 2013524352 in 128
+M6 before wt_parse
+M7 wt_parse ok
+M8 before weights load
+[ext-weights] no /data/local/tmp/hvxhmx23/gehtp/qwen35_08b_fused_pp.weights.bin (fallback to inline weights)
+M10 before wt_exec_run_io
+M11 exec done rc=0 total_us=2761546
+[timing] ops=884 sum_op_us=2742309 wall_us=2761546 ops_per_sec=320.1
+op_timing code=7 n=67 total_us=2836 avg_us=42.3 max_us=69
+op_timing code=11 n=99 total_us=122344 avg_us=1235.8 max_us=5357
+op_timing code=12 n=161 total_us=26760 avg_us=166.2 max_us=1329
+op_timing code=13 n=6 total_us=370 avg_us=61.7 max_us=62
+op_timing code=14 n=25 total_us=846 avg_us=33.8 max_us=106
+op_timing code=15 n=69 total_us=945 avg_us=13.7 max_us=44
+op_timing code=20 n=4 total_us=4898 avg_us=1224.5 max_us=4492
+op_timing code=24 n=181 total_us=1032689 avg_us=5705.5 max_us=11290
+op_timing code=25 n=79 total_us=249581 avg_us=3159.3 max_us=5558
+op_timing code=26 n=92 total_us=1806 avg_us=19.6 max_us=865
+op_timing code=27 n=31 total_us=11768 avg_us=379.6 max_us=1925
+op_timing code=28 n=2 total_us=28 avg_us=14.0 max_us=15
+op_timing code=35 n=32 total_us=429554 avg_us=13423.6 max_us=13683
+op_timing code=36 n=18 total_us=202768 avg_us=11264.9 max_us=11279
+op_timing code=37 n=18 total_us=655116 avg_us=36395.3 max_us=36649
+[timing] slowest op#230 code=37 us=36649
+[prof] op_ts.bin 884 ops
+M12 wrote 15892480 bytes
+[run] seg_us read=3906475 parse=13718 wgt=26513 exec=2761546 write=26848 wall=7243255
+[PASS] 884 ops, out temp 96 = 15892480 bytes -> /data/local/tmp/hvxhmx23/gehtp/out_016r_gdn.f16.raw
+[PASS] 42_gehtp_runner overall
+--- summary: 0 pass, 0 fail ---

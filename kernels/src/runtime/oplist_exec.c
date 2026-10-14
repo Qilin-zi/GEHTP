@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <HAP_perf.h>
+#include <HAP_farf.h>
 #include <qurt.h>
 
 #include "dc_parts.h"
@@ -75,6 +76,13 @@ struct wt_exec {
     uint8_t* vtcm_pool;
     uint32_t vtcm_pool_size;
     uint32_t wtcache_pin_cap;   /* 010 T006: TEMPOFF pin_cap(字节, 0=不 pin → 回退 4096) */
+    /* 013 A 段 T016: TEMPOFF 尾随布局段解析结果 (has_layout=1 才有效)。
+     * 装载期按此一次分区 (pin/arena/resident 三区互斥, VTCM-base 相对);
+     * 无布局段(旧 blob)走 legacy 懒初始化探戈路径, 零回归。 */
+    int has_layout;
+    uint32_t layout_pin_off, layout_pin_sz;
+    uint32_t layout_arena_off, layout_arena_sz;
+    uint32_t layout_resid_off, layout_resid_sz;
     uint32_t wt_resident_slot;   /* 010 US1: 当前驻留 VTCM 的权重 slot (0xFFFFFFFF=无) */
     uint32_t bias_resident_slot; /* 010 US1: 当前驻留 VTCM 的 bias slot (0xFFFFFFFF=无) */
     uint32_t vtcm_off_arr[MAX_TEMPS];
@@ -329,8 +337,13 @@ static int vtcm_pool_ensure(void) {
         /* 反向互斥回收 (同 exec_matmul): 前置 f16/conv HMX 快路径
          * hmx_runtime_setup 持全量 VTCM → 二次 acquire 必失败, 先让出。
          * attach 模式下 base 借自 wtcache 时 engine_ready 必已置位,
-         * 不会走到本分支, teardown 清指针不伤 wtcache 的 ctx。 */
-        if (hmx_runtime_get_vtcm_base()) hmx_runtime_teardown();
+         * 不会走到本分支, teardown 清指针不伤 wtcache 的 ctx。
+         * 013 A 段 T016: has_layout 时装载期已一次分区 (engine_ready 恒 1),
+         * 探戈禁令 — 不再 teardown 让出 (本分支对 has_layout 是死代码)。 */
+        if (!g_exec.has_layout && hmx_runtime_get_vtcm_base()) {
+            hmx_runtime_teardown();
+            g_exec.st.tango++;   /* 013 A 段: 探戈取证 (旧路径独有) */
+        }
         if (wtcache_open(&g_exec.wc, wtcache_pin_arg()) != WTC_OK) return -1;
         g_exec.engine_ready = 1;
     }
@@ -631,14 +644,22 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
              * 持全量 VTCM 且从不释放 → 同进程二次 acquire 返 0 (WTC_ERR_VTCM_ACQUIRE)。
              * 先 teardown 让出再独占。teardown 对 attach 模式只清指针 (ctx 归
              * wtcache), 但 engine_ready=0 + base 非 NULL 只能是自有 ctx, 安全。
-             * 反向 (wtcache 先开, f16 后到) 走 attach 共享 scratch 区, 不冲突。 */
-            if (hmx_runtime_get_vtcm_base()) hmx_runtime_teardown();
+             * 反向 (wtcache 先开, f16 后到) 走 attach 共享 scratch 区, 不冲突。
+             * 013 A 段 T016: has_layout 时装载期已开 wtcache (engine_ready=1),
+             * 本 !engine_ready 分支是死代码; teardown 再显式禁探戈。 */
+            if (!g_exec.has_layout && hmx_runtime_get_vtcm_base()) {
+                hmx_runtime_teardown();
+                g_exec.st.tango++;   /* 013 A 段: 探戈取证 (旧路径独有) */
+            }
             rc = wtcache_open(&g_exec.wc, wtcache_pin_arg());
             if (rc != WTC_OK) { snprintf(err, errn, "wtcache 0x%X", rc); return -1; }
         }
         void* vb = NULL; uint32_t vs = 0; void* pb = NULL; uint32_t pc = 0;
         wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
-        uint32_t off = (pc + 2047u) & ~2047u;
+        /* 013 A 段: has_layout 时 carve 基址查表 (装载期已验 == align2048(pc));
+         * 旧 blob 保持运行时反推 (零回归)。 */
+        uint32_t off = g_exec.has_layout ? g_exec.layout_arena_off
+                                         : ((pc + 2047u) & ~2047u);
         if (!vb || off >= vs) {
             snprintf(err, errn, "vtcm no room (off %u vs %lu)",
                      (unsigned)off, (unsigned long)vs);
@@ -680,8 +701,17 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
             return -1;
         }
         /* wtcache_open 末尾 memset(VTCM,0) 留 dirty 零行, 驱逐会覆盖 HMX 直写的 e.out
-         * (dualdomain run3 同根因); FLUSH 全 VTCM 一次清干净 */
-        qurt_mem_cache_clean((qurt_addr_t)vb, vs, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+         * (dualdomain run3 同根因); FLUSH 清干净。013 A 段 T016 (R6 flush 收敛):
+         * has_layout 时装载期已全 VTCM flush 一次, re-carve 仅 flush arena 区段;
+         * 旧 blob (无布局段) 保持全 VTCM flush (零回归)。 */
+        if (g_exec.has_layout) {
+            qurt_mem_cache_clean((qurt_addr_t)((uint8_t*)vb + g_exec.layout_arena_off),
+                                 g_exec.layout_resid_off - g_exec.layout_arena_off,
+                                 QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            g_exec.st.arena_flush++;   /* 013 A 段 (R6): arena 区段 flush 计数 */
+        } else {
+            qurt_mem_cache_clean((qurt_addr_t)vb, vs, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+        }
         g_exec.engine_ready = 1;
         g_exec.matmul_carved = 1;
         g_exec.carve_op = g_current_op_global;
@@ -747,6 +777,16 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
 }
 
 void wt_exec_shutdown(void) {
+    /* 013 A 段 (R6) 收口取证: 布局 blob 期望 layout=1 / full_vtcm_flush=1 /
+     * tango=0。memset st 前打印; FARF 不保证进 logcat, 同值补写 optrace
+     * (文件通道, 设备取证正典)。 */
+    FARF(ALWAYS, "013 A-seg summary: layout=%u full_vtcm_flush=%u arena_flush=%u tango=%u",
+         (unsigned)g_exec.has_layout, wtcache_flush_count(),
+         g_exec.st.arena_flush, g_exec.st.tango);
+    rtrace("013 A-seg summary layout", g_exec.has_layout);
+    rtrace("013 A-seg summary full_vtcm_flush", (int)wtcache_flush_count());
+    rtrace("013 A-seg summary arena_flush", (int)g_exec.st.arena_flush);
+    rtrace("013 A-seg summary tango", (int)g_exec.st.tango);
     memset(&g_exec.st, 0, sizeof(g_exec.st));
     g_exec.pinned_count = 0;
     if (g_exec.engine_ready) {
@@ -769,6 +809,7 @@ void wt_exec_shutdown(void) {
     if (hmx_runtime_is_attached()) hmx_runtime_teardown();
     g_exec.vtcm_pool = NULL;
     g_exec.vtcm_pool_size = 0;
+    g_exec.has_layout = 0;   /* 013 A 段 T016: 下个 run 重新解析布局段 */
     g_exec.wtcache_pin_cap = 0;
     g_exec.carve_op = 0xFFFFFFFFu;
     g_exec.carve_live_end = 0u;
@@ -887,7 +928,21 @@ static int exec_conv2d_hmx(const uint16_t* cols, const uint16_t* wm,
      * 二次 HAP acquire 同进程必失败, 旧行为=静默回落标量 (t2l 16 个 f16
      * matmul 全标量的根因)。scratch 会覆盖 W4A16 arena → 强制重 carve。 */
     if (hmx_runtime_get_vtcm_base() == NULL) {
-        if (g_exec.engine_ready) {
+        if (g_exec.has_layout) {
+            /* 013 A 段 invariant #2: 查表有界 arena attach (零运行时布局决策)。
+             * conv 不在 hmx_arena_max_of 闭式内 → arena 可能盖不住本 op,
+             * 返回 -1 回落标量 (emit 侧 BudgetReport 已点名 uncovered)。 */
+            void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+            if (!vb || g_exec.layout_arena_sz == 0u) {
+                snprintf(err, errn, "conv2d arena empty (layout)");
+                return -1;
+            }
+            rtrace("hmx attach arena", (int)g_exec.layout_arena_sz);
+            hmx_runtime_setup_region((uint8_t*)vb + g_exec.layout_arena_off,
+                                     g_exec.layout_arena_sz);
+            g_exec.matmul_carved = 0;
+        } else if (g_exec.engine_ready) {
             void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
             wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
             uint32_t off = (pc + 2047u) & ~2047u;
@@ -1970,7 +2025,21 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
      * 区, 不再整体放弃 (旧行为=静默回落标量)。scratch 覆盖 W4A16 arena →
      * matmul_carved 清零, 下一个 W4A16 op 重 carve。 */
     if (hmx_runtime_get_vtcm_base() == NULL) {
-        if (g_exec.engine_ready) {
+        if (g_exec.has_layout) {
+            /* 013 A 段 invariant #2: 查表有界 arena attach (零运行时布局决策)。
+             * arena_sz = hmx_arena_max_of 闭式 ≥ 本 op mm need (装载期已验
+             * 三区互斥) — 不再运行时 [align2048(pc), vs-pool) 反推。 */
+            void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+            if (!vb || g_exec.layout_arena_sz == 0u) {
+                snprintf(err, errn, "matmul_f16 arena empty (layout)");
+                return -1;
+            }
+            rtrace("hmx attach arena", (int)g_exec.layout_arena_sz);
+            hmx_runtime_setup_region((uint8_t*)vb + g_exec.layout_arena_off,
+                                     g_exec.layout_arena_sz);
+            g_exec.matmul_carved = 0;
+        } else if (g_exec.engine_ready) {
             void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
             wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
             uint32_t off = (pc + 2047u) & ~2047u;
@@ -2795,12 +2864,13 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
         uint32_t cap, reserve, pin_cap, n;
         memcpy(&cap, p, 4); memcpy(&reserve, p + 4, 4); memcpy(&pin_cap, p + 8, 4); memcpy(&n, p + 12, 4);
         if (len < 16u + n * 12u) { snprintf(err, errn, "tempoff table short"); return -1; }
-        if (cap == 0 || cap > 0x80000000u) { snprintf(err, errn, "tempoff cap bad"); return -1; }
+        /* 013 A 段 T016: cap=0 = 全 VTCM 驻留图 (无 DDR temp) — emit 合法产物 */
+        if (cap > 0x80000000u) { snprintf(err, errn, "tempoff cap bad"); return -1; }
         uint32_t vtcm_cap = (reserve >> 16) * 1024u;
         reserve = (reserve & 0xFFFFu) * 1024u;
         g_exec.wtcache_pin_cap = pin_cap;  /* 010 T006: 0=不 pin → wtcache_open 回退 4096 */
-        uint8_t* pool = memalign(128, (size_t)cap + reserve);
-        if (!pool) { snprintf(err, errn, "tempoff pool alloc"); return -1; }
+        uint8_t* pool = (cap + reserve) ? memalign(128, (size_t)cap + reserve) : NULL;
+        if ((cap + reserve) && !pool) { snprintf(err, errn, "tempoff pool alloc"); return -1; }
         for (uint32_t i = 0; i < n; i++) {
             const uint8_t* e = p + 16 + i * 12;
             uint32_t tid, off, sz;
@@ -2833,8 +2903,77 @@ static int wt_exec_load_tempoff(const struct wt_blob* b, char* err, size_t errn)
         /* VTCM 驻留池: wtcache 布局(引擎初始化时补 VTCM 基址) */
         g_exec.vtcm_pool_size = vtcm_cap;
         g_exec.vtcm_pool = NULL;  /* 懒初始化: 首个 VTCM 消费 op 时开 wtcache */
+        /* 013 A 段 T016: 尾随布局段解析 (magic 'VTCL')。存在 → 装载期一次分区;
+         * 缺省 → legacy 懒初始化探戈路径 (旧 blob 零回归)。布局段紧跟 temp 表:
+         * [magic][ver][pin{off,sz}][arena{off,sz}][resid{off,sz}] 共 32B。 */
+        g_exec.has_layout = 0;
+        if (len >= 16u + n * 12u + WT_TEMPOFF_LAYOUT_BYTES) {
+            const uint8_t* q = p + 16 + n * 12;
+            uint32_t lmagic;
+            memcpy(&lmagic, q, 4);
+            if (lmagic == WT_TEMPOFF_LAYOUT_MAGIC) {
+                memcpy(&g_exec.layout_pin_off, q + 8, 4);
+                memcpy(&g_exec.layout_pin_sz, q + 12, 4);
+                memcpy(&g_exec.layout_arena_off, q + 16, 4);
+                memcpy(&g_exec.layout_arena_sz, q + 20, 4);
+                memcpy(&g_exec.layout_resid_off, q + 24, 4);
+                memcpy(&g_exec.layout_resid_sz, q + 28, 4);
+                g_exec.has_layout = 1;
+            }
+        }
         tp = p; tn = n; tvtcm_cap = vtcm_cap;
         break;
+    }
+    /* 013 A 段 T016: 装载期一次分区 (探戈消解)。has_layout 时 wtcache 在装载期
+     * 一次性 acquire 全 VTCM (此后 f16/conv attach、W4A16 carve、驻留池都读同一
+     * 张表, 零运行时布局决策、零 teardown/re-acquire)。驻留池基址直接取表中
+     * resid_off, 不再运行时 vs-pool_size 反推。旧 blob (无布局段) 保持懒初始化
+     * 探戈路径。表↔实际 acquire 的 drift 在装载期硬报错 (不许落到运行时)。 */
+    if (g_exec.has_layout && !g_exec.engine_ready) {
+        uint32_t pin_sz = g_exec.layout_pin_sz ? g_exec.layout_pin_sz : 4096u;
+        if (wtcache_open(&g_exec.wc, pin_sz) != WTC_OK) {
+            snprintf(err, errn, "layout wtcache open fail");
+            return -1;
+        }
+        g_exec.engine_ready = 1;
+        void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+        wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+        if (!vb || g_exec.layout_resid_off + g_exec.layout_resid_sz > vs) {
+            snprintf(err, errn, "layout resid oob (off %u sz %u vs %u)",
+                     (unsigned)g_exec.layout_resid_off,
+                     (unsigned)g_exec.layout_resid_sz, (unsigned)vs);
+            return -1;
+        }
+        /* 三区互斥 + arena 基址=表驱动 pin 端 (装载期 drift 硬报错, 不落运行时) */
+        if (g_exec.layout_arena_off != ((pin_sz + 2047u) & ~2047u)) {
+            snprintf(err, errn, "layout arena off %u != align2048(pin %u)",
+                     (unsigned)g_exec.layout_arena_off, (unsigned)pin_sz);
+            return -1;
+        }
+        if (g_exec.layout_arena_off + g_exec.layout_arena_sz >
+            g_exec.layout_resid_off) {
+            snprintf(err, errn, "layout overlap: arena [%u,%u) resid [%u,%u)",
+                     (unsigned)g_exec.layout_arena_off,
+                     (unsigned)(g_exec.layout_arena_off + g_exec.layout_arena_sz),
+                     (unsigned)g_exec.layout_resid_off,
+                     (unsigned)(g_exec.layout_resid_off + g_exec.layout_resid_sz));
+            return -1;
+        }
+        if (g_exec.vtcm_pool_size) {
+            if (g_exec.layout_resid_sz != g_exec.vtcm_pool_size) {
+                snprintf(err, errn, "layout resid sz drift %u != pool %u",
+                         (unsigned)g_exec.layout_resid_sz,
+                         (unsigned)g_exec.vtcm_pool_size);
+                return -1;
+            }
+            g_exec.vtcm_pool = (uint8_t*)vb + g_exec.layout_resid_off;
+        }
+        FARF(ALWAYS, "013 A-seg layout: pin[0,%u) arena[%u,%u) resid[%u,%u)",
+             (unsigned)pin_sz,
+             (unsigned)g_exec.layout_arena_off,
+             (unsigned)(g_exec.layout_arena_off + g_exec.layout_arena_sz),
+             (unsigned)g_exec.layout_resid_off,
+             (unsigned)(g_exec.layout_resid_off + g_exec.layout_resid_sz));
     }
     /* 003 T013: carve footer ↔ TEMPOFF 双源对拍(重数匹配)。emit 侧已有同款
      * 检查, 这里防 blob 被拼接/改写/异版工具产出后的静默布局漂移 —— 漂移时
@@ -3521,7 +3660,10 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
 }
 
 void wt_exec_get_stats(struct wt_exec_stats* st) {
-    if (st) *st = g_exec.st;
+    if (st) {
+        *st = g_exec.st;
+        st->full_flush = wtcache_flush_count();  /* 013 A 段: flush 计数归 wtcache 管 */
+    }
 }
 
 /* 执行全部 op。返回 0=全过; >0 = 失败的 op 序号 (1 基); engine_m 回传 MATMUL 的 M。

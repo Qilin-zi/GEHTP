@@ -1,0 +1,25 @@
+=== 016c_gehtp_runner ===
+M0 after ex_open
+=== 016c_gehtp_runner (generic WTOP runner) ===
+M1 before job read
+M2 job read 176
+M3 job keys ok /data/local/tmp/hvxhmx23/gehtp/blob_res_016.wtop /data/local/tmp/hvxhmx23/gehtp/res_016c.f16.raw
+[prof] per-op optrace OFF
+[prof] op_ts full (每 op 记录, 口径=全量逐条)
+M4 wgt_size=(none)
+M5 blob 147840 in 16384
+M6 before wt_parse
+M7 wt_parse ok
+M8 before weights load
+[ext-weights] no /data/local/tmp/hvxhmx23/gehtp/blob_res_016.weights.bin (fallback to inline weights)
+M10 before wt_exec_run_io
+M11 exec done rc=0 total_us=29537
+[timing] ops=2 sum_op_us=3837 wall_us=29537 ops_per_sec=67.7
+op_timing code=24 n=2 total_us=3837 avg_us=1918.5 max_us=2145
+[timing] slowest op#0 code=24 us=2145
+[prof] op_ts.bin 2 ops
+M12 wrote 16384 bytes
+[run] seg_us read=15285 parse=13138 wgt=28589 exec=29537 write=2610 wall=219033
+[PASS] 2 ops, out temp 1 = 16384 bytes -> /data/local/tmp/hvxhmx23/gehtp/res_016c.f16.raw
+[PASS] 42_gehtp_runner overall
+--- summary: 0 pass, 0 fail ---

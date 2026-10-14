@@ -48,15 +48,29 @@
 
 ---
 
-## US-A — VTCM 静态布局（T013/T014 完成，T015-T017 待设备门）
+## US-A — VTCM 静态布局（已收口 2026-10-14：T013-T017 全绿）
 
-**T013/T014（A 段地基，host 侧可验部分）已完成** commit `cdc6610`：
+**T013/T014（地基，commit `cdc6610`）**：
 
 - **T013** `wtop_emit.cpp`：TEMPOFF temp 表后追加 32B 布局段 `[magic 'VTCL'][ver 1][region_pin{off,size}][region_arena{off,size}][region_resident{off,size}]`。三区 VTCM-base 相对、互斥：pin=[0,pin_cap)、arena=[align2048(pin_cap), +hmx_arena_max)、resident 尾倒划到 16MB 顶。`hmx_arena_max_of()` 覆盖 f16 matmul / W4A16 / SPLIT 三形态。旧运行时 `len<16+n*12` 是 `<` 非 `==`，尾随段向后兼容。
 - **T014** `hmx_common.c`：新增 `hmx_runtime_setup_region(void* base, unsigned size)`（base=0→全量 setup；base!=0→attach 共享 scratch）。不改 `hmx_runtime_setup(size)` 签名（会毁 ~20 旧调用点 UB），旧调用点零扰动。
-- **验证**：host build exit 0；ctest 50/50；`test_vtcm_auto` 三形态（pin_cap 0 / 0 / 16384）magic/ver/三区 self-consistent 全绿。
 
-**T015-T017（设备门，未开始）**：`wtcache_impl.c` 布局表驱动 + `oplist_exec.c` 装载期一次分区/删探戈/flush 收敛。`oplist_exec.c`/`wtcache_impl.c` 仅由 `build_libs.sh`（`hexagon-clang -mv81`）交叉编译，host 无构建路径——**正确性只能板上 d0f1784 验**，编译检查需 SDK 交叉编译。收口判据：f16 md5 f87461e2 / gdn cos ≥0.9999 / op_ts 实证全 VTCM flush=1、探戈零发生。
+**T015/T016（执行器上移，2026-10-14）**：
+
+- **T015** `wtcache.h`/`wtcache_impl.c`：`wtcache_flush_count()`（wtcache_open 计数）；执行器装载期按表 `wtcache_open(pin_sz)`，f16/conv 消费点 `hmx_runtime_setup_region(vb+arena_off, arena_sz)` 表驱动有界 attach——零运行时布局决策。
+- **T016** `oplist_exec.c`：VTCL 解析 → 装载期一次分区 + 三重 drift 硬校验（三区互斥 / arena==align2048(pin) / resid_sz==驻留池）；驻留池基址取表 resid_off；探戈计数全挂 `!has_layout`（布局图恒 0）；re-carve 仅 flush arena 段；carve 基址查表；cap=0（全 VTCM 驻留图）契约修复；关机 FARF+optrace 双通道打 layout/full_flush/arena_flush/tango。
+
+**T017 设备门（板 d0f1784，证据 `evidence/t016-a-seg-gate.md`）**：
+
+- 合成双 matmul 驻留 blob（VTCL+n_vtcm=2，host 逐字节核验）新旧 lib 双跑**位级同**（md5 `ce338fe6`）
+- optrace：`layout=1 full_vtcm_flush=1 arena_flush=0 tango=0`（探戈零发生、装载期恰一次全 VTCM flush；W4A16 re-carve 段 flush 编译在未触发，待 C 段覆盖）
+- f16 线 `f87461e2` 位级同锚（exec 5.99s）；gdn 线 `9d1c0877` 位级同锚（=cos 0.999930/top1 32/32，exec 2.76s）
+
+### A 段收益与诚实定位
+
+- **机制性前置设施落地**：装载期一次分区/探戈消解/flush 收敛/查表 attach 全实跑验证；cap=0 全驻留图合法产物契约修复。
+- **对本轮基准无性能收益也无回归**（位级双确认）：0.8B f16/gdn 基准图无 VTCL 段走 legacy 路径；收益兑现依赖 C 段 + emit 侧驻留规划打开。
+- **过程坑入册**：fastrpc 按 lib 名缓存（重推必须换名）；板上 lib 必须 SWIV 签名版；FARF 不进 logcat（取证走 optrace）。黑话词典 `docs/GEHTP_GLOSSARY.md` 随本段建立。
 
 
 
