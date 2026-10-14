@@ -103,6 +103,7 @@ class PersistentDeviceRuntime:
         self._lock = threading.RLock()
         self._server_pid: Optional[int] = None
         self._job: dict[str, Any] = {}
+        self._so_name: str = "gehtp_persistent.so"
 
     # ---- adb helpers ----
     def _adb(self, *args: str, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
@@ -121,9 +122,14 @@ class PersistentDeviceRuntime:
         return r.stdout
 
     # ---- server lifecycle ----
+    def _pgrep_so(self) -> str:
+        """按 so_name 构造防自匹配的 pgrep -f 模式 (首字符 [x] 括号法)。"""
+        so = self._so_name or "gehtp_persistent.so"
+        return "[" + so[0] + "]" + so[1:]
+
     def server_running(self) -> bool:
         # [g] 方括号防 pgrep -f 自匹配; setsid 后 $! 不可靠, liveness 恒以 pgrep 实测
-        r = self._adb("shell", "pgrep -f '[g]ehtp_persistent.so' || true")
+        r = self._adb("shell", f"pgrep -f '{self._pgrep_so()}' || true")
         return bool(r.stdout.split())
 
     def start_server(
@@ -137,6 +143,7 @@ class PersistentDeviceRuntime:
         so_name: str = "gehtp_persistent.so",
     ) -> dict[str, Any]:
         """启动 DSP 常驻 runner。blob 为设备侧 .wtop 绝对路径 (须已 push)。"""
+        self._so_name = so_name
         if self.server_running():
             # 已有服务器 (含同配置复用场景): ping 通即接管
             try:
@@ -187,7 +194,7 @@ class PersistentDeviceRuntime:
             self._adb("shell", launch, timeout=20.0)
         except subprocess.TimeoutExpired:
             pass
-        r = self._adb("shell", "pgrep -f '[g]ehtp_persistent.so' || true")
+        r = self._adb("shell", f"pgrep -f '{self._pgrep_so()}' || true")
         pids = r.stdout.split()
         if not pids:
             raise PersistentRuntimeError("server launch failed (pgrep empty)")
@@ -219,12 +226,12 @@ class PersistentDeviceRuntime:
             pass
         t0 = time.monotonic()
         while time.monotonic() - t0 < 10.0:
-            r = self._adb("shell", "pgrep -f '[g]ehtp_persistent.so' || true")
+            r = self._adb("shell", f"pgrep -f '{self._pgrep_so()}' || true")
             if not r.stdout.split():
                 self._server_pid = None
                 return
             time.sleep(0.5)
-        r = self._adb("shell", "pgrep -f '[g]ehtp_persistent.so' || true")
+        r = self._adb("shell", f"pgrep -f '{self._pgrep_so()}' || true")
         pids = r.stdout.split()
         if pids:
             self._adb("shell", "kill " + " ".join(pids))
