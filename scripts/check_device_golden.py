@@ -94,6 +94,8 @@ def main():
             pairs.append((f"prompt{i} ", p))
 
     failed = False
+    batch = len(pairs) > 1
+    sum_agree = sum_rows = 0
     for tag, gpath in pairs:
         gold = load_raw(gpath, args.gold_dtype)
         dev_c = dev
@@ -102,14 +104,23 @@ def main():
         elif dev.ndim == 2 and gold.size == dev.shape[1]:
             dev_c = dev[-1:]  # golden 仅末位置 → 只比末行
         cos, maxd, agree, rows = compare(dev_c, gold)
+        sum_agree += agree
+        sum_rows += rows
         line = (f"{tag}cos={cos:.6f} max|d|={maxd:.4f} top1={agree}/{rows}")
         ok = cos >= args.cos_min
-        if top1_total is not None:
-            need = top1_total if len(pairs) == 1 else rows
-            line += f" (门 {top1_hit}/{top1_total})" if len(pairs) == 1 else ""
-            ok = ok and agree >= (top1_hit if len(pairs) == 1 else need)
+        if top1_total is not None and not batch:
+            ok = ok and agree >= top1_hit
+            line += f" (门 {top1_hit}/{top1_total})"
         print(("PASS " if ok else "FAIL ") + line)
         failed = failed or not ok
+
+    if top1_total is not None and batch:
+        # 批量: top1 门按标定命中率作用在合计上。原实现暗改为逐对全对,
+        # 标定带 slack 的门 (如 29/32) 会被悄悄收紧成每对 100%。
+        rate_ok = sum_agree * top1_total >= top1_hit * sum_rows
+        print(f"批量 top1 合计 {sum_agree}/{sum_rows} "
+              f"(门率 {top1_hit}/{top1_total}) {'PASS' if rate_ok else 'FAIL'}")
+        failed = failed or not rate_ok
 
     if failed:
         print("GATE FAIL — 数值回归, 勿部署", file=sys.stderr)

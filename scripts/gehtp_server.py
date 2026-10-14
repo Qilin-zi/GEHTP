@@ -436,7 +436,9 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        # 通配 origin + credentials 是 CORS 规范禁止组合 (浏览器会整体拒绝),
+        # 内部测试服务无 cookie 依赖, 关掉 credentials 保住通配 origin
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -868,7 +870,8 @@ async def health_endpoint() -> Dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser(description="GEHTP OpenAI-Compatible Inference Service")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Host to bind to (对外暴露需显式 --host 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     args = parser.parse_args()

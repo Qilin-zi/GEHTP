@@ -157,18 +157,21 @@ cmd_run() {
         fi
     fi
     adb -s "$device" push "$input" "$GDIR/input.f16.raw" >/dev/null
+    # 本地 job 文件带 $$ 唯一化: 并发 gehtp run 固定同名会互踩 (写/推之间被覆盖)
+    local job_local="/tmp/gehtp_job.$$.txt"
     if [ "$wgt_local_size" -gt 0 ]; then
         printf 'blob %s/%s\ninput %s/input.f16.raw\noutput %s/output.f16.raw\nout_temp %s\nweights_size %s\n' \
-            "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" "$wgt_local_size" > /tmp/gehtp_job.txt
+            "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" "$wgt_local_size" > "$job_local"
     else
         printf 'blob %s/%s\ninput %s/input.f16.raw\noutput %s/output.f16.raw\nout_temp %s\n' \
-            "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" > /tmp/gehtp_job.txt
+            "$GDIR" "$bname" "$GDIR" "$GDIR" "$out_temp" > "$job_local"
     fi
     # PROF W-P2: trace 旗标经 job.txt 下发 (runner 读到 =1 才开 per-op 落盘行)
-    [ "$trace" = 1 ] && printf 'trace 1\n' >> /tmp/gehtp_job.txt
+    [ "$trace" = 1 ] && printf 'trace 1\n' >> "$job_local"
     # 精度排查: hook spec 经 job.txt 下发 (opidx:temp,... 张量 dump)
-    [ -n "$hook_spec" ] && printf 'hook %s\n' "$hook_spec" >> /tmp/gehtp_job.txt
-    adb -s "$device" push /tmp/gehtp_job.txt "$GDIR/job.txt" >/dev/null
+    [ -n "$hook_spec" ] && printf 'hook %s\n' "$hook_spec" >> "$job_local"
+    adb -s "$device" push "$job_local" "$GDIR/job.txt" >/dev/null
+    rm -f "$job_local"
 
     # PROF W-P2: prof 产物目录取 output 同侧 prof/, 键 = blob 名
     local prof_dir; prof_dir="$(dirname "$output")/prof"
