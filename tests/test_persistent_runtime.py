@@ -96,7 +96,8 @@ class TestInit:
         handle = runtime.init("model-1", kv_max=2048)
         assert isinstance(handle, PersistentHandle)
         assert handle.model_id == "model-1"
-        assert handle.kv_max_position == 2048
+        # 句柄容量按 decode 图可寻址真值钳位 (position < MAX_POS)
+        assert handle.kv_max_position == MAX_POS
 
     def test_init_validates_kv_max(self, runtime):
         with pytest.raises(ValueError, match="kv_max must be positive"):

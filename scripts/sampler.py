@@ -64,10 +64,8 @@ def top_k_top_p_filtering(
         if cumulative >= top_p:
             break
 
-    allowed = set(orig_idx for orig_idx, _ in indexed[:cutoff_idx])
-
     filtered = [0.0] * vocab_size
-    for orig_idx, prob in zip(allowed, [p for _, p in indexed[:cutoff_idx]]):
+    for orig_idx, prob in indexed[:cutoff_idx]:
         filtered[orig_idx] = prob
 
     total = sum(filtered)

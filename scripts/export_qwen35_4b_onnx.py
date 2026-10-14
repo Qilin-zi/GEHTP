@@ -17,7 +17,8 @@ import argparse
 import os
 import sys
 
-QPM_ROOT = "/disk2/Qwen35dev/qwen3.5_4b_base/example1"
+QPM_ROOT = os.environ.get("GEHTP_QPM_ROOT",
+"/disk2/Qwen35dev/qwen3.5_4b_base/example1")
 sys.path.insert(0, QPM_ROOT)
 
 # 强制 torch fallback: 环境若装了 CUDA 版 causal_conv1d/FLA,QPM 会走 GPU kernel 崩

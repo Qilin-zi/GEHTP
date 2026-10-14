@@ -13,7 +13,8 @@ import argparse
 import os
 import sys
 
-QPM_ROOT = "/disk2/Qwen35dev/qwen3.5_4b_base/example1"
+QPM_ROOT = os.environ.get("GEHTP_QPM_ROOT",
+"/disk2/Qwen35dev/qwen3.5_4b_base/example1")
 sys.path.insert(0, QPM_ROOT)
 
 import transformers.utils.import_utils as _tf_import

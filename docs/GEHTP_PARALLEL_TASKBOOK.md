@@ -223,6 +223,21 @@
 
 ## 8. 战役日志（追加区，新进展置顶）
 
+### 2026-10-14 0.6B decode 线 — GEMV t1 内核 ILP 修复: step_us 655→118.2ms (5.5×) + M=1 GEMV 上 HMX 路线裁决 NO-GO (85cf28d)
+
+**归因**: 0.6B (Qwen3-0.6B) decode 经 gehtp_proxy 常驻 runner (f3003eb) 稳定 655ms/步 (1.53 tok/s)。op_ts 分解: MATMUL_F16 ×253 = 530.7ms = **91.5% wall** (lm_head 143.8ms + 252 层 FC 386.9ms), 全 HVX 2.0-2.2GB/s (标定 UserDMA 59.9GB/s), Σdma_us=0 — 无任何 staging/tiling 决策参与。
+
+**三臂裁决 (例 50_q6b_gemv_ab, d0f1784, 引擎 ts 实锤 + 确定性整数金标 byte-exact 全门绿)**: "VTCM/tiling 规划" (= 编译期 crouton 布局 + HMX + 线性 DMA 驻场, K=1024/N=2048/W=4MB 同数据同形状) 对 M=1 GEMV 族 **NO-GO**:
+- A M=1 HVX 现状 2596µs (1.50GB/s) ‖ B M=32 HMX 运行时散 pack 35047µs = 0.07× ‖ C M=32 HMX 预打包 crouton+DMA (w_pp=flags bit3) 4664µs = 0.56×。
+- C 已把 pack 消掉 (B→C 7.5×) 但 HMX MMA ~1.75µs/pair ≈ 37GFLOP/s 是发射率墙 (与 0.8B lm_head 37.6 同墙), M=32 单行 tile 喂不饱 HMX — 是发射率墙不是搬运墙。w_pp 机制本身正常, 大 M matmul 仍可用。
+
+**真杠杆落地 (85cf28d, 库 19c988d1, runner 1759b60d, 位级不变)**: t1 gemv 内核 4 列独立累加器交错发射 + hex_l2fetch 前瞻 2 组 (`oplist_exec.c` exec_matmul_f16_gemv); 位级不变量 = 每列 rp 仍 k 升序同一 mpyacc 序 + 标量尾段原样。
+- 单 op: 2596→1021µs (2.54×, 3.83GB/s)。
+- **0.6B E2E decode: step_us 655.0→118.2ms 均值 (p50 118.6/min 115.3/max 119.9) = 8.46 tok/s, token 10/10 位级 == 金标** [13,576,6722,315,15344,374,21718,13,576,6722]; 全图 1.2GB 权重流/步 ÷ 118ms ≈ 10GB/s 聚合 = vmemu-DRAM 实测上限 (ex49 标定) — **带宽已到顶, 下一步空间在字节减半 (W4A16 供给侧)**。
+- 0.8B 各线共享此内核且设备 v23 lib 即此版, 重跑自动受益 (位级不变量保证数值门零回归)。
+
+**坑**: ①重建 session 前必须 `rm req.bin resp.bin` — idle 自退后残留的 shutdown 帧会毒死新 boot 的 runner (首请求即优雅退出); ②单 op 小 N 摊不平启停 (3.83GB/s) vs 全图聚合 10GB/s, 勿用单 op 带宽外推全图。
+
 ### 2026-10-08 003 线 — blob-v3 契约收口(引擎指派/显式回落/carve+TEMPOFF) + 0.8B 全新管线无补丁复现
 
 **blob ver=3 契约落定** (`oplist_parse.h` / `wtop_emit.cpp`):

@@ -14,7 +14,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$BASH_SOURCE[0]")" && pwd)"
-LIB="/disk2/V81Dev/hvxhmx_libsV2.3"
+LIB="${GEHTP_V81_LIB:-/disk2/V81Dev/hvxhmx_libsV2.3}"
 SDK="${HEXAGON_SDK_ROOT:-/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0}"
 HT="$SDK/tools/HEXAGON_Tools/19.0.07"
 CC="$HT/Tools/bin/hexagon-clang"

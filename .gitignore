@@ -40,6 +40,7 @@ test_models/*/prof/
 test_models/minicpm5_2b*/
 test_models/qwen35_4b/
 test_models/qwen3vl_4b*/
+test_models/qwen3_06b/
 
 # CMake ctest 临时目录 (编译器测试运行残留)
 compiler/Testing/

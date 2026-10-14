@@ -61,6 +61,9 @@ void hvhx_v2_sqr_f32      (float * __restrict__ dst, const float * __restrict__ 
 void hvhx_v2_floor_f32    (float * __restrict__ dst, const float * __restrict__ src, uint32_t n);
 void hvhx_v2_truncate_f32 (float * __restrict__ dst, const float * __restrict__ src, uint32_t n);
 
+/* ---- f16 取反 (符号位 XOR, 位级 = 标量 -v; 0.6B decode RoPE Neg 供给) ---- */
+void hvhx_v2_neg_f16      (uint16_t * __restrict__ dst, const uint16_t * __restrict__ src, uint32_t n);
+
 /* ---- 缩放 / 缩放+偏移 ---- */
 void hvhx_v2_scale_f32        (float * __restrict__ dst, const float * __restrict__ src,
                                uint32_t n, float scale);

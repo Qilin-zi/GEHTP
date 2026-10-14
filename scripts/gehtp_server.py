@@ -106,6 +106,10 @@ class RequestQueue:
 
 request_queue = RequestQueue(MAX_CONCURRENT_REQUESTS, MAX_QUEUED_REQUESTS)
 
+# persistent runner 的 KV/SSM 是全局单状态 (设备 reset 不分 handle):
+# 整代生成 (reset→末步) 互斥, 并发请求在此排队; 队列/429 语义不变
+_generation_lock = asyncio.Lock()
+
 # Per-model tokenizer cache (tokenizers are immutable after load)
 _tokenizers: Dict[str, ChatTokenizer] = {}
 
@@ -270,66 +274,38 @@ async def _run_generation(
         yield {"type": "error", "message": "empty prompt (no input tokens)"}
         return
 
-    try:
-        runtime.reset(slot)
-    except DeviceRuntimeError:
-        pass
-
-    position = 0
-    kv_position = 0
-    generated_text = ""
-    last_token_id: Optional[int] = None
-    result: Any = None
-
-    async def _run_step(token_id: int) -> Any:
-        nonlocal position, kv_position
-        r = await asyncio.to_thread(runtime.run, slot, [token_id], position, kv_position)
-        position += 1
-        kv_position += 1
-        return r
-
-    # ---- prompt 相位 ----
-    for tok in input_ids:
-        if await request.is_disconnected():
-            try:
-                runtime.cancel(slot)
-                runtime.reset(slot)
-            except DeviceRuntimeError:
-                pass
-            session.fail()
-            yield {"type": "done", "finish_reason": "cancelled"}
-            return
+    async with _generation_lock:
         try:
-            result = await _run_step(tok)
-        except DeviceRuntimeError as exc:
-            session.fail()
-            yield {"type": "error", "message": f"device error: {exc}"}
-            return
-        except Exception as exc:  # noqa: BLE001 - host-side safety net
-            session.fail()
-            yield {"type": "error", "message": f"runtime error: {exc}"}
-            return
-    try:
-        session.advance(len(input_ids))
-    except ValueError:
-        yield {"type": "done", "finish_reason": "length"}
-        return
+            runtime.reset(slot)
+        except DeviceRuntimeError:
+            pass
 
-    # ---- 生成相位 ----
-    for _ in range(max_tokens):
-        if await request.is_disconnected():
-            try:
-                runtime.cancel(slot)
-                runtime.reset(slot)
-            except DeviceRuntimeError:
-                pass
-            session.fail()
-            yield {"type": "done", "finish_reason": "cancelled"}
-            return
+        position = 0
+        kv_position = 0
+        generated_text = ""
+        last_token_id: Optional[int] = None
+        result: Any = None
 
-        if result is None:
+        async def _run_step(token_id: int) -> Any:
+            nonlocal position, kv_position
+            r = await asyncio.to_thread(runtime.run, slot, [token_id], position, kv_position)
+            position += 1
+            kv_position += 1
+            return r
+
+        # ---- prompt 相位 ----
+        for tok in input_ids:
+            if await request.is_disconnected():
+                try:
+                    runtime.cancel(slot)
+                    runtime.reset(slot)
+                except DeviceRuntimeError:
+                    pass
+                session.fail()
+                yield {"type": "done", "finish_reason": "cancelled"}
+                return
             try:
-                result = await _run_step(last_token_id)
+                result = await _run_step(tok)
             except DeviceRuntimeError as exc:
                 session.fail()
                 yield {"type": "error", "message": f"device error: {exc}"}
@@ -338,50 +314,79 @@ async def _run_generation(
                 session.fail()
                 yield {"type": "error", "message": f"runtime error: {exc}"}
                 return
-
-        if isinstance(result, (list, tuple)):
-            logits = [float(x) for x in result]
-            if not logits:
-                session.fail()
-                yield {"type": "error", "message": "device returned empty logits"}
-                return
-            token_id = greedy_sample(logits) if greedy else sampler.step(logits)[0]
-        else:
-            # Token id from the device: already the sampling decision.
-            token_id = int(result)
-        result = None
-        last_token_id = token_id
-
         try:
-            token_text = tokenizer.decode([token_id])
-        except TokenizerError as exc:
-            session.fail()
-            yield {"type": "error", "message": f"tokenizer decode failed: {exc}"}
-            return
-
-        merged = generated_text + token_text
-        stop_at = _find_stop(merged, stop_sequences)
-        if stop_at >= 0:
-            emitted = merged[:stop_at][len(generated_text):]
-            generated_text = merged[:stop_at]
-            try:
-                session.advance(1)
-            except ValueError:
-                pass
-            if emitted:
-                yield {"type": "token", "token_id": token_id, "text": emitted}
-            yield {"type": "done", "finish_reason": "stop"}
-            return
-
-        generated_text = merged
-        try:
-            session.advance(1)
+            session.advance(len(input_ids))
         except ValueError:
             yield {"type": "done", "finish_reason": "length"}
             return
-        yield {"type": "token", "token_id": token_id, "text": token_text}
 
-    yield {"type": "done", "finish_reason": "length"}
+        # ---- 生成相位 ----
+        for _ in range(max_tokens):
+            if await request.is_disconnected():
+                try:
+                    runtime.cancel(slot)
+                    runtime.reset(slot)
+                except DeviceRuntimeError:
+                    pass
+                session.fail()
+                yield {"type": "done", "finish_reason": "cancelled"}
+                return
+
+            if result is None:
+                try:
+                    result = await _run_step(last_token_id)
+                except DeviceRuntimeError as exc:
+                    session.fail()
+                    yield {"type": "error", "message": f"device error: {exc}"}
+                    return
+                except Exception as exc:  # noqa: BLE001 - host-side safety net
+                    session.fail()
+                    yield {"type": "error", "message": f"runtime error: {exc}"}
+                    return
+
+            if isinstance(result, (list, tuple)):
+                logits = [float(x) for x in result]
+                if not logits:
+                    session.fail()
+                    yield {"type": "error", "message": "device returned empty logits"}
+                    return
+                token_id = greedy_sample(logits) if greedy else sampler.step(logits)[0]
+            else:
+                # Token id from the device: already the sampling decision.
+                token_id = int(result)
+            result = None
+            last_token_id = token_id
+
+            try:
+                token_text = tokenizer.decode([token_id])
+            except TokenizerError as exc:
+                session.fail()
+                yield {"type": "error", "message": f"tokenizer decode failed: {exc}"}
+                return
+
+            merged = generated_text + token_text
+            stop_at = _find_stop(merged, stop_sequences)
+            if stop_at >= 0:
+                emitted = merged[:stop_at][len(generated_text):]
+                generated_text = merged[:stop_at]
+                try:
+                    session.advance(1)
+                except ValueError:
+                    pass
+                if emitted:
+                    yield {"type": "token", "token_id": token_id, "text": emitted}
+                yield {"type": "done", "finish_reason": "stop"}
+                return
+
+            generated_text = merged
+            try:
+                session.advance(1)
+            except ValueError:
+                yield {"type": "done", "finish_reason": "length"}
+                return
+            yield {"type": "token", "token_id": token_id, "text": token_text}
+
+        yield {"type": "done", "finish_reason": "length"}
 
 
 def _sse_chunk(request_id: str, model_id: str, delta: Dict[str, Any], finish_reason: Optional[str]) -> str:
@@ -431,7 +436,9 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        # 通配 origin + credentials 是 CORS 规范禁止组合 (浏览器会整体拒绝),
+        # 内部测试服务无 cookie 依赖, 关掉 credentials 保住通配 origin
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -717,7 +724,7 @@ async def chat_completions(request: Request) -> Response:
                         pass
                     if session.status == SessionStatus.ACTIVE:
                         session.fail()
-                session_manager.release(session.session_id)
+                session_manager.release(session.session_id, remove=True)
                 request_queue.release()
                 metrics.set_active_sessions(session_manager.active_count())
 
@@ -758,13 +765,13 @@ async def chat_completions(request: Request) -> Response:
                 )
                 raise DeviceError(event["message"])
     except Exception:
-        session_manager.release(session.session_id)
+        session_manager.release(session.session_id, remove=True)
         request_queue.release()
         metrics.set_active_sessions(session_manager.active_count())
         raise
 
     if finish_reason == "cancelled":
-        session_manager.release(session.session_id)
+        session_manager.release(session.session_id, remove=True)
         request_queue.release()
         metrics.set_active_sessions(session_manager.active_count())
         raise DeviceError("client disconnected", code="client_disconnected")
@@ -781,7 +788,7 @@ async def chat_completions(request: Request) -> Response:
         generation_latency_ms=generation_latency_ms,
     )
     session_manager.finish(session.session_id)
-    session_manager.release(session.session_id)
+    session_manager.release(session.session_id, remove=True)
     request_queue.release()
     metrics.set_active_sessions(session_manager.active_count())
     logger.info(
@@ -863,7 +870,8 @@ async def health_endpoint() -> Dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser(description="GEHTP OpenAI-Compatible Inference Service")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Host to bind to (对外暴露需显式 --host 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     args = parser.parse_args()

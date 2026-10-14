@@ -150,7 +150,7 @@ def parse_op_ts(path):
             ts.append((s, d, 0, 0, 0, 0, 0, 0))
         elif ver == 2:
             s, d, dus, db, eng = struct.unpack_from("<IIIII", data, off); off += 20
-            ts.append((s, d, dus, db, eng, 0, 0, 0))
+            ts.append((s, d, dus, db, eng, eng, 0, 0))
         elif ver == 3:
             s, d, dus, db, eng, pl, dv = struct.unpack_from("<IIIIIII", data, off); off += 28
             ts.append((s, d, dus, db, eng, pl, dv, 0))

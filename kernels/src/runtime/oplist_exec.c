@@ -41,6 +41,7 @@
 #if defined(__HVX__) || defined(__hexagon__)
 #include "internal/hvx-base.h"  /* GEMV 向量体: hvx_vmemu / hvx_vec_mpyacc_f32_f16 / hvx_vec_f32_to_f16 */
 #include "internal/hvx-fa-kernels.h"  /* HVX_OP_ADD_F32 (vec_dot 收尾通道加) */
+#include "internal/hex-utils.h" /* hex_l2fetch: GEMV t1 权重流 DRAM 延迟预取 */
 #include "internal/hvx-reduce.h"      /* hvx_vec_reduce_sum_f32 (水平归约) */
 #if defined(__hexagon__)
 #include <hexagon_types.h>          /* HMX Q6_* intrinsic 依赖 (Address/UWord32/Word32) */
@@ -1396,7 +1397,10 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
     const uint16_t* x = (const uint16_t*)ref_ptr(b, x_t);
     uint16_t* y = (uint16_t*)temp_get(y_t, n * 2u);
     if (!x || !y) { snprintf(err, errn, "unary ref fail"); return -1; }
-    if (g_rtrace) { fprintf(g_rtrace, "unary x=%p y=%p n=%u sub=%u\n", (void*)x, (void*)y, (unsigned)n, (unsigned)subtype); fflush(g_rtrace); }
+    /* 曾有 if(g_rtrace) fprintf+fflush 调试行在此: rtrace 句柄被 run 级里程碑
+     * 常开打开后, 该行退化为逐 op 落盘 (~900us/op, 0.6B decode 84 unary op/步
+     * ≈75ms/步)。008 T020 只门控了 pre/post 行, 漏了这条。调试走 optrace
+     * pre/post (g_trace_on), 勿再往 exec_* 内加裸 fprintf。 */
     /* HVX 快路径(策略 B): 有 f32 内核的 subtype, n >= 32 时走
      * f16→f32(向量 cvt)→内核(就地)→f32→f16。exp/sigmoid/tanh/silu 定义域
      * 无约束; sqrt/rsqrt/log 标量带负输入钳 0 守卫, 暂留标量避免 NaN 回归。 */
@@ -1425,6 +1429,11 @@ static int exec_unary(const struct wt_blob* b, const struct wt_op* op,
             }
         } else if (subtype == 14) {
             memcpy(y, x, (size_t)n * 2u);
+            hvx_ok = 1;
+        } else if (subtype == 0) {
+            /* NEG: f16 符号位 XOR 向量化 (位级 = 标量 -v, ±0/NaN 同), 免
+             * f32 scratch 往返。0.6B decode RoPE Neg ×56 曾是 16.3% wall。 */
+            hvhx_v2_neg_f16(y, x, n);
             hvx_ok = 1;
         }
         if (hvx_ok) {
@@ -2008,7 +2017,12 @@ static int exec_matmul_f16_gemv(const uint16_t* a, const uint16_t* w, uint16_t* 
     /* 布局 A[M,K] × W[N,K] (t1 转置, 输出行 K 连续): 逐输出列 vec_dot,
      * hvx-fa-kernels.h 同款收尾 (mpyacc pair 累加 → lo+hi 通道加 → 水平
      * 归约)。K 尾数走标量, 免向量过读越界。004 T013: seq1 全部 187 个
-     * M=1 t1 FC (含 lm_head K=1024/N=248320) 走此体。 */
+     * M=1 t1 FC (含 lm_head K=1024/N=248320) 走此体。
+     * 例50 裁决 (2026-10-14): 单列版 load→use 零预取距离, DDR 延迟逐发
+     * 停摆 → 4MB W 只跑出 1.5GB/s (vmemu 流读上限 10GB/s, ex49)。修法 =
+     * 4 列交错 (hvx_dot_f16_f16_aa_rx4 同构): 4 条独立 rp 链 + 每 k 段
+     * 5 个 load 先发后用。位级不变量: 每列 rp 仍是 k 升序同一 mpyacc 序
+     * 列, 标量尾段/收尾不动 — 与单列版逐位同 (例50 金标门守住)。 */
     if (t1 && !t0) {
         for (uint32_t bb = 0; bb < bb_max; ++bb) {
             const uint16_t* ab = a + (size_t)bb * M * K;
@@ -2016,7 +2030,51 @@ static int exec_matmul_f16_gemv(const uint16_t* a, const uint16_t* w, uint16_t* 
             uint16_t* yb = y + (size_t)bb * M * N_full;
             for (uint32_t m = 0; m < M; ++m) {
                 const uint16_t* xb = ab + (size_t)m * K;
-                for (uint32_t n = 0; n < N; ++n) {
+                uint32_t n = 0;
+                /* l2fetch 前瞻两组 (8KB×隔组, 4 行/组连续): DDR→L2 异步预取
+                 * 盖住 ~500cyc 延迟; 组内 4 路 load→use 由 L2 (~40cyc) 喂饱。
+                 * G=4/8 实测 (例50): 8 列寄存器压力回退, 4 列 + 隔组预取最优。
+                 * 仅预取, 数值路径零变化。 */
+                if (n + 4u <= N)
+                    hex_l2fetch(wb + (size_t)(n0 + n) * K,
+                                4u * K * 2u, 4u * K * 2u, 1u);
+                if (n + 8u <= N)
+                    hex_l2fetch(wb + (size_t)(n0 + n + 4u) * K,
+                                4u * K * 2u, 4u * K * 2u, 1u);
+                for (; n + 4u <= N; n += 4u) {
+                    if (n + 12u <= N) {
+                        hex_l2fetch(wb + (size_t)(n0 + n + 8u) * K,
+                                    4u * K * 2u, 4u * K * 2u, 1u);
+                    }
+                    const uint16_t* wr[4];
+                    HVX_VectorPair rp[4];
+                    for (uint32_t g = 0; g < 4u; ++g) {
+                        wr[g] = wb + (size_t)(n0 + n + g) * K;
+                        rp[g] = Q6_W_vzero();
+                    }
+                    uint32_t k = 0;
+                    for (; k + 64u <= K; k += 64u) {
+                        HVX_Vector xv = hvx_vmemu(xb + k);
+                        HVX_Vector wv[4];
+                        for (uint32_t g = 0; g < 4u; ++g)
+                            wv[g] = hvx_vmemu(wr[g] + k);
+                        for (uint32_t g = 0; g < 4u; ++g)
+                            rp[g] = hvx_vec_mpyacc_f32_f16(rp[g], xv, wv[g]);
+                    }
+                    for (uint32_t g = 0; g < 4u; ++g) {
+                        float tail = 0.0f;
+                        for (uint32_t kk = k; kk < K; ++kk)
+                            tail += f16_to_f32(xb[kk]) * f16_to_f32(wr[g][kk]);
+                        HVX_Vector rs = HVX_OP_ADD_F32(Q6_V_lo_W(rp[g]),
+                                                       Q6_V_hi_W(rp[g]));
+                        rs = hvx_vec_reduce_sum_f32(rs);
+                        float vsum;
+                        hvx_vec_store_u(&vsum, 4u, rs);
+                        yb[(size_t)m * N_full + n0 + n + g] =
+                            f32_to_f16(vsum + tail);
+                    }
+                }
+                for (; n < N; ++n) {
                     const uint16_t* wr = wb + (size_t)(n0 + n) * K;
                     HVX_VectorPair rp = Q6_W_vzero();
                     uint32_t k = 0;

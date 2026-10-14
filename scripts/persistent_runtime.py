@@ -17,8 +17,10 @@ T018 host 驱动一致)。
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
+import socket
 import struct
 import subprocess
 import tempfile
@@ -88,6 +90,12 @@ class PersistentDeviceRuntime:
     PERSIST_DIR = "/data/local/tmp/hvxhmx23/gehtp_persist"
     DEVROOT = "/data/local/tmp/hvxhmx23"
     POLL_INTERVAL = 0.05
+    FAST_POLL_S = 0.01       # 快路径设备侧 wait 循环 sleep 粒度 (toybox 支持小数)
+    FAST_RPC_MAX_B64 = 98304  # 单命令行内嵌 b64 上限 (~96KB), 超过回退 push 路径
+    # v2 传输: 板上常驻 gehtp_proxy 桥 (kernels/ap_tools), adb forward 后 TCP 长连接。
+    # 设 tcp_port=9820 即启用; None 走文件队列 (fast exec-out / push 回退)。
+    tcp_port: Optional[int] = None
+    _tcp_sock = None
     STARTUP_TIMEOUT = 300.0     # 2GB blob 读入 + parse 需要数十秒
 
     def __init__(
@@ -101,8 +109,10 @@ class PersistentDeviceRuntime:
         self._handles: dict[str, PersistentHandle] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.RLock()
+        self._rpc_lock = threading.Lock()  # 文件队列单帧协议: host 侧整帧互斥
         self._server_pid: Optional[int] = None
         self._job: dict[str, Any] = {}
+        self._so_name: str = "gehtp_persistent.so"
 
     # ---- adb helpers ----
     def _adb(self, *args: str, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
@@ -121,9 +131,14 @@ class PersistentDeviceRuntime:
         return r.stdout
 
     # ---- server lifecycle ----
+    def _pgrep_so(self) -> str:
+        """按 so_name 构造防自匹配的 pgrep -f 模式 (首字符 [x] 括号法)。"""
+        so = self._so_name or "gehtp_persistent.so"
+        return "[" + so[0] + "]" + so[1:]
+
     def server_running(self) -> bool:
         # [g] 方括号防 pgrep -f 自匹配; setsid 后 $! 不可靠, liveness 恒以 pgrep 实测
-        r = self._adb("shell", "pgrep -f '[g]ehtp_persistent.so' || true")
+        r = self._adb("shell", f"pgrep -f '{self._pgrep_so()}' || true")
         return bool(r.stdout.split())
 
     def start_server(
@@ -135,8 +150,10 @@ class PersistentDeviceRuntime:
         weights_size: Optional[int] = None,
         idle_exit_s: int = 1800,
         so_name: str = "gehtp_persistent.so",
+        ts: bool = False,
     ) -> dict[str, Any]:
         """启动 DSP 常驻 runner。blob 为设备侧 .wtop 绝对路径 (须已 push)。"""
+        self._so_name = so_name
         if self.server_running():
             # 已有服务器 (含同配置复用场景): ping 通即接管
             try:
@@ -168,6 +185,8 @@ class PersistentDeviceRuntime:
         ]
         if weights_size:
             lines.append(f"weights_size {weights_size}")
+        if ts:
+            lines.append("ts 1")  # runner 侧 op_ts 落盘+逐 run 日志 (profiling 用, 默认关)
         with tempfile.NamedTemporaryFile("w", suffix=".job.txt", delete=False) as f:
             f.write("\n".join(lines) + "\n")
             job_local = f.name
@@ -187,7 +206,7 @@ class PersistentDeviceRuntime:
             self._adb("shell", launch, timeout=20.0)
         except subprocess.TimeoutExpired:
             pass
-        r = self._adb("shell", "pgrep -f '[g]ehtp_persistent.so' || true")
+        r = self._adb("shell", f"pgrep -f '{self._pgrep_so()}' || true")
         pids = r.stdout.split()
         if not pids:
             raise PersistentRuntimeError("server launch failed (pgrep empty)")
@@ -219,12 +238,12 @@ class PersistentDeviceRuntime:
             pass
         t0 = time.monotonic()
         while time.monotonic() - t0 < 10.0:
-            r = self._adb("shell", "pgrep -f '[g]ehtp_persistent.so' || true")
+            r = self._adb("shell", f"pgrep -f '{self._pgrep_so()}' || true")
             if not r.stdout.split():
                 self._server_pid = None
                 return
             time.sleep(0.5)
-        r = self._adb("shell", "pgrep -f '[g]ehtp_persistent.so' || true")
+        r = self._adb("shell", f"pgrep -f '{self._pgrep_so()}' || true")
         pids = r.stdout.split()
         if pids:
             self._adb("shell", "kill " + " ".join(pids))
@@ -236,20 +255,103 @@ class PersistentDeviceRuntime:
     def _rpc(self, hdr: dict[str, Any], body: bytes = b"", timeout: Optional[float] = None) -> dict[str, Any]:
         p = self.PERSIST_DIR
         timeout = timeout or self.timeout
-        self._adb_ok("shell", f"rm -f {p}/resp.bin")
-        j = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
-        payload = struct.pack("!I", len(j)) + j + body
-        with tempfile.NamedTemporaryFile("wb", suffix=".req", delete=False) as f:
-            f.write(payload)
-            req_local = f.name
-        try:
-            self._adb_ok("push", req_local, f"{p}/req.bin", timeout=timeout)
-        finally:
-            os.unlink(req_local)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            r = self._adb("shell", f"test -s {p}/resp.bin && echo Y || echo N")
-            if r.stdout.strip() == "Y":
+        with self._rpc_lock:
+            j = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
+            payload = struct.pack("!I", len(j)) + j + body
+            if self.tcp_port is not None:
+                data = self._tcp_xfer(payload, timeout, hdr.get("op"))
+            else:
+                data = self._file_xfer(payload, timeout, hdr.get("op"))
+            if len(data) < 4:
+                raise PersistentRuntimeError(f"short resp ({len(data)}B)")
+            n = struct.unpack("!I", data[:4])[0]
+            if len(data) < 4 + n:
+                raise PersistentRuntimeError(f"truncated resp ({len(data)}B < {4+n})")
+            out = json.loads(data[4:4 + n].decode("utf-8"))
+            if out.get("rc", 0) != 0:
+                raise PersistentRuntimeError(
+                    f"device rc={out.get('rc')}: {out.get('err', 'unknown')}")
+            return out
+
+    def _tcp_xfer(self, payload: bytes, timeout: float, op: Any) -> bytes:
+        """板上 gehtp_proxy 桥: [4B total][payload] → resp 文件内容。断线重连一次。"""
+        last_err: Optional[BaseException] = None
+        for _ in range(2):
+            if self._tcp_sock is None:
+                try:
+                    self._adb_ok("forward", f"tcp:{self.tcp_port}", f"tcp:{self.tcp_port}")
+                    self._tcp_sock = socket.create_connection(
+                        ("127.0.0.1", self.tcp_port), timeout=self.timeout)
+                    self._tcp_sock.setsockopt(
+                        socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError as e:
+                    last_err = e
+                    continue
+            try:
+                assert self._tcp_sock is not None
+                self._tcp_sock.settimeout(timeout)
+                self._tcp_sock.sendall(struct.pack("!I", len(payload)) + payload)
+                buf = b""
+                while len(buf) < 4:
+                    c = self._tcp_sock.recv(4 - len(buf))
+                    if not c:
+                        raise OSError("eof on tcp bridge")
+                    buf += c
+                (n,) = struct.unpack("!I", buf)
+                out = b""
+                while len(out) < n:
+                    c = self._tcp_sock.recv(n - len(out))
+                    if not c:
+                        raise OSError("eof on tcp bridge")
+                    out += c
+                return out
+            except OSError as e:
+                last_err = e
+                try:
+                    self._tcp_sock.close()
+                except OSError:
+                    pass
+                self._tcp_sock = None
+        raise PersistentRuntimeError(f"tcp rpc failed (op={op}): {last_err}")
+
+    def _file_xfer(self, payload: bytes, timeout: float, op: Any) -> bytes:
+        p = self.PERSIST_DIR
+        b64 = base64.b64encode(payload).decode("ascii")
+        if len(b64) <= self.FAST_RPC_MAX_B64:
+            # 单次 exec-out 往返 (原 rm/push/poll/pull/rm 五连 adb ~110ms → ~45ms)。
+            # 尾部不 rm resp.bin: 由下次调用头部 rm -f 清 (runner boot 亦 unlink 双文件)。
+            cmd = (
+                f"cd {p} && rm -f resp.bin && echo -n {b64} | base64 -d > req.bin && "
+                f"while [ ! -s resp.bin ]; do sleep {self.FAST_POLL_S}; done && cat resp.bin"
+            )
+            try:
+                r = subprocess.run(
+                    ["adb", "-s", self.device, "exec-out", cmd],
+                    capture_output=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                raise PersistentRuntimeError(
+                    f"rpc timeout after {timeout}s (op={op})")
+            data = r.stdout
+            if r.returncode != 0 or len(data) < 4:
+                raise PersistentRuntimeError(
+                    f"fast rpc fail rc={r.returncode} len={len(data)} "
+                    f"err={r.stderr[:200]!r} (op={op})")
+        else:
+            # 大 body (长预填充等): 命令行内嵌放不下, 回退 push+poll 旧路径
+            self._adb_ok("shell", f"rm -f {p}/resp.bin")
+            with tempfile.NamedTemporaryFile("wb", suffix=".req", delete=False) as f:
+                f.write(payload)
+                req_local = f.name
+            try:
+                self._adb_ok("push", req_local, f"{p}/req.bin", timeout=timeout)
+            finally:
+                os.unlink(req_local)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                r = self._adb("shell", f"test -s {p}/resp.bin && echo Y || echo N")
+                if r.stdout.strip() != "Y":
+                    time.sleep(self.POLL_INTERVAL)
+                    continue
                 with tempfile.NamedTemporaryFile(suffix=".resp", delete=False) as f:
                     resp_local = f.name
                 try:
@@ -259,18 +361,11 @@ class PersistentDeviceRuntime:
                         data = g.read()
                 finally:
                     os.unlink(resp_local)
-                if len(data) < 4:
-                    raise PersistentRuntimeError(f"short resp ({len(data)}B)")
-                n = struct.unpack("!I", data[:4])[0]
-                if len(data) < 4 + n:
-                    raise PersistentRuntimeError(f"truncated resp ({len(data)}B < {4+n})")
-                out = json.loads(data[4:4 + n].decode("utf-8"))
-                if out.get("rc", 0) != 0:
-                    raise PersistentRuntimeError(
-                        f"device rc={out.get('rc')}: {out.get('err', 'unknown')}")
-                return out
-            time.sleep(self.POLL_INTERVAL)
-        raise PersistentRuntimeError(f"rpc timeout after {timeout}s (op={hdr.get('op')})")
+                break
+            else:
+                raise PersistentRuntimeError(f"rpc timeout after {timeout}s (op={op})")
+        return data
+
 
     # ---- public contract (原 socket 设计同名接口) ----
     def _ensure_device_server(self) -> None:
@@ -295,10 +390,12 @@ class PersistentDeviceRuntime:
     ) -> PersistentHandle:
         if kv_max <= 0:
             raise ValueError("kv_max must be positive")
+        # decode 图 position 硬上限 MAX_POS: 句柄容量按可寻址真值上报, 否则
+        # 上层 (registry→服务端 KV 预算验证) 会放行注定生成中途 503 的请求
         handle = PersistentHandle(
             handle_id=f"persist_{model_id}_{int(time.time()*1000)}",
             model_id=model_id,
-            kv_max_position=kv_max,
+            kv_max_position=min(kv_max, MAX_POS),
             model_meta={
                 "wtop_path": wtop_path,
                 "manifest_path": manifest_path,

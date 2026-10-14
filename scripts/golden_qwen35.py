@@ -28,7 +28,8 @@ import numpy as np
 # torch / modeling 类仅金标生成路径需要(重 import); --cut-row 切行 helper
 # 在裸环境(numpy only)可用。export_qwen35_onnx 转用 transformers>=4.57 内建
 # Qwen3_5 类后已无 QPM_ROOT 常量, 旧 QPM 路径留 compat 缺省。
-QPM_ROOT_DEFAULT = "/disk2/Qwen35dev/qwen3.5_4b_base/example1"
+QPM_ROOT_DEFAULT = os.environ.get("GEHTP_QPM_ROOT",
+"/disk2/Qwen35dev/qwen3.5_4b_base/example1")
 
 
 # --------------------------------------------------------------------------
