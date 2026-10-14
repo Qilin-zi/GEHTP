@@ -108,10 +108,14 @@ def main():
         dd, hh = d[:n], h[:n]
         c = float(dd @ hh / (np.linalg.norm(dd) * np.linalg.norm(hh) + 1e-30))
         md = float(np.max(np.abs(dd - hh)))
-        tag = "OK " if c >= 0.999 else ("warn" if c >= 0.99 else "BAD")
+        if d.size != h.size:
+            # 元素数不匹配 = 形状/少写 bug 签名, 截断前缀的 cos 仅供参考
+            tag = "SIZE"
+        else:
+            tag = "OK " if c >= 0.999 else ("warn" if c >= 0.99 else "BAD")
         print(f"op{idx:<5} t{temp:<5} {role:<9} writer=op{ref_idx:<5} {names[ref_idx]:<16} "
-              f"{tag} cos={c:.6f} max|d|={md:.4f}")
-        if tag == "BAD" and first_bad is None:
+              f"{tag} cos={c:.6f} max|d|={md:.4f} nelem dev={d.size} host={h.size}")
+        if tag in ("BAD", "SIZE") and first_bad is None:
             first_bad = (idx, ref_idx)
     print("---")
     print("首个 BAD 锚点:", first_bad if first_bad is not None else "(全部 OK/无 BAD)")

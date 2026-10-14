@@ -67,7 +67,8 @@ def reachable_to_output(nodes, consumers):
 
 def ancestors(nodes, prod, tensors):
     """反向 BFS 自图输出 (tensors 里 type==1 者, 如 logits), 经 prod 映射张量→节点。"""
-    out_tensors = [t for t, td in tensors.items() if td.get("type") == 1]
+    out_tensors = [t for t, td in tensors.items()
+                   if td.get("type") == 1 or td.get("type") == "OUTPUT"]
     roots = sorted({prod[t] for t in out_tensors if t in prod})
     seen = set()
     dq = deque(roots)
@@ -97,6 +98,10 @@ def main():
     nodes, tensors = load_net(args.net_json)
     prod, consumers = build_maps(nodes)
     anc, roots, out_tensors = ancestors(nodes, prod, tensors)
+    if not out_tensors:
+        # 空输出集会把全图标成不可达 → 全 SAFE_DEADEND 的假阴性报告
+        sys.exit(f"no output tensors found in {args.net_json} "
+                 f"(tensors type==1/'OUTPUT' 均无) — 拒绝生成空集审计")
 
     # 收集 copy-sem 站点
     sites = {t: [] for t in COPY_SEM_TYPES}

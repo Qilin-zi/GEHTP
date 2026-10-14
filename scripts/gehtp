@@ -252,7 +252,8 @@ cmd_setup() {
     fi
 
     echo "== [1/5] kernels lib =="
-    [ -f "$KD/lib/libhvxhmx_v23.signed.so" ] || (cd "$KD" && ./build_libs.sh >/dev/null)
+    # 恒重建: 陈旧 .signed.so 存在≠库与头同步 (arity 漂移→运行时 rc=-11 哑错)
+    (cd "$KD" && ./build_libs.sh >/dev/null)
 
     echo "== [2/5] generic runner (42_gehtp_runner) =="
     local INC_HEX="-I$HEX/incs -I$HEX/incs/stddef \

@@ -104,6 +104,7 @@ class PersistentDeviceRuntime:
         self._handles: dict[str, PersistentHandle] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.RLock()
+        self._rpc_lock = threading.Lock()  # 文件队列单帧协议: host 侧整帧互斥
         self._server_pid: Optional[int] = None
         self._job: dict[str, Any] = {}
         self._so_name: str = "gehtp_persistent.so"
@@ -249,67 +250,68 @@ class PersistentDeviceRuntime:
     def _rpc(self, hdr: dict[str, Any], body: bytes = b"", timeout: Optional[float] = None) -> dict[str, Any]:
         p = self.PERSIST_DIR
         timeout = timeout or self.timeout
-        j = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
-        payload = struct.pack("!I", len(j)) + j + body
-        b64 = base64.b64encode(payload).decode("ascii")
-        if len(b64) <= self.FAST_RPC_MAX_B64:
-            # 单次 exec-out 往返 (原 rm/push/poll/pull/rm 五连 adb ~110ms → ~45ms)。
-            # 尾部不 rm resp.bin: 由下次调用头部 rm -f 清 (runner boot 亦 unlink 双文件)。
-            cmd = (
-                f"cd {p} && rm -f resp.bin && echo -n {b64} | base64 -d > req.bin && "
-                f"while [ ! -s resp.bin ]; do sleep {self.FAST_POLL_S}; done && cat resp.bin"
-            )
-            try:
-                r = subprocess.run(
-                    ["adb", "-s", self.device, "exec-out", cmd],
-                    capture_output=True, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                raise PersistentRuntimeError(
-                    f"rpc timeout after {timeout}s (op={hdr.get('op')})")
-            data = r.stdout
-            if r.returncode != 0 or len(data) < 4:
-                raise PersistentRuntimeError(
-                    f"fast rpc fail rc={r.returncode} len={len(data)} "
-                    f"err={r.stderr[:200]!r} (op={hdr.get('op')})")
-        else:
-            # 大 body (长预填充等): 命令行内嵌放不下, 回退 push+poll 旧路径
-            self._adb_ok("shell", f"rm -f {p}/resp.bin")
-            with tempfile.NamedTemporaryFile("wb", suffix=".req", delete=False) as f:
-                f.write(payload)
-                req_local = f.name
-            try:
-                self._adb_ok("push", req_local, f"{p}/req.bin", timeout=timeout)
-            finally:
-                os.unlink(req_local)
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                r = self._adb("shell", f"test -s {p}/resp.bin && echo Y || echo N")
-                if r.stdout.strip() != "Y":
-                    time.sleep(self.POLL_INTERVAL)
-                    continue
-                with tempfile.NamedTemporaryFile(suffix=".resp", delete=False) as f:
-                    resp_local = f.name
+        with self._rpc_lock:
+            j = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
+            payload = struct.pack("!I", len(j)) + j + body
+            b64 = base64.b64encode(payload).decode("ascii")
+            if len(b64) <= self.FAST_RPC_MAX_B64:
+                # 单次 exec-out 往返 (原 rm/push/poll/pull/rm 五连 adb ~110ms → ~45ms)。
+                # 尾部不 rm resp.bin: 由下次调用头部 rm -f 清 (runner boot 亦 unlink 双文件)。
+                cmd = (
+                    f"cd {p} && rm -f resp.bin && echo -n {b64} | base64 -d > req.bin && "
+                    f"while [ ! -s resp.bin ]; do sleep {self.FAST_POLL_S}; done && cat resp.bin"
+                )
                 try:
-                    self._adb_ok("pull", f"{p}/resp.bin", resp_local, timeout=timeout)
-                    self._adb_ok("shell", f"rm -f {p}/resp.bin")
-                    with open(resp_local, "rb") as g:
-                        data = g.read()
-                finally:
-                    os.unlink(resp_local)
-                break
+                    r = subprocess.run(
+                        ["adb", "-s", self.device, "exec-out", cmd],
+                        capture_output=True, timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    raise PersistentRuntimeError(
+                        f"rpc timeout after {timeout}s (op={hdr.get('op')})")
+                data = r.stdout
+                if r.returncode != 0 or len(data) < 4:
+                    raise PersistentRuntimeError(
+                        f"fast rpc fail rc={r.returncode} len={len(data)} "
+                        f"err={r.stderr[:200]!r} (op={hdr.get('op')})")
             else:
+                # 大 body (长预填充等): 命令行内嵌放不下, 回退 push+poll 旧路径
+                self._adb_ok("shell", f"rm -f {p}/resp.bin")
+                with tempfile.NamedTemporaryFile("wb", suffix=".req", delete=False) as f:
+                    f.write(payload)
+                    req_local = f.name
+                try:
+                    self._adb_ok("push", req_local, f"{p}/req.bin", timeout=timeout)
+                finally:
+                    os.unlink(req_local)
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    r = self._adb("shell", f"test -s {p}/resp.bin && echo Y || echo N")
+                    if r.stdout.strip() != "Y":
+                        time.sleep(self.POLL_INTERVAL)
+                        continue
+                    with tempfile.NamedTemporaryFile(suffix=".resp", delete=False) as f:
+                        resp_local = f.name
+                    try:
+                        self._adb_ok("pull", f"{p}/resp.bin", resp_local, timeout=timeout)
+                        self._adb_ok("shell", f"rm -f {p}/resp.bin")
+                        with open(resp_local, "rb") as g:
+                            data = g.read()
+                    finally:
+                        os.unlink(resp_local)
+                    break
+                else:
+                    raise PersistentRuntimeError(
+                        f"rpc timeout after {timeout}s (op={hdr.get('op')})")
+            if len(data) < 4:
+                raise PersistentRuntimeError(f"short resp ({len(data)}B)")
+            n = struct.unpack("!I", data[:4])[0]
+            if len(data) < 4 + n:
+                raise PersistentRuntimeError(f"truncated resp ({len(data)}B < {4+n})")
+            out = json.loads(data[4:4 + n].decode("utf-8"))
+            if out.get("rc", 0) != 0:
                 raise PersistentRuntimeError(
-                    f"rpc timeout after {timeout}s (op={hdr.get('op')})")
-        if len(data) < 4:
-            raise PersistentRuntimeError(f"short resp ({len(data)}B)")
-        n = struct.unpack("!I", data[:4])[0]
-        if len(data) < 4 + n:
-            raise PersistentRuntimeError(f"truncated resp ({len(data)}B < {4+n})")
-        out = json.loads(data[4:4 + n].decode("utf-8"))
-        if out.get("rc", 0) != 0:
-            raise PersistentRuntimeError(
-                f"device rc={out.get('rc')}: {out.get('err', 'unknown')}")
-        return out
+                    f"device rc={out.get('rc')}: {out.get('err', 'unknown')}")
+            return out
 
     # ---- public contract (原 socket 设计同名接口) ----
     def _ensure_device_server(self) -> None:

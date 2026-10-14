@@ -5,17 +5,17 @@
 #       (主 + 4KB DDR 溢出变体) → wtop_emit (主 + spill) → kernels 编译/签名
 #       → 推板 52f67807 → 运行例 37 → 拉结果 → 判据汇总
 # 用法: conv_add_pipeline.sh [device]      # 不带参数 = 仅 host 全链
-# 依赖(只读): venv310、qairt SDK、Hexagon SDK、SWIV
+# 依赖(只读): env.sh 五件套 (qairt SDK / Hexagon SDK / SWIV)
 # 设备纪律: 仅 52f67807; CMA 耗尽停下通知用户; wt_exec_shutdown 成败必调(例内)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
+# 五件套路径收敛 (SDK/PY/HEX/HT/SWIV): 宿主机与容器同源, 勿再手写绝对路径
+source "$ROOT/env.sh"
 TM="$ROOT/test_models/conv_add"
 BL="$ROOT/blobs_conv_add"
 CB="$ROOT/compiler/build_linux"
 KD="$ROOT/kernels"
-SDK=/disk2/QCtools/qairt_2.48.40.260702
-PY=/disk2/Qwen35dev/revlibHtpPrepare/venv310/bin/python3
 DEVICE="${ANDROID_SERIAL:-52f67807}"
 DEVDIR="/data/local/tmp/hvxhmx23/g37"
 
@@ -51,19 +51,17 @@ fi
 
 echo "=== [4/6] kernels 编译/签名 + 推板 ==="
 cd "$KD"
-SDK_HEX=/local/mnt/workspace/Qualcomm/Hexagon_SDK/6.6.0.0
-HT="$SDK_HEX/tools/HEXAGON_Tools/19.0.07"
 CC="$HT/Tools/bin/hexagon-clang"
 ./build_libs.sh >/dev/null 2>&1
 "$HT/Tools/bin/hexagon-llvm-objdump" -d lib/libhvxhmx_v23.so | grep -q vgather && { echo "vgather 铁律违反"; exit 1; }
-INC_HEX="-I$SDK_HEX/incs -I$SDK_HEX/incs/stddef \
-         -I$SDK_HEX/rtos/qurt/computev81/include \
-         -I$SDK_HEX/rtos/qurt/computev81/include/qurt"
+INC_HEX="-I$HEX/incs -I$HEX/incs/stddef \
+         -I$HEX/rtos/qurt/computev81/include \
+         -I$HEX/rtos/qurt/computev81/include/qurt"
 $CC -mv81 -O2 -mhvx -mhmx -shared -fPIC -std=gnu11 -Wall -mhvx-length=128B \
     $INC_HEX -I"$KD/include" -I"$KD/examples/common" \
     -o /tmp/test_37.so "$KD/examples/37_conv2d_add/main.c" \
     "$KD/examples/common/example_util.c" -L"$KD/lib" -lhvxhmx_v23 -lc -ldl -lgcc
-python3 /disk2/QCtools/swiv_build_utility.py -i /tmp/test_37.so -o /tmp/test_37.so.signed 2>&1 | tail -1
+python3 "$SWIV" -i /tmp/test_37.so -o /tmp/test_37.so.signed 2>&1 | tail -1
 
 adb -s "$DEVICE" shell "mkdir -p $DEVDIR" >/dev/null
 adb -s "$DEVICE" push "$KD/lib/libhvxhmx_v23.signed.so" /data/local/tmp/hvxhmx23/libhvxhmx_v23.so >/dev/null
