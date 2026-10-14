@@ -105,6 +105,18 @@
 - 过程坑：`/data/local/tmp/hvxhmx23/gehtp` 已变 root:755（他会话 root adb 活跃）——绕行=私有目录 cl020 + runner 重编私有名烘焙 job 路径；板上库**必须推 SWIV 签名版、但以普通 .so 名落地**（推未签名版 dlopen 直接死，且 FARF 不可见）；`run_main_on_hexagon.farf` 掩码文件可开 AP 侧详细日志（用后已删）。
 
 
+## 附加实测 — w4 线 0.8B 当前树全链重编（2026-10-14，证据 evidence/q4-line-rerun-device.md）
+
+013 原 spec 承诺「w4 线对 007 q4 锚 25.7s 实质下降」，T011 移出的是**原生 W4A16** E2E（M%256 NO-GO）。本次以当前树**重编译**（gdn 融合 18/18 烤入）+ q4 发射（--gguf，w4 占比 99.7%，blob 5be4bd7f）补齐：
+
+| 门 | 结果 |
+|---|---|
+| 精度（冻结门 cos≥0.98+top1≥20/32，vs cpu_golden/q4_0） | **4/4 PASS**（cos 0.99976–0.99996 / top1 31–32） |
+| exec vs 25.7s 锚 | **15.09s，−41.3%**（wall 27.4→16.3s） |
+| op_timing | MATMUL_F16 9.39s（锚 10.6s）；lm_head 4.59s（持平）；**gdn_block 融合 18 块共 0.65s**（旧图散在杂项 ~10.5s，主刀） |
+
+诚实归属：收益=**全链重编**（gdn 融合+编译期折叠，920 ops vs 旧 11504），非 013 A/C 机制（0.8B VTCM auto 撤退无 TAG_MEM_PLAN、q4 线无 W4A16 op，本就不触）。007 锚的「旧图+当代 lib」欠账就此补齐，w4 线与 f16 线同源同代。
+
 ## US-D — 形态 flag 化（未开始）
 
 ## 终局双门（T028 汇总，未开始）
