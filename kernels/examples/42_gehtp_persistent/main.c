@@ -25,6 +25,8 @@
  *   in_bytes <run 请求输入体字节数>   req/resp/out <各文件绝对路径>
  *   idle_exit_s <无请求自动退出秒数, 0=不退出>
  *   weights_size <可选, 外部权重字节数> (0.8B decode blob 内联 2GB 不用)
+ *   trace <可选 0/1, optrace 逐 op 落盘> ts <可选 0/1, op_ts 落盘+逐 run 日志>
+ *   (trace/ts 默认 0: 服务态文件 IO 吃步时, profiling 时才开)
  *
  * 用法 (host 侧 scripts/persistent_runtime.py 封装):
  *   adb shell "cd $DEVROOT && ADSP_LIBRARY_PATH=$DEVROOT \
@@ -177,6 +179,7 @@ static int32_t argmax_f16(const uint8_t* p, uint32_t bytes) {
 static struct wt_op_ts* g_ts_buf = NULL;
 static uint32_t g_ts_n = 0;
 static char g_ts_path[256];
+static int g_ts_on = 0;   // job.txt ts 键; 门控每 run 日志与 op_ts 落盘
 
 static void dump_op_ts(int64_t wall_us) {
     if (!g_ts_buf || !g_ts_n) return;
@@ -376,11 +379,11 @@ static int handle_request(struct wt_blob* w, uint8_t* req, size_t rlen,
         }
         memcpy(in_body, req + body_off, rlen - body_off);
         int64_t t0 = HAP_perf_get_time_us();
-        ex_log("[run] exec begin (want_out=%d)", (int)want_out);
+        if (g_ts_on) ex_log("[run] exec begin (want_out=%d)", (int)want_out);
         int rc = wt_exec_run_io(w, in_body, NULL, out_temp,
                                 NULL, NULL, err, sizeof(err));
         int64_t us = HAP_perf_get_time_us() - t0;
-        ex_log("[run] exec done rc=%d us=%lld", rc, (long long)us);
+        if (g_ts_on) ex_log("[run] exec done rc=%d us=%lld", rc, (long long)us);
         char resp[256];
         if (rc != 0) {
             char esc[96];
@@ -390,7 +393,7 @@ static int handle_request(struct wt_blob* w, uint8_t* req, size_t rlen,
         } else {
             int32_t tok = argmax_f16(wt_exec_temp(out_temp),
                                      wt_exec_temp_last_bytes(out_temp));
-            ex_log("[run] argmax tok=%d", (int)tok);
+            if (g_ts_on) ex_log("[run] argmax tok=%d", (int)tok);
             dump_op_ts(us);
             if (want_out) {
                 if (dump_out_file(out_p, out_temp) != 0)
@@ -420,12 +423,12 @@ int main(void) {
     if (!job) { ex_log("[FAIL] read %s", JOB_PATH); return ex_summary() || 1; }
 
     char blob_p[256], req_p[256], resp_p[256], out_p[256], temp_s[32], inb_s[32];
-    char idle_s[32], wgt_size_s[32], trace_s[32];
+    char idle_s[32], wgt_size_s[32], trace_s[32], ts_s[32];
     memset(blob_p, 0, sizeof(blob_p)); memset(req_p, 0, sizeof(req_p));
     memset(resp_p, 0, sizeof(resp_p)); memset(out_p, 0, sizeof(out_p));
     memset(temp_s, 0, sizeof(temp_s)); memset(inb_s, 0, sizeof(inb_s));
     memset(idle_s, 0, sizeof(idle_s)); memset(wgt_size_s, 0, sizeof(wgt_size_s));
-    memset(trace_s, 0, sizeof(trace_s));
+    memset(trace_s, 0, sizeof(trace_s)); memset(ts_s, 0, sizeof(ts_s));
     if (job_get((char*)job, "blob", blob_p, sizeof(blob_p)) ||
         job_get((char*)job, "req", req_p, sizeof(req_p)) ||
         job_get((char*)job, "resp", resp_p, sizeof(resp_p)) ||
@@ -443,6 +446,9 @@ int main(void) {
     // optrace 默认关: 服务态逐 op fopen+append 一步 16MB+ 文件 IO, 步时 2.5×
     int trace_on = job_get((char*)job, "trace", trace_s, sizeof(trace_s)) == 0
                    ? (int)strtol(trace_s, NULL, 10) : 0;
+    // op_ts 落盘默认关: 服务态每步 43KB RFS 写 ~35ms; 需 profiling 时 job.txt 写 "ts 1"
+    g_ts_on = job_get((char*)job, "ts", ts_s, sizeof(ts_s)) == 0
+              ? (int)strtol(ts_s, NULL, 10) : 0;
     int have_wgt = job_get((char*)job, "weights_size", wgt_size_s, sizeof(wgt_size_s)) == 0;
     free(job);
     ex_log("[cfg] blob=%s out_temp=%u in_bytes=%u idle=%lds%s",
@@ -467,7 +473,7 @@ int main(void) {
     }
     ex_log("M7 wt_parse ok (slots=%u ops=%u)", (unsigned)w->n_slots, (unsigned)w->n_ops);
     wt_exec_set_trace(trace_on);
-    g_ts_buf = calloc(w->n_ops, sizeof(*g_ts_buf));
+    g_ts_buf = g_ts_on ? calloc(w->n_ops, sizeof(*g_ts_buf)) : NULL;
     if (g_ts_buf) {
         wt_exec_set_ts(g_ts_buf, w->n_ops);
         g_ts_n = w->n_ops;
