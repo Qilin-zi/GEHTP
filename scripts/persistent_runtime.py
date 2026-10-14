@@ -17,6 +17,7 @@ T018 host 驱动一致)。
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import struct
@@ -88,6 +89,8 @@ class PersistentDeviceRuntime:
     PERSIST_DIR = "/data/local/tmp/hvxhmx23/gehtp_persist"
     DEVROOT = "/data/local/tmp/hvxhmx23"
     POLL_INTERVAL = 0.05
+    FAST_POLL_S = 0.01       # 快路径设备侧 wait 循环 sleep 粒度 (toybox 支持小数)
+    FAST_RPC_MAX_B64 = 98304  # 单命令行内嵌 b64 上限 (~96KB), 超过回退 push 路径
     STARTUP_TIMEOUT = 300.0     # 2GB blob 读入 + parse 需要数十秒
 
     def __init__(
@@ -141,6 +144,7 @@ class PersistentDeviceRuntime:
         weights_size: Optional[int] = None,
         idle_exit_s: int = 1800,
         so_name: str = "gehtp_persistent.so",
+        ts: bool = False,
     ) -> dict[str, Any]:
         """启动 DSP 常驻 runner。blob 为设备侧 .wtop 绝对路径 (须已 push)。"""
         self._so_name = so_name
@@ -175,6 +179,8 @@ class PersistentDeviceRuntime:
         ]
         if weights_size:
             lines.append(f"weights_size {weights_size}")
+        if ts:
+            lines.append("ts 1")  # runner 侧 op_ts 落盘+逐 run 日志 (profiling 用, 默认关)
         with tempfile.NamedTemporaryFile("w", suffix=".job.txt", delete=False) as f:
             f.write("\n".join(lines) + "\n")
             job_local = f.name
@@ -243,20 +249,44 @@ class PersistentDeviceRuntime:
     def _rpc(self, hdr: dict[str, Any], body: bytes = b"", timeout: Optional[float] = None) -> dict[str, Any]:
         p = self.PERSIST_DIR
         timeout = timeout or self.timeout
-        self._adb_ok("shell", f"rm -f {p}/resp.bin")
         j = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
         payload = struct.pack("!I", len(j)) + j + body
-        with tempfile.NamedTemporaryFile("wb", suffix=".req", delete=False) as f:
-            f.write(payload)
-            req_local = f.name
-        try:
-            self._adb_ok("push", req_local, f"{p}/req.bin", timeout=timeout)
-        finally:
-            os.unlink(req_local)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            r = self._adb("shell", f"test -s {p}/resp.bin && echo Y || echo N")
-            if r.stdout.strip() == "Y":
+        b64 = base64.b64encode(payload).decode("ascii")
+        if len(b64) <= self.FAST_RPC_MAX_B64:
+            # 单次 exec-out 往返 (原 rm/push/poll/pull/rm 五连 adb ~110ms → ~45ms)。
+            # 尾部不 rm resp.bin: 由下次调用头部 rm -f 清 (runner boot 亦 unlink 双文件)。
+            cmd = (
+                f"cd {p} && rm -f resp.bin && echo -n {b64} | base64 -d > req.bin && "
+                f"while [ ! -s resp.bin ]; do sleep {self.FAST_POLL_S}; done && cat resp.bin"
+            )
+            try:
+                r = subprocess.run(
+                    ["adb", "-s", self.device, "exec-out", cmd],
+                    capture_output=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                raise PersistentRuntimeError(
+                    f"rpc timeout after {timeout}s (op={hdr.get('op')})")
+            data = r.stdout
+            if r.returncode != 0 or len(data) < 4:
+                raise PersistentRuntimeError(
+                    f"fast rpc fail rc={r.returncode} len={len(data)} "
+                    f"err={r.stderr[:200]!r} (op={hdr.get('op')})")
+        else:
+            # 大 body (长预填充等): 命令行内嵌放不下, 回退 push+poll 旧路径
+            self._adb_ok("shell", f"rm -f {p}/resp.bin")
+            with tempfile.NamedTemporaryFile("wb", suffix=".req", delete=False) as f:
+                f.write(payload)
+                req_local = f.name
+            try:
+                self._adb_ok("push", req_local, f"{p}/req.bin", timeout=timeout)
+            finally:
+                os.unlink(req_local)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                r = self._adb("shell", f"test -s {p}/resp.bin && echo Y || echo N")
+                if r.stdout.strip() != "Y":
+                    time.sleep(self.POLL_INTERVAL)
+                    continue
                 with tempfile.NamedTemporaryFile(suffix=".resp", delete=False) as f:
                     resp_local = f.name
                 try:
@@ -266,18 +296,20 @@ class PersistentDeviceRuntime:
                         data = g.read()
                 finally:
                     os.unlink(resp_local)
-                if len(data) < 4:
-                    raise PersistentRuntimeError(f"short resp ({len(data)}B)")
-                n = struct.unpack("!I", data[:4])[0]
-                if len(data) < 4 + n:
-                    raise PersistentRuntimeError(f"truncated resp ({len(data)}B < {4+n})")
-                out = json.loads(data[4:4 + n].decode("utf-8"))
-                if out.get("rc", 0) != 0:
-                    raise PersistentRuntimeError(
-                        f"device rc={out.get('rc')}: {out.get('err', 'unknown')}")
-                return out
-            time.sleep(self.POLL_INTERVAL)
-        raise PersistentRuntimeError(f"rpc timeout after {timeout}s (op={hdr.get('op')})")
+                break
+            else:
+                raise PersistentRuntimeError(
+                    f"rpc timeout after {timeout}s (op={hdr.get('op')})")
+        if len(data) < 4:
+            raise PersistentRuntimeError(f"short resp ({len(data)}B)")
+        n = struct.unpack("!I", data[:4])[0]
+        if len(data) < 4 + n:
+            raise PersistentRuntimeError(f"truncated resp ({len(data)}B < {4+n})")
+        out = json.loads(data[4:4 + n].decode("utf-8"))
+        if out.get("rc", 0) != 0:
+            raise PersistentRuntimeError(
+                f"device rc={out.get('rc')}: {out.get('err', 'unknown')}")
+        return out
 
     # ---- public contract (原 socket 设计同名接口) ----
     def _ensure_device_server(self) -> None:
@@ -302,10 +334,12 @@ class PersistentDeviceRuntime:
     ) -> PersistentHandle:
         if kv_max <= 0:
             raise ValueError("kv_max must be positive")
+        # decode 图 position 硬上限 MAX_POS: 句柄容量按可寻址真值上报, 否则
+        # 上层 (registry→服务端 KV 预算验证) 会放行注定生成中途 503 的请求
         handle = PersistentHandle(
             handle_id=f"persist_{model_id}_{int(time.time()*1000)}",
             model_id=model_id,
-            kv_max_position=kv_max,
+            kv_max_position=min(kv_max, MAX_POS),
             model_meta={
                 "wtop_path": wtop_path,
                 "manifest_path": manifest_path,
