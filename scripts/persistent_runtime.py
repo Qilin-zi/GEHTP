@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socket
 import struct
 import subprocess
 import tempfile
@@ -91,6 +92,10 @@ class PersistentDeviceRuntime:
     POLL_INTERVAL = 0.05
     FAST_POLL_S = 0.01       # 快路径设备侧 wait 循环 sleep 粒度 (toybox 支持小数)
     FAST_RPC_MAX_B64 = 98304  # 单命令行内嵌 b64 上限 (~96KB), 超过回退 push 路径
+    # v2 传输: 板上常驻 gehtp_proxy 桥 (kernels/ap_tools), adb forward 后 TCP 长连接。
+    # 设 tcp_port=9820 即启用; None 走文件队列 (fast exec-out / push 回退)。
+    tcp_port: Optional[int] = None
+    _tcp_sock = None
     STARTUP_TIMEOUT = 300.0     # 2GB blob 读入 + parse 需要数十秒
 
     def __init__(
@@ -253,55 +258,10 @@ class PersistentDeviceRuntime:
         with self._rpc_lock:
             j = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
             payload = struct.pack("!I", len(j)) + j + body
-            b64 = base64.b64encode(payload).decode("ascii")
-            if len(b64) <= self.FAST_RPC_MAX_B64:
-                # 单次 exec-out 往返 (原 rm/push/poll/pull/rm 五连 adb ~110ms → ~45ms)。
-                # 尾部不 rm resp.bin: 由下次调用头部 rm -f 清 (runner boot 亦 unlink 双文件)。
-                cmd = (
-                    f"cd {p} && rm -f resp.bin && echo -n {b64} | base64 -d > req.bin && "
-                    f"while [ ! -s resp.bin ]; do sleep {self.FAST_POLL_S}; done && cat resp.bin"
-                )
-                try:
-                    r = subprocess.run(
-                        ["adb", "-s", self.device, "exec-out", cmd],
-                        capture_output=True, timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    raise PersistentRuntimeError(
-                        f"rpc timeout after {timeout}s (op={hdr.get('op')})")
-                data = r.stdout
-                if r.returncode != 0 or len(data) < 4:
-                    raise PersistentRuntimeError(
-                        f"fast rpc fail rc={r.returncode} len={len(data)} "
-                        f"err={r.stderr[:200]!r} (op={hdr.get('op')})")
+            if self.tcp_port is not None:
+                data = self._tcp_xfer(payload, timeout, hdr.get("op"))
             else:
-                # 大 body (长预填充等): 命令行内嵌放不下, 回退 push+poll 旧路径
-                self._adb_ok("shell", f"rm -f {p}/resp.bin")
-                with tempfile.NamedTemporaryFile("wb", suffix=".req", delete=False) as f:
-                    f.write(payload)
-                    req_local = f.name
-                try:
-                    self._adb_ok("push", req_local, f"{p}/req.bin", timeout=timeout)
-                finally:
-                    os.unlink(req_local)
-                deadline = time.monotonic() + timeout
-                while time.monotonic() < deadline:
-                    r = self._adb("shell", f"test -s {p}/resp.bin && echo Y || echo N")
-                    if r.stdout.strip() != "Y":
-                        time.sleep(self.POLL_INTERVAL)
-                        continue
-                    with tempfile.NamedTemporaryFile(suffix=".resp", delete=False) as f:
-                        resp_local = f.name
-                    try:
-                        self._adb_ok("pull", f"{p}/resp.bin", resp_local, timeout=timeout)
-                        self._adb_ok("shell", f"rm -f {p}/resp.bin")
-                        with open(resp_local, "rb") as g:
-                            data = g.read()
-                    finally:
-                        os.unlink(resp_local)
-                    break
-                else:
-                    raise PersistentRuntimeError(
-                        f"rpc timeout after {timeout}s (op={hdr.get('op')})")
+                data = self._file_xfer(payload, timeout, hdr.get("op"))
             if len(data) < 4:
                 raise PersistentRuntimeError(f"short resp ({len(data)}B)")
             n = struct.unpack("!I", data[:4])[0]
@@ -312,6 +272,100 @@ class PersistentDeviceRuntime:
                 raise PersistentRuntimeError(
                     f"device rc={out.get('rc')}: {out.get('err', 'unknown')}")
             return out
+
+    def _tcp_xfer(self, payload: bytes, timeout: float, op: Any) -> bytes:
+        """板上 gehtp_proxy 桥: [4B total][payload] → resp 文件内容。断线重连一次。"""
+        last_err: Optional[BaseException] = None
+        for _ in range(2):
+            if self._tcp_sock is None:
+                try:
+                    self._adb_ok("forward", f"tcp:{self.tcp_port}", f"tcp:{self.tcp_port}")
+                    self._tcp_sock = socket.create_connection(
+                        ("127.0.0.1", self.tcp_port), timeout=self.timeout)
+                    self._tcp_sock.setsockopt(
+                        socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError as e:
+                    last_err = e
+                    continue
+            try:
+                assert self._tcp_sock is not None
+                self._tcp_sock.settimeout(timeout)
+                self._tcp_sock.sendall(struct.pack("!I", len(payload)) + payload)
+                buf = b""
+                while len(buf) < 4:
+                    c = self._tcp_sock.recv(4 - len(buf))
+                    if not c:
+                        raise OSError("eof on tcp bridge")
+                    buf += c
+                (n,) = struct.unpack("!I", buf)
+                out = b""
+                while len(out) < n:
+                    c = self._tcp_sock.recv(n - len(out))
+                    if not c:
+                        raise OSError("eof on tcp bridge")
+                    out += c
+                return out
+            except OSError as e:
+                last_err = e
+                try:
+                    self._tcp_sock.close()
+                except OSError:
+                    pass
+                self._tcp_sock = None
+        raise PersistentRuntimeError(f"tcp rpc failed (op={op}): {last_err}")
+
+    def _file_xfer(self, payload: bytes, timeout: float, op: Any) -> bytes:
+        p = self.PERSIST_DIR
+        b64 = base64.b64encode(payload).decode("ascii")
+        if len(b64) <= self.FAST_RPC_MAX_B64:
+            # 单次 exec-out 往返 (原 rm/push/poll/pull/rm 五连 adb ~110ms → ~45ms)。
+            # 尾部不 rm resp.bin: 由下次调用头部 rm -f 清 (runner boot 亦 unlink 双文件)。
+            cmd = (
+                f"cd {p} && rm -f resp.bin && echo -n {b64} | base64 -d > req.bin && "
+                f"while [ ! -s resp.bin ]; do sleep {self.FAST_POLL_S}; done && cat resp.bin"
+            )
+            try:
+                r = subprocess.run(
+                    ["adb", "-s", self.device, "exec-out", cmd],
+                    capture_output=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                raise PersistentRuntimeError(
+                    f"rpc timeout after {timeout}s (op={op})")
+            data = r.stdout
+            if r.returncode != 0 or len(data) < 4:
+                raise PersistentRuntimeError(
+                    f"fast rpc fail rc={r.returncode} len={len(data)} "
+                    f"err={r.stderr[:200]!r} (op={op})")
+        else:
+            # 大 body (长预填充等): 命令行内嵌放不下, 回退 push+poll 旧路径
+            self._adb_ok("shell", f"rm -f {p}/resp.bin")
+            with tempfile.NamedTemporaryFile("wb", suffix=".req", delete=False) as f:
+                f.write(payload)
+                req_local = f.name
+            try:
+                self._adb_ok("push", req_local, f"{p}/req.bin", timeout=timeout)
+            finally:
+                os.unlink(req_local)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                r = self._adb("shell", f"test -s {p}/resp.bin && echo Y || echo N")
+                if r.stdout.strip() != "Y":
+                    time.sleep(self.POLL_INTERVAL)
+                    continue
+                with tempfile.NamedTemporaryFile(suffix=".resp", delete=False) as f:
+                    resp_local = f.name
+                try:
+                    self._adb_ok("pull", f"{p}/resp.bin", resp_local, timeout=timeout)
+                    self._adb_ok("shell", f"rm -f {p}/resp.bin")
+                    with open(resp_local, "rb") as g:
+                        data = g.read()
+                finally:
+                    os.unlink(resp_local)
+                break
+            else:
+                raise PersistentRuntimeError(f"rpc timeout after {timeout}s (op={op})")
+        return data
+
 
     # ---- public contract (原 socket 设计同名接口) ----
     def _ensure_device_server(self) -> None:
