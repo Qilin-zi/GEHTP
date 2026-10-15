@@ -2126,6 +2126,192 @@ static int exec_matmul_f16_gemv(const uint16_t* a, const uint16_t* w, uint16_t* 
     return 0;
 }
 
+/* 013 Q4_0 权重 M<32 GEMV (decode M=1 FC / 小 M)。
+ * 契约见 exec_matmul_f16_hmx w_q4 注释 + emit repack_q4_0_tiles:
+ *   tile(ct,kt) @ (ct*n_dot+kt)*640, ct=N-tile(=全局列/32), kt=K-tile, n_dot=K/32;
+ *   quant byte @ tile[i*32+r] (i=K 对 0..15, r=列%32), lo=值(2i) hi=值(2i+1);
+ *   d f16 @ tile+512+2*r (每 输出列 r × K 块 kt 一个); 值 = d*(q-8), q∈[0,15]。
+ * K%32==0 (上层判别保证) 无尾数。t0 只影响激活布局 (Q4 tile 方向固定, t1 无关);
+ * batched 已在上层硬错拒绝 (Q4 槽不支持 batched)。 */
+static int exec_matmul_q4_0_gemv(const uint16_t* a, const uint8_t* w_q4, uint16_t* y,
+                                 uint32_t M, uint32_t K, uint32_t N,
+                                 uint32_t n0, uint32_t N_full,
+                                 int t0, char* err, size_t errn) {
+    (void)err; (void)errn;
+    uint32_t n_dot = K / 32u;
+#if defined(__HVX__) || defined(__hexagon__)
+    /* HVX 列向量化: 一条 f32 向量 = tile 的 32 输出列, K 维标量流。nibble→f32
+     * (q-8) 的 vshuff/vzxt/魔数序列逐条复用 hvhx_v2_dequant_q4_0_crouton 已上板
+     * 位级验证的舞步 (S1/S2/-4/-1 语义), 但不落 f16 中转, 直乘激活 (省一半
+     * 转换+省 VTCM scratch)。scale d 每 kt 只乘一次 (标量 ref 逐元素乘 d —
+     * 同积不同累加序, f32 下差 ~ulp 级; 金标门 cmp_device_q4_vs_golden 裁决)。
+     * 权重流前瞻: cts 权重块全连续, 每 8 ct 一条 l2fetch 组预取 (160KB@K=1024)
+     * 常保一组在途 — 每-ct 双发小预取会在大 N (lm_head 7760 ct) 下打满 fetch 队列。
+     * CTG=4: 四 ct 一 pass 共享激活 splat; K 维先 af[] 预转换 f32 一次 (免
+     * 每 tile 32 次标量 f16 转换的子正规 while 开销)。scale kt 末重载省寄存器。
+     * n0/N 非 128 对齐 (手构 blob) 走下方标量 ref。 */
+    if ((n0 & 127u) == 0u && (N & 127u) == 0u && n_dot != 0u && K <= 8192u) {
+        static float af[8192]; /* 单线程执行器, K 维 f32 预转换缓存 */
+        const HVX_Vector nib_m = Q6_Vb_vsplat_R(0x0Fu);
+        const HVX_Vector magic = Q6_V_vsplat_R(0x4B000000u); /* 2^23 */
+        const HVX_Vector base = hvx_vec_splat_f32(8388616.0f); /* 2^23+8 */
+        for (uint32_t m = 0; m < M; ++m) {
+            const uint16_t* xb = a + (t0 ? (size_t)m : (size_t)m * K);
+            if (t0) {
+                for (uint32_t k = 0; k < K; ++k) af[k] = f16_to_f32(a[(size_t)k * M + m]);
+            } else {
+                for (uint32_t k = 0; k < K; ++k) af[k] = f16_to_f32(xb[k]);
+            }
+            uint32_t n_ct = N / 32u;
+            uint32_t blk = n_dot * 640u;
+            const uint8_t* tb0 = w_q4 + (size_t)(n0 / 32u) * n_dot * 640u;
+            /* 组预取: cts 的权重块全连续, 每 8 ct 一条 l2fetch 盖一组
+             * (160KB@K=1024), 常保一组在途 — 每-ct 双发小预取会在大 N
+             * (lm_head 7760 ct) 下打满 fetch 队列。 */
+            uint32_t sb = 8u * blk;
+            hex_l2fetch_block(tb0, n_ct < 8u ? n_ct * blk : sb);
+            for (uint32_t j = 0; j < n_ct; j += 4u) {
+                const uint8_t* tb = w_q4 + (size_t)(n0 / 32u + j) * n_dot * 640u;
+                if ((j & 7u) == 0u) {
+                    size_t rem = (size_t)(n_ct - j) * blk;
+                    if (rem > sb) {
+                        size_t nxt = rem - sb;
+                        hex_l2fetch_block(tb + sb, nxt < sb ? nxt : sb);
+                    }
+                }
+                HVX_Vector acc0 = Q6_V_vzero(), acc1 = Q6_V_vzero();
+                HVX_Vector acc2 = Q6_V_vzero(), acc3 = Q6_V_vzero();
+                for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                    const uint8_t* qt = tb + (size_t)kt * 640u;
+                    const uint8_t* qt1 = qt + (size_t)1u * blk;
+                    const uint8_t* qt2 = qt + (size_t)2u * blk;
+                    const uint8_t* qt3 = qt + (size_t)3u * blk;
+                    HVX_Vector uns0 = Q6_V_vzero(), uns1 = Q6_V_vzero();
+                    HVX_Vector uns2 = Q6_V_vzero(), uns3 = Q6_V_vzero();
+                    for (uint32_t g = 0; g < 4u; ++g) {
+                        HVX_Vector vq0 = hvx_vmemu(qt + g * 128u);
+                        HVX_Vector vq1 = hvx_vmemu(qt1 + g * 128u);
+                        HVX_Vector vq2 = hvx_vmemu(qt2 + g * 128u);
+                        HVX_Vector vq3 = hvx_vmemu(qt3 + g * 128u);
+                        /* lo nibble=K 偶行, hi=K 奇行; mix.lo/mix.hi 各覆盖 2 cp */
+                        HVX_VectorPair mix0 =
+                            Q6_W_vshuff_VVR(Q6_Vub_vlsr_VubR(vq0, 4),
+                                            Q6_V_vand_VV(vq0, nib_m), -1);
+                        HVX_VectorPair mix1 =
+                            Q6_W_vshuff_VVR(Q6_Vub_vlsr_VubR(vq1, 4),
+                                            Q6_V_vand_VV(vq1, nib_m), -1);
+                        HVX_VectorPair mix2 =
+                            Q6_W_vshuff_VVR(Q6_Vub_vlsr_VubR(vq2, 4),
+                                            Q6_V_vand_VV(vq2, nib_m), -1);
+                        HVX_VectorPair mix3 =
+                            Q6_W_vshuff_VVR(Q6_Vub_vlsr_VubR(vq3, 4),
+                                            Q6_V_vand_VV(vq3, nib_m), -1);
+                        for (uint32_t h = 0; h < 2u; ++h) {
+#define Q4_CT4_DANCE(IDX)                                                     \
+                            do {                                              \
+                                HVX_Vector half##IDX = h ? Q6_V_hi_W(mix##IDX) \
+                                                          : Q6_V_lo_W(mix##IDX); \
+                                HVX_VectorPair w1##IDX = Q6_Wuh_vzxt_Vub(half##IDX); \
+                                HVX_VectorPair we##IDX =                      \
+                                    Q6_Wuw_vzxt_Vuh(Q6_V_lo_W(w1##IDX));      \
+                                HVX_VectorPair wo##IDX =                      \
+                                    Q6_Wuw_vzxt_Vuh(Q6_V_hi_W(w1##IDX));      \
+                                re##IDX = Q6_W_vshuff_VVR(Q6_V_hi_W(we##IDX), \
+                                                          Q6_V_lo_W(we##IDX), -4); \
+                                ro##IDX = Q6_W_vshuff_VVR(Q6_V_hi_W(wo##IDX), \
+                                                          Q6_V_lo_W(wo##IDX), -4); \
+                            } while (0)
+#define Q4_CT4_MAC(IDX)                                                       \
+                            do {                                              \
+                                HVX_Vector qe##IDX = hvx_vec_sub_f32_f32(     \
+                                    Q6_V_vor_VV(c ? Q6_V_hi_W(re##IDX)        \
+                                                  : Q6_V_lo_W(re##IDX), magic), \
+                                    base);                                    \
+                                HVX_Vector qo##IDX = hvx_vec_sub_f32_f32(     \
+                                    Q6_V_vor_VV(c ? Q6_V_hi_W(ro##IDX)        \
+                                                  : Q6_V_lo_W(ro##IDX), magic), \
+                                    base);                                    \
+                                uns##IDX = hvx_vec_add_f32_f32(uns##IDX,     \
+                                    hvx_vec_mul_f32_f32(qe##IDX, s0));        \
+                                uns##IDX = hvx_vec_add_f32_f32(uns##IDX,     \
+                                    hvx_vec_mul_f32_f32(qo##IDX, s1));        \
+                            } while (0)
+                            HVX_VectorPair re0, ro0, re1, ro1, re2, ro2, re3, ro3;
+                            Q4_CT4_DANCE(0);
+                            Q4_CT4_DANCE(1);
+                            Q4_CT4_DANCE(2);
+                            Q4_CT4_DANCE(3);
+                            for (uint32_t c = 0; c < 2u; ++c) {
+                                uint32_t cp = g * 4u + h * 2u + c;
+                                uint32_t k0 = kt * 32u + 2u * cp;
+                                HVX_Vector s0 = hvx_vec_splat_f32(af[k0]);
+                                HVX_Vector s1 = hvx_vec_splat_f32(af[k0 + 1u]);
+                                Q4_CT4_MAC(0);
+                                Q4_CT4_MAC(1);
+                                Q4_CT4_MAC(2);
+                                Q4_CT4_MAC(3);
+                            }
+#undef Q4_CT4_DANCE
+#undef Q4_CT4_MAC
+                        }
+                    }
+                    /* 19.0.07 对本循环组 (g/h/c 三层 + dance/MAC) 的调度存在
+                     * stale-vector 类错码: 无 call/栅栏时 CTG=4 全列输出归零 (probe
+                     * 复现, 见 013 探针线); kt 末一条编译器栅栏 (零指令开销, 仅
+                     * 禁止跨点重排) 即恢复正确 — 同 hvx_int8gemm.c 软件流水器
+                     * 已知病灶家族, 但 -O1/-enable-swp=false 均救不了, 只能栅栏。 */
+                    __asm__ volatile("" ::: "memory");
+                    /* scale kt 末才用, 此处重载省 4 个常驻寄存器 */
+                    acc0 = hvx_vec_add_f32_f32(acc0, hvx_vec_mul_f32_f32(uns0,
+                        Q6_V_lo_W(hvx_vec_f16_to_f32(hvx_vmemu(qt + 512u)))));
+                    acc1 = hvx_vec_add_f32_f32(acc1, hvx_vec_mul_f32_f32(uns1,
+                        Q6_V_lo_W(hvx_vec_f16_to_f32(hvx_vmemu(qt1 + 512u)))));
+                    acc2 = hvx_vec_add_f32_f32(acc2, hvx_vec_mul_f32_f32(uns2,
+                        Q6_V_lo_W(hvx_vec_f16_to_f32(hvx_vmemu(qt2 + 512u)))));
+                    acc3 = hvx_vec_add_f32_f32(acc3, hvx_vec_mul_f32_f32(uns3,
+                        Q6_V_lo_W(hvx_vec_f16_to_f32(hvx_vmemu(qt3 + 512u)))));
+                }
+                uint16_t* yb = y + (size_t)m * N_full + n0 + j * 32u;
+                hvx_vec_store_u(yb, 64u, hvx_vec_f32_to_f16(acc0, Q6_V_vzero()));
+                hvx_vec_store_u(yb + 32u, 64u, hvx_vec_f32_to_f16(acc1, Q6_V_vzero()));
+                hvx_vec_store_u(yb + 64u, 64u, hvx_vec_f32_to_f16(acc2, Q6_V_vzero()));
+                hvx_vec_store_u(yb + 96u, 64u, hvx_vec_f32_to_f16(acc3, Q6_V_vzero()));
+            }
+        }
+        g_last_engine = WT_ENG_HVX;
+        return 0;
+    }
+#endif
+    for (uint32_t m = 0; m < M; ++m) {
+        const uint16_t* xb = a + (t0 ? (size_t)m : (size_t)m * K);
+        for (uint32_t n = 0; n < N; ++n) {
+            uint32_t gcol = n0 + n;
+            uint32_t ct = gcol / 32u, r = gcol % 32u;
+            float acc = 0.0f;
+            for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                const uint8_t* tile = w_q4 + ((size_t)ct * n_dot + kt) * 640u;
+                const uint16_t* drow = (const uint16_t*)(const void*)(tile + 512u);
+                /* scale 每 (输出列 r, K 块 kt) 一个 @ tile+512+2r, 整块 32 K
+                 * 共用一个 (GGUF Q4_0 块契约)。quants 按 i=K 对 (0..15) ×
+                 * r=列 (0..31) 布局: byte tile[i*32+r] lo=值(2i) hi=值(2i+1)。 */
+                float d = f16_to_f32(drow[r]);
+                for (uint32_t i = 0; i < 16u; ++i) {
+                    uint8_t b = tile[i * 32u + r];
+                    uint32_t k0 = kt * 32u + 2u * i;
+                    uint32_t k1 = k0 + 1u;
+                    float a0 = f16_to_f32(t0 ? a[(size_t)k0 * M + m] : xb[k0]);
+                    float a1 = f16_to_f32(t0 ? a[(size_t)k1 * M + m] : xb[k1]);
+                    acc += a0 * d * (float)((int)(b & 0xFu) - 8);
+                    acc += a1 * d * (float)((int)(b >> 4) - 8);
+                }
+            }
+            y[(size_t)m * N_full + gcol] = f32_to_f16(acc);
+        }
+    }
+    g_last_engine = WT_ENG_SCALAR;
+    return 0;
+}
+
 /* f16×f16 GEMM (float 图; f32 累加 f16 存储）。M3c 正确性版 —— 性能版
  * 走 HMX (M7)。flags bit0 = a 转置(存 [K,M]), bit1 = w 转置(存 [N,K]),
  * bit2 = batched BMM(attention q·kᵀ/probs·v; 批数在高 16 位) */
@@ -2413,8 +2599,11 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
      * FR-002: stream W 行主序，无 crouton repack (memory-bound)。
      * 成功返回 0，失败回落标量。 */
     if (M < 32u) {
-        if (exec_matmul_f16_gemv(a, w, y, M, K, N, n0, N_full, t0, t1,
-                                batched, Bn, err, errn) == 0) {
+        int gv_rc = w_q4
+            ? exec_matmul_q4_0_gemv(a, w_q4, y, M, K, N, n0, N_full, t0, err, errn)
+            : exec_matmul_f16_gemv(a, w, y, M, K, N, n0, N_full, t0, t1,
+                                   batched, Bn, err, errn);
+        if (gv_rc == 0) {
             return 0;  /* GEMV 成功：已设置 g_last_engine */
         }
     }

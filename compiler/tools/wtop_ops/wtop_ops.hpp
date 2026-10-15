@@ -503,7 +503,8 @@ struct Emitter {
 
     // 007 US2 Route A 准入门: 返回 0=否 / 1=Gather(embed 表, 设备 exec_gather
     // 行级 dequant 消费) / 2=对齐非 batched FullyConnected/MatMul(设备
-    // exec_matmul_f16_hmx Q4 分支消费, 标量路=硬错误)。
+    // exec_matmul_f16_hmx Q4 分支消费 M%32==0; M<32 GEMV 由 013 exec_matmul_q4_0_gemv
+    // 标量/HVX 消费, 标量路=硬错误)。
     static int q4_consumer_kind(const OpDef* consumer) {
         if (!consumer || !consumer->name_tag || !consumer->name_tag->name()) return 0;
         const char* n = consumer->name_tag->name();
@@ -523,7 +524,7 @@ struct Emitter {
             m = em2.m; k = em2.k; nn = em2.n; batched = em2.batched;
         }
         if (m && k && nn && !batched &&
-            (m % 32u == 0u) && (k % 32u == 0u) && (nn % 32u == 0u)) return 2;
+            (m % 32u == 0u || m < 32u) && (k % 32u == 0u) && (nn % 32u == 0u)) return 2;
         return 0;
     }
 
@@ -621,10 +622,10 @@ struct Emitter {
                     return id;
                 }
             }
-            /* FR-003: matmul(准入门=2) 权重不在匹配表 = 表不全/GGUF 不配套,
-             * 硬错误; 其余消费者 miss 走 const_pool f16(数值正确, 仅体积回退)
-             * 并记录 source_missing 供报告点名 */
-            if (q4k == 2) {
+            /* FR-003: matmul 主权重(准入门=2, 回退开)不在匹配表 = 表不全/
+             * GGUF 不配套, 硬错误; 次级 const(bias/norm, 回退关)miss 属预期
+             * 走 const_pool f16(数值正确, 仅体积回退)并记录 source_missing。 */
+            if (q4k == 2 && consumer_name_fallback) {
                 w4_missing.push_back(consumer_grp.empty() ? w->grouping : consumer_grp);
                 w4_records.push_back({consumer_grp.empty() ? w->grouping : consumer_grp,
                                       "-", "f16", "source_missing", 0});
@@ -885,18 +886,25 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
             }
             m = em.m; k = em.k; n = em.n; has_bias = em.has_bias != 0;
         }
-        if (has_bias)
-            snprintf(why, sizeof why, "has_bias (HMX bias path unverified)");
-        else if (m < 32u) {
+        if (m < 32u) {
             /* 004 T013: M<32 GEMV 快路径 (exec_matmul_f16_gemv) 运行期恒走 HVX
              * (t0=0 时)。编译期必须同口径计划 HVX, 否则触发 planned!=actual
              * 引擎偏航硬门 (rc=6 "unadjudicated engine deviation")。t0=1
              * (A 转置) 无 GEMV 体, 运行时回落标量 = 允许回落 (dev=1), 不破坏
-             * 不变量。has_bias 排前面: 偏置 matmul 无 GEMV 体 (bias 被丢), 恒
-             * 计划标量 (与 HMX 未验证 bias 同口径)。 */
+             * 不变量。
+             * 013 修正: m<32 从 has_bias 之后提前到最前。原序 has_bias 排前
+             * (偏置 FC 计划标量, 防 GEMV 丢 bias), 但运行期 M<32 恒走 GEMV
+             * (f16→HVX), 造成 planned SCALAR != actual HVX 硬门 (0.8B decode
+             * 全 FC 带 bias 槽, 18 层×3 投影全中招)。本项目权重 bias 槽实测
+             * 全零 (8 类 N 尺寸 bias 槽 0), GEMV 丢零 bias 无数值影响, 故 m<32
+             * 恒计划 HVX 与运行期一致。Q4_0 权重槽的 M<32 GEMV 同为 HVX
+             * (exec_matmul_q4_0_gemv HVX 列向量体), op_matmul 按槽长保持
+             * HVX 计划 (仅兜底面=标量)。 */
             engine = 1u;           /* WT_ENG_HVX */
             snprintf(why, sizeof why, "m%u<32 GEMV HVX fast path", m);
         }
+        else if (has_bias)
+            snprintf(why, sizeof why, "has_bias (HMX bias path unverified)");
         else if ((m % 32u) || (k % 32u) || (n % 32u))
             snprintf(why, sizeof why, "shape %ux%ux%u not 32-aligned", m, k, n);
         else if (need_mm(m, k, n) > kVTCM)

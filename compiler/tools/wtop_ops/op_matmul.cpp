@@ -263,6 +263,17 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
                 return 0;
             }
         }
+        /* 013: Q4_0 权重槽的 M<32 GEMV 运行期走 HVX 列向量体
+         * (exec_matmul_q4_0_gemv; n0/N 非 32 对齐手构 blob 兜底标量)。
+         * 与 assign_engine m<32 计划 HVX 同口径, 无需覆盖 —— 仅形状/槽长
+         * 落 Q4 判别 (长度即唯一判别: Q4_0 tile = (K/32)*(N/32)*640, 与
+         * f16(k*n*2)/W4A16(k*n/2) 互斥) 时确保回落面可标量 (对齐兜底)。
+         * 历史: 曾按槽长覆盖 SCALAR (GEMV 无 HVX 体时代), HVX 体落地后
+         * 触发 planned SCALAR != actual HVX 硬门。 */
+        if ((w_s & 0x8000u) && ((w_s & 0x7FFFu) < em.slots.size()) &&
+            em.slots[w_s & 0x7FFFu].len == (size_t)(k / 32u) * (size_t)(nn / 32u) * 640u) {
+            em.cur_engine = wt_annot_pack(1u, 1u, 0u);  /* Q4_0 GEMV = HVX, 可回落 */
+        }
         if (has_bias) {
             /* OP_MATMUL_F16_BIAS (opcode 36): 尾部追加 bias 槽。
              * 005 US3b: 设备 HMX 路径已有 bias 通道(scale 区 out_bias,
