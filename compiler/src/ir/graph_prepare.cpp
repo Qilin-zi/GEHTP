@@ -601,7 +601,13 @@ static uint64_t mm_scratch_need(uint32_t m, uint32_t k, uint32_t n) {
     size_t off_s = (off_o + o + 2047u) & ~(size_t)2047u;
     return off_s + 2048u;
 }
-struct VtcmAutoScan { bool w4 = false; bool conv = false; uint64_t scratch_max = 0; uint64_t weight_sum = 0; };
+struct VtcmAutoScan {
+    bool w4 = false;
+    bool conv = false;
+    uint64_t scratch_max = 0;
+    uint64_t weight_sum = 0;
+    uint64_t gdn_scratch = 0;  // GdnBlock 内核私有 scratch(层间时间复用, 取 max)
+};
 static VtcmAutoScan vtcm_auto_scan(const GraphPrepare& gp);
 
 // Source: graph_prepare.cc, 2329 bytes at 0xF71F00
@@ -681,25 +687,52 @@ GraphStatus GraphPrepare::do_prepare2_late(std::vector<uint32_t>& runlist_tags) 
             constexpr uint64_t kVtcmTotal = 16ull << 20;  // 设备 A2 query; 发射侧 kVTCMTotal 同源
             constexpr uint64_t kPinMisc = 512ull << 10;   // 固定杂项余量(执行器 pin_cap==0 回退 4096 + ring/temp 上界)
             const uint64_t conv_head = (vas.conv ? (2ull << 20) : 0ull);
-            // 010 T004: pin_cap 真算 = 权重常驻需求 2048 对齐(替换旧的固定 align2048 余量假设)。
-            // 权重过大(与 scratch + 固定余量合计 ≥ 16MB)时不 pin → 0(执行器回退 4096 = 旧口径流式)。
+
+            // ① 常驻需求(预算)= 矩阵族候选张量生命期打包后的峰值重叠水位。
+            //    发射侧(op_matmul)已按 ddr_vtcm_cap 预留 pool、chunk 预算 = 16MB − pool,
+            //    这里只负责把需求算出来、反过来定 pool —— 不再让 scratch 先吃满 16MB
+            //    再让常驻吃剩的(=0)。探针用满 16MB 预算跑一次分配, 取 in_vtcm 峰值。
+            //    2048 对齐 = alloc_vtcm_stage 叠加基址口径(wtop_ops.hpp)。
+            uint64_t residency_demand = 0;
+            {
+                std::vector<DdrTempEntry> probe;
+                uint64_t probe_cap = 0, probe_vcap = 0;
+                if (compute_ddr_offsets(0, &probe, &probe_cap, nullptr, nullptr,
+                                        kVtcmTotal, &probe_vcap) == 0) {
+                    for (const auto& e : probe)
+                        if (e.in_vtcm)
+                            residency_demand = std::max<uint64_t>(residency_demand, e.offset + e.size);
+                }
+                residency_demand = (residency_demand + 2047u) & ~uint64_t(2047u);
+            }
+
+            // ② 池 = 驻留峰值 + 内核私有 scratch(GdnBlock): scratch 非图张量,
+            //    驻留打包看不见, emit 侧 alloc_vtcm_stage 在峰值之上 bump 叠加,
+            //    这里先留出。W4A16 act staging 依赖 emit 期物化态, 但图含 W4A16
+            //    时本就 auto-off(下方 vas.w4), 非 W4 图 staging 恒 0, 不计。
+            const uint64_t gdn_pad = vas.gdn_scratch;
+
+            // ③ 权重常驻(pin_cap)与常驻池/scratch/余量共存检查(010 T004)。
             uint64_t pin_cap = (vas.weight_sum + 2047u) & ~uint64_t(2047u);
-            if (pin_cap > 0 && pin_cap + vas.scratch_max + conv_head + kPinMisc >= kVtcmTotal) {
-                pin_cap = 0;  // 权重塞不进(与 scratch/余量争 16MB) → 流式, 不 pin
+            if (pin_cap > 0 && pin_cap + vas.scratch_max + residency_demand + gdn_pad + conv_head + kPinMisc >= kVtcmTotal) {
+                pin_cap = 0;  // 权重塞不进(与常驻/scratch/余量争 16MB) → 流式, 不 pin
             }
             const uint64_t head = conv_head + kPinMisc + pin_cap;
+
             if (vas.w4) {
                 std::fprintf(stderr, "[memplan] vtcm auto off: 图含 W4A16 matmul (carve/池预算统一另线收口)\n");
-            } else if (vas.scratch_max + head < kVtcmTotal) {
-                vtcm_eff = (kVtcmTotal - vas.scratch_max - head) & ~uint64_t(1023u);
+            } else if (residency_demand > 0 || gdn_pad > 0) {
+                vtcm_eff = residency_demand + gdn_pad;
                 mem_plan_.pin_cap = pin_cap;
-                std::fprintf(stderr, "[memplan] vtcm auto: scratch_max=%llu conv=%d pin_cap=%llu head=%llu → pool=%llu (%.2fMB)\n",
-                             (unsigned long long)vas.scratch_max, (int)vas.conv,
+                std::fprintf(stderr, "[memplan] vtcm auto: 常驻=%.2fMB gdn_scratch=%.2fMB scratch_max=%.2fMB conv=%d pin_cap=%llu head=%llu → pool=%.2fMB\n",
+                             residency_demand / 1048576.0,
+                             vas.gdn_scratch / 1048576.0,
+                             vas.scratch_max / 1048576.0, (int)vas.conv,
                              (unsigned long long)pin_cap,
                              (unsigned long long)head,
-                             (unsigned long long)vtcm_eff, vtcm_eff / 1048576.0);
+                             vtcm_eff / 1048576.0);
             } else {
-                std::fprintf(stderr, "[memplan] vtcm auto off: scratch_max=%llu + head=%llu ≥ VTCM 16MB\n",
+                std::fprintf(stderr, "[memplan] vtcm auto off: 无常驻候选 (scratch_max=%llu + head=%llu ≥ VTCM 16MB)\n",
                              (unsigned long long)vas.scratch_max, (unsigned long long)head);
             }
         }
@@ -2508,6 +2541,20 @@ static VtcmAutoScan vtcm_auto_scan(const GraphPrepare& gp) {
         if (std::strcmp(nm, "MatMul") != 0 && std::strcmp(nm, "FullyConnected") != 0) {
             if (std::strcmp(nm, "Conv2d") == 0 || std::strcmp(nm, "DepthWiseConv2d") == 0)
                 r.conv = true;
+            else if (std::strcmp(nm, "GdnBlock") == 0) {
+                /* 内核私有 scratch 预算(extractor 闭式值, 128 对齐): 非图张量,
+                 * 驻留打包看不见 —— emit 侧 alloc_vtcm_stage 在驻留峰值之上
+                 * 叠加, 池预算必须把它算进来(层间时间复用同一段, 取 max)。
+                 * extra 序列化时才现算注册表注入, 此处多为空 → 现调 extractor
+                 * (MatMul/FC 分支同套路)。 */
+                std::vector<uint8_t> xb = od->serialized_extra;
+                if (xb.size() < sizeof(ExtraGdnBlock)) xb = extract_gdn_block_extra(gp, *od);
+                if (xb.size() >= sizeof(ExtraGdnBlock)) {
+                    ExtraGdnBlock eg{};
+                    std::memcpy(&eg, xb.data(), sizeof(eg));
+                    r.gdn_scratch = std::max<uint64_t>(r.gdn_scratch, eg.vtcm_budget_bytes);
+                }
+            }
             continue;
         }
         uint32_t m = 0, k = 0, n = 0, has_bias = 0, batched = 0;

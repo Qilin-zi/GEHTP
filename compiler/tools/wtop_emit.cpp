@@ -546,6 +546,50 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         for (op_id_t id = 1; id <= 10; id++) order.push_back(id);  // 兜底(常规图 id 1..10)
     }
     em.compute_last_use(order, gp);
+    /* 诊断(carve alias 取证): 打关键 op 的反序列化侧输入边(src,out_idx)。 */
+    if (getenv("GEHTP_DBG_EDGES")) {
+        {
+            const OpDef* outn = gp.get_op_at(gp.get_output_node_id());
+            std::fprintf(stderr, "[edges] order.size=%zu output_node=%llu inputs:",
+                         order.size(), (unsigned long long)gp.get_output_node_id());
+            if (outn)
+                for (const auto& e : outn->inputs)
+                    std::fprintf(stderr, " (%llu,%u)", (unsigned long long)e.src_id, e.out_idx);
+            std::fprintf(stderr, "\n");
+            const OpDef* last = gp.get_op_at(order.back());
+            std::fprintf(stderr, "[edges] order.back=%llu %s\n", (unsigned long long)order.back(),
+                         last && last->name_tag && last->name_tag->name() ? last->name_tag->name() : "?");
+        }
+        for (op_id_t dbg_id : {9ull, 18ull, 103ull, 346ull}) {
+            const OpDef* d = gp.get_op_at(dbg_id);
+            if (!d) { std::fprintf(stderr, "[edges] op %llu: <absent>\n", (unsigned long long)dbg_id); continue; }
+            std::fprintf(stderr, "[edges] op %llu %s inputs:", (unsigned long long)dbg_id,
+                         d->name_tag && d->name_tag->name() ? d->name_tag->name() : "?");
+            for (const auto& e : d->inputs)
+                std::fprintf(stderr, " (%llu,%u)", (unsigned long long)e.src_id, e.out_idx);
+            std::fprintf(stderr, "\n");
+        }
+        if (const char* ps = getenv("GEHTP_DBG_POS")) {  // 逗号分隔 pos 列表
+            std::string s(ps);
+            size_t st = 0;
+            while (st < s.size()) {
+                size_t c = s.find(',', st);
+                if (c == std::string::npos) c = s.size();
+                size_t p = std::strtoul(s.substr(st, c - st).c_str(), nullptr, 10);
+                st = c + 1;
+                if (p >= order.size()) continue;
+                const OpDef* d = gp.get_op_at(order[p]);
+                if (!d) { std::fprintf(stderr, "[pos %zu] <absent>\n", p); continue; }
+                std::fprintf(stderr, "[pos %zu] id=%llu %s dead=%d inputs:", p,
+                             (unsigned long long)order[p],
+                             d->name_tag && d->name_tag->name() ? d->name_tag->name() : "?",
+                             (int)d->is_dead());
+                for (const auto& e : d->inputs)
+                    std::fprintf(stderr, " (%llu,%u)", (unsigned long long)e.src_id, e.out_idx);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
     // Output 引用的 temp 必须活到循环外(唯一真实跨循环引用)
     {
         const OpDef* out = gp.get_op_at(gp.get_output_node_id());
@@ -562,13 +606,6 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
         op_id_t id = order[pos];
         em.cur_op = id;
         em.cur_engine = wt_annot_pack(0u, 1u, 0u);  /* 默认内存/控制 op: scalar, 可回落 */
-        if (pos < 8 || id < 100) {
-            const OpDef* dbg = gp.get_op_at(id);
-            std::fprintf(stderr, "[dbg] pos=%zu id=%llu name=%s const=%d\n", pos,
-                         (unsigned long long)id,
-                         dbg && dbg->name_tag && dbg->name_tag->name() ? dbg->name_tag->name() : "?",
-                         dbg && dbg->is_const());
-        }
         const OpDef* od = gp.get_op_at(id);
         if (!od || od->is_const() || !od->name_tag) continue;
         std::string nm = od->name_tag->name() ? od->name_tag->name() : "";
@@ -669,6 +706,9 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 if (dit != em.ddr_temp_tab.end() && dit->second.second > 0 &&
                     vit != em.ddr_temp_vtcm.end() && vit->second) {
                     auto lut = em.last_use.find(Emitter::tkey(id, 0));
+                    if (getenv("GEHTP_DBG_EDGES") && lut == em.last_use.end())
+                        std::fprintf(stderr, "[carve-miss] id=%llu pos=%zu last_use.size=%zu\n",
+                                     (unsigned long long)id, pos, em.last_use.size());
                     uint32_t rend = (lut != em.last_use.end())
                                         ? lut->second + 1u
                                         : static_cast<uint32_t>(order.size());
@@ -678,6 +718,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                                                  (uint32_t)pos, rend,
                                                  dit->second.first, dit->second.second,
                                                  tit->second});
+                    if (getenv("GEHTP_DBG_EDGES"))
+                        std::fprintf(stderr, "[carve-reg] id=%llu pos=%zu temp=%u off=%u sz=%u rend=%u\n",
+                                     (unsigned long long)id, pos, tit->second,
+                                     dit->second.first, dit->second.second, rend);
                 }
             }
         }
@@ -716,30 +760,47 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     /* 008 T017 别名延展: Reshape 引用消除使折叠节点按 op_temp 别名到生产者
      * 同一 temp (alias_temp 取 last_use 并集), 折叠节点随后又按同一 temp 登记
      * → 同 temp 双窗重叠假别名(真图 0.8B 再发射实锤: op 3 [512,896) 双窗
-     * [3,4)/[3,5) 同缓冲)。按 temp id 归并: 同 temp 只登记一条, 窗口取最早
-     * op_index .. 最晚 end 的并集。异 temp 即使同 offset(真图不可能, 规划器
-     * 保证异活张量异区)也不归并, 交给下方不变式自校验硬报错 (T022 负例)。 */
-    std::map<uint32_t, Emitter::PendingCarve> by_temp;
-    for (const auto& pc : em.pending_carves) {
-        auto it = by_temp.find(pc.temp_id);
-        if (it == by_temp.end()) {
-            by_temp[pc.temp_id] = pc;
-        } else {
-            Emitter::PendingCarve& m = it->second;
-            if (pc.op_index < m.op_index) m.op_index = pc.op_index;
-            if (pc.producer_pos < m.producer_pos) m.producer_pos = pc.producer_pos;
-            if (pc.lifetime_end_pos > m.lifetime_end_pos)
-                m.lifetime_end_pos = pc.lifetime_end_pos;
+     * [3,4)/[3,5) 同缓冲)。
+     * 0.6B 驻留线补充: 同 temp id 还有第二种来源 —— fresh_temp 静态 id 回收
+     * (28 层同形状张量复用 id+同偏移, 规划器保证层间生命期不相交)。此时
+     * 无差别取并集会把 28 条不相交窗并成贯穿全图的幻影巨窗, 与共享偏移的
+     * 其他 temp 撞出假别名(carve alias 实锤)。判据: 别名 = 同缓冲连续存活
+     * → 窗重叠; 回收 = 不同缓冲 → 窗不相交。故仅并重叠窗(区间合并), 不相交
+     * 的各自留独立 carve 记录(runtime carve footer 本就按窗口活跃集定址,
+     * 同偏移不相交多窗合法)。异 temp 即使同 offset(规划器保证异活异区)也
+     * 不归并, 交给下方不变式自校验硬报错 (T022 负例)。 */
+    std::map<uint32_t, std::vector<Emitter::PendingCarve>> by_temp;
+    for (const auto& pc : em.pending_carves) by_temp[pc.temp_id].push_back(pc);
+    for (auto& kv : by_temp) {
+        std::vector<Emitter::PendingCarve>& lst = kv.second;
+        std::sort(lst.begin(), lst.end(),
+                  [](const Emitter::PendingCarve& a, const Emitter::PendingCarve& b) {
+                      return a.producer_pos < b.producer_pos;
+                  });
+        for (size_t i = 1; i < lst.size();) {
+            Emitter::PendingCarve& m = lst[i - 1];
+            const Emitter::PendingCarve& c = lst[i];
+            if (c.producer_pos <= m.lifetime_end_pos) {  /* 重叠/相接 = 同缓冲别名链 */
+                if (c.op_index < m.op_index) m.op_index = c.op_index;
+                if (c.producer_pos < m.producer_pos) m.producer_pos = c.producer_pos;
+                if (c.lifetime_end_pos > m.lifetime_end_pos)
+                    m.lifetime_end_pos = c.lifetime_end_pos;
+                lst.erase(lst.begin() + i);
+            } else {
+                ++i;
+            }
         }
     }
     for (const auto& kv : by_temp) {
-        const Emitter::PendingCarve& pc = kv.second;
+        for (const Emitter::PendingCarve& pc : kv.second) {
         uint32_t end = pc.lifetime_end_pos <= order.size()
                            ? emit_boundary[pc.lifetime_end_pos]
                            : (uint32_t)em.ops.size();
         if (end <= pc.op_index) end = pc.op_index + 1u;
         em.carve_entries.push_back({pc.op_index, pc.vtcm_offset, pc.size_bytes,
                                     pc.op_index, end});
+        em.carve_dbg.push_back({pc.temp_id, {pc.producer_pos, pc.lifetime_end_pos}});
+        }
     }
     em.pending_carves.clear();
     /* 003 T015: 预置 staging → carve 记录。窗口 [DMA op, 消费 op 的下一图节点
@@ -1033,6 +1094,12 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                 }
             }
         if (em.dummy_slot_id < em.slots.size()) refd[em.dummy_slot_id] = 1;
+        /* 控制面槽 (TEMPOFF/EXT_IN/EXT_OUT/STATE) 由设备按 addr 扫描发现,
+         * 不经 op args 引用 —— GC 判活只看 args 会把它们剥成全零死槽
+         * (板上实锤: "carve footer but no vtcm tempoff pool")。 */
+        for (uint32_t i = 0; i < em.slots.size(); i++)
+            if (em.slots[i].addr != 0 && em.slots[i].addr != WT_SLOT_EXT_WGT)
+                refd[i] = 1;
         std::vector<wt_slot> nslots;
         std::vector<uint8_t> narea, nextarea;
         uint32_t dropped = 0;
@@ -1168,6 +1235,18 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                                 o->residency_start, o->residency_end,
                                 c->op_index, (unsigned long long)b0, (unsigned long long)b1,
                                 c->residency_start, c->residency_end);
+                            /* 诊断: carve_entries 与 pending 归并序一致(by_temp 逐条
+                             * push, staging 随后) — 对位打 temp_id/图位。 */
+                            for (size_t di = 0; di < em.carve_entries.size() && di < em.carve_dbg.size(); di++)
+                                std::fprintf(stderr, "  carve[%zu] emit_op=%u off=%u sz=%u life=[%u,%u) temp=%u gpos=[%u,%u)\n",
+                                             di, em.carve_entries[di].op_index,
+                                             em.carve_entries[di].vtcm_offset,
+                                             em.carve_entries[di].size_bytes,
+                                             em.carve_entries[di].residency_start,
+                                             em.carve_entries[di].residency_end,
+                                             em.carve_dbg[di].first,
+                                             em.carve_dbg[di].second.first,
+                                             em.carve_dbg[di].second.second);
                             return 3;
                         }
                     }

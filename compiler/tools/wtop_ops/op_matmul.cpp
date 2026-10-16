@@ -288,6 +288,41 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
         }
         {
             uint32_t w_use = w_s, fl = flags;
+            /* N=16 门缝: FC 权重 N<32 且 M/K 32 对齐时, 编译期把权重槽从
+             * [N,K] 零填到 [round_up(N,32),K], flags bit4 = n_pad 标记。运行期
+             * exec_matmul_f16_hmx 以 N_compute=round_up(N_full,32) 走 HMX, 输出
+             * 窄解包只写前 N_full 列 (N_full<N 即识别 n_pad)。0.8B 36 个 SSM
+             * in_proj_z FC (M=32 K=1024 N=16) 由此 scalar 11.26ms/op → HMX。
+             * 仅 FC: t1=1 权重 [N,K] 行主序, 运行期 pack src=n*K+k 与 N_full 无关
+             * (零列 padding 干净); MatMul t1=0 权重 [K,N] pack src 用 N_full 作
+             * stride, 与 [K,32] 满形 padding 冲突, 故 n_pad 仅限 FC。 */
+            if (nm == "FullyConnected" && !has_bias && (w_s & 0x8000u) &&
+                (m % 32u) == 0u && (k % 32u) == 0u && nn > 0u && nn < 32u) {
+                uint32_t src = w_s & 0x7FFFu;
+                if (src < em.slots.size() && em.slots[src].len == (size_t)k * nn * 2u) {
+                    const wt_slot& s = em.slots[src];
+                    const uint16_t* wbytes = nullptr;
+                    if (s.addr == WT_SLOT_EXT_WGT) {
+                        if (s.offset + s.len <= em.ext_weight_area.size())
+                            wbytes = (const uint16_t*)(em.ext_weight_area.data() + s.offset);
+                    } else {
+                        if (s.offset + s.len <= em.weight_area.size())
+                            wbytes = (const uint16_t*)(em.weight_area.data() + s.offset);
+                    }
+                    if (wbytes) {
+                        uint32_t np = (nn + 31u) & ~31u;
+                        std::vector<uint16_t> padded((size_t)np * k, 0u);
+                        for (uint32_t i = 0; i < nn; ++i)
+                            std::memcpy(&padded[(size_t)i * k], wbytes + (size_t)i * k,
+                                        (size_t)k * 2u);
+                        uint32_t ps = (s.addr == WT_SLOT_EXT_WGT)
+                            ? em.add_ext_slot(np * k * 2u, np * k, (const uint8_t*)padded.data())
+                            : em.add_slot(np * k * 2u, np * k, (const uint8_t*)padded.data());
+                        w_use = 0x8000u | ps;
+                        fl |= 16u;  /* flags bit4 = n_pad */
+                    }
+                }
+            }
             uint32_t pp = try_prepack(0u, nn);
             if (pp) { w_use = 0x8000u | pp; fl |= kFlagWgtPP; }
             em.add_op(OP_MATMUL_F16, {a_t, w_use, out_t, m, k, nn, fl});

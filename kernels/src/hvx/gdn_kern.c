@@ -3,6 +3,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef __hexagon__
+#include <HAP_perf.h>
+#endif
 #ifndef __hexagon__
 #include <malloc.h>   /* memalign 原型 (host x86 缺则按 int 截断指针 → SIGSEGV) */
 #endif
@@ -60,6 +63,45 @@ static void gdn_hvx_scale(float* __restrict__ y, int n, float scale) {
     HVX_Vector* ya = (HVX_Vector*)y;
     for (int i = 0; i < n / 32; i++)
         ya[i] = Q6_Vsf_vmpy_VsfVsf(ya[i], cs);
+}
+/* B1 conv+SiLU 向量化 (2026-10-15 板上阶段计时: conv 22.2ms/层 = 61%)。
+ * FIR 逐乘加 RNE 与标量位级同 (每 lane 即一通道, i 升序同式);
+ * SiLU = s·(1+exp(-s))^{-1}: exp 走 hvx_vec_exp_f32 (softmax 线已上板),
+ * 倒数 NR (hvx_vec_inverse_f32_guard) — 与 expf/IEEE div 有 ulp 级差,
+ * yc 非位级同; s 大负→d 大→inv→0 ≈ silu≈0, s 大正→d≈1 ≈ s, 端点同式。
+ * 前置: DI 32 倍数, yr/win/cw/xf 行 128B 对齐 (GDN_ALLOC align 128)。 */
+static void gdn_hvx_conv_silu(float* yr, const float* cw, const float* win,
+                              const float* xf, int DI, int dc, int nv) {
+    const HVX_Vector nan_mask = Q6_V_vsplat_R(0x7f800000);
+    const HVX_Vector one = hvx_vec_splat_f32(1.0f);
+    for (int v = 0; v < nv; v++) {
+        const float* xfv = xf + (size_t)v * 32;
+        HVX_Vector acc = Q6_V_vsplat_R(0);
+        for (int i = 0; i < dc - 1; i++) {
+            const float* wv = cw + (size_t)i * DI + (size_t)v * 32;
+            const float* xv = win + (size_t)i * DI + (size_t)v * 32;
+            acc = Q6_Vsf_vadd_VsfVsf(acc,
+                  Q6_Vsf_vmpy_VsfVsf(*(const HVX_Vector*)wv, *(const HVX_Vector*)xv));
+        }
+        const float* cwv = cw + (size_t)(dc - 1) * DI + (size_t)v * 32;
+        acc = Q6_Vsf_vadd_VsfVsf(acc,
+              Q6_Vsf_vmpy_VsfVsf(*(const HVX_Vector*)cwv, *(const HVX_Vector*)xfv));
+        /* silu: acc * 1/(1+exp(-acc)); neg = vasr(acc, 1) 非精确负, 用 vmux(-)? 无 vneg sf → 0-acc */
+        HVX_Vector e = hvx_vec_exp_f32(Q6_Vsf_vsub_VsfVsf(Q6_V_vsplat_R(0), acc));
+        HVX_Vector d = Q6_Vsf_vadd_VsfVsf(one, e);
+        HVX_Vector inv = hvx_vec_inverse_f32_guard(d, nan_mask);
+        *(HVX_Vector*)(yr + (size_t)v * 32) = Q6_Vsf_vmpy_VsfVsf(acc, inv);
+    }
+}
+/* f16→f32 整段向量化 (cw 预转 / 每 token xqkv 转): lo=前 32 hi=后 32 (binary.c 同式) */
+static void gdn_hvx_cvt_f32(float* dst, const int16_t* src, int n, int nv16) {
+    for (int v = 0; v < nv16; v++) {
+        HVX_Vector h = hvx_vmemu(src + (size_t)v * 64);
+        HVX_VectorPair p = hvx_vec_f16_to_f32(h);
+        *(HVX_Vector*)(dst + (size_t)v * 64)        = Q6_V_lo_W(p);
+        *(HVX_Vector*)(dst + (size_t)v * 64 + 32)   = Q6_V_hi_W(p);
+    }
+    (void)n;
 }
 /* C[m][j] = Σ_n S[m][n]·KT[n][j]  (D×c GEMM, c=32 恰一向量宽)
  * S [D][D] 行主序, KT [D][c] 行主序, C [D][c] 行主序; 无树归约 (每 lane 即一 j)。
@@ -341,45 +383,108 @@ int delta_chunk_f16(rec_state_t* st, const int16_t* k, const int16_t* v,
 /* ================= 009 整块单发射: B1 conv+SiLU → B2 delta chunk 级联 =================
  * 逐字镜像 compiler ops.cpp GdnBlock 分支 (numerics-contract ver=1, B1-B5):
  *   B2 conv 门 SiLU 后 yc 保 f32 (不落 f16); B3 delta 块内全程 f32, S 原地;
- *   B4 出口 y 取 f16 RNE (gdn_f32_to_f16 与 host 位级同)。 */
+ *   B4 出口 y 取 f16 RNE (gdn_f32_to_f16 与 host 位级同)。
+ * research D5: work != NULL 时 16 个中间缓冲全部自 work 区 bump (VTCM 池内
+ * carve 窗口, emit 闭式预算), 免逐层 DDR malloc/free; work == NULL 走原
+ * malloc 路径 (host 调试/旧 blob 回退), 数值两条路径逐字节同。 */
+/* work 区结束标记 base+cap 可能越过 4GB 回绕 (池钉在 VTCM 顶, gdn 窗顶=4GB),
+ * 故不能对结束指针做比较 —— 改以「已消费偏移 used + 本次 bytes > cap」判界,
+ * used 是小量不回绕。 */
+static void* gdn_wk_take(uint8_t** wp, const uint8_t* base, size_t cap,
+                         size_t bytes, size_t align, int zero) {
+    uintptr_t b = ((uintptr_t)*wp + (align - 1)) & ~(uintptr_t)(align - 1);
+    size_t used = (size_t)(b - (uintptr_t)base);
+    if (used + bytes > cap) return NULL;
+    void* r = (void*)b;
+    *wp = (uint8_t*)(b + bytes);
+    if (zero) memset(r, 0, bytes);
+    return r;
+}
+/* 阶段计时 (板上成本定位, 累计全调用): runner 走查后打印一行。
+ * [0]alloc+cw转 [1]conv B1 [2]norm/转置 [3]Gram L [4]solve_tri
+ * [5]GEMM1 S·k [6]bmat/u [7]GEMM2 S·q [8]y 累加 [9]S 更新 */
+uint64_t g_gdn_phase_us[10];
+uint64_t g_gdn_calls;
+#ifdef __hexagon__
+#define GDN_T(phase) g_gdn_phase_us[phase] += (uint64_t)HAP_perf_get_time_us()
+#define GDN_T0() int64_t _gt = HAP_perf_get_time_us()
+#define GDN_T1(phase) g_gdn_phase_us[phase] += (uint64_t)(HAP_perf_get_time_us() - _gt)
+#else
+#define GDN_T(phase) (void)0
+#define GDN_T0() (void)0
+#define GDN_T1(phase) (void)0
+#endif
 int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                   const int16_t* g, int16_t* y, float* S,
+                  uint8_t* work, size_t work_bytes,
                   int T, int H, int D, int d_conv, int chunk) {
     if (T <= 0 || H <= 0 || D <= 0 || d_conv < 2 || chunk <= 0 || chunk > GDN_C_MAX)
         return 1;
     const int hd = H * D, DI = 3 * hd;   /* 局部 hd 避开文件顶 HD=128 宏 */
     const float scale = 1.0f / sqrtf((float)D);
 
-    float* yc  = malloc((size_t)T * DI * 4);
-    float* win = calloc((size_t)(d_conv - 1) * DI, 4);
+    uint8_t* wp = work;
     /* kf/vf/qf/u 走 HVX 对齐 (matvec/外积热点); 其余标量 malloc 不动 */
-    float* kf  = memalign(128, (size_t)chunk * D * 4);
-    float* vf  = memalign(128, (size_t)chunk * D * 4);
-    float* qf  = memalign(128, (size_t)chunk * D * 4);
-    float* Gc  = malloc((size_t)chunk * 4);
-    float* L   = calloc((size_t)chunk * chunk, 4);
-    float* Tm  = calloc((size_t)chunk * chunk, 4);
-    float* bmat = memalign(128, (size_t)chunk * D * 4);
-    float* u    = memalign(128, (size_t)chunk * D * 4);
-    float* bf   = memalign(128, (size_t)D * 4);
-    float* kf_T = memalign(128, (size_t)D * chunk * 4);   /* kf 转置 [D][c] 供 GEMM (T022d) */
-    float* qf_T = memalign(128, (size_t)D * chunk * 4);   /* qf 转置 [D][c] */
-    float* gemm_buf = memalign(128, (size_t)D * chunk * 4); /* GEMM 输出 [D][c] scratch */
-    float* cw_f32 = malloc((size_t)d_conv * DI * 4);   /* cw f16→f32 预转一次 (T022d) */
-    float* xf_buf = malloc((size_t)DI * 4);            /* 每 token xqkv f16→f32 一次 */
+#define GDN_ALLOC(p, bytes, align, zero)                                        \
+    (p) = work ? gdn_wk_take(&wp, work, work_bytes, (bytes), (align), (zero))   \
+               : ((zero) ? calloc(1, (bytes))                                   \
+                         : ((align) > 8 ? memalign((align), (bytes)) : malloc((bytes))))
+    float* yc;   GDN_ALLOC(yc,  (size_t)T * DI * 4, 128, 0);
+    float* win;  GDN_ALLOC(win, (size_t)(d_conv - 1) * DI * 4, 128, 1);
+    float* kf;   GDN_ALLOC(kf,  (size_t)chunk * D * 4, 128, 0);
+    float* vf;   GDN_ALLOC(vf,  (size_t)chunk * D * 4, 128, 0);
+    float* qf;   GDN_ALLOC(qf,  (size_t)chunk * D * 4, 128, 0);
+    float* Gc;   GDN_ALLOC(Gc,  (size_t)chunk * 4, 8, 0);
+    float* L;    GDN_ALLOC(L,   (size_t)chunk * chunk * 4, 8, 1);
+    float* Tm;   GDN_ALLOC(Tm,  (size_t)chunk * chunk * 4, 8, 1);
+    float* bmat; GDN_ALLOC(bmat, (size_t)chunk * D * 4, 128, 0);
+    float* u;    GDN_ALLOC(u,    (size_t)chunk * D * 4, 128, 0);
+    float* bf;   GDN_ALLOC(bf,   (size_t)D * 4, 128, 0);
+    float* kf_T; GDN_ALLOC(kf_T, (size_t)D * chunk * 4, 128, 0);   /* kf 转置 [D][c] 供 GEMM (T022d) */
+    float* qf_T; GDN_ALLOC(qf_T, (size_t)D * chunk * 4, 128, 0);   /* qf 转置 [D][c] */
+    float* gemm_buf; GDN_ALLOC(gemm_buf, (size_t)D * chunk * 4, 128, 0); /* GEMM 输出 [D][c] scratch */
+    float* cw_f32; GDN_ALLOC(cw_f32, (size_t)d_conv * DI * 4, 128, 0);  /* cw f16→f32 预转一次 (T022d) */
+    float* xf_buf; GDN_ALLOC(xf_buf, (size_t)DI * 4, 128, 0);           /* 每 token xqkv f16→f32 一次 */
+#undef GDN_ALLOC
     if (!yc || !win || !kf || !vf || !qf || !Gc || !L || !Tm || !bmat || !u || !bf ||
         !kf_T || !qf_T || !gemm_buf || !cw_f32 || !xf_buf) {
-        free(yc); free(win); free(kf); free(vf); free(qf); free(Gc);
-        free(L); free(Tm); free(bmat); free(u); free(bf);
-        free(kf_T); free(qf_T); free(gemm_buf);
-        free(cw_f32); free(xf_buf);
+        if (!work) {
+            free(yc); free(win); free(kf); free(vf); free(qf); free(Gc);
+            free(L); free(Tm); free(bmat); free(u); free(bf);
+            free(kf_T); free(qf_T); free(gemm_buf);
+            free(cw_f32); free(xf_buf);
+        }
         return 2;
     }
 
+    g_gdn_calls++;
+    GDN_T0();
     /* B2: conv1d + SiLU, 滑窗零起, 推窗在算后 (conv_f16 同式, 出 f32 yc) */
     /* cw f16→f32 预转一次 (原内层 786K 冗余转换); xqkv 每 token 转一次复用 (T022d) */
+#if HVX_GDN_ENABLED
+    if ((DI & 63) == 0)
+        gdn_hvx_cvt_f32(cw_f32, cw, d_conv * DI, (d_conv * DI) / 64);
+    else
+#endif
     for (int i = 0; i < d_conv * DI; i++) cw_f32[i] = gdn_f16_to_f32(cw[i]);
+    GDN_T1(0);
     {
+    GDN_T0();
+#if HVX_GDN_ENABLED
+    if ((DI & 63) == 0)
+        for (int t = 0; t < T; t++) {
+            const int16_t* xr = xqkv + (size_t)t * DI;
+            float* yr = yc + (size_t)t * DI;
+            const int nv = DI / 32;
+            gdn_hvx_cvt_f32(xf_buf, xr, DI, DI / 64);
+            gdn_hvx_conv_silu(yr, cw_f32, win, xf_buf, DI, d_conv, nv);
+            memmove(win, win + DI, (size_t)(d_conv - 2) * DI * sizeof(float));
+            float* wtail = win + (size_t)(d_conv - 2) * DI;
+            for (int v = 0; v < nv; v++)
+                *(HVX_Vector*)(wtail + (size_t)v * 32) = *(const HVX_Vector*)(xf_buf + (size_t)v * 32);
+        }
+    else
+#endif
     for (int t = 0; t < T; t++) {
         const int16_t* xr = xqkv + (size_t)t * DI;
         float* yr = yc + (size_t)t * DI;
@@ -396,6 +501,7 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
         for (int ch = 0; ch < DI; ch++)
             win[(size_t)(d_conv - 2) * DI + ch] = xf_buf[ch];
     }
+    GDN_T1(1);
     }
 
     /* B3: delta 块内全 f32; state S f32 原地 (prefill 零起), chunk 跨块携带 */
@@ -409,6 +515,7 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                 acc += gdn_f16_to_f32(g[(base + t) * H + h]);
                 Gc[t] = acc;
             }
+            GDN_T0();
             for (int t = 0; t < c; t++) {
                 const float* yrow = yc + (size_t)(base + t) * DI + (size_t)h * D;
                 /* q/k l2norm (HF use_qk_l2norm_in_kernel=True, 镜像 ops.cpp GdnBlock):
@@ -432,7 +539,9 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                     qf_T[(size_t)nn * c + t] = qf[(size_t)t * D + nn];
                 }
             }
+            GDN_T1(2);
             {
+            GDN_T0();
             for (int j = 0; j < c; j++) {
                 float bj = gdn_f16_to_f32(beta[(base + j) * H + h]);
                 for (int i = 0; i < j; i++) {
@@ -441,8 +550,10 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                 }
                 for (int i = j; i < c; i++) L[(size_t)j * c + i] = 0.0f;
             }
+            GDN_T1(3);
             }
             {
+            GDN_T0();
             for (int r = 0; r < c; r++)                            /* Tm=(I+L)^{-1}, ref_solve_tri 同式 */
                 for (int j = 0; j < c; j++) {
                     float s = (r == j) ? 1.0f : 0.0f;
@@ -450,9 +561,12 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                         s -= L[(size_t)r * c + i] * Tm[(size_t)i * c + j];
                     Tm[(size_t)r * c + j] = s;
                 }
+            GDN_T1(4);
             }
             {
+            GDN_T0();
             gdn_hvx_gemm(Sh, kf_T, gemm_buf, D, c);   /* gemm_buf[m][j] = (S·k_j)[m], 一次算全 j */
+            GDN_T1(5);
             for (int j = 0; j < c; j++) {
                 float ej = expf(Gc[j]);
                 float bj = gdn_f16_to_f32(beta[(base + j) * H + h]);
@@ -466,9 +580,14 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                     gdn_hvx_axpy(u + (size_t)j * D, bmat + (size_t)i * D, tij, D, nvec);
                 }
             }
+            GDN_T1(6);
             }
             {
+            GDN_T0();
             gdn_hvx_gemm(Sh, qf_T, gemm_buf, D, c);   /* gemm_buf[m][t] = (S·q_t)[m], 一次算全 t */
+            GDN_T1(7);
+            {
+            GDN_T0();
             for (int t = 0; t < c; t++) {
                 float et = expf(Gc[t]);
                 for (int m = 0; m < D; m++) bf[m] = gemm_buf[(size_t)m * c + t] * et;
@@ -481,8 +600,11 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                 for (int m = 0; m < D; m++)                         /* B4: 出口 f16 RNE */
                     y[(size_t)(base + t) * hd + (size_t)h * D + m] = gdn_f32_to_f16(bf[m]);
             }
+            GDN_T1(8);
+            }
             }
             {
+            GDN_T0();
             float eC = expf(Gc[c - 1]);
             gdn_hvx_scale(Sh, D * D, eC);
             for (int i = 0; i < c; i++) {
@@ -490,13 +612,16 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                 /* S += w·u_i·k_i^T (HVX rank-1 外积) */
                 gdn_hvx_outer(Sh, u + (size_t)i * D, kf + (size_t)i * D, w, D, nvec);
             }
+            GDN_T1(9);
             }
         }
     }
 
-    free(yc); free(win); free(kf); free(vf); free(qf); free(Gc);
-    free(L); free(Tm); free(bmat); free(u); free(bf);
-    free(kf_T); free(qf_T); free(gemm_buf);
-    free(cw_f32); free(xf_buf);
+    if (!work) {
+        free(yc); free(win); free(kf); free(vf); free(qf); free(Gc);
+        free(L); free(Tm); free(bmat); free(u); free(bf);
+        free(kf_T); free(qf_T); free(gemm_buf);
+        free(cw_f32); free(xf_buf);
+    }
     return 0;
 }

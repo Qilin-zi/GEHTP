@@ -137,8 +137,65 @@ int GraphPrepare::compute_ddr_offsets(uint64_t budget,
     // 第7步阶段二: 两级分配。先跑 VTCM 池(驻留); 装不下的进 DDR 池。
     // 两池用同一分配器实例独立跑(生命期复用各自池内生效)。
     if (vtcm_budget > 0) {
+        // 驻留按消费引擎分域(008 US1 实测: HMX 读驻留 +2%, HVX 读驻留
+        // 1.3-43× 变慢)—— 只有"全部真读者都是矩阵族 op"的张量进 VTCM 池候选,
+        // 其余直接走 DDR 池。Reshape 不物化, 穿透到链尾真读者。恒开(引擎分域
+        // 是驻留正确性要求, 非 cost 模型实验, 与 cost_aware 解耦)。
+        std::vector<fa::FancyAllocator::AllocRequest> vtcm_reqs;
+        {
+            auto is_matrix_op = [&](op_id_t id) -> bool {
+                const OpDef* o = get_op_at(id);
+                if (!o || !o->name_tag || !o->name_tag->name()) return false;
+                const char* n = o->name_tag->name();
+                size_t len = std::strlen(n);
+                auto starts = [&](const char* p) {
+                    size_t l = std::strlen(p);
+                    return len >= l && std::strncmp(n, p, l) == 0;
+                };
+                return starts("MatMul") || starts("FullyConnected") ||
+                       starts("Dense") || starts("Conv") ||
+                       starts("DepthWiseConv") || starts("DilatedConv") ||
+                       starts("GroupedConv") || starts("Einsum");
+            };
+            auto is_alias_op = [&](op_id_t id) -> bool {
+                const OpDef* o = get_op_at(id);
+                return o && o->name_tag && o->name_tag->name() &&
+                       std::strcmp(o->name_tag->name(), "Reshape") == 0;
+            };
+            // 消费者反查用 inputs 真值(consumers 缓存陈旧, 同活性分析口径)
+            std::unordered_map<op_id_t, std::vector<op_id_t>> consumers_of;
+            for (size_t p = 0; p < order.size(); p++) {
+                const OpDef* c = get_op_at(order[p]);
+                if (!c || is_alias_op(order[p])) continue;
+                for (const auto& e : c->inputs) {
+                    if (e.out_idx != 0) continue;
+                    op_id_t s = e.src_id;
+                    size_t guard = 0;
+                    while (is_alias_op(s) && guard++ < 64) {
+                        const OpDef* a = get_op_at(s);
+                        if (!a || a->inputs.empty() || a->inputs[0].out_idx != 0) break;
+                        s = a->inputs[0].src_id;
+                    }
+                    consumers_of[s].push_back(order[p]);
+                }
+            }
+            size_t domain_cand = 0;
+            for (const auto& r : reqs) {
+                bool all_matrix = true;  // 无消费者=图输出/尾张量 → 候选
+                auto cit = consumers_of.find(r.op_id);
+                if (cit != consumers_of.end()) {
+                    all_matrix = true;
+                    for (op_id_t c : cit->second)
+                        if (!is_matrix_op(c)) { all_matrix = false; break; }
+                }
+                if (all_matrix) { vtcm_reqs.push_back(r); ++domain_cand; }
+            }
+            std::fprintf(stderr,
+                         "ddr_offsets: 驻留分域(矩阵族消费者) %zu/%zu 张量入 VTCM 候选\n",
+                         domain_cand, reqs.size());
+        }
         fa::FancyAllocator fa_v;
-        auto vac = fa_v.allocate_with_lifetime(reqs, (size_t)vtcm_budget, 128);
+        auto vac = fa_v.allocate_with_lifetime(vtcm_reqs, (size_t)vtcm_budget, 128);
         std::vector<fa::FancyAllocator::AllocRequest> ddr_reqs;
         for (const auto& r : reqs) {
             auto it = vac.find(r.op_id);
@@ -146,6 +203,21 @@ int GraphPrepare::compute_ddr_offsets(uint64_t budget,
                 entries->push_back({r.op_id, it->second.offset, r.size, true});
             else
                 ddr_reqs.push_back(r);
+        }
+        {
+            // [memplan] 常驻需求快照: 生命期打包后的峰值重叠水位 = 常驻池应划多大。
+            uint64_t vtcm_peak = 0, vtcm_sum = 0;
+            size_t vtcm_n = 0;
+            for (const auto& e : *entries)
+                if (e.in_vtcm) {
+                    vtcm_peak = std::max<uint64_t>(vtcm_peak, e.offset + e.size);
+                    vtcm_sum += e.size;
+                    ++vtcm_n;
+                }
+            std::fprintf(stderr,
+                "ddr_offsets: VTCM 驻留 %zu 张量 Σ=%.2fMB 峰值重叠水位=%.2fMB (预算 %.2fMB)\n",
+                vtcm_n, vtcm_sum / 1048576.0, vtcm_peak / 1048576.0,
+                (double)vtcm_budget / 1048576.0);
         }
         fa::FancyAllocator fa_d;
         auto dac = fa_d.allocate_with_lifetime(ddr_reqs, (size_t)cap, 128);
@@ -159,11 +231,17 @@ int GraphPrepare::compute_ddr_offsets(uint64_t budget,
         }
         if (budget == 0) {
             /* ddr 预算缺省(仅 vtcm 池开): cap 记生命期打包实际水位而非 Σ全量
-             * 尺寸 —— 运行时按 blob cap memalign, Σ口径会虚耗数百 MB DDR */
+             * 尺寸 —— 运行时按 blob cap memalign, Σ口径会虚耗数百 MB DDR。
+             * 另加划痕余量: emit 表外物化窗(broadcast materialize)从 cap 顶向
+             * 下长 [cap−peak, cap), 与静态区上沿(=hw)不得交叠(wtop_emit T010
+             * 硬门)。cap=hw 零余量时任何划痕需求必炸(auto 路径首跑实锤
+             * peak=0.23MB); 显式 --ddr-budget 路线天然有余量不受影响。
+             * 4MB 对齐 bump_reserve 口径, 实测裕度 17×。 */
             uint64_t hw = 0;
             for (const auto& e : *entries)
                 if (!e.in_vtcm) hw = std::max<uint64_t>(hw, e.offset + e.size);
-            *cap_out = hw;
+            constexpr uint64_t kScratchWinHeadroom = 4ull << 20;
+            *cap_out = hw + kScratchWinHeadroom;
         } else {
             *cap_out = cap;
         }

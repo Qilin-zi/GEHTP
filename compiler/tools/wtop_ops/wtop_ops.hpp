@@ -111,6 +111,7 @@ struct Emitter {
     };
     std::vector<PendingCarve> pending_carves; // graph-order lifetimes, resolved after emit
     std::vector<CarveEntry> carve_entries; // v3 optional VTCM carve footer
+    std::vector<std::pair<uint32_t, std::pair<uint32_t, uint32_t>>> carve_dbg; // 诊断: temp_id, gpos[producer,end]
     uint32_t cur_engine = 0;            // add_op 时写入 op_annot 的打包注解 u32
     std::map<uint64_t, uint32_t> op_temp;  // (op_id<<32 | out_idx) → temp id
     std::map<uint64_t, uint32_t> i32_slots;  // int32 索引 const 独立缓存(键 op_id)
@@ -905,16 +906,16 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
         }
         else if (has_bias)
             snprintf(why, sizeof why, "has_bias (HMX bias path unverified)");
-        else if ((m % 32u) || (k % 32u) || (n % 32u))
+        else if ((m % 32u) || (k % 32u) || ((n % 32u) && (n >= 32u)))
             snprintf(why, sizeof why, "shape %ux%ux%u not 32-aligned", m, k, n);
-        else if (need_mm(m, k, n) > kVTCM)
+        else if (need_mm(m, k, (n + 31u) & ~31u) > kVTCM)
             snprintf(why, sizeof why, "scratch need %llu > VTCM %llu (m%u k%u n%u)",
-                     (unsigned long long)need_mm(m, k, n),
+                     (unsigned long long)need_mm(m, k, (n + 31u) & ~31u),
                      (unsigned long long)kVTCM, m, k, n);
         else {
             engine = 2u;           /* WT_ENG_HMX; batched runtime loops per batch */
-            snprintf(why, sizeof why, "m%u k%u n%u 32-aligned, need %llu <= 16MB",
-                     m, k, n, (unsigned long long)need_mm(m, k, n));
+            snprintf(why, sizeof why, "m%u k%u n%u 32-aligned(or n<32 pad), need %llu <= 16MB",
+                     m, k, n, (unsigned long long)need_mm(m, k, (n + 31u) & ~31u));
         }
     } else if (nm == "Conv2d") {
         engine = 2u;               /* WT_ENG_HMX */
@@ -944,6 +945,23 @@ inline uint32_t assign_engine(const OpDef* od, const std::string& nm) {
         } else {
             engine = 0u;           /* WT_ENG_SCALAR */
             snprintf(why, sizeof why, "n=%llu not 32-aligned", (unsigned long long)n);
+        }
+    } else if (nm == "RmsNorm") {
+        /* 2026-10-15 精度修复后重开 HVX: hvx-norm.h 由 Qf32 定点累加(截断 x²<2^-31
+         * / 饱和 scale>1) 改为 f32 累加 + 标量 sqrtf 求 scale, 微小行(GDN 门控态
+         * rms~1e-4)不再 0.5× 偏差; 同时新增 bias 变体内核
+         * (hvx_fast_rms_norm_mul_bias_f32), 故带 bias 也走 HVX。
+         * 运行期 gate 镜像 exec_rmsnorm2: want_hvx = m>=1 && rw%32==0;
+         * 行宽 rw = 末轴(hidden)。rw%32!=0 时计划 scalar(回落允许, 不硬报)。 */
+        uint32_t rw = 1;
+        if (od->output_def.rank >= 1)
+            rw = (uint32_t)od->output_def.dims[od->output_def.rank - 1];
+        if ((rw % 32u) == 0u) {
+            engine = 1u;           /* WT_ENG_HVX */
+            snprintf(why, sizeof why, "rmsnorm rw%u 32-aligned", rw);
+        } else {
+            engine = 0u;           /* WT_ENG_SCALAR */
+            snprintf(why, sizeof why, "rmsnorm rw%u not 32-aligned", rw);
         }
     } else {
         snprintf(why, sizeof why, "no fast kernel for '%s'", nm.c_str());

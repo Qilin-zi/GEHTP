@@ -202,6 +202,16 @@ int main(void) {
         wt_exec_set_trace(tr);
         ex_log("[prof] per-op optrace %s", tr ? "ON" : "OFF");
     }
+    /* gdn_work 键: 'S' = S 状态 DDR + scratch 入 VTCM 窗 (VTCM 访问成本定位) */
+    {
+        static char gw_s[8];
+        memset(gw_s, 0, sizeof(gw_s));
+        if (job_get((char*)job, "gdn_work", gw_s, sizeof(gw_s)) == 0 && gw_s[0]) {
+            extern int g_gdn_work_use;
+            g_gdn_work_use = (int)gw_s[0];
+            ex_log("[gdn] work_use=%c", gw_s[0]);
+        }
+    }
     /* 精度排查: hook 键 = 逐 op 张量 dump spec ("opidx:temp,..."), 产物
      * /data/local/tmp/hrt/gehtp/hook_<idx>_<temp>.f16.raw (host gehtp run 拉回)。
      * 缓冲按全模型锚点串规模给 (80 锚点 ≈ 762 字符, 1KB 够)。 */
@@ -368,6 +378,17 @@ int main(void) {
     }
 
     ex_log("M11 exec done rc=%d total_us=%lld", rc, (long long)total_us);
+    {   /* gdn 内核阶段计时 (板上成本定位, gdn_kern.c 累计) */
+        extern uint64_t g_gdn_phase_us[10];
+        extern uint64_t g_gdn_calls;
+        ex_log("[gdn-phase] calls=%llu cw=%llu conv=%llu norm=%llu gram=%llu tri=%llu gemm1=%llu bmatu=%llu gemm2=%llu yacc=%llu supd=%llu (us)",
+               (unsigned long long)g_gdn_calls,
+               (unsigned long long)g_gdn_phase_us[0], (unsigned long long)g_gdn_phase_us[1],
+               (unsigned long long)g_gdn_phase_us[2], (unsigned long long)g_gdn_phase_us[3],
+               (unsigned long long)g_gdn_phase_us[4], (unsigned long long)g_gdn_phase_us[5],
+               (unsigned long long)g_gdn_phase_us[6], (unsigned long long)g_gdn_phase_us[7],
+               (unsigned long long)g_gdn_phase_us[8], (unsigned long long)g_gdn_phase_us[9]);
+    }
     if (op_us) {
         /* per-opcode 聚合: 总耗时/调用数/max 单项 (找热点算子) */
         enum { MAX_AGG = 64 };

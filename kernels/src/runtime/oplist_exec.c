@@ -162,6 +162,7 @@ void wt_exec_set_fault(uint32_t mask) {
 }
 static uint32_t g_current_op = 0xFFFFFFFFu;
 static uint32_t g_current_op_global = 0xFFFFFFFFu;
+int g_gdn_work_use = 1;   /* 'S' = S 入窗 scratch 走 malloc (VTCM 成本定位开关) */
 static uint32_t g_current_opcode = 0u;
 static void rtrace(const char* msg, int v) {
     if (!g_rtrace) g_rtrace = fopen("/data/local/tmp/hrt/gehtp/optrace.txt", "a");
@@ -2320,6 +2321,78 @@ static int exec_matmul_q4_0_gemv(const uint16_t* a, const uint8_t* w_q4, uint16_
  * 失败(未 setup/超 VTCM/wtcache 已占同一物理 VTCM)返回 -1, 回落标量。
  * 仅 DSP (__HVX__/__hexagon__) 编译; host 无 HMX, 走标量。 */
 #if defined(__HVX__) || defined(__hexagon__)
+/* A: HVX 化激活 crouton 打包 (行主序 [M,K] → crouton pair-interleave)。
+ * 位级同下方标量循环 (hmx_crouton_pos)。t0 恒 0 (p0 blob 实证 199/199 op),
+ * 故只做行主序快路; t0 转置激活罕见, 调用处回落标量。
+ * 每 tile 16 个 row-pair, vshuff(v1,v0,-2) 交织 = hmx-utils.h
+ * hmx_interleave_cols_to_tiles 同款 (已上板)。源 a 在 DDR (vmemu 非对齐读),
+ * 目标 act_cr 在 VTCM (2KB 对齐写)。尾行对越界读护栏: 末行 64B 超读回落标量。 */
+static void hmx_pack_act_crouton_hvx(uint16_t* restrict act_cr, const uint16_t* restrict a,
+                                     uint32_t M, uint32_t K, uint32_t n_row, uint32_t n_dot) {
+    const size_t nel = (size_t)M * K;
+    for (uint32_t r = 0; r < n_row; ++r) {
+        const uint16_t* arow = a + (size_t)r * 32 * K;
+        uint16_t* rtile = act_cr + (size_t)r * n_dot * 1024;
+        for (uint32_t kt = 0; kt < n_dot; ++kt) {
+            uint16_t* tile = rtile + (size_t)kt * 1024;
+            const uint16_t* rbase = arow + (size_t)kt * 32;
+            for (uint32_t i = 0; i < 16; ++i) {
+                const uint16_t* r0 = rbase + (size_t)(2 * i) * K;
+                const uint16_t* r1 = rbase + (size_t)(2 * i + 1) * K;
+                if ((size_t)(r1 - a) + 64 <= nel) {
+                    HVX_Vector v0 = hvx_vmemu(r0);
+                    HVX_Vector v1 = hvx_vmemu(r1);
+                    HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
+                    *(HVX_Vector*)(tile + (size_t)i * 64) = Q6_V_lo_W(vp);
+                } else {
+                    for (uint32_t k = 0; k < 32; ++k) {
+                        tile[(size_t)i * 64 + 2 * k]     = r0[k];
+                        tile[(size_t)i * 64 + 2 * k + 1] = r1[k];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* A: HVX 化输出回解 (crouton → 行主序 [M,N_full], 位级同标量)。
+ * 每 row-pair: vdeal(v,v,-2) 拆偶(行2i)/奇(行2i+1), lo 低 64B = 行2i,
+ * hi 低 64B = 行2i+1; 各 64B 未对齐写到 y (DDR, 步距 N_full)。
+ * 与 pack 的 vshuff 严格互逆, 无 ulp 漂移。 */
+static void hmx_unpack_out_crouton_hvx(uint16_t* restrict y, const uint16_t* restrict out_cr,
+                                       uint32_t n_row, uint32_t n_col, uint32_t n0, uint32_t N_full) {
+    for (uint32_t r = 0; r < n_row; ++r) {
+        for (uint32_t c = 0; c < n_col; ++c) {
+            const uint16_t* tile = out_cr + ((size_t)r * n_col + c) * 1024;
+            uint16_t* ybase = y + (size_t)r * 32 * N_full + n0 + c * 32;
+            for (uint32_t i = 0; i < 16; ++i) {
+                HVX_Vector v = hvx_vmem(tile + (size_t)i * 64);
+                HVX_VectorPair dp = Q6_W_vdeal_VVR(v, v, -2);
+                hvx_vec_store_u(ybase + (size_t)(2 * i) * N_full,     64, Q6_V_lo_W(dp));
+                hvx_vec_store_u(ybase + (size_t)(2 * i + 1) * N_full, 64, Q6_V_hi_W(dp));
+            }
+        }
+    }
+}
+
+/* N=16 门缝: n_pad 时输出窄解包 —— 单 tile (n_col=1, n_real<32), 每 row-pair
+ * vdeal 拆行后只写前 n_real 列 (stride n_real), 弃 padding 零列。与上方全宽版
+ * 同 vdeal 互逆面, 位级同标量。仅 N_full<N(即 n_pad) 时由 exec_matmul_f16_hmx
+ * 调用, n0 恒 0 (n_pad 非 SPLIT)。 */
+static void hmx_unpack_out_crouton_narrow(uint16_t* restrict y, const uint16_t* restrict out_cr,
+                                          uint32_t n_row, uint32_t n_real) {
+    for (uint32_t r = 0; r < n_row; ++r) {
+        const uint16_t* tile = out_cr + (size_t)r * 1024;
+        uint16_t* ybase = y + (size_t)r * 32 * n_real;
+        for (uint32_t i = 0; i < 16; ++i) {
+            HVX_Vector v = hvx_vmem(tile + (size_t)i * 64);
+            HVX_VectorPair dp = Q6_W_vdeal_VVR(v, v, -2);
+            hvx_vec_store_u(ybase + (size_t)(2 * i) * n_real,     n_real * 2u, Q6_V_lo_W(dp));
+            hvx_vec_store_u(ybase + (size_t)(2 * i + 1) * n_real, n_real * 2u, Q6_V_hi_W(dp));
+        }
+    }
+}
+
 static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y,
                                uint32_t M, uint32_t K, uint32_t N,
                                uint32_t n0, uint32_t N_full,
@@ -2388,17 +2461,19 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
     memset(sca, 0, 2048u);
     for (uint32_t i = 0; i < 32u; ++i) sca[2u * i] = 0x3C00u;
 
-    /* pack act: A[M,K] (或 t0 转置) → crouton[(r*n_dot+kt)*1024] */
-    for (uint32_t r = 0; r < n_row; ++r)
-        for (uint32_t kt = 0; kt < n_dot; ++kt) {
-            uint16_t* tile = act_cr + ((size_t)r * n_dot + kt) * 1024u;
-            for (uint32_t m = 0; m < 32u; ++m)
-                for (uint32_t k = 0; k < 32u; ++k) {
-                    size_t src = t0 ? ((size_t)(kt * 32u + k) * M + (r * 32u + m))
-                                    : ((size_t)(r * 32u + m) * K + (kt * 32u + k));
-                    tile[hmx_crouton_pos(m, k)] = a[src];
-                }
-        }
+    /* pack act: A[M,K] (或 t0 转置) → crouton[(r*n_dot+kt)*1024].
+     * A: t0=0 (行主序) 走 HVX vshuff 交织快路, 位级同标量; t0=1 罕见回落。 */
+    if (!t0) {
+        hmx_pack_act_crouton_hvx(act_cr, a, M, K, n_row, n_dot);
+    } else {
+        for (uint32_t r = 0; r < n_row; ++r)
+            for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                uint16_t* tile = act_cr + ((size_t)r * n_dot + kt) * 1024u;
+                for (uint32_t m = 0; m < 32u; ++m)
+                    for (uint32_t k = 0; k < 32u; ++k)
+                        tile[hmx_crouton_pos(m, k)] = a[(size_t)(kt * 32u + k) * M + (r * 32u + m)];
+            }
+    }
 
     if (w_pp) {
         /* 008 T012: 预打包权重 (emit 期镜像打包, flags bit3) — 线性 DMA
@@ -2525,14 +2600,13 @@ static int exec_matmul_f16_hmx(const uint16_t* a, const uint16_t* w, uint16_t* y
     hmx_unit_release();
     hmx_disable_execution();
 
-    /* unpack out: crouton[(r*n_col+c)*1024] → row-major y[M,N_full] 列子区间 [n0, n0+N) */
-    for (uint32_t r = 0; r < n_row; ++r)
-        for (uint32_t c = 0; c < n_col; ++c) {
-            uint16_t* tile = out_cr + ((size_t)r * n_col + c) * 1024u;
-            for (uint32_t m = 0; m < 32u; ++m)
-                for (uint32_t n = 0; n < 32u; ++n)
-                    y[(size_t)(r * 32u + m) * N_full + (n0 + c * 32u + n)] = tile[hmx_crouton_pos(m, n)];
-        }
+    /* unpack out: crouton[(r*n_col+c)*1024] → row-major y[M,N_full] 列子区间 [n0, n0+N).
+     * A: HVX vdeal 拆行快路, 位级同标量。N_full<N = n_pad (N=round_up(N_full,32)),
+     * 走窄解包只写前 N_full 列 (padding 零列弃)。 */
+    if (N_full < N)
+        hmx_unpack_out_crouton_narrow(y, out_cr, n_row, N_full);
+    else
+        hmx_unpack_out_crouton_hvx(y, out_cr, n_row, n_col, n0, N_full);
     g_last_engine = WT_ENG_HMX;  /* W-P3: f16 GEMM 走 HMX crouton 路径 */
     return 0;
 }
@@ -2553,8 +2627,12 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
     int t0 = (int)(flags & 1u), t1 = (int)(flags & 2u);
     int batched = (int)(flags & 4u);
     int w_pp = (int)((flags >> 3) & 1u);   /* 008 T012: wgt 预打包 (emit 镜像) */
+    int n_pad = (int)((flags >> 4) & 1u);  /* N=16 门缝: 权重零填 N→round_up(N,32), 窄解包 */
     uint32_t Bn = flags >> 16;
     if (Bn == 0) Bn = 1;
+    /* n_pad: 计算 N = round_up(N_full,32) (emit 已零填权重到 [N_compute,K]),
+     * 输出 stride/实宽仍 N_full。仅非 SPLIT 非 batched (emit 保证)。 */
+    uint32_t N_compute = n_pad ? ((N + 31u) & ~31u) : N;
     /* FC bias (opcode 36) 仅非 batched 整 op (emit 侧保证; 手构图违禁硬错) */
     if (bias && batched) { snprintf(err, errn, "matmul_f16_bias 不支持 batched"); return -1; }
     /* 008 T012: 预打包槽约束 — emit 仅非 batched 发 bit3, 手构图违禁硬错;
@@ -2628,7 +2706,7 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
             want_hmx = 0;  /* planned scalar */
         }
     } else {
-        want_hmx = ((M % 32u) == 0u && (K % 32u) == 0u && (N % 32u) == 0u);
+        want_hmx = ((M % 32u) == 0u && (K % 32u) == 0u && ((N % 32u) == 0u || n_pad));
     }
     /* 005 US3b (T019): bias 的 HMX 路径 SC-005 已过, 生产默认走 HMX;
      * g_force_bias_scalar 仅测试例 (46) 造标量参照用。 */
@@ -2659,12 +2737,12 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
                     }
                 }
             } else {
-                engine = (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
+                engine = (exec_matmul_f16_hmx(a, w, y, M, K, N_compute, n0, N_full, t0, t1, err, errn,
                                               bias, w_q4, w_pp) == 0)
                              ? 1 : -1;
             }
         } else if (engine == 1) {
-            if (exec_matmul_f16_hmx(a, w, y, M, K, N, n0, N_full, t0, t1, err, errn,
+            if (exec_matmul_f16_hmx(a, w, y, M, K, N_compute, n0, N_full, t0, t1, err, errn,
                                      bias, w_q4, w_pp) != 0) {
                 snprintf(err, errn, "matmul_f16 split 混合路径 (FR-013 ④ 违禁): 前 chunk HMX 本 chunk 失败");
                 return -1;
@@ -2792,34 +2870,38 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
     uint32_t rw = b->slots[w_s].len / 2u;
     if (rw == 0 || n % rw != 0) { snprintf(err, errn, "rmsnorm2 shape n%u rw%u", n, rw); return -1; }
     uint32_t m = n / rw;
-    /* HVX 快路径(策略 B): 无 bias 时走 hvhx_v2_rms_norm_mul_f32_rows
-     * (逐行 rmsnorm×weight, HVX/标量自适应)。有 bias 时回落标量
-     * (HVX 无 rmsnorm+weight+bias 融合内核)。rw%32==0 才触发 HVX 主体。
+    /* HVX 快路径(策略 B): 走 hvhx_v2_rms_norm_mul[_bias]_f32_rows
+     * (逐行 rmsnorm×weight[+bias], HVX/标量自适应)。有 bias 走 bias 融合内核
+     * (hvx_fast_rms_norm_mul_bias_f32)。rw%32==0 才触发 HVX 主体。
      *
-     * [2026-09-28 精度根因] 该 HVX 路径用 Qf32 定点累加 + 快速 rsqrt
-     * (hvx_vec_rsqrt_f32 / Q6_Vqf32_vmpy), 在微小行(0.8B GDN 门控态 rms~1e-4,
-     * x² 低于 Qf32 分辨率 2^-31 被截断成 0)上产生 0.5× 量级偏差:
-     * 实测 op911(RMSNorm) 512 行中 49 行 cos<0.99, 最差 0.887; 标量 double 路径
-     * 同数据 0 行<0.99(最差 0.9967)。故默认关(标量), 仅 GEHTP_HVX_RMSNORM=1
-     * 显式开启(待定点 kernel 修好后再默认开)。 */
+     * [2026-09-28 精度根因→已修] 旧内核用 Qf32 定点累加 + 快速 rsqrt
+     * (hvx_vec_rsqrt_f32 / Q6_Vqf32_vmpy), 在微小行上 x² 低于 Qf32 分辨率 2^-31
+     * 被截断成 0, 产生 0.5× 量级偏差。现内核已改 f32 累加 (Q6_Vsf_vmpy/vadd)
+     * + 标量 sqrtf 求 scale, 全范围无饱和。默认仍关, 编译器 ver=3 计划 HVX 即开。 */
     static int g_hvx_rmsnorm = -1;
     if (g_hvx_rmsnorm < 0) {
         const char* e = getenv("GEHTP_HVX_RMSNORM");
         g_hvx_rmsnorm = (e && e[0] == '1') ? 1 : 0;  /* 默认关, 显式 1 才开 */
     }
     /* 003 T010: ver=3 按 g_planned_engine 分发 (编译器为准, 覆盖 env); ver<=2 保留 env 自决 */
-    int want_hvx = g_hvx_rmsnorm && !bv && m >= 1u && (rw % 32u) == 0u;
+    int want_hvx = g_hvx_rmsnorm && m >= 1u && (rw % 32u) == 0u;
     if (b->annot_base)
-        want_hvx = (g_planned_engine == WT_ENG_HVX) && !bv && m >= 1u && (rw % 32u) == 0u;
+        want_hvx = (g_planned_engine == WT_ENG_HVX) && m >= 1u && (rw % 32u) == 0u;
     if (want_hvx) {
         uint32_t st = 0;
-        float* sc = f32_scratch(n, 2, &st);
+        float* sc = f32_scratch(n, bv ? 3 : 2, &st);
         if (sc) {
             float* A = sc;          /* [n] 输入/输出(就地) */
             float* W = sc + st;     /* [rw] 权重 */
             hvhx_v2_cvt_f16_to_f32(A, x, n);
             hvhx_v2_cvt_f16_to_f32(W, wv, rw);
-            hvhx_v2_rms_norm_mul_f32_rows(A, W, A, m, rw, 1e-6f);
+            if (bv) {
+                float* B = sc + 2 * st;  /* [rw] 偏置 */
+                hvhx_v2_cvt_f16_to_f32(B, bv, rw);
+                hvhx_v2_rms_norm_mul_bias_f32_rows(A, W, B, A, m, rw, 1e-6f);
+            } else {
+                hvhx_v2_rms_norm_mul_f32_rows(A, W, A, m, rw, 1e-6f);
+            }
             hvhx_v2_cvt_f32_to_f16(y, A, n);
             g_last_engine = WT_ENG_HVX;  /* 003 T017: rmsnorm2 HVX 补漏记 */
             return 0;
@@ -2829,12 +2911,11 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
             return -1;
         /* 回落裁决已通过 (允许回落): 无重复裁决, 直接落标量 */
     } else if (b->annot_base && g_planned_engine != WT_ENG_SCALAR) {
-        /* 003 T010/T011: 计划非标量但 want_hvx==false (HMX 无路径 / 带 bias /
-         * rw%32!=0) → 按回落策略裁决, 禁止回落则硬报错, 绝不静默落标量。 */
+        /* 003 T010/T011: 计划非标量但 want_hvx==false (HMX 无路径 / rw%32!=0)
+         * → 按回落策略裁决, 禁止回落则硬报错, 绝不静默落标量。 */
         if (engine_fallback_or_die(g_planned_engine,
                 g_planned_engine == WT_ENG_HMX ? "rmsnorm2 has no HMX path" :
-                (bv ? "rmsnorm2 has bias; HVX path unavailable" :
-                      "rmsnorm2 shape gate (rw%32!=0)"),
+                      "rmsnorm2 shape gate (rw%32!=0)",
                 err, errn) != 0)
             return -1;
     }
@@ -3691,16 +3772,47 @@ static int exec_gdn_block(const struct wt_blob* b, const struct wt_op* op,
         snprintf(err, errn, "gdn block w slot len mismatch");
         return -1;
     }
-    /* prefill 瞬态 state: f32 零起 (decode 步形 0x6000|idx 持久槽归 T027)。
-     * memalign(128) 供 gdn_block_f16 HVX matvec/外积对齐 (T022d)。 */
-    float* S = (float*)memalign(128, (size_t)H * D * D * 4u);
-    if (!S) { snprintf(err, errn, "gdn block state alloc"); return -1; }
-    memset(S, 0, (size_t)H * D * D * 4u);
+    /* research D5 落地: 内核私有 scratch = 池内 carve 窗口。emit 为每个
+     * GdnBlock 登记本 op 专属记录 (op_index=本发射 op, size=闭式预算),
+     * 层间时间复用同一段; S + 全部 f32 中间量入窗, 免逐层 DDR malloc。
+     * 找不到窗 (旧 blob/无池/超池回退) → memalloc DDR 原路径。 */
+    const size_t s_bytes = (size_t)H * D * D * 4u;
+    uint8_t* win = NULL;
+    if (b->carve_base && b->n_carve && ge.vtcm_budget_bytes > 0) {
+        if (g_exec.vtcm_pool || vtcm_pool_ensure() == 0) {
+            for (uint32_t j = 0; j < b->n_carve && !win; j++) {
+                const uint8_t* r = b->carve_base + (size_t)j * WT_CARVE_REC_SIZE;
+                if (wt_rd_u32(r) != g_current_op_global) continue;        /* 本 op 专属记录 */
+                if (wt_rd_u32(r + 8u) != ge.vtcm_budget_bytes) continue;  /* size=闭式预算 */
+                win = g_exec.vtcm_pool + wt_rd_u32(r + 4u);
+            }
+        }
+    }
+    const uint32_t wk_off = ((uint32_t)s_bytes + 127u) & ~127u;
+    float* S;
+    uint8_t* wk = NULL;
+    size_t wk_bytes = 0;
+    /* work_use='S' = S 入窗 scratch 走 malloc (定位 VTCM 访问成本, 实验开关;
+     * DSP 取不到 shell env → 经 job.txt 键 gdn_work 由 runner 置此全局) */
+    if (win && g_gdn_work_use == 'S') {
+        wk = win + wk_off;
+        wk_bytes = ge.vtcm_budget_bytes - wk_off;
+        S = (float*)memalign(128, s_bytes);
+        if (!S) { snprintf(err, errn, "gdn block state alloc"); return -1; }
+    } else if (win && ge.vtcm_budget_bytes > wk_off) {
+        S = (float*)win;   /* 窗口 2048 对齐 (alloc_vtcm_stage), HVX 128 需求满足 */
+        wk = win + wk_off;
+        wk_bytes = ge.vtcm_budget_bytes - wk_off;
+    } else {
+        S = (float*)memalign(128, s_bytes);
+        if (!S) { snprintf(err, errn, "gdn block state alloc"); return -1; }
+    }
+    memset(S, 0, s_bytes);
     int rc = gdn_block_f16((const int16_t*)xqkv, (const int16_t*)cw,
                            (const int16_t*)beta, (const int16_t*)g,
-                           (int16_t*)y, S, (int)T, (int)H, (int)D,
+                           (int16_t*)y, S, wk, wk_bytes, (int)T, (int)H, (int)D,
                            (int)dcnv, (int)chunk);
-    free(S);
+    if (!wk) free(S);
     if (rc != 0) { snprintf(err, errn, "gdn_block_f16 rc=%d", rc); return -1; }
     g_last_engine = WT_ENG_HVX;  /* 003 T017 纪律: 执行体 gdn_kern.c 为 HVX, 成功后记避免误标 */
     return 0;

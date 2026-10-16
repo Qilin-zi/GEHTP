@@ -19,6 +19,7 @@
 #define GDN_SM_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,9 +59,12 @@ int delta_chunk_f16(rec_state_t* st, const int16_t* k, const int16_t* v,
  * 输入: xqkv [T, 3HD] f16 (in_proj 出值, q|k|v 三段); cw [d_conv, 3HD] f16;
  *       beta [T,H] f16; g [T,H] f16 (负 log decay)。
  * 输出: y [T, HD] f16 token-major。state S [H*D*D] f32 外置原地 (prefill 零起)。
+ * work != NULL: 中间缓冲自 work 区 bump (VTCM carve 窗口, D5; calloc 语义
+ * 显式 memset); work == NULL 走 malloc (host 调试/旧 blob)。
  * 返回 0; 1 = 参数非法; 2 = 中间缓冲分配失败。 */
 int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                   const int16_t* g, int16_t* y, float* S,
+                  uint8_t* work, size_t work_bytes,
                   int T, int H, int D, int d_conv, int chunk);
 
 /* ---- 标量 f32 oracle (host/device 同源, 判定真值) ---- */

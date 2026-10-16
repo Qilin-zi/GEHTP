@@ -35,6 +35,13 @@ void hvhx_v2_rms_norm_mul_f32(const float * __restrict__ src,
                               float       * __restrict__ dst,
                               uint32_t num_elems, float eps);
 
+/** @brief RMSNorm + 逐元素权重 + 逐元素偏置, 单行 f32. (带 bias 的 RMSNorm 形态) */
+void hvhx_v2_rms_norm_mul_bias_f32(const float * __restrict__ src,
+                                   const float * __restrict__ weight,
+                                   const float * __restrict__ bias,
+                                   float       * __restrict__ dst,
+                                   uint32_t num_elems, float eps);
+
 /** @brief LayerNorm, 单行 f32. dst = (x-mean)/sqrt(var+eps). */
 void hvhx_v2_norm_f32(const float * __restrict__ src,
                       float       * __restrict__ dst,
@@ -56,6 +63,16 @@ void hvhx_v2_rms_norm_mul_f32_rows(const float * __restrict__ src,
                                    const float * __restrict__ weight,
                                    float       * __restrict__ dst,
                                    uint32_t n_rows, uint32_t row_size, float eps);
+
+/**
+ * @brief 批量 RMSNorm + 权重 + 偏置. src/dst [n_rows, row_size],
+ *        weight/bias [row_size].
+ */
+void hvhx_v2_rms_norm_mul_bias_f32_rows(const float * __restrict__ src,
+                                        const float * __restrict__ weight,
+                                        const float * __restrict__ bias,
+                                        float       * __restrict__ dst,
+                                        uint32_t n_rows, uint32_t row_size, float eps);
 
 /**
  * @brief 批量 RMSNorm (无权重). src/dst [n_rows, row_size].

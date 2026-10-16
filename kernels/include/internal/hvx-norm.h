@@ -19,49 +19,41 @@ static inline void hvx_fast_rms_norm_f32(const uint8_t * restrict src,
     const int nvec = num_elems / VLEN_FP32;    // number of full vectors
     const int nloe = num_elems % VLEN_FP32;    // leftover elements
 
-    // Compute sum of squares for full vectors
+    // Compute sum of squares for full vectors (f32 accumulation; Qf32 会截断 x²<2^-31/饱和>1)
     HVX_Vector sum_v = Q6_V_vsplat_R(0x00000000);
-    HVX_Vector epsilon_v = hvx_vec_splat_f32(epsilon);
 
     #pragma unroll(4)
     for (int i = 0; i < nvec; i++) {
         HVX_Vector v1 = v_src[i];
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
-        sum_v = Q6_Vqf32_vadd_Vqf32Vqf32(sum_v, v2);
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, v1);
+        sum_v = Q6_Vsf_vadd_VsfVsf(sum_v, v2);
     }
 
     // Handle tail elements using vectorized ops with masking
     if (nloe > 0) {
         HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
         HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
-        sum_v = Q6_Vqf32_vadd_Vqf32Vqf32(sum_v, v2);
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, v1);
+        sum_v = Q6_Vsf_vadd_VsfVsf(sum_v, v2);
     }
 
-    // Reduce HVX sum
-    sum_v = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sum_v));
-
-    HVX_Vector t_v            = hvx_vec_splat_f32((float) num_elems);
-    HVX_Vector denom_v        = hvx_vec_inverse_f32(t_v);
-    HVX_Vector mean_v         = Q6_Vqf32_vmpy_VsfVsf(sum_v, denom_v);
-    HVX_Vector mean_epsilon_v = Q6_Vqf32_vadd_Vqf32Vsf(mean_v, epsilon_v);
+    // Reduce to scalar sum; scale = 1/sqrt(mean + eps) in f32 (全范围, 无 Qf32 饱和)
+    float sum        = hvx_vec_get_f32(hvx_vec_reduce_sum_f32(sum_v));
+    float scale      = 1.0f / sqrtf(sum / (float) num_elems + epsilon);
+    HVX_Vector scale_v = hvx_vec_splat_f32(scale);
 
     // Scale full vectors
-    HVX_Vector scale_v = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(mean_epsilon_v));
-
     #pragma unroll(4)
     for (int i = 0; i < nvec; i++) {
         HVX_Vector v1 = v_src[i];
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
-        v_dst[i] = Q6_Vsf_equals_Vqf32(v2);
+        v_dst[i] = Q6_Vsf_vmpy_VsfVsf(v1, scale_v);
     }
 
     // Handle tail elements using vectorized ops with masking
     if (nloe > 0) {
         HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
         HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
-        HVX_Vector result = Q6_Vsf_equals_Vqf32(v2);
+        HVX_Vector result = Q6_Vsf_vmpy_VsfVsf(v1, scale_v);
 
         // Store with masking to avoid overwriting memory beyond the tensor
         hvx_vec_store_a(&v_dst[nvec], nloe * 4, result);
@@ -80,56 +72,103 @@ static inline void hvx_fast_rms_norm_mul_f32(const uint8_t * restrict src,
     const int nvec = num_elems / VLEN_FP32;    // number of full vectors
     const int nloe = num_elems % VLEN_FP32;    // leftover elements
 
-    // Compute sum of squares for full vectors
+    // Compute sum of squares for full vectors (f32 accumulation)
     HVX_Vector sum_v = Q6_V_vsplat_R(0x00000000);
-    HVX_Vector epsilon_v = hvx_vec_splat_f32(epsilon);
 
     #pragma unroll(4)
     for (int i = 0; i < nvec; i++) {
         HVX_Vector v1 = v_src[i];
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
-        sum_v = Q6_Vqf32_vadd_Vqf32Vqf32(sum_v, v2);
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, v1);
+        sum_v = Q6_Vsf_vadd_VsfVsf(sum_v, v2);
     }
 
     // Handle tail elements using vectorized ops with masking
     if (nloe > 0) {
         HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
         HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
-        sum_v = Q6_Vqf32_vadd_Vqf32Vqf32(sum_v, v2);
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, v1);
+        sum_v = Q6_Vsf_vadd_VsfVsf(sum_v, v2);
     }
 
-    // Reduce HVX sum
-    sum_v = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sum_v));
-
-    HVX_Vector t_v            = hvx_vec_splat_f32((float) num_elems);
-    HVX_Vector denom_v        = hvx_vec_inverse_f32(t_v);
-    HVX_Vector mean_v         = Q6_Vqf32_vmpy_VsfVsf(sum_v, denom_v);
-    HVX_Vector mean_epsilon_v = Q6_Vqf32_vadd_Vqf32Vsf(mean_v, epsilon_v);
+    // Reduce to scalar sum; scale = 1/sqrt(mean + eps) in f32 (全范围)
+    float sum        = hvx_vec_get_f32(hvx_vec_reduce_sum_f32(sum_v));
+    float scale      = 1.0f / sqrtf(sum / (float) num_elems + epsilon);
+    HVX_Vector scale_v = hvx_vec_splat_f32(scale);
 
     // Scale and multiply
-    HVX_Vector scale_v = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(mean_epsilon_v));
-
     #pragma unroll(4)
     for (int i = 0; i < nvec; i++) {
         HVX_Vector v1 = v_src[i];
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
-        HVX_Vector v3 = Q6_Vsf_equals_Vqf32(v2);
-        HVX_Vector result = Q6_Vqf32_vmpy_VsfVsf(v3, v_weight[i]);
-        v_dst[i] = Q6_Vsf_equals_Vqf32(result);
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, scale_v);
+        v_dst[i] = Q6_Vsf_vmpy_VsfVsf(v2, v_weight[i]);
     }
 
     // Handle tail elements using vectorized ops with masking
     if (nloe > 0) {
         HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
         HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
-        HVX_Vector v3 = Q6_Vsf_equals_Vqf32(v2);
-        HVX_Vector result = Q6_Vqf32_vmpy_VsfVsf(v3, v_weight[nvec]);
-        HVX_Vector res_v = Q6_Vsf_equals_Vqf32(result);
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, scale_v);
+        HVX_Vector result = Q6_Vsf_vmpy_VsfVsf(v2, v_weight[nvec]);
 
         // Store with masking to avoid overwriting memory beyond the tensor
-        hvx_vec_store_a(&v_dst[nvec], nloe * 4, res_v);
+        hvx_vec_store_a(&v_dst[nvec], nloe * 4, result);
+    }
+}
+
+static inline void hvx_fast_rms_norm_mul_bias_f32(const uint8_t * restrict src,
+                                                  const uint8_t * restrict weight,
+                                                  const uint8_t * restrict bias,
+                                                  uint8_t * restrict dst,
+                                                  const int num_elems,
+                                                  float     epsilon) {
+    const HVX_Vector * restrict v_src    = (const HVX_Vector *) src;
+    const HVX_Vector * restrict v_weight = (const HVX_Vector *) weight;
+    const HVX_Vector * restrict v_bias   = (const HVX_Vector *) bias;
+    HVX_Vector * restrict v_dst          = (HVX_Vector *) dst;
+
+    const int nvec = num_elems / VLEN_FP32;    // number of full vectors
+    const int nloe = num_elems % VLEN_FP32;    // leftover elements
+
+    // Compute sum of squares for full vectors (f32 accumulation)
+    HVX_Vector sum_v = Q6_V_vsplat_R(0x00000000);
+
+    #pragma unroll(4)
+    for (int i = 0; i < nvec; i++) {
+        HVX_Vector v1 = v_src[i];
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, v1);
+        sum_v = Q6_Vsf_vadd_VsfVsf(sum_v, v2);
+    }
+
+    if (nloe > 0) {
+        HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
+        HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, v1);
+        sum_v = Q6_Vsf_vadd_VsfVsf(sum_v, v2);
+    }
+
+    // Reduce to scalar sum; scale = 1/sqrt(mean + eps) in f32 (全范围)
+    float sum        = hvx_vec_get_f32(hvx_vec_reduce_sum_f32(sum_v));
+    float scale      = 1.0f / sqrtf(sum / (float) num_elems + epsilon);
+    HVX_Vector scale_v = hvx_vec_splat_f32(scale);
+
+    // Scale, multiply by weight, add bias
+    #pragma unroll(4)
+    for (int i = 0; i < nvec; i++) {
+        HVX_Vector v1 = v_src[i];
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, scale_v);
+        HVX_Vector v3 = Q6_Vsf_vmpy_VsfVsf(v2, v_weight[i]);
+        v_dst[i] = Q6_Vsf_vadd_VsfVsf(v3, v_bias[i]);
+    }
+
+    // Handle tail elements using vectorized ops with masking
+    if (nloe > 0) {
+        HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
+        HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
+        HVX_Vector v2 = Q6_Vsf_vmpy_VsfVsf(v1, scale_v);
+        HVX_Vector v3 = Q6_Vsf_vmpy_VsfVsf(v2, v_weight[nvec]);
+        HVX_Vector result = Q6_Vsf_vadd_VsfVsf(v3, v_bias[nvec]);
+
+        hvx_vec_store_a(&v_dst[nvec], nloe * 4, result);
     }
 }
 
