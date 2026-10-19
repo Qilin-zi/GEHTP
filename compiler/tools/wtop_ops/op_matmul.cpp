@@ -269,8 +269,12 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
          * 落 Q4 判别 (长度即唯一判别: Q4_0 tile = (K/32)*(N/32)*640, 与
          * f16(k*n*2)/W4A16(k*n/2) 互斥) 时确保回落面可标量 (对齐兜底)。
          * 历史: 曾按槽长覆盖 SCALAR (GEMV 无 HVX 体时代), HVX 体落地后
-         * 触发 planned SCALAR != actual HVX 硬门。 */
-        if ((w_s & 0x8000u) && ((w_s & 0x7FFFu) < em.slots.size()) &&
+         * 触发 planned SCALAR != actual HVX 硬门。
+         * 修 (2026-10-16): 必须限 m<32。M≥32 Q4 (prefill M=32) 走 HMX
+         * crouton 反量化 (exec_matmul_f16_hmx w_q4 分支), 须保留 assign_engine
+         * 的 HMX 计划。漏 m<32 → M=32 Q4 被误标 HVX → 运行期 "matmul has no
+         * HVX path" 回落标量 → "Q4 权重槽无标量路径" 硬错。 */
+        if ((w_s & 0x8000u) && m < 32u && ((w_s & 0x7FFFu) < em.slots.size()) &&
             em.slots[w_s & 0x7FFFu].len == (size_t)(k / 32u) * (size_t)(nn / 32u) * 640u) {
             em.cur_engine = wt_annot_pack(1u, 1u, 0u);  /* Q4_0 GEMV = HVX, 可回落 */
         }
