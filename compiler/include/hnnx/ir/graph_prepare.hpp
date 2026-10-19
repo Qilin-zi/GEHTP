@@ -39,6 +39,9 @@ struct ConstExtent {
 
 // 005 US3a: pass_fc_bias 复用(与 emit 同源的 MatMul 形状/标志推导)
 std::vector<uint8_t> extract_matmul_extra(const GraphPrepare& gp, const OpDef& opdef);
+// 跨 TU 的算子 extra 提取入口(序列化 serialize_opdef 与 VTCM vtcm_auto_scan 共用,
+// 定义在 graph_prepare_serialize.cpp): 按 op 名查注册表现算。
+std::vector<uint8_t> compute_op_extra(const GraphPrepare& gp, const OpDef& opdef);
 
 class GraphPrepare {
 public:

@@ -15,6 +15,9 @@ endif()
 add_library(htp_core STATIC
     src/ir/opdef.cpp
     src/ir/graph_prepare.cpp
+    src/ir/graph_prepare_serialize.cpp
+    src/ir/graph_prepare_transforms.cpp
+    src/ir/graph_prepare_execute_host.cpp
     src/ir/graph_deps.cpp
     src/ir/graph_dumper.cpp
     src/ir/tensor.cpp
