@@ -151,6 +151,15 @@ static uint32_t g_planned_engine = WT_ENG_SCALAR;
  * ver<3 恒 {1, scalar} = 允许回落标量 (legacy 自决语义不变)。 */
 static uint32_t g_planned_fb_allowed = 1u;
 static uint32_t g_planned_fb_engine = WT_ENG_SCALAR;
+/* 013 US-D (T022): 本 op broadcast 形态(1 整块/2 行循环/3 strided, 0=legacy 无)。
+ * 与 g_planned_engine 同源自 footer u32, run_range 每 op 分发前读。 */
+static uint32_t g_planned_bcast_form = 0u;
+/* 013 US-D (T023): 本 op matmul Q4_0 权重槽判别位 (1=Q4 槽)。与 g_planned_engine
+ * 同源自 footer u32, run_range 每 op 分发前读。 */
+static uint32_t g_planned_q4 = 0u;
+/* 013 US-D (T024): 装载期一次校验去重键 (本 blob 已跑过 annot 一致性校验)。
+ * 绑定 blob 指针而非布尔, 支持同进程多 blob 各自校验一次。 */
+static const struct wt_blob* g_validated_blob = NULL;
 /* 003 T018: 本 op 偏差标志 (0=按计划 1=允许回落 2=已中止)。
  * 仅 v3 分发路径会置位 (engine_fallback_or_die); ver<3 无计划语义恒 0。
  * 中止态由 run_range 填充点按 rc!=0 统一置 2, 各 die 分支无需重复设。 */
@@ -601,36 +610,29 @@ static int exec_matmul(const struct wt_blob* b, const struct wt_op* op,
 
     const uint8_t *bias = NULL, *atbl = NULL, *otbl = NULL;
     uint32_t bias_slot_idx = 0xFFFFFFFFu;
-    if (op->n_args == 9) {
-        /* 013: 9-arity 直读三槽 (emit 把 bias/atbl/otbl 槽索引写入 args[6..8],
-         * 与 w_raw 同款裸 slot 约定)。槽长校验保留 = emit 契约哨兵。 */
-        uint32_t bias_s = op->args[6], atbl_s = op->args[7], otbl_s = op->args[8];
-        if (bias_s >= b->n_slots || atbl_s >= b->n_slots || otbl_s >= b->n_slots) {
-            snprintf(err, errn, "w4a16 supply slot oob");
-            return -1;
-        }
-        bias = b->weight_base + b->slots[bias_s].offset;
-        atbl = b->weight_base + b->slots[atbl_s].offset;
-        otbl = b->weight_base + b->slots[otbl_s].offset;
-        bias_slot_idx = bias_s;
-        if (b->slots[bias_s].len != bias_b || b->slots[atbl_s].len != atbl_b ||
-            b->slots[otbl_s].len != otbl_b) {
-            snprintf(err, errn, "w4a16 supply slot size mismatch");
-            return -1;
-        }
-    } else {
-        /* 6-arity legacy: 槽表按长度扫描 (逐字节不动) */
-        for (uint32_t i = 0; i < b->n_slots; i++) {
-            const uint8_t* p = b->weight_base + b->slots[i].offset;
-            uint32_t L = b->slots[i].len;
-            if (!bias && L == bias_b) { bias = p; bias_slot_idx = i; }
-            else if (!atbl && L == atbl_b) atbl = p;
-            else if (!otbl && L == otbl_b) otbl = p;
-        }
-        if (!bias || !atbl || !otbl) {
-            snprintf(err, errn, "supply slots missing (bias/atbl/otbl)");
-            return -1;
-        }
+    /* 013 T026: legacy 6-arity 槽表按长度扫描已删 — W4A16 仅 9-arity 直读。
+     * 6-arity 旧 blob 由 parse 侧 legacy_arity 放行, 但执行期硬拒
+     * (免长度扫描误配槽; 新 emit 恒发 9-arity)。 */
+    if (op->n_args != 9) {
+        snprintf(err, errn, "w4a16 arity %u (legacy 6-arity scan removed)",
+                 (unsigned)op->n_args);
+        return -1;
+    }
+    /* 013: 9-arity 直读三槽 (emit 把 bias/atbl/otbl 槽索引写入 args[6..8],
+     * 与 w_raw 同款裸 slot 约定)。槽长校验保留 = emit 契约哨兵。 */
+    uint32_t bias_s = op->args[6], atbl_s = op->args[7], otbl_s = op->args[8];
+    if (bias_s >= b->n_slots || atbl_s >= b->n_slots || otbl_s >= b->n_slots) {
+        snprintf(err, errn, "w4a16 supply slot oob");
+        return -1;
+    }
+    bias = b->weight_base + b->slots[bias_s].offset;
+    atbl = b->weight_base + b->slots[atbl_s].offset;
+    otbl = b->weight_base + b->slots[otbl_s].offset;
+    bias_slot_idx = bias_s;
+    if (b->slots[bias_s].len != bias_b || b->slots[atbl_s].len != atbl_b ||
+        b->slots[otbl_s].len != otbl_b) {
+        snprintf(err, errn, "w4a16 supply slot size mismatch");
+        return -1;
     }
     if (!(act_s & WT_REF_VTCM_FLAG) && b->slots[act_s].len != act_b) {
         snprintf(err, errn, "act slot size mismatch");
@@ -2662,12 +2664,8 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
      * crouton); batched/标量路走到 = 硬错误(emit 侧未对齐/batched 已兜底
      * f16, 此处防手构 blob 误用; host 执行器无 HMX, Q4 blob 属设备专属)。 */
     const uint8_t* w_q4 = NULL;
-    if ((op->args[1] & 0x8000u) && (K % 32u) == 0u && (N_full % 32u) == 0u) {
-        uint32_t wsx = op->args[1] & 0x7FFFu;
-        if (wsx < b->n_slots &&
-            b->slots[wsx].len == (size_t)(K / 32u) * (size_t)(N_full / 32u) * 640u)
-            w_q4 = (const uint8_t*)w;
-    }
+    if (g_planned_q4 && (op->args[1] & 0x8000u))
+        w_q4 = (const uint8_t*)w;  /* 013 US-D (T023): Q4 槽判别按位, 免槽长探针 */
     if (w_q4 && batched) {
         snprintf(err, errn, "matmul_f16: Q4 权重槽不支持 batched (emit 应兜底 f16)");
         return -1;
@@ -2675,8 +2673,10 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
 #if defined(__HVX__) || defined(__hexagon__)
     /* FR-001: M<32 GEMV 快路径 (HVX f32-accumulate)，插在 HMX 门之前。
      * FR-002: stream W 行主序，无 crouton repack (memory-bound)。
-     * 成功返回 0，失败回落标量。 */
-    if (M < 32u) {
+     * 成功返回 0，失败回落标量。
+     * 013 US-D (T024): ver=3 注解路径免 M<32 运行时重算 — planned_engine==HVX
+     * ⟺ M<32 (emit assign_engine 唯一决定); ver<=2 legacy 保留运行时自决。 */
+    if (b->annot_base ? (g_planned_engine == WT_ENG_HVX) : (M < 32u)) {
         int gv_rc = w_q4
             ? exec_matmul_q4_0_gemv(a, w_q4, y, M, K, N, n0, N_full, t0, err, errn)
             : exec_matmul_f16_gemv(a, w, y, M, K, N, n0, N_full, t0, t1,
@@ -2935,30 +2935,6 @@ static int exec_rmsnorm2(const struct wt_blob* b, const struct wt_op* op,
     return 0;
 }
 
-/* 007 US1 broadcast 形态判定 — 正典 = specs/007-perf-sprint-1/evidence/
- * broadcast_census.md "判定规则"节; 孪生实现在
- * compiler/tools/wtop_ops/wtop_ops.hpp broadcast_shape_class (判据互指, 勿单边改)。
- * 1 = 整块 (in 外轴全广播: 块重复 / 整块铺标量)
- * 2 = 行循环 (末轴 in==out 连续拷行 / in==1 逐行铺标量, 外轴里程计免除 div)
- * 3 = 通用退化 (wrap 轴 / strided gather; 保留标量, emit 侧计划 scalar = 合法) */
-static int broadcast_shape_class(const uint32_t in_d[4], const uint32_t out_d[4])
-{
-    uint32_t r = 4;
-    while (r > 0 && out_d[r - 1] == 1) r--;
-    if (r == 0) r = 1;
-    uint32_t ir = 4;
-    if (ir > r) ir = r;
-    if (in_d[ir - 1] != out_d[r - 1] && in_d[ir - 1] != 1) return 3; /* 末轴 wrap */
-    uint32_t lead = r - ir;
-    int outer_bcast = 1;
-    for (uint32_t d = 0; d + 1 < ir; d++) {
-        if (in_d[d] == 1) continue;               /* 外轴广播 */
-        if (in_d[d] != out_d[d + lead]) return 3; /* 外轴 wrap (c%idim 环绕) */
-        outer_bcast = 0;
-    }
-    return outer_bcast ? 1 : 2;
-}
-
 /* numpy 广播: 右对齐逐轴, in==1 的轴扩到 out(缺失轴视 1)。
  * in_d/out_d 为 QNN 4D 填充 dims; 压尾 1 得有效 rank 后解坐标。
  * 007 US1: 形态 1/2 有 HVX 纯搬运执行体 (位级 = 标量逐元素拷贝, 无数值
@@ -2978,7 +2954,7 @@ static int exec_broadcast(const struct wt_blob* b, const struct wt_op* op,
     if (r == 0) r = 1;
     if (ir > r) ir = r;  /* 输入 rank 不得高于输出(右对齐前导 1 已折叠) */
     uint32_t lead = r - ir;
-    int bclass = broadcast_shape_class(in_d, out_d);
+    int bclass = (int)g_planned_bcast_form;  /* 013 US-D (T022): 编译期形态, 免重算 */
     /* HVX 快路径: 计划 HVX 且形态 1/2 且整除守卫过 (守卫失败 = 形状异常,
      * 落到下方按回落策略诚实记 dev, 不出错误字节)。ver<=2 无注解恒标量
      * (legacy 字节流不动)。 */
@@ -4050,6 +4026,21 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
     if (first + count > b->n_ops) { snprintf(err, errn, "range oob"); return -1; }
     if (wt_exec_load_tempoff(b, err, errn) != 0) return -1;
     if (wt_exec_load_states(b, err, errn) != 0) return -1;
+    /* 013 US-D (T024): 双侧判据漂移检测搬到装载期一次校验 — Q4 槽判别位与
+     * 引擎注解矛盾 (emit bug / 手构 blob) 立即硬错误, 不在逐 op 执行中途才现形。
+     * 哨兵本体仍保留在 exec_matmul_f16_impl (防漏), 此处 fail-fast 早炸。 */
+    if (b->annot_base && g_validated_blob != b) {
+        for (uint32_t vi = 0; vi < b->n_ops; vi++) {
+            uint32_t van = wt_rd_u32(b->annot_base + (size_t)vi * 4u);
+            if (wt_annot_q4(van) && wt_annot_engine(van) == WT_ENG_SCALAR) {
+                snprintf(err, errn,
+                         "annot: op %u Q4 slot planned scalar (emit bug / 手构 blob)",
+                         (unsigned)vi);
+                return -1;
+            }
+        }
+        g_validated_blob = b;
+    }
     const int64_t t_run0 = HAP_perf_get_time_us();  /* PROF W-P2: ts 时间轴零点 */
     for (uint32_t ii = 0; ii < count; ii++) {
         uint32_t i = first + ii;
@@ -4067,10 +4058,14 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
             g_planned_engine = wt_annot_engine(an);
             g_planned_fb_allowed = wt_annot_fb_allowed(an);
             g_planned_fb_engine = wt_annot_fb_engine(an);
+            g_planned_bcast_form = wt_annot_bcast_form(an);
+            g_planned_q4 = wt_annot_q4(an);
         } else {
             g_planned_engine = WT_ENG_SCALAR;
             g_planned_fb_allowed = 1u;   /* legacy: 恒允许回落 (旧自决语义) */
             g_planned_fb_engine = WT_ENG_SCALAR;
+            g_planned_bcast_form = 0u;   /* legacy: 无形态位 (ver<3 恒标量) */
+            g_planned_q4 = 0u;           /* legacy: 无 Q4 判别位 */
         }
         int rc;
         if (op->opcode >= sizeof(g_op_exec_table) / sizeof(g_op_exec_table[0]) ||
