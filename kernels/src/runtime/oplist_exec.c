@@ -1,9 +1,9 @@
 /* oplist_exec.c — 设备端 op 执行器 (函数指针表分派, 无图; host 已按依赖序排好)
  *
  * 约定 (对齐 PLAN.md §3; 供给面按字节尺寸认领 — t10 供给栈约定):
- *   MATMUL 的 bias / act_table / out_table 不进 op args, 执行器在 slot 表里按
- *   尺寸匹配: len==(N/32)*512 → bias; len==8*(K/32)*4 的前两个 → atbl/otbl
- *   (t10 两张表字节相同, 按出现顺序区分)。
+ *   MATMUL 的 bias / act_table / out_table 由 9-arity 直读 (args[6..8]); 013 起
+ *   删 6-arity 按 slot len 尺寸匹配扫描 (len==(N/32)*512 → bias; len==8*(K/32)*4
+ *   的前两个 → atbl/otbl), 非 9-arity 执行期硬拒、装载期仍放行 6-arity 向后兼容。
  *   PIN: 引擎建立后把 slot 面搬入 VTCM (幂等); 引擎未建立时仅记账 (首个
  *   MATMUL 自行 staging, 正确性不依赖 PIN)。
  * temp 缓冲: id 0..7; MATMUL 写 temp[out] = i16 crouton (M,N) 面;

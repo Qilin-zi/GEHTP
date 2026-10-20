@@ -15,7 +15,7 @@ off 0  : "WTOP" | u16 ver=1 | u16 endian_chk=0x1234 | u32 n_slots | u32 n_ops
 接     : slot[n] × 16B { len, count, offset(128B对齐,相对weight区), addr(恒0) }
 接     : op[n] { u16 opcode; u16 n_args; u32 args[n] }   (args 只放 slot/temp id+维度)
 接     : weight 区 (128B 对齐, slot 间 pad 128B)
-opcode : 0 NOP [] · 1 MATMUL_W4A16 [act_slot,w_slot,out_temp,M,K,N]
+opcode : 0 NOP [] · 1 MATMUL_W4A16 [act_slot,w_slot,out_temp,M,K,N,bias_slot,atbl_slot,otbl_slot]
          2 RMSNORM_F16 [x_temp,w_slot,y_temp,n] · 3 PIN [slot]
 ```
 
@@ -33,10 +33,11 @@ void     wt_exec_shutdown(void);        /* wtcache_close + temps 释放 (铁律�
 void     wt_w3_report(blob_name, buf, size, &w, emit_cb, ud);   /* W3 报告行 */
 ```
 
-- MATMUL: 按 slot len 启发定位 bias/atbl/otbl; 引擎惰性建立 (首次 MATMUL 时
-  wtcache_open+carve, **V2.2 修复后 open 末尾全 VTCM FLUSH**); 每次 op 重新
-  cpu_to_vtcm 权重 (restage); act 由 UserDMA bypass 读 blob 内 DDR (**铁律①:
-  blob 读入后必须 `dc_clean_ddr`**)。
+- MATMUL: 9-arity 直读 bias/atbl/otbl (args[6..8]; 013 起删 6-arity 按 slot len
+  启发扫描路径, 非 9-arity 执行期硬拒, 装载期 parse 仍放行 6-arity 向后兼容);
+  引擎惰性建立 (首次 MATMUL 时 wtcache_open+carve, **V2.2 修复后 open 末尾全
+  VTCM FLUSH**); 每次 op 重新 cpu_to_vtcm 权重 (restage); act 由 UserDMA bypass
+  读 blob 内 DDR (**铁律①: blob 读入后必须 `dc_clean_ddr`**)。
 - RMSNORM: 标量路径 (inv_crouton 解码 → double 累加 rms → f16 出), 与 example 21
   内嵌镜像 bit-exact (0 ULP)。
 - shutdown 后可再次 `wt_exec_run` (引擎重建, temp0 跨重开 byte-exact — example 21 门)。
