@@ -1012,10 +1012,14 @@ inline int broadcast_shape_class(const uint32_t in_d[4], const uint32_t out_d[4]
 
 /* 注入的 OP_BROADCAST_F16 子 op 引擎注解 (007 P1 修正: 父 op assign_engine
  * 的 n%32 判据看不见 broadcast 自身形状 —— 按形态分派: 类 1/2 → HVX 纯搬运,
- * 类 3 → scalar 计划(合法非回落, dev=0); fb_allowed 恒 1 沿 003 契约)。 */
+ * 类 3 → scalar 计划(合法非回落, dev=0); fb_allowed 恒 1 沿 003 契约)。
+ * 013 US-D (T022): 形态类(1/2/3)一并打包进 annotation bit[6:7], 运行期直读
+ * 免重算 —— 设备侧孪生 broadcast_shape_class 因此可删 (T024)。 */
 inline uint32_t broadcast_engine_annot(const uint32_t in_d[4], const uint32_t out_d[4])
 {
-    return wt_annot_pack(broadcast_shape_class(in_d, out_d) == 3 ? 0u : 1u, 1u, 0u);
+    uint32_t cls = (uint32_t)broadcast_shape_class(in_d, out_d);
+    uint32_t eng = (cls == 3) ? 0u : 1u;
+    return wt_annot_set_bcast_form(wt_annot_pack(eng, 1u, 0u), cls);
 }
 
 /* T018: decode 状态全局槽映射。surgery 脚本按类型命名空间分配 state_idx

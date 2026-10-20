@@ -392,6 +392,21 @@ static inline uint32_t wt_annot_set_reuse(uint32_t* a, int reuse) {
     return *a;
 }
 static inline uint32_t wt_annot_reuse(uint32_t a) { return (a >> 5) & 1u; }
+/* 013 US-D (T022): broadcast 形态(类 1 整块/2 行循环/3 strided)入 annotation
+ * bit[6:7]。编译期已知(emit broadcast_engine_annot 按 in_d/out_d 判), 运行期
+ * 免重算(oplist_exec.c exec_broadcast 直读)。bit[6:7] 原为预留, 与 bit[0:5]
+ * 无冲突。 */
+static inline uint32_t wt_annot_set_bcast_form(uint32_t a, uint32_t form) {
+    return (a & ~(0x3u << 6)) | ((form & 0x3u) << 6);
+}
+static inline uint32_t wt_annot_bcast_form(uint32_t a) { return (a >> 6) & 0x3u; }
+/* 013 US-D (T023): matmul Q4_0 权重槽判别入 annotation bit[8]。编译期已知
+ * (op_matmul 按槽长判一次), 运行期免槽长探针 (oplist_exec.c exec_matmul_f16_impl
+ * 的 w_q4 分支原按槽长现按位)。 */
+static inline uint32_t wt_annot_set_q4(uint32_t a, uint32_t q4) {
+    return q4 ? (a | (1u << 8)) : (a & ~(1u << 8));
+}
+static inline uint32_t wt_annot_q4(uint32_t a) { return (a >> 8) & 1u; }
 
 #ifdef __cplusplus
 }

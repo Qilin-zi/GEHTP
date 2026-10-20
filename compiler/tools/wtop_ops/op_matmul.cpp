@@ -79,6 +79,16 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
     bool w4 = w_is_const && (w_s != em.dummy_slot_id) &&
               (m % 256u == 0u) &&
               (em.slots[w_s & 0x7FFFu].len == (k * nn / 2u));
+    /* 013 US-D (T023): Q4_0 权重槽判别 (len = (k/32)*(nn/32)*640, 640B/tile,
+     * 0.625B/elem) — 与 w4 (W4A16 紧凑 0.5B/elem) / f16 (2B/elem) 互斥无歧义。
+     * 编译期算一次入 annotation bit[8], 运行期免槽长探针 (oplist_exec.c
+     * exec_matmul_f16_impl 的 w_q4 原按槽长现按位)。K/N 须 32 对齐 (镜像运行期
+     * 原判据)。 */
+    bool w_q4_slot = w_is_const && (w_s != em.dummy_slot_id) && (w_s & 0x8000u) &&
+                     (k % 32u) == 0u && (nn % 32u) == 0u &&
+                     ((w_s & 0x7FFFu) < em.slots.size()) &&
+                     (em.slots[w_s & 0x7FFFu].len ==
+                      (size_t)(k / 32u) * (size_t)(nn / 32u) * 640u);
     if (w4) {
         if (has_bias) {
             /* W4A16 的 bias 走权重内嵌表(exec_matmul 扫槽), 独立 bias 槽
@@ -274,9 +284,13 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
          * crouton 反量化 (exec_matmul_f16_hmx w_q4 分支), 须保留 assign_engine
          * 的 HMX 计划。漏 m<32 → M=32 Q4 被误标 HVX → 运行期 "matmul has no
          * HVX path" 回落标量 → "Q4 权重槽无标量路径" 硬错。 */
-        if ((w_s & 0x8000u) && m < 32u && ((w_s & 0x7FFFu) < em.slots.size()) &&
-            em.slots[w_s & 0x7FFFu].len == (size_t)(k / 32u) * (size_t)(nn / 32u) * 640u) {
+        if (w_q4_slot && m < 32u) {
             em.cur_engine = wt_annot_pack(1u, 1u, 0u);  /* Q4_0 GEMV = HVX, 可回落 */
+        }
+        if (w_q4_slot) {
+            /* 013 US-D (T023): Q4 槽判别位入 annotation (M<32 GEMV 与 M≥32
+             * dense 两路都置位; 后者 cur_engine 仍为 assign_engine 的 HMX)。 */
+            em.cur_engine = wt_annot_set_q4(em.cur_engine, 1u);
         }
         if (has_bias) {
             /* OP_MATMUL_F16_BIAS (opcode 36): 尾部追加 bias 槽。
