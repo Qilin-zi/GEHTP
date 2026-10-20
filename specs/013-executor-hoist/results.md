@@ -117,6 +117,64 @@
 
 诚实归属：收益=**全链重编**（gdn 融合+编译期折叠，920 ops vs 旧 11504），非 013 A/C 机制（0.8B VTCM auto 撤退无 TAG_MEM_PLAN、q4 线无 W4A16 op，本就不触）。007 锚的「旧图+当代 lib」欠账就此补齐，w4 线与 f16 线同源同代。
 
-## US-D — 形态 flag 化（未开始）
+## US-D — 形态 flag 化（已收口 2026-10-19：T021-T025 全绿）
 
-## 终局双门（T028 汇总，未开始）
+**Goal**: broadcast 形态 / GEMV 引擎 / Q4 槽判别编译期入 annotation flag，运行时零重推导。
+
+**落地项（commit `9871577`）**：
+
+- **T021** 前置检查：012 已落地主线（bca460a 含 exec_matmul_f16_hmx 会话外提段），分发段稳定。
+- **T022** `wtop_ops.hpp` `broadcast_engine_annot`：形态类(1 整块/2 行循环/3 strided)入
+  annotation bit[6:7]（`wt_annot_set_bcast_form`）。
+- **T023** `op_matmul.cpp` + `oplist_parse.h`：GEMV 走 planned_engine 编码(M<32 编译期已知)；
+  Q4_0 权重槽判别入 bit[8]（`wt_annot_set_q4`），替代运行期 `len==(k/32)*(nn/32)*640` 槽长探针。
+- **T024** `oplist_exec.c`：注解路径直用 emit 形态（exec_broadcast 直读 form、exec_matmul_f16_impl
+  直读 q4 位），删运行时 shape-class 重算与 Q4 探针；双侧判据漂移检测挪装载期一次校验。
+
+**T025 D 段门（板 d0f1784，正典旗标）**：
+
+| 门 | 锚 | 实测 | 裁决 |
+|---|---|---|---|
+| prefill（gdn-ON 默认线）精度 | cos 0.999921 / top1 32 | md5 `2c09d8ba` == 锚（位级同） | ✓ |
+| prefill 性能 | exec 0.490s | **0.489s** | ✓ 无回退 |
+| seq1 decode（GEMV 主场） | cos 0.999975 / 1.89s | 1.885s rc=0 | ✓ 非回归 |
+
+**收益与诚实定位**：执行器热路径零运行时形态规划达成（SC-004）；本段是**机制性等价改写**
+（编译期 flag == 运行期旧判据，位级同锚背书），无独立性能收益——与 A/C 段同口径。
+
+## Polish — T026 删 legacy 6-arity 扫描（已收口 2026-10-19）
+
+`exec_matmul`（W4A16）删 `n_args==6` O(n_slots) 槽表扫描，仅 9-arity 直读三槽，非 9-arity
+执行期硬拒；parse 侧 `legacy_arity` 保留（装载仍放行 6-arity，向后兼容不 bump WT_BLOB_VER）。
+
+**设备门（板 d0f1784，lib `libhvxhmx_013usd.so`）**：
+
+| blob | arity | 结果 |
+|---|---|---|
+| `blob_w4_v9.wtop` | 9 | md5 `7654a8f6…` == 已知答案（位级同，直读路径未破） |
+| `blob_w4_6ar.wtop` | 6 | `w4a16 arity 6 (legacy 6-arity scan removed)` 硬拒（预期） |
+
+三线重跑零回退（prefill 0.489s/`2c09d8ba` + seq1 1.885s + W4A16 合成）。证据
+`evidence/t026-legacy-scan-removal.md`。
+
+## T027 — 回合主线 merge（已收口并 push 2026-10-19：`95188e1`）
+
+merge/013-into-mainline（双亲 graph_prepare 拆分 `29a931e` + 013 `9871577`）**零冲突**
+（文件集 disjoint）→ origin/task/prof-wp 快进。host compiler 全量构建 exit 0；ctest
+**48/50**（唯二红 = test_wtop_emit/test_vtcm_auto 的 VTCM 驻留 auto 预存失败，013 之前已在
+主线，非本回合引入，见 `evidence/t027-merge-mainline.md`）；三线板测位级同锚。
+
+## 终局双门（T028 汇总）
+
+**精度不回退**（默认线 cos 0.999921 / top1 32，位级同锚 md5 `2c09d8ba`）+ **性能实测**
+（prefill exec **0.490s** 无回退；seq1 decode 1.89s 非回归）。
+
+| 段 | 收益 | 性质 |
+|---|---|---|
+| B（W4A16 供给侧） | 机制可达（4 表+9-arity+删扫描+M 门槛） | 无性能门（M%256 NO-GO 裁决归档） |
+| A（VTCM 静态布局） | 装载期一次分区/探戈消解 | 机制前置，本基准无收益 |
+| C（carve 静态表） | W4A16 op 1.95×（单 op 对照） | 收益未兑（0.8B 无 W4A16 op） |
+| D（形态 flag） | 热路径零运行时形态规划 | 机制等价，无独立收益 |
+| Polish T026 | 删 6-arity 扫描 | 卫生 |
+
+原生 W4A16 0.8B E2E 收益（M%256 NO-GO）显式移出 013 范围，归档于此。
