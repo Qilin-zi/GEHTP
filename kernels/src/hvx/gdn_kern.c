@@ -498,9 +498,13 @@ uint64_t g_gdn_calls;
 int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                   const int16_t* g, int16_t* y, float* S,
                   uint8_t* work, size_t work_bytes,
-                  int T, int H, int D, int d_conv, int chunk) {
+                  int T, int H, int D, int d_conv, int chunk, int s_cold) {
     if (T <= 0 || H <= 0 || D <= 0 || d_conv < 2 || chunk <= 0 || chunk > GDN_C_MAX)
         return 1;
+    /* 016-P3 冷盘跳过: s_cold=1 = S 零起且瞬态(prefill)。仅单 chunk(T<=chunk)
+     * 时三矩阵相位(S·k / S·q / S 更新)读写全 0, 位级等价可跳过; 多 chunk
+     * (T>chunk) 时 S 跨 chunk 携带, 决不跳。decode 持久化路径须传 s_cold=0。 */
+    const int skip_cold = (s_cold && T <= chunk);
     const int hd = H * D, DI = 3 * hd;   /* 局部 hd 避开文件顶 HD=128 宏 */
     const float scale = 1.0f / sqrtf((float)D);
 
@@ -664,20 +668,24 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
             }
             {
             GDN_T0();
-            gdn_hvx_gemm(Sh, kf_T, gemm_buf, D, c);   /* gemm_buf[m][j] = (S·k_j)[m], 一次算全 j */
+            if (!skip_cold)
+                gdn_hvx_gemm(Sh, kf_T, gemm_buf, D, c);   /* gemm_buf[m][j] = (S·k_j)[m], 一次算全 j */
             GDN_T1(5);
             for (int j = 0; j < c; j++) {
                 float ej = expf(Gc[j]);
                 float bj = gdn_f16_to_f32(beta[(base + j) * H + h]);
-                for (int m = 0; m < D; m++)
-                    bmat[(size_t)j * D + m] = bj * (vf[(size_t)j * D + m] - ej * gemm_buf[(size_t)m * c + j]);
+                for (int m = 0; m < D; m++) {
+                    float sk = skip_cold ? 0.0f : gemm_buf[(size_t)m * c + j];
+                    bmat[(size_t)j * D + m] = bj * (vf[(size_t)j * D + m] - ej * sk);
+                }
                 gdn_hvx_tri_accum(u, bmat, Tm, j, c, D, nvec);   /* u[j] = Σ_{i≤j} Tm[j][i]·bmat[i] */
             }
             GDN_T1(6);
             }
             {
             GDN_T0();
-            gdn_hvx_gemm(Sh, qf_T, gemm_buf, D, c);   /* gemm_buf[m][t] = (S·q_t)[m], 一次算全 t */
+            if (!skip_cold)
+                gdn_hvx_gemm(Sh, qf_T, gemm_buf, D, c);   /* gemm_buf[m][t] = (S·q_t)[m], 一次算全 t */
             GDN_T1(7);
             {
             GDN_T0();
@@ -690,7 +698,8 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
             }
             for (int t = 0; t < c; t++) {
                 float et = expf(Gc[t]);
-                for (int m = 0; m < D; m++) bf[m] = gemm_buf[(size_t)m * c + t] * et;
+                for (int m = 0; m < D; m++)
+                    bf[m] = (skip_cold ? 0.0f : gemm_buf[(size_t)m * c + t]) * et;
                 for (int i = 0; i <= t; i++) {
                     float w = expf(Gc[t] - Gc[i]);
                     float qk = QK[(size_t)t * c + i] * w;
@@ -705,12 +714,14 @@ int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
             }
             {
             GDN_T0();
-            float eC = expf(Gc[c - 1]);
-            gdn_hvx_scale(Sh, D * D, eC);
-            for (int i = 0; i < c; i++) {
-                float w = expf(Gc[c - 1] - Gc[i]);
-                /* S += w·u_i·k_i^T (HVX rank-1 外积) */
-                gdn_hvx_outer(Sh, u + (size_t)i * D, kf + (size_t)i * D, w, D, nvec);
+            if (!skip_cold) {
+                float eC = expf(Gc[c - 1]);
+                gdn_hvx_scale(Sh, D * D, eC);
+                for (int i = 0; i < c; i++) {
+                    float w = expf(Gc[c - 1] - Gc[i]);
+                    /* S += w·u_i·k_i^T (HVX rank-1 外积) */
+                    gdn_hvx_outer(Sh, u + (size_t)i * D, kf + (size_t)i * D, w, D, nvec);
+                }
             }
             GDN_T1(9);
             }

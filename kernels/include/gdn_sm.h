@@ -65,7 +65,7 @@ int delta_chunk_f16(rec_state_t* st, const int16_t* k, const int16_t* v,
 int gdn_block_f16(const int16_t* xqkv, const int16_t* cw, const int16_t* beta,
                   const int16_t* g, int16_t* y, float* S,
                   uint8_t* work, size_t work_bytes,
-                  int T, int H, int D, int d_conv, int chunk);
+                  int T, int H, int D, int d_conv, int chunk, int s_cold);
 
 /* ---- 标量 f32 oracle (host/device 同源, 判定真值) ---- */
 void ref_conv_step (conv_state_t* st, const float* w, const float* x, float* y);
