@@ -220,7 +220,15 @@ enum {
                                槽 miss (posmap 不符) = 硬错误, 状态 bug 必炸 */
     OP_MATMUL_F16 = 24,     /* [a_ref,w_s,out_t,M,K,N,flags] f16×f16→f16 (f32 累加)
                                flags bit0=转置 a(存[K,M]) bit1=转置 w(存[N,K]);
-                               W4A16 留给 Q4_0 打包权重 (float 图 GEMM) */
+                               W4A16 留给 Q4_0 打包权重 (float 图 GEMM);
+                               bit3=wgt_prepacked(crouton f16 镜像, HMX DMA);
+                               bit4=n_pad (N<32 零填到 32, FC t1 专属);
+                               bit5=w4ts (018: Q4_0 640B tile 槽 + M<32 + t1
+                               → exec_matmul_w4_stream: DMA 菊花链流式搬
+                               tile 进 VTCM + q8_0 激活 + rmpy 行并行 matvec;
+                               emit 条件 w_q4_slot&&m<32&&!batched&&t1&&
+                               !bias&&K<=8192&&K%128==0; 未置位 Q4 槽走
+                               q4_0_gemv) */
     OP_RMSNORM2_F16 = 25,   /* [x_ref,w_s,b_s,y_t,n] 通用 RMSNorm: 纯 f16 面直读
                                (无 crouton); n=总元素, 行宽=w 槽长/2, m=n/行宽;
                                b_s 为 bias 槽(无 bias 时 zero dummy 槽); eps=1e-6

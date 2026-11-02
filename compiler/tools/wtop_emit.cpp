@@ -829,7 +829,6 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     auto hmx_arena_max_of = [&]() -> uint64_t {
         uint64_t amax = 0;
         for (size_t i = 0; i < em.ops.size(); i++) {
-            if ((em.op_annot[i] & 0x3u) != 2u) continue;  /* 2=WT_ENG_HMX (wt_engine) */
             uint16_t opc = em.ops[i].opcode;
             if (em.ops[i].n_args < 6) continue;
             const uint32_t* a = em.ops[i].args;
@@ -840,6 +839,17 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
             if (opc == OP_MATMUL_F16_SPLIT && em.ops[i].n_args >= 8) N = a[7];
             auto al2k = [](uint64_t x) { return (x + 2047) & ~(uint64_t)2047; };
             auto al128 = [](uint64_t x) { return (x + 127) & ~(uint64_t)127; };
+            /* 018 W4TS: bit5 的 OP_MATMUL_F16 走 exec_matmul_w4_stream 的
+             * hmx arena (ring 8×slot + act_q8 + act_f32 + out_f32), 与执行器
+             * 自划闭式逐项同式。annot engine=HVX(1) 不挡此项 (bit5 优先判)。 */
+            if (opc == OP_MATMUL_F16 && em.ops[i].n_args >= 7 && (a[6] & 32u)) {
+                uint64_t slot = (K / 32) * 640;
+                uint64_t aq8 = M * (K / 32) * 1152;
+                amax = std::max(amax, al2k(8 * 4 * slot) + al2k(aq8) + al2k(M * K * 4) +
+                                      al2k(M * N * 4) + 2048);  /* ring 8 槽 × G4 组 */
+                continue;
+            }
+            if ((em.op_annot[i] & 0x3u) != 2u) continue;  /* 2=WT_ENG_HMX (wt_engine) */
             if (opc == OP_MATMUL_F16 || opc == OP_MATMUL_F16_BIAS ||
                 opc == OP_MATMUL_F16_SPLIT) {
                 amax = std::max(amax, al2k(M * K * 2) + al2k(K * N * 2) + al2k(M * N * 2) + 2048);

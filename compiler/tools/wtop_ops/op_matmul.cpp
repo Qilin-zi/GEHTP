@@ -343,6 +343,15 @@ static int op_matmul(Emitter& em, GraphPrepare& gp, const OpDef* od, std::map<ui
             }
             uint32_t pp = try_prepack(0u, nn);
             if (pp) { w_use = 0x8000u | pp; fl |= kFlagWgtPP; }
+            /* 018 W4TS: Q4_0 tile 槽 + decode 形态 → flags bit5, 运行期走
+             * exec_matmul_w4_stream (DMA 菊花链流式搬 tile + q8 激活 +
+             * rmpy 行并行 matvec)。与 W4A16(m%256,k*n/2) 互斥已由 w_q4_slot
+             * 槽长判别保证; t1 限定 (tile 是 [N,K] 布局); K≤8192 同
+             * q4_0_gemv 激活缓存上限。未命中维持 q4_0_gemv 零回归。 */
+            if (w_q4_slot && m < 32u && !em2.batched &&
+                ((fl >> 1) & 1u) && k <= 8192u && (k % 128u) == 0u) {
+                fl |= 32u;  /* flags bit5 = w4ts */
+            }
             em.add_op(OP_MATMUL_F16, {a_t, w_use, out_t, m, k, nn, fl});
         }
     }

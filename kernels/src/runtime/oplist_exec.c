@@ -25,6 +25,9 @@
 #include <qurt.h>
 
 #include "dc_parts.h"
+#include "dma_utils.h"   /* 018 W4TS: dma_desc_init/submit/is_done 菊花链 */
+#include "dma_desc.h"    /* dma_desc_1d_t */
+#include "dma_cmds.h"    /* dmwait */
 #include "fence.h"
 #include "kvcache.h"
 #include "gdn_sm.h"
@@ -43,6 +46,38 @@
 #include "internal/hvx-fa-kernels.h"  /* HVX_OP_ADD_F32 (vec_dot 收尾通道加) */
 #include "internal/hex-utils.h" /* hex_l2fetch: GEMV t1 权重流 DRAM 延迟预取 */
 #include "internal/hvx-reduce.h"      /* hvx_vec_reduce_sum_f32 (水平归约) */
+#include "internal/hvx-inverse.h"     /* 018 W4TS: q8 量化 hvx_vec_inverse_f16 */
+#include "internal/hvx-repl.h"        /* 018 W4TS: q8 量化 hvx_vec_repl_f16 */
+#ifndef QK_Q8_0_TILED
+#define QK_Q8_0_TILED 128  /* htp-ops.h 同值 (不引该头: op 上下文定义与本地冲突) */
+#endif
+/* 018 W4TS: vendored hvx-mm-kernels-tiled.h 首次被本文件实例化 — iq4nl/mxfp4
+ * 内核引用的三个 LUT 常量在 ggml 侧定义于 matmul-ops.c (vendored 时未随迁),
+ * 照抄补齐 (本文件只调 q4_0 内核, 三表仅满足符号存在)。 */
+static const uint8_t __attribute__((aligned(128))) kvalues_iq4nl_lut[] = {
+    0x81, 0, 0x98, 0, 0xAD, 0, 0xBF, 0, 0xCF, 0, 0xDD, 0, 0xEA, 0, 0xF6, 0, 0x01, 0, 0x0D, 0, 0x19, 0, 0x26, 0,
+    0x35, 0, 0x45, 0, 0x59, 0, 0x71, 0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0,
+    0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0,
+    0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0,
+    0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0, 0,    0,
+};
+static const uint8_t __attribute__((aligned(128))) kvalues_mxfp4_lut[] = {
+    0,    0, 1,    0, 2,    0, 3, 0, 4, 0, 6, 0, 8, 0, 12, 0, 0, 0, 0xff, 0, 0xfe, 0, 0xfd, 0, 0xfc, 0,
+    0xfa, 0, 0xf8, 0, 0xf4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0,    0, 0,    0, 0,    0, 0,    0,
+    0,    0, 0,    0, 0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0,    0, 0,    0, 0,    0, 0,    0,
+    0,    0, 0,    0, 0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0,    0, 0,    0, 0,    0, 0,    0,
+    0,    0, 0,    0, 0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0,    0, 0,    0, 0,    0,
+};
+static const uint8_t __attribute__((aligned(128))) expand_x32_e8m0[128] = {
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x02, 0x00, 0x08, 0x08, 0x01, 0x02, 0x00, 0x04, 0x04, 0x00, 0x00,
+    0x00, 0x11, 0x10, 0x10, 0x10, 0x02, 0x00, 0x04, 0x00, 0x01, 0x02, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00, 0x01, 0x04,
+    0x00, 0x00, 0x22, 0x20, 0x20, 0x20, 0x21, 0x22, 0x20, 0x24, 0x04, 0x00, 0x00, 0x00, 0x09, 0x08, 0x00, 0x00, 0x02,
+    0x00, 0x04, 0x00, 0x11, 0x12, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x01, 0x04, 0x00, 0x00, 0x02, 0x00, 0x08, 0x08,
+    0x01, 0x02, 0x00, 0x04, 0x44, 0x40, 0x40, 0x40, 0x41, 0x40, 0x40, 0x40, 0x42, 0x40, 0x44, 0x40, 0x41, 0x42, 0x48,
+    0x48, 0x08, 0x08, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x12, 0x10, 0x10, 0x10, 0x01, 0x02, 0x00, 0x04, 0x04, 0x00,
+    0x00, 0x00, 0x09, 0x08, 0x00, 0x00, 0x22, 0x20, 0x24, 0x20, 0x21, 0x22, 0x20, 0x20,
+};
+#include "internal/hvx-mm-kernels-tiled.h"  /* 018 W4TS: tiled_vec_dot_q4_0_32x1 + quantize_row_f32_q8_0_tiled (vendored ggml) */
 #if defined(__hexagon__)
 #include <hexagon_types.h>          /* HMX Q6_* intrinsic 依赖 (Address/UWord32/Word32) */
 #include <hmx_hexagon_protos.h>     /* Q6_mxclracc_hf / Q6_bias_mxmem2_A / Q6_activation_hf_mxmem_RR_deep / Q6_mxmem_AR_after_hf */
@@ -2315,6 +2350,221 @@ static int exec_matmul_q4_0_gemv(const uint16_t* a, const uint8_t* w_q4, uint16_
     return 0;
 }
 
+/* ── 018 W4TS: Q4_0 640B tile 槽 decode 流式 matvec ─────────────────────
+ * 三件套 (llama.cpp ggml-hexagon 同构; 探针 51: HVX vmemu→DDR ~10GB/s 硬墙;
+ * 探针 52: 驻留 RAW 0.99× 死路; 破墙唯 DMA 流式+tile 布局+行并行 rmpy):
+ *   ① 权重 32 行 2D tile 连续布局 (emit repack_q4_0_tiles 已产, ct 主序)
+ *   ② UserDMA 菊花链流式搬 tile 进 VTCM (src/dst 双 bypass = ggml 生产契约,
+ *     dst_bypass=1 直写 VTCM 免逐 tile fence; ring 8 槽晚 poll 算搬重叠)
+ *   ③ vendored tiled_vec_dot_q4_0_32x1 (rmpy int8 行并行, 32 输出列/链,
+ *     无水平归约) + q8_0 tiled 激活量化 (一次/op, K≤8192)
+ * 触发: flags bit5 (emit: w_q4_slot && m<32 && !batched && t1 && K≤8192 &&
+ * K%128==0)。VTCM: hmx_runtime arena 自划 (同 HMX 先例), 需求已入编译期
+ * hmx_arena_max_of (wtop_emit.cpp)。数值: q8 激活 × q4 权重 int 累加 + f32
+ * scale 对 — 与 q4_0_gemv (f16 激活) 非位级 (预期; G1 门 cos≥0.9999)。
+ * 失败返回 -1 → 分发回落 exec_matmul_q4_0_gemv (同 HVX 引擎标, 三腿不违)。 */
+#define W4TS_RING 8u
+#define W4TS_GROUP 4u  /* 每 desc 搬 G 个 ct (摊薄 launch: 1.42µs/ct@G1 → /G) */
+#define W4TS_CLEAN_MAX 1024u  /* 已 flush 权重 (基址,长度) 集合容量; 0.6B 194 个 */
+static int exec_matmul_w4_stream(const uint16_t* a, const uint8_t* w_q4, uint16_t* y,
+                                 uint32_t M, uint32_t K, uint32_t N,
+                                 uint32_t n0, uint32_t N_full,
+                                 char* err, size_t errn) {
+    const uint32_t n_dot = K / 32u, n_ct = N / 32u;
+    const size_t slot_bytes = (size_t)n_dot * 640u;
+    const size_t grp_bytes = W4TS_GROUP * slot_bytes;
+    const uint32_t n_grp = (n_ct + W4TS_GROUP - 1u) / W4TS_GROUP;
+#if defined(__HVX__) || defined(__hexagon__)
+    const size_t act_q8_bytes = (size_t)n_dot * 1152u;
+    /* VTCM arena attach (同 exec_matmul_f16_hmx 三支先例) */
+    if (hmx_runtime_get_vtcm_base() == NULL) {
+        if (g_exec.has_layout) {
+            void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+            if (!vb || g_exec.layout_arena_sz == 0u) {
+                snprintf(err, errn, "w4ts arena empty (layout)"); return -1;
+            }
+            rtrace("w4ts attach arena", (int)g_exec.layout_arena_sz);
+            hmx_runtime_setup_region((uint8_t*)vb + g_exec.layout_arena_off,
+                                     g_exec.layout_arena_sz);
+        } else if (g_exec.engine_ready) {
+            void* vb = NULL; uint32_t vs = 0, pc = 0; void* pb = NULL;
+            wtcache_layout(g_exec.wc, &vb, &vs, &pb, &pc);
+            uint32_t off = (pc + 2047u) & ~2047u;
+            uint32_t hi = (vs > g_exec.vtcm_pool_size) ? (vs - g_exec.vtcm_pool_size) : 0u;
+            uint32_t cap = (vb && hi > off) ? (hi - off) : 0u;
+            if (cap == 0u) { snprintf(err, errn, "w4ts attach no scratch"); return -1; }
+            rtrace("w4ts attach cap", (int)cap);
+            hmx_runtime_attach((uint8_t*)vb + off, cap);
+        } else if (hmx_runtime_setup(4u * 1024u * 1024u) != 0) {
+            snprintf(err, errn, "w4ts hmx setup fail"); return -1;
+        }
+    }
+    char* vtcm = (char*)hmx_runtime_get_vtcm_base();
+    unsigned int vtcm_sz = hmx_runtime_get_vtcm_size();
+    if (!vtcm || vtcm_sz == 0u) return -1;
+    /* arena 自划: [ring 8×(G·slot) | act_q8 M×n_dot×1152 | act_f32 M×K | out M×N] */
+    size_t off_aq8  = (W4TS_RING * grp_bytes + 2047u) & ~(size_t)2047u;
+    size_t off_af32 = (off_aq8 + (size_t)M * act_q8_bytes + 2047u) & ~(size_t)2047u;
+    size_t off_out  = (off_af32 + (size_t)M * K * 4u + 2047u) & ~(size_t)2047u;
+    size_t need = off_out + (size_t)M * N * 4u + 2048u;
+    if (need > (size_t)vtcm_sz) { snprintf(err, errn, "w4ts vtcm overflow"); return -1; }
+    uint8_t* ring    = (uint8_t*)vtcm;
+    uint8_t* act_q8  = (uint8_t*)vtcm + off_aq8;
+    float*   act_f32 = (float*)(vtcm + off_af32);
+    float*   out_f32 = (float*)(vtcm + off_out);
+
+    /* 源 clean 一次性 (铁律① CPU写DDR→DMA bypass 读): 每 (基址,长度) 首见
+     * FLUSH_INVALIDATE, 同范围后续 step 跳过 (权重只读, 摊销为零)。单静态对
+     * 只记一个权重 → 194 个 W4TS 权重每 op 重 flush (366.6MB/step 全重刷)。
+     * 改有界已 flush 集合: 首见 flush 一次并登记, 命中跳过。超容(>W4TS_CLEAN_MAX)
+     * 退化为逐次 flush(仍正确, 仅回旧行为), 不静默漏刷。 */
+    static const uint8_t* s_cleaned_base[W4TS_CLEAN_MAX];
+    static size_t          s_cleaned_len[W4TS_CLEAN_MAX];
+    static uint32_t        s_cleaned_n = 0;
+    const uint8_t* w_src = w_q4 + (size_t)(n0 / 32u) * slot_bytes;
+    const size_t w_len = (size_t)n_ct * slot_bytes;
+    int seen = 0;
+    for (uint32_t ci = 0; ci < s_cleaned_n; ci++) {
+        if (s_cleaned_base[ci] == w_src && s_cleaned_len[ci] == w_len) { seen = 1; break; }
+    }
+    if (!seen) {
+        fence_handoff((void*)w_src, (uint32_t)w_len, FC_CPU, FC_DMA, FM_DDR);
+        if (s_cleaned_n < W4TS_CLEAN_MAX) {
+            s_cleaned_base[s_cleaned_n] = w_src;
+            s_cleaned_len[s_cleaned_n] = w_len;
+            s_cleaned_n++;
+        }
+    }
+
+    /* 激活: f16→f32 (标量逐元素, K≤8192 一次/op) → q8_0 tiled (vendored) */
+    for (uint32_t m = 0; m < M; ++m) {
+        const uint16_t* xb = a + (size_t)m * K;
+        float* af = act_f32 + (size_t)m * K;
+        for (uint32_t k = 0; k < K; ++k) af[k] = f16_to_f32(xb[k]);
+        quantize_row_f32_q8_0_tiled(af, act_q8 + (size_t)m * act_q8_bytes, (int)K);
+    }
+
+    /* DMA ring: desc 静态复用 (重写前必 is_done, 不 free 无野指针; op 末
+     * dmwait 排空不留悬垂链)。每 desc 搬 G 个 ct (摊薄 launch)。预热
+     * min(RING, n_grp) 组; 尾组可不满。 */
+    static dma_desc_1d_t s_desc[W4TS_RING] __attribute__((aligned(16)));
+    const uint32_t pre = (n_grp < W4TS_RING) ? n_grp : W4TS_RING;
+    for (uint32_t i = 0; i < pre; ++i) {
+        const uint32_t ct0 = i * W4TS_GROUP;
+        const uint32_t cnt = (n_ct - ct0 < W4TS_GROUP) ? (n_ct - ct0) : W4TS_GROUP;
+        dma_desc_1d_params_t p;
+        memset(&p, 0, sizeof(p));
+        p.src_address = (uint32_t)(uintptr_t)(w_src + (size_t)ct0 * slot_bytes);
+        p.dst_address = (uint32_t)(uintptr_t)(ring + (size_t)i * grp_bytes);
+        p.length = (uint32_t)((size_t)cnt * slot_bytes);
+        p.order = 1u; p.src_bypass = 1u; p.dst_bypass = 1u;
+        if (dma_desc_init(&s_desc[i], &p, DMA_DESC_TYPE_1D) != DMA_SUCCESS) {
+            snprintf(err, errn, "w4ts dma pre %u init fail", i); return -1;
+        }
+        void* batch[1] = { (void*)&s_desc[i] };  /* desc_batch = 指针数组, 非 desc 本体地址 */
+        if (dma_desc_submit(batch, 1) != DMA_SUCCESS) {
+            snprintf(err, errn, "w4ts dma pre %u submit fail", i); return -1;
+        }
+    }
+    for (uint32_t g = 0; g < n_grp; ++g) {
+        const uint32_t slot = g & (W4TS_RING - 1u);
+        while (dma_desc_is_done(&s_desc[slot]) == DMA_INCOMPLETE) { }
+        const uint8_t* grp_v = ring + (size_t)slot * grp_bytes;
+        const uint32_t ct0 = g * W4TS_GROUP;
+        const uint32_t cnt = (n_ct - ct0 < W4TS_GROUP) ? (n_ct - ct0) : W4TS_GROUP;
+        for (uint32_t j = 0; j < cnt; ++j) {
+            const uint8_t* tile_v = grp_v + (size_t)j * slot_bytes;
+            for (uint32_t m = 0; m < M; ++m) {
+                tiled_vec_dot_q4_0_32x1(K, out_f32 + (size_t)m * N + (size_t)(ct0 + j) * 32u,
+                                        tile_v, act_q8 + (size_t)m * act_q8_bytes,
+                                        32u, NULL);
+            }
+        }
+        const uint32_t ng = g + W4TS_RING;
+        if (ng < n_grp) {
+            const uint32_t nct0 = ng * W4TS_GROUP;
+            const uint32_t ncnt = (n_ct - nct0 < W4TS_GROUP) ? (n_ct - nct0) : W4TS_GROUP;
+            dma_desc_1d_params_t p;
+            memset(&p, 0, sizeof(p));
+            p.src_address = (uint32_t)(uintptr_t)(w_src + (size_t)nct0 * slot_bytes);
+            p.dst_address = (uint32_t)(uintptr_t)(ring + (size_t)slot * grp_bytes);
+            p.length = (uint32_t)((size_t)ncnt * slot_bytes);
+            p.order = 1u; p.src_bypass = 1u; p.dst_bypass = 1u;
+            if (dma_desc_init(&s_desc[slot], &p, DMA_DESC_TYPE_1D) != DMA_SUCCESS) {
+                snprintf(err, errn, "w4ts dma ct %u init fail", nct0); return -1;
+            }
+            void* batch[1] = { (void*)&s_desc[slot] };
+            if (dma_desc_submit(batch, 1) != DMA_SUCCESS) {
+                snprintf(err, errn, "w4ts dma ct %u submit fail", nct0); return -1;
+            }
+        }
+    }
+    dma_wait_for_idle();  /* 排空: 下个 op 的 DMA 消费者无悬垂链 */
+    /* f32 → f16 写 y (out_f32 在 VTCM, CPU/HVX 同域一致) */
+    for (uint32_t m = 0; m < M; ++m) {
+        uint16_t* yb = y + (size_t)m * N_full + n0;
+        const float* ob = out_f32 + (size_t)m * N;
+        uint32_t n = 0;
+        for (; n + 64u <= N; n += 64u) {
+            HVX_Vector lo = hvx_vmemu((const uint8_t*)(ob + n));
+            HVX_Vector hi = hvx_vmemu((const uint8_t*)(ob + n + 32u));
+            hvx_vmemu(yb + n) = hvx_vec_f32_to_f16(lo, hi);
+        }
+        if (n < N) {  /* N%32==0 保证尾恰 32 */
+            HVX_Vector lo = hvx_vmemu((const uint8_t*)(ob + n));
+            hvx_vec_store_u(yb + n, 64u, hvx_vec_f32_to_f16_shuff(lo, lo));
+        }
+    }
+    g_last_engine = WT_ENG_HVX;
+    return 0;
+#else
+    /* host 标量镜像: q8 激活 × q4 tile, int 累加 × f16 scale 对 (与设备
+     * rmpy 路径数学同构; G2 host 对拍门基准)。静态缓冲 K≤8192/N_dot≤256。 */
+    static float af[8192], d_a[256];
+    static int8_t aq8[8192];
+    for (uint32_t m = 0; m < M; ++m) {
+        const uint16_t* xb = a + (size_t)m * K;
+        for (uint32_t k = 0; k < K; ++k) af[k] = f16_to_f32(xb[k]);
+        for (uint32_t kt = 0; kt < n_dot; ++kt) {
+            float mx = 0.0f;
+            for (uint32_t j = 0; j < 32u; ++j) {
+                float v = fabsf(af[kt * 32u + j]);
+                if (v > mx) mx = v;
+            }
+            float d = (mx > 0.0f) ? mx / 127.0f : 1.0f;
+            d_a[kt] = f16_to_f32(f32_to_f16(d));  /* 设备 d 存 f16 */
+            float inv = (mx > 0.0f) ? 1.0f / d : 0.0f;
+            for (uint32_t j = 0; j < 32u; ++j) {
+                int q = (int)lrintf(af[kt * 32u + j] * inv);
+                aq8[kt * 32u + j] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+            }
+        }
+        for (uint32_t ct = 0; ct < n_ct; ++ct) {
+            for (uint32_t r = 0; r < 32u; ++r) {
+                float acc = 0.0f;
+                for (uint32_t kt = 0; kt < n_dot; ++kt) {
+                    const uint8_t* tile =
+                        w_q4 + ((size_t)(n0 / 32u + ct) * n_dot + kt) * 640u;
+                    const uint16_t* drow = (const uint16_t*)(const void*)(tile + 512u);
+                    float d_w = f16_to_f32(drow[r]);
+                    int isum = 0;
+                    for (uint32_t i = 0; i < 16u; ++i) {
+                        uint8_t b = tile[i * 32u + r];
+                        isum += ((int)(b & 0xFu) - 8) * (int)aq8[kt * 32u + 2u * i];
+                        isum += ((int)(b >> 4) - 8) * (int)aq8[kt * 32u + 2u * i + 1u];
+                    }
+                    acc += d_w * d_a[kt] * (float)isum;
+                }
+                y[(size_t)m * N_full + n0 + ct * 32u + r] = f32_to_f16(acc);
+            }
+        }
+    }
+    g_last_engine = WT_ENG_HVX;  /* planned=HVX 同标 (host 无引擎实体) */
+    return 0;
+#endif
+}
+
 /* f16×f16 GEMM (float 图; f32 累加 f16 存储）。M3c 正确性版 —— 性能版
  * 走 HMX (M7)。flags bit0 = a 转置(存 [K,M]), bit1 = w 转置(存 [N,K]),
  * bit2 = batched BMM(attention q·kᵀ/probs·v; 批数在高 16 位) */
@@ -2630,6 +2880,7 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
     int batched = (int)(flags & 4u);
     int w_pp = (int)((flags >> 3) & 1u);   /* 008 T012: wgt 预打包 (emit 镜像) */
     int n_pad = (int)((flags >> 4) & 1u);  /* N=16 门缝: 权重零填 N→round_up(N,32), 窄解包 */
+    int w4ts = (int)((flags >> 5) & 1u);   /* 018: Q4 tile 槽 DMA 流式 + rmpy matvec */
     uint32_t Bn = flags >> 16;
     if (Bn == 0) Bn = 1;
     /* n_pad: 计算 N = round_up(N_full,32) (emit 已零填权重到 [N_compute,K]),
@@ -2677,6 +2928,12 @@ static int exec_matmul_f16_impl(const struct wt_blob* b, const struct wt_op* op,
      * 013 US-D (T024): ver=3 注解路径免 M<32 运行时重算 — planned_engine==HVX
      * ⟺ M<32 (emit assign_engine 唯一决定); ver<=2 legacy 保留运行时自决。 */
     if (b->annot_base ? (g_planned_engine == WT_ENG_HVX) : (M < 32u)) {
+        /* 018 W4TS 优先: bit5 + Q4 槽 + t1 → DMA 流式 rmpy matvec。
+         * 失败回落 q4_0_gemv (同 HVX 引擎标, planned==actual 三腿不违)。 */
+        if (w_q4 && w4ts && t1 && exec_matmul_w4_stream(a, w_q4, y, M, K, N,
+                                                        n0, N_full, err, errn) == 0) {
+            return 0;
+        }
         int gv_rc = w_q4
             ? exec_matmul_q4_0_gemv(a, w_q4, y, M, K, N, n0, N_full, t0, err, errn)
             : exec_matmul_f16_gemv(a, w, y, M, K, N, n0, N_full, t0, t1,
