@@ -2366,6 +2366,188 @@ static int exec_matmul_q4_0_gemv(const uint16_t* a, const uint8_t* w_q4, uint16_
 #define W4TS_RING 8u
 #define W4TS_GROUP 4u  /* 每 desc 搬 G 个 ct (摊薄 launch: 1.42µs/ct@G1 → /G) */
 #define W4TS_CLEAN_MAX 1024u  /* 已 flush 权重 (基址,长度) 集合容量; 0.6B 194 个 */
+
+/* ── 020 decode 静态 DMA 调度 (T003/T004): 全局 footer 流 ─────────────────
+ * 编译期 footer (WT_DMA_SCHED) 把 decode 图所有权重搬运摊平成连续 DMA 记录流
+ * {op_idx, src_offset, len, vtcm_dst}, 运行期逐 token 重放。执行器拆两层:
+ *  - 填充层 (w4ts_fill_ahead): 全局描述符环持续前向提交 DMA, 跨 op 不排空;
+ *  - 消费层 (exec_matmul_w4_stream_global): 顺序消费 footer 记录, 按组算。
+ * 核心收益: 去掉 exec_matmul_w4_stream 原 per-op 的 dma_wait_for_idle()
+ * 排空 (op 间前奏串行), 让 DMA 在非 matmul op 期间预取权重 (021 批处理前件)。
+ * 激活条件: blob 带 footer (b->dma_base) 且本 op 几何与 footer 记录序一致。
+ * footer 与 op 序漂移 (外置权重跳过等) = 硬错误 (0.6B 全内联不存在; 4B 线
+ * 走 019 40-bit 流另立)。不参与 footer 的 blob (无 bit5) 恒走 legacy per-op
+ * ring (零回归)。全部 file-static 不拆 TU (013 前科: de-static 改 HMX 代码
+ * 生成致 cos 0.33)。 */
+#if defined(__HVX__) || defined(__hexagon__)
+#define W4TS_GRING 8u   /* 全局描述符环深度 (≥ 单 op 最大组数; 大组 op 回退) */
+static dma_desc_1d_t s_w4_desc[W4TS_GRING] __attribute__((aligned(16)));
+static uint8_t* s_w4_vtcm;               /* 全局权重环 VTCM 基址 (流激活后设) */
+static uint32_t s_w4_grp_max;            /* footer 最大单条 len (环槽字节跨度) */
+static uint32_t s_w4_fill;               /* 已提交 DMA 的记录数 (填充游标) */
+static uint32_t s_w4_consume;            /* 已消费的记录数 (消费游标) */
+static const struct wt_blob* s_w4_blob;  /* 本 token footer 来源 */
+static int s_w4_active;                  /* 本 token 全局流激活标志 */
+
+/* 020: footer 记录解码 (在线 20B → {src_offset, len}; off 相对 weight 区起点) */
+static void w4ts_rec(const struct wt_blob* b, uint32_t r, uint64_t* off, uint32_t* len) {
+    const uint8_t* p = b->dma_base + (size_t)r * WT_DMA_SCHED_REC;
+    *off = (uint64_t)wt_rd_u32(p + 4u) | ((uint64_t)wt_rd_u32(p + 8u) << 32);
+    *len = wt_rd_u32(p + 12u);
+}
+
+/* 020: 全局流权重 fence — 整个内联权重区一次 FLUSH_INVALIDATE (load 后权重
+ * 静态只读, 一次即足)。逐 record fence 会把有界集合撑爆 (0.6B decode 252 GEMV
+ * × ~20 组 ≈ 5040 条 > W4TS_CLEAN_MAX)。仅内联权重区 (<4GB) 支持单 fence;
+ * 外置权重 (4B 线) 不在此路径。 */
+static void w4ts_fence_all(const struct wt_blob* b) {
+    static const struct wt_blob* s_fenced = NULL;
+    if (s_fenced == b) return;
+    if (b->weight_bytes > 0u && b->weight_bytes <= 0xFFFFFFFFull) {
+        fence_handoff((void*)b->weight_base, (uint32_t)b->weight_bytes,
+                      FC_CPU, FC_DMA, FM_DDR);
+    }
+    s_fenced = b;
+}
+
+/* 020: 填充层 — 持续前向提交 DMA (受环深 + 消费进度约束, 跨 op 不排空)。
+ * 环回槽重写安全由消费进度保证: fill < consume+GRING → fill-GRING < consume
+ * (该槽上一条记录已被消费等 is_done), 故无需再 is_done 探针。失败 (init/submit)
+ * 只停填 (不报), 消费层用 fill<=r 探针判短并硬错。 */
+static void w4ts_fill_ahead(void) {
+    const struct wt_blob* b = s_w4_blob;
+    if (!b || !b->dma_base) return;
+    while (s_w4_fill < b->n_dma && s_w4_fill < s_w4_consume + W4TS_GRING) {
+        uint32_t slot = s_w4_fill % W4TS_GRING;
+        uint64_t off; uint32_t len;
+        w4ts_rec(b, s_w4_fill, &off, &len);
+        dma_desc_1d_params_t p;
+        memset(&p, 0, sizeof(p));
+        p.src_address = (uint32_t)(uintptr_t)(b->weight_base + off);
+        p.dst_address = (uint32_t)(uintptr_t)(s_w4_vtcm + (size_t)slot * s_w4_grp_max);
+        p.length = len;
+        p.order = 1u; p.src_bypass = 1u; p.dst_bypass = 1u;
+        if (dma_desc_init(&s_w4_desc[slot], &p, DMA_DESC_TYPE_1D) != DMA_SUCCESS) return;
+        void* batch[1] = { (void*)&s_w4_desc[slot] };
+        if (dma_desc_submit(batch, 1) != DMA_SUCCESS) return;
+        s_w4_fill++;
+    }
+}
+
+/* 020: 全局流激活 (每 token 一次; 有 footer 时)。算 grp_max + 整区 fence 一次。
+ * 先排空上一 token 残留 (run_range op 失败早退时 stream_end 未跑, 描述符可能
+ * 仍 in-flight; 排空后再重写才安全)。 */
+static void w4ts_stream_begin(const struct wt_blob* b) {
+    dma_wait_for_idle();
+    s_w4_blob = b;
+    s_w4_fill = 0;
+    s_w4_consume = 0;
+    s_w4_grp_max = 0;
+    s_w4_active = 0;
+    if (!b || !b->dma_base || b->n_dma == 0) return;
+    for (uint32_t r = 0; r < b->n_dma; r++) {
+        uint64_t off; uint32_t len;
+        w4ts_rec(b, r, &off, &len);
+        if (len > s_w4_grp_max) s_w4_grp_max = len;
+    }
+    w4ts_fence_all(b);
+    s_w4_active = 1;
+}
+
+/* 020: 全局流排空 (每 token 末; 下一 token 填充层可安全重写描述符)。 */
+static void w4ts_stream_end(void) {
+    if (s_w4_active) { dma_wait_for_idle(); s_w4_active = 0; }
+}
+
+/* 020: 消费层 — 从全局权重环顺序消费本 op 的 footer 记录组。act 量化与
+ * f32→f16 写回与 legacy 路径同构; 区别仅在权重 DMA 由全局填充层驱动 + 无
+ * op 末 dma_wait_for_idle 排空。 */
+static int exec_matmul_w4_stream_global(const uint16_t* a, uint16_t* y,
+                                        uint32_t M, uint32_t K, uint32_t N,
+                                        uint32_t n0, uint32_t N_full,
+                                        uint32_t n_dot, uint32_t n_ct,
+                                        size_t slot_bytes, uint32_t n_grp,
+                                        char* err, size_t errn) {
+    const size_t act_q8_bytes = (size_t)n_dot * 1152u;
+    char* vtcm = (char*)hmx_runtime_get_vtcm_base();
+    unsigned int vtcm_sz = hmx_runtime_get_vtcm_size();
+    if (!vtcm || vtcm_sz == 0u) return -1;
+    s_w4_vtcm = (uint8_t*)vtcm;
+    /* footer 与本 op 序一致校验 (漂移 = 外置权重跳过等契约破 = 硬错误) */
+    const uint32_t r0 = s_w4_consume;
+    if (r0 + n_grp > s_w4_blob->n_dma) {
+        snprintf(err, errn, "w4ts footer short at op %u", (unsigned)g_current_op_global);
+        return -1;
+    }
+    const uint32_t op0 = wt_rd_u32(s_w4_blob->dma_base + (size_t)r0 * WT_DMA_SCHED_REC);
+    const uint32_t op1 = wt_rd_u32(s_w4_blob->dma_base +
+                                   (size_t)(r0 + n_grp - 1u) * WT_DMA_SCHED_REC);
+    if (op0 != g_current_op_global || op1 != g_current_op_global) {
+        snprintf(err, errn, "w4ts footer drift op %u (rec op %u/%u)",
+                 (unsigned)g_current_op_global, (unsigned)op0, (unsigned)op1);
+        return -1;
+    }
+    /* arena 自划: [全局权重环 8×grp_max | act_q8 | act_f32 | out] */
+    size_t off_aq8  = (W4TS_GRING * (size_t)s_w4_grp_max + 2047u) & ~(size_t)2047u;
+    size_t off_af32 = (off_aq8 + (size_t)M * act_q8_bytes + 2047u) & ~(size_t)2047u;
+    size_t off_out  = (off_af32 + (size_t)M * K * 4u + 2047u) & ~(size_t)2047u;
+    size_t need = off_out + (size_t)M * N * 4u + 2048u;
+    if (need > (size_t)vtcm_sz) {
+        snprintf(err, errn, "w4ts global vtcm overflow"); return -1;
+    }
+    uint8_t* act_q8  = (uint8_t*)vtcm + off_aq8;
+    float*   act_f32 = (float*)(vtcm + off_af32);
+    float*   out_f32 = (float*)(vtcm + off_out);
+    /* 激活 f16→f32→q8_0 (同 legacy) */
+    for (uint32_t m = 0; m < M; ++m) {
+        const uint16_t* xb = a + (size_t)m * K;
+        float* af = act_f32 + (size_t)m * K;
+        for (uint32_t k = 0; k < K; ++k) af[k] = f16_to_f32(xb[k]);
+        quantize_row_f32_q8_0_tiled(af, act_q8 + (size_t)m * act_q8_bytes, (int)K);
+    }
+    /* 消费 footer 记录组: 填充层跨 op 预取, 本 op 按序等 is_done + 算 */
+    for (uint32_t g = 0; g < n_grp; ++g) {
+        const uint32_t r = s_w4_consume;
+        const uint32_t slot = r % W4TS_GRING;
+        w4ts_fill_ahead();
+        if (s_w4_fill <= r) {
+            snprintf(err, errn, "w4ts fill short rec %u", (unsigned)r);
+            return -1;
+        }
+        while (dma_desc_is_done(&s_w4_desc[slot]) == DMA_INCOMPLETE) { }
+        const uint8_t* grp_v = s_w4_vtcm + (size_t)slot * s_w4_grp_max;
+        const uint32_t ct0 = g * W4TS_GROUP;
+        const uint32_t cnt = (n_ct - ct0 < W4TS_GROUP) ? (n_ct - ct0) : W4TS_GROUP;
+        for (uint32_t j = 0; j < cnt; ++j) {
+            const uint8_t* tile_v = grp_v + (size_t)j * slot_bytes;
+            for (uint32_t m = 0; m < M; ++m) {
+                tiled_vec_dot_q4_0_32x1(K, out_f32 + (size_t)m * N + (size_t)(ct0 + j) * 32u,
+                                        tile_v, act_q8 + (size_t)m * act_q8_bytes,
+                                        32u, NULL);
+            }
+        }
+        s_w4_consume = r + 1u;
+    }
+    /* f32 → f16 写 y (同 legacy) */
+    for (uint32_t m = 0; m < M; ++m) {
+        uint16_t* yb = y + (size_t)m * N_full + n0;
+        const float* ob = out_f32 + (size_t)m * N;
+        uint32_t n = 0;
+        for (; n + 64u <= N; n += 64u) {
+            HVX_Vector lo = hvx_vmemu((const uint8_t*)(ob + n));
+            HVX_Vector hi = hvx_vmemu((const uint8_t*)(ob + n + 32u));
+            hvx_vmemu(yb + n) = hvx_vec_f32_to_f16(lo, hi);
+        }
+        if (n < N) {
+            HVX_Vector lo = hvx_vmemu((const uint8_t*)(ob + n));
+            hvx_vec_store_u(yb + n, 64u, hvx_vec_f32_to_f16_shuff(lo, lo));
+        }
+    }
+    g_last_engine = WT_ENG_HVX;
+    return 0;
+}
+#endif /* __HVX__ / __hexagon__ */
+
 static int exec_matmul_w4_stream(const uint16_t* a, const uint8_t* w_q4, uint16_t* y,
                                  uint32_t M, uint32_t K, uint32_t N,
                                  uint32_t n0, uint32_t N_full,
@@ -2403,6 +2585,12 @@ static int exec_matmul_w4_stream(const uint16_t* a, const uint8_t* w_q4, uint16_
     char* vtcm = (char*)hmx_runtime_get_vtcm_base();
     unsigned int vtcm_sz = hmx_runtime_get_vtcm_size();
     if (!vtcm || vtcm_sz == 0u) return -1;
+    /* 020: 全局 footer 流 — 有 footer 时走全局消费 (权重环跨 op 持续重放,
+     * 无 op 末 dma_wait_for_idle 排空)。footer 无 (无 bit5) → legacy 零回归。 */
+    if (s_w4_active) {
+        return exec_matmul_w4_stream_global(a, y, M, K, N, n0, N_full,
+                                            n_dot, n_ct, slot_bytes, n_grp, err, errn);
+    }
     /* arena 自划: [ring 8×(G·slot) | act_q8 M×n_dot×1152 | act_f32 M×K | out M×N] */
     size_t off_aq8  = (W4TS_RING * grp_bytes + 2047u) & ~(size_t)2047u;
     size_t off_af32 = (off_aq8 + (size_t)M * act_q8_bytes + 2047u) & ~(size_t)2047u;
@@ -4298,6 +4486,10 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         }
         g_validated_blob = b;
     }
+    /* 020: 激活全局 footer DMA 流 (有 footer 时; 无则 no-op, 零回归)。 */
+#if defined(__HVX__) || defined(__hexagon__)
+    w4ts_stream_begin(b);
+#endif
     const int64_t t_run0 = HAP_perf_get_time_us();  /* PROF W-P2: ts 时间轴零点 */
     for (uint32_t ii = 0; ii < count; ii++) {
         uint32_t i = first + ii;
@@ -4401,6 +4593,10 @@ int wt_exec_run_range(const struct wt_blob* b, uint32_t first, uint32_t count,
         }
         if (rc) return (int)i + 1;
     }
+    /* 020: 排空全局 footer DMA 流 (下一 token 填充层安全重写描述符)。 */
+#if defined(__HVX__) || defined(__hexagon__)
+    w4ts_stream_end();
+#endif
     return 0;
 }
 

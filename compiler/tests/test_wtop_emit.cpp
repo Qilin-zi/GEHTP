@@ -701,6 +701,59 @@ int main() {
             }
         }
         delete w3;
+        /* 020 T001 正例: DMA schedule footer 往返 (emit 线格式 → wt_parse 读回)。
+         * 手组 v3 blob = header + 24B 槽 + op 表 + 注解 footer + dma footer
+         * (magic/count/20B 记录) + weight 128B 对齐。断言 wt_parse 命中 n_dma=1
+         * 且逐字段读回 {op_idx, src_offset u64, len, vtcm_dst} 与写入一致。 */
+        {
+            std::vector<uint8_t> b;
+            auto w16 = [&b](uint16_t v) { b.push_back((uint8_t)(v & 0xff)); b.push_back((uint8_t)(v >> 8)); };
+            auto w32 = [&b](uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((uint8_t)(v >> (8 * i))); };
+            b.insert(b.end(), {'W', 'T', 'O', 'P'});
+            w16(WT_BLOB_VER_3); w16(WT_ENDIAN_CHK);
+            w32(1); w32(1);                        // 1 slot, 1 op
+            // slot0 (24B v3): len=5120, count=64, offset=0, addr=0, rsv=0
+            w32(5120); w32(64); w32(0); w32(0); w32(0); w32(0);
+            // op0: OP_MATMUL_F16 arity 7 [a=5, w=0x8000|0, out=6, M=32, K=128, N=64, flags=32(bit5)]
+            w16(OP_MATMUL_F16); w16(7);
+            w32(5); w32(0x8000u | 0u); w32(6); w32(32); w32(128); w32(64); w32(32u);
+            // 注解 footer (v3, n_ops × u32)
+            w32(0);
+            // dma footer: [magic][count=1][op_idx=0, src_off lo=0, hi=0, len=5120, vtcm_dst=0]
+            w32(WT_DMA_SCHED_MAGIC); w32(1);
+            w32(0); w32(0); w32(0); w32(5120); w32(0);
+            while (b.size() % 128) b.push_back(0);
+            b.resize(b.size() + 5120, 0);          // weight 区 (slot0 len=5120)
+            wt_blob* wd = new wt_blob{};
+            CHECK(wt_parse(b.data(), b.size(), wd) == WT_OK, "dma: v3 blob w/ footer wt_parse OK");
+            CHECK(wd->ver == WT_BLOB_VER_3 && wd->n_dma == 1 && wd->dma_base != NULL,
+                  "dma: footer 命中 n_dma=1");
+            if (wd->dma_base) {
+                const uint8_t* p = wd->dma_base;
+                bool ok = (wt_rd_u32(p + 0) == 0) &&          /* op_idx */
+                          (wt_rd_u32(p + 4) == 0) &&          /* src_off_lo */
+                          (wt_rd_u32(p + 8) == 0) &&          /* src_off_hi */
+                          (wt_rd_u32(p + 12) == 5120) &&      /* len */
+                          (wt_rd_u32(p + 16) == 0);           /* vtcm_dst */
+                CHECK(ok, "dma: 20B 记录逐字段读回一致");
+            }
+            /* 负例: dma footer count 越界 → OP_TRUNC (确定性拒绝) */
+            {
+                std::vector<uint8_t> bad;
+                auto w16b = [&bad](uint16_t v) { bad.push_back((uint8_t)(v & 0xff)); bad.push_back((uint8_t)(v >> 8)); };
+                auto w32b = [&bad](uint32_t v) { for (int i = 0; i < 4; i++) bad.push_back((uint8_t)(v >> (8 * i))); };
+                bad.insert(bad.end(), {'W', 'T', 'O', 'P'});
+                w16b(WT_BLOB_VER_3); w16b(WT_ENDIAN_CHK); w32b(1); w32b(1);
+                w32b(5120); w32b(64); w32b(0); w32b(0); w32b(0); w32b(0);
+                w16b(OP_MATMUL_F16); w16b(7);
+                w32b(5); w32b(0x8000u | 0u); w32b(6); w32b(32); w32b(128); w32b(64); w32b(32u);
+                w32b(0);                               // annot
+                w32b(WT_DMA_SCHED_MAGIC); w32b(7);     // count=7 但无记录体
+                CHECK(wt_parse(bad.data(), bad.size(), wd) == WT_ERR_OP_TRUNC,
+                      "dma neg: footer count 越界 → OP_TRUNC");
+            }
+            delete wd;
+        }
         /* --dma-runlist 不扰动默认形态: conv_add (无溢出计划) 两次发射逐字节一致 */
         {
             const std::string blob_dma = dir + "blob_dmaflag.wtop";

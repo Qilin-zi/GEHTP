@@ -144,6 +144,17 @@ extern "C" {
 #define WT_CL_REF_REC 8u
 #define WT_MAX_CL 256u        /* 执行器布局表容量 (emit 超 = footer 仍写全) */
 #define WT_MAX_CL_REF 1024u   /* 执行器 op→layout 引用表容量 */
+/* 020 decode 静态 DMA 调度 (2026-11-04): 可选 footer, 位于 carve 布局 footer
+ * 之后、weight 128B 对齐之前:
+ *   [magic u32 = WT_DMA_SCHED_MAGIC][count u32][count × 20B]
+ * 20B record 在线格式 = {op_idx u32, src_off_lo u32, src_off_hi u32,
+ * len u32, vtcm_dst u32} (src_offset = lo|hi<<32, u64 size-agnostic,
+ * 相对 weight 区起点)。每条 = 一个 DMA 搬运单元 (W4TS 权重组粒度由编译
+ * 器决定), 按 op 顺序摊平成全局连续流, 运行期逐 token 重放。仅含 bit5
+ * (W4TS) matmul 的 blob 写此项; magic 探测同 carve/gdn 逻辑 (对齐填充
+ * 全 0 永不误判)。 */
+#define WT_DMA_SCHED_MAGIC 0x53414D44u /* "DMAS" little-endian */
+#define WT_DMA_SCHED_REC   20u         /* op_idx + src_off lo/hi + len + vtcm_dst */
 #define WT_ENG_ACT 0u
 #define WT_ENG_OUT 1u
 #define WT_ENG_WT 2u
@@ -328,6 +339,17 @@ struct wt_gdn_extra {
     uint32_t contract_ver;      /* numerics-contract.md 版本 */
 };
 
+/* 020 decode 静态 DMA 调度 (2026-11-04): footer 记录的内存形态。
+ * 在线格式 20B = {op_idx u32, src_off_lo u32, src_off_hi u32, len u32,
+ * vtcm_dst u32}; src_offset = lo|hi<<32 (u64 size-agnostic, 相对 weight
+ * 区起点), 由 wt_parse 逐条转录 (小端, 同 slot v2 两半合成模式)。 */
+struct wt_dma_sched {
+    uint32_t op_idx;
+    uint64_t src_offset;
+    uint32_t len;
+    uint32_t vtcm_dst;
+};
+
 struct wt_blob {
     uint16_t ver;
     uint32_t n_slots;
@@ -346,6 +368,8 @@ struct wt_blob {
     uint32_t n_cl;              /* 布局条数 */
     const uint8_t* cl_ref_base; /* op→layout 引用对区 (8B/条 {op_index, layout_id}) */
     uint32_t n_cl_ref;
+    const uint8_t* dma_base;    /* 020: optional decode 静态 DMA 调度 footer (20B/条) */
+    uint32_t n_dma;             /* DMA 调度条数 */
 };
 
 /* 算子输入契约单点注册表: enum wt_arg_kind + struct wt_arg_spec/wt_op_spec +

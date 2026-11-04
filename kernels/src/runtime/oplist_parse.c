@@ -44,6 +44,8 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
     out->n_carve = 0;
     out->gdn_base = NULL;
     out->n_gdn = 0;
+    out->dma_base = NULL;
+    out->n_dma = 0;
 
     /* v1: 16B 槽记录 {len,count,offset32,addr}; v2: 24B {len,count,off64,addr,rsv} */
     const uint32_t slot_rec = (out->ver >= WT_BLOB_VER_2) ? WT_SLOT_SIZE_V2 : WT_SLOT_SIZE;
@@ -148,6 +150,18 @@ int wt_parse(const uint8_t* buf, size_t size, struct wt_blob* out) {
             out->cl_ref_base = buf + p + 4u;
             out->n_cl_ref = nr;
             p += 4u + (size_t)nr * WT_CL_REF_REC;
+        }
+
+        /* 020: 可选 decode 静态 DMA 调度 footer — [magic][count][count × 20B],
+         * 位于 carve 布局 footer 之后、weight 128B 对齐之前。无 W4TS matmul
+         * 的 blob 此处是 128B 对齐填充(全 0), magic 探测确定性(同 carve 逻辑)。 */
+        if (size >= p + 8u && wt_rd_u32(buf + p) == WT_DMA_SCHED_MAGIC) {
+            uint32_t nd = wt_rd_u32(buf + p + 4u);
+            if (size < p + 8u + (size_t)nd * WT_DMA_SCHED_REC)
+                return WT_ERR_OP_TRUNC;
+            out->dma_base = buf + p + 8u;
+            out->n_dma = nd;
+            p += 8u + (size_t)nd * WT_DMA_SCHED_REC;
         }
     }
 

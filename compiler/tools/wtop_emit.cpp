@@ -828,6 +828,11 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
     // 与 5c 预算门原式逐项同 (f16 matmul / W4A16 w4_carve_need / SPLIT 按 N)。
     auto hmx_arena_max_of = [&]() -> uint64_t {
         uint64_t amax = 0;
+        /* 020: 全局 footer 流 — 权重环 8 槽 × max_grp (跨 op 固定, 不逐 op 取
+         * max) + per-op act/out (逐 op 取 max)。与执行器 w4ts_stream_begin 的
+         * grp_max (= max over footer 记录 len = max over op 的 min(4,n_ct)*slot)
+         * 与 exec_matmul_w4_stream_global 的 off_aq8/off_af32/off_out 闭式逐项同式。 */
+        uint64_t w4_grp_max = 0, w4_perop_max = 0;
         for (size_t i = 0; i < em.ops.size(); i++) {
             uint16_t opc = em.ops[i].opcode;
             if (em.ops[i].n_args < 6) continue;
@@ -844,9 +849,15 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
              * 自划闭式逐项同式。annot engine=HVX(1) 不挡此项 (bit5 优先判)。 */
             if (opc == OP_MATMUL_F16 && em.ops[i].n_args >= 7 && (a[6] & 32u)) {
                 uint64_t slot = (K / 32) * 640;
+                uint64_t n_ct = N / 32;
                 uint64_t aq8 = M * (K / 32) * 1152;
-                amax = std::max(amax, al2k(8 * 4 * slot) + al2k(aq8) + al2k(M * K * 4) +
-                                      al2k(M * N * 4) + 2048);  /* ring 8 槽 × G4 组 */
+                uint64_t perop = al2k(aq8) + al2k(M * K * 4) + al2k(M * N * 4) + 2048;
+                /* legacy per-op ring (无 footer blob 仍走 per-op 8×4×slot) */
+                amax = std::max(amax, al2k(8 * 4 * slot) + perop);
+                /* 020 全局 footer 流: 环槽跨度 = 首组 len (min(4,n_ct)*slot) */
+                uint64_t grp = (n_ct < 4) ? (n_ct * slot) : (4 * slot);
+                if (grp > w4_grp_max) w4_grp_max = grp;
+                if (perop > w4_perop_max) w4_perop_max = perop;
                 continue;
             }
             if ((em.op_annot[i] & 0x3u) != 2u) continue;  /* 2=WT_ENG_HMX (wt_engine) */
@@ -860,6 +871,10 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                                        al128(8 * (N / 32) * 4) + 128 + 128);
             }
         }
+        /* 020: 全局 footer 流预算 = 固定权重环 8×max_grp + per-op act/out 峰值。
+         * al2k 闭式内联 (lambda 作用域在循环内, 此处不可见): (x+2047)&~2047 */
+        if (w4_grp_max)
+            amax = std::max(amax, ((8 * w4_grp_max + 2047) & ~(uint64_t)2047) + w4_perop_max);
         return amax;
     };
     if (em.ddr_static) {
@@ -1427,6 +1442,62 @@ int emit(const std::string& bin_path, const std::string& in_f16_path,
                              "(first m%u k%u n%u arena_hi %u)\n",
                              cls.size(), refs.size(), cls[0].M, cls[0].K, cls[0].N,
                              cls[0].arena_hi);
+            }
+        }
+        /* 020 decode 静态 DMA 调度 footer — [magic][count][count × 20B],
+         * 位于 carve 布局 footer 之后、weight 128B 对齐之前。扫描所有 bit5
+         * (W4TS) 的 OP_MATMUL_F16, 把每个 op 的权重组按 op 顺序摊平成全局
+         * 连续流 (每 token 相同, emit 一次)。组粒度 = 4 列 tile (对齐 018
+         * W4TS_GROUP, 摊薄 launch); src_offset 相对内联 weight 区起点 (u64,
+         * size-agnostic, 线格式 lo|hi 两半合成同 slot v2); vtcm_dst = 全局
+         * 摊平组序 (执行器 T003 映射物理槽 = 组序 % RING)。外置权重槽
+         * (WT_SLOT_EXT_WGT, 4B 线) 不参与, 留待扩展。 */
+        {
+            struct DmaSchedRec { uint32_t op_idx; uint64_t src_offset; uint32_t len; uint32_t vtcm_dst; };
+            std::vector<DmaSchedRec> recs;
+            for (size_t i = 0; i < em.ops.size(); i++) {
+                const wt_op& o = em.ops[i];
+                if (o.opcode != OP_MATMUL_F16 || o.n_args < 7 || !(o.args[6] & 32u))
+                    continue;
+                uint32_t w_s = o.args[1] & 0x7FFFu;
+                if (w_s >= em.slots.size()) {
+                    std::fprintf(stderr, "error: dma sched w_slot %u OOB (n_slots %zu)\n",
+                                 w_s, em.slots.size());
+                    return 3;
+                }
+                if (em.slots[w_s].addr == WT_SLOT_EXT_WGT) continue;  /* 外置权重不参与 */
+                uint32_t K = o.args[4], N = o.args[5];
+                if (K == 0 || N == 0 || (K & 31u) || (N & 31u)) continue;
+                uint32_t n_dot = K / 32u, n_ct = N / 32u;
+                uint64_t slot_bytes = (uint64_t)n_dot * 640u;
+                uint64_t base = em.slots[w_s].offset;
+                uint32_t n_grp = (n_ct + 3u) / 4u;
+                for (uint32_t g = 0; g < n_grp; g++) {
+                    uint32_t ct0 = g * 4u;
+                    uint32_t cnt = (n_ct - ct0 < 4u) ? (n_ct - ct0) : 4u;
+                    recs.push_back({(uint32_t)i, base + (uint64_t)ct0 * slot_bytes,
+                                    cnt * (uint32_t)slot_bytes, (uint32_t)recs.size()});
+                }
+            }
+            if (!recs.empty()) {
+                auto put32 = [&](uint32_t v) {
+                    size_t old = em.blob.size();
+                    em.blob.resize(old + 4);
+                    std::memcpy(em.blob.data() + old, &v, 4);
+                    p += 4;
+                };
+                put32(WT_DMA_SCHED_MAGIC);
+                put32((uint32_t)recs.size());
+                for (const auto& r : recs) {
+                    put32(r.op_idx);
+                    put32((uint32_t)(r.src_offset & 0xFFFFFFFFu));
+                    put32((uint32_t)(r.src_offset >> 32));
+                    put32(r.len);
+                    put32(r.vtcm_dst);
+                }
+                std::fprintf(stderr, "[020] DMA sched footer: %zu groups (first op %u off %llu len %u)\n",
+                             recs.size(), recs[0].op_idx,
+                             (unsigned long long)recs[0].src_offset, recs[0].len);
             }
         }
         size_t woff = (p + 127) & ~(size_t)127;
